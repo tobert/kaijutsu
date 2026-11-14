@@ -151,7 +151,7 @@ fn assistant(index: usize, content: &MessageContent) -> LlmResult<(Walked, Vec<S
                 match block {
                     ContentBlock::Text { text: t } => join(&mut text, t),
                     ContentBlock::Reasoning { text: r, .. } => join(&mut reasoning, r),
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         if !input.is_object() {
                             return Err(LlmError::InvalidRequest(format!(
                                 "council: message {index}: tool call {name:?} ({id}) input is not a JSON object"
@@ -247,7 +247,7 @@ mod tests {
     use super::*;
 
     fn call(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
-        ContentBlock::ToolUse { id: id.into(), name: name.into(), input }
+        ContentBlock::ToolUse { id: id.into(), name: name.into(), input, signature: None }
     }
 
     fn result(id: &str, content: &str, is_error: bool) -> ContentBlock {

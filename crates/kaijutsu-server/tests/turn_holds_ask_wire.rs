@@ -53,7 +53,7 @@ fn done(stop: &str) -> StreamEvent {
 }
 
 fn shell_write(id: &str, command: &str) -> StreamEvent {
-    StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input: serde_json::json!({ "command": command }) }
+    StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input: serde_json::json!({ "command": command }), signature: None }
 }
 
 fn reply(text: &str) -> Vec<StreamEvent> {
@@ -420,7 +420,7 @@ fn a_hold_outlasts_the_tool_call_timeout() {
 
 fn background_shell_write(id: &str, command: &str) -> StreamEvent {
     StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(),
-        input: serde_json::json!({ "command": command, "run_in_background": true }) }
+        input: serde_json::json!({ "command": command, "run_in_background": true }), signature: None }
 }
 
 /// A background call holds only until the answer: an allow returns a
@@ -478,7 +478,7 @@ fn a_denied_background_call_returns_the_denial() {
 
 fn glob(id: &str, dir: &std::path::Path) -> StreamEvent {
     StreamEvent::ToolUse { id: id.into(), name: "glob".into(),
-        input: serde_json::json!({ "pattern": "*.txt", "path": dir.display().to_string() }) }
+        input: serde_json::json!({ "pattern": "*.txt", "path": dir.display().to_string() }), signature: None }
 }
 
 /// An ask with no stored command holds the turn too. On allow, the turn

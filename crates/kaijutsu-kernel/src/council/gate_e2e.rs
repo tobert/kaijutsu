@@ -1961,7 +1961,7 @@ fn shell_write_call(id: &str, command: &str, background: bool) -> Vec<crate::llm
     use crate::llm::stream::StreamEvent;
     let input = serde_json::json!({ "command": command, "run_in_background": background });
     vec![
-        StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input },
+        StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input, signature: None },
         StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None },
     ]
 }

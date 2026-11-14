@@ -349,7 +349,7 @@ impl HydrationState {
         // The call joins a reply still being folded, as the live turn joins
         // it to the reply it replays.
         self.tool_uses.push(ContentBlock::ToolUse { id: id.clone(), name: SYSTEM_MESSAGES_TOOL.to_string(),
-            input: serde_json::json!({}) });
+            input: serde_json::json!({}), signature: None });
         self.flush_assistant();
         self.messages.push(Message::tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: id, content: system_messages_result(&[entry]), is_error: false,
@@ -458,6 +458,7 @@ impl HydrationState {
                     id: tool_use_id,
                     name,
                     input,
+                    signature: block.signature.clone(),
                 });
             }
             (BlockRole::Asset, BlockKind::Text) => {
@@ -992,6 +993,7 @@ mod pairing_repair_tests {
                 id: id.to_string(),
                 name: "shell".to_string(),
                 input: serde_json::json!({}),
+                signature: None,
             }]),
             turn_scoped: false,
         }
@@ -1271,7 +1273,7 @@ mod pairing_repair_tests {
         let mut duplicate_calls = assistant_with_tool_use("duplicate");
         let MessageContent::Blocks(ref mut blocks) = duplicate_calls.content else { unreachable!() };
         blocks.push(ContentBlock::ToolUse {
-            id: "duplicate".into(), name: "different_tool".into(), input: serde_json::json!({}),
+            id: "duplicate".into(), name: "different_tool".into(), input: serde_json::json!({}), signature: None,
         });
         let mut duplicate_results = results(&["duplicate"]);
         let MessageContent::Blocks(ref mut blocks) = duplicate_results.content else { unreachable!() };
@@ -1494,6 +1496,7 @@ mod estimate_tokens_tests {
                     id: "tool_1".to_string(),
                     name: "read_file".to_string(),
                     input: tool_input,
+                    signature: None,
                 },
                 ContentBlock::Image {
                     hash: "abc123".to_string(),

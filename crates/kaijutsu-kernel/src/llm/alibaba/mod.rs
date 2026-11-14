@@ -289,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn earlier_reasoning_goes_back_with_preserve_thinking() {
         use crate::llm::ContentBlock;
-        let call = |id: &str| ContentBlock::ToolUse { id: id.into(), name: "ls".into(), input: serde_json::json!({}) };
+        let call = |id: &str| ContentBlock::ToolUse { id: id.into(), name: "ls".into(), input: serde_json::json!({}), signature: None };
         let result = |id: &str| ContentBlock::ToolResult { tool_use_id: id.into(), content: "ok".into(), is_error: false };
         let history = vec![
             Message::user("look around"),
@@ -373,7 +373,7 @@ mod tests {
         use crate::llm::stream::{CacheTarget, CacheTtl};
         let history = vec![
             Message::user("look"),
-            Message::with_tool_uses(None, vec![ContentBlock::ToolUse { id: "c1".into(), name: "ls".into(), input: serde_json::json!({}) }]),
+            Message::with_tool_uses(None, vec![ContentBlock::ToolUse { id: "c1".into(), name: "ls".into(), input: serde_json::json!({}), signature: None }]),
             Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "c1".into(), content: "ok".into(), is_error: false }]),
         ];
         let o = opts("qwen3.8-flash")

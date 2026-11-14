@@ -412,7 +412,7 @@ impl StateMachine {
                 // answers it with an error tool result instead of failing the
                 // turn.
                 match parsed {
-                    Ok(input) if input.is_object() => vec![StreamEvent::ToolUse { id, name, input }],
+                    Ok(input) if input.is_object() => vec![StreamEvent::ToolUse { id, name, input, signature: None }],
                     Ok(other) => vec![StreamEvent::ToolUseInvalid {
                         id,
                         name,
@@ -535,7 +535,7 @@ data: {\"type\":\"message_stop\"}
         // ContentBlockStop emits one ToolUse.
         assert_eq!(events.len(), 2);
         match &events[0] {
-            StreamEvent::ToolUse { id, name, input } => {
+            StreamEvent::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "toolu_ABC");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["location"], "Tokyo");
@@ -1099,6 +1099,7 @@ data: {\"type\":\"content_block_stop\",\"index\":0}
                     id: "toolu_S".into(),
                     name: "f".into(),
                     input: serde_json::json!({"path": "/a"}),
+                    signature: None,
                 },
             ]
         );

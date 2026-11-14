@@ -66,7 +66,7 @@ async fn run_turn(client: &Client, opts: BuildOpts, messages: Vec<Message>) -> T
                 turn.thinking.last_mut().expect("a thinking run is open").1 = signature
             }
             StreamEvent::TextDelta(t) => turn.text.push_str(&t),
-            StreamEvent::ToolUse { id, name, input } => turn.tool_uses.push((id, name, input)),
+            StreamEvent::ToolUse { id, name, input, .. } => turn.tool_uses.push((id, name, input)),
             StreamEvent::Done { stop_reason, input_tokens, output_tokens, extra } => {
                 done = true;
                 turn.stop_reason = stop_reason;
@@ -153,7 +153,7 @@ async fn tool_round_trip(client: &Client, model: &str) {
     let replayed = Message::with_reasoning_text_and_tool_uses(
         first.thinking.clone(),
         (!first.text.is_empty()).then(|| first.text.clone()),
-        vec![ContentBlock::ToolUse { id: id.clone(), name, input }],
+        vec![ContentBlock::ToolUse { id: id.clone(), name, input, signature: None }],
     );
     let result = Message::tool_results(vec![ContentBlock::ToolResult {
         tool_use_id: id,

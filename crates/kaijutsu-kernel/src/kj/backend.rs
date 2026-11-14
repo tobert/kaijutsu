@@ -55,10 +55,11 @@ enum BackendCommand {
     Set {
         /// Backend name — free-form, unique (e.g. anthropic, gpt, zorak)
         name: String,
-        /// Wire dialect: anthropic | deepseek | openai | alibaba | codex-app | council.
+        /// Wire dialect: anthropic | deepseek | openai | alibaba | codex-app | council | gemini.
         /// alibaba is Alibaba Model Studio; its key defaults to
         /// ALIBABA_API_KEY. council is a council v2 server, such as a nagaya,
-        /// which serves chat turns, gate decisions and embeddings.
+        /// which serves chat turns, gate decisions and embeddings. gemini is
+        /// Google's native Gemini API; its key defaults to GEMINI_API_KEY.
         #[arg(long)]
         kind: String,
         /// Endpoint URL. REQUIRED for --kind openai (it says WHICH
@@ -802,11 +803,11 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         let r = d
-            .dispatch(&argv(&["backend", "set", "gemini", "--kind", "gemini"]), &c)
+            .dispatch(&argv(&["backend", "set", "bogus", "--kind", "bogus"]), &c)
             .await;
         match r {
             KjResult::Err(msg) => {
-                assert!(msg.contains("unknown backend kind 'gemini'"), "{msg}");
+                assert!(msg.contains("unknown backend kind 'bogus'"), "{msg}");
                 assert!(msg.contains("anthropic"), "error lists the closed set: {msg}");
             }
             other => panic!("an unknown kind must fail loud: {other:?}"),

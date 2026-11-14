@@ -50,7 +50,7 @@ fn done(stop: &str) -> StreamEvent {
 }
 
 fn call(id: &str, tool: &str, input: serde_json::Value) -> StreamEvent {
-    StreamEvent::ToolUse { id: id.into(), name: tool.into(), input }
+    StreamEvent::ToolUse { id: id.into(), name: tool.into(), input, signature: None }
 }
 
 fn shell_write(id: &str, command: &str) -> StreamEvent {

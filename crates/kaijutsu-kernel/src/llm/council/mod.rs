@@ -486,14 +486,14 @@ mod tests {
         let paths = || -> Vec<String> { seen.lock().unwrap().iter().map(|c| format!("{} {}", c.method, c.path)).collect() };
         assert_eq!(paths(), ["GET /council/v2/identity", "POST /council/v2/generations"], "one generation and no PUT");
         let first = drain(&mut opened.unwrap()).await;
-        let Some(StreamEvent::ToolUse { id, name, input }) = first.first().cloned() else { panic!("{first:?}") };
+        let Some(StreamEvent::ToolUse { id, name, input, .. }) = first.first().cloned() else { panic!("{first:?}") };
         assert_eq!((id.as_str(), name.as_str(), input), ("c0", "ls", json!({"path": "/tmp"})));
         let Some(StreamEvent::Done { stop_reason, input_tokens, extra: Some(crate::llm::UsageExtra::Council(x)), .. }) = first.last() else {
             panic!("{first:?}")
         };
         assert_eq!((stop_reason.as_deref(), *input_tokens, x.kept, x.seed, x.model.as_str()), (Some("tool_use"), Some(47), 40, Some(11), "gemma-4"));
 
-        history.push(Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::ToolUse { id, name, input: json!({"path": "/tmp"}) }]), turn_scoped: false });
+        history.push(Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::ToolUse { id, name, input: json!({"path": "/tmp"}), signature: None }]), turn_scoped: false });
         history.push(Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "c0".into(), content: "a\nb".into(), is_error: false }]));
         let second = drain(&mut c.stream(o, history).await.unwrap()).await;
         assert!(second.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "Two files.")), "{second:?}");
@@ -779,6 +779,7 @@ mod tests {
                     id: "a".into(),
                     name: "ls".into(),
                     input: written,
+                    signature: None,
                 }]),
                 turn_scoped: false,
             },

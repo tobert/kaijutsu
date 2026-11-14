@@ -659,7 +659,7 @@ fn build_block(block: &ContentBlock, dialect: Dialect) -> Option<RequestContent>
             text: text.clone(),
             cache_control: None,
         }),
-        ContentBlock::ToolUse { id, name, input } => Some(RequestContent::ToolUse {
+        ContentBlock::ToolUse { id, name, input, .. } => Some(RequestContent::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
@@ -922,6 +922,7 @@ mod tests {
                 id: "toolu_01ABC".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"location": "Tokyo"}),
+                signature: None,
             }],
         )];
         let req = build_request(&opts("claude-haiku-4-5"), &messages, false);
@@ -1329,6 +1330,7 @@ mod tests {
                 id: "toolu_01".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "Tokyo"}),
+                signature: None,
             }],
         )];
         let req = build_request(&o, &messages, false);
@@ -1918,7 +1920,7 @@ mod tests {
     fn an_empty_text_block_beside_other_content_is_dropped() {
         let blocks = built_blocks(&assistant_with(vec![
             ContentBlock::Text { text: String::new() },
-            ContentBlock::ToolUse { id: "t".into(), name: "f".into(), input: serde_json::json!({}) },
+            ContentBlock::ToolUse { id: "t".into(), name: "f".into(), input: serde_json::json!({}), signature: None },
         ]));
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(matches!(&blocks[0], RequestContent::ToolUse { .. }));

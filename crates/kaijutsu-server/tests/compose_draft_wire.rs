@@ -1062,7 +1062,7 @@ fn a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge() {
             .expect("link the example into the default type");
         let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
-            vec![StreamEvent::ToolUse { id: "round".into(), name: "missing_tool".into(), input: serde_json::json!({}) }, done("tool_use")],
+            vec![StreamEvent::ToolUse { id: "round".into(), name: "missing_tool".into(), input: serde_json::json!({}), signature: None }, done("tool_use")],
             vec![StreamEvent::TextStart, StreamEvent::TextDelta("ack".into()), StreamEvent::TextEnd, done("end_turn")],
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);

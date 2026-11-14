@@ -35,6 +35,7 @@ pub mod council;
 pub mod db_config;
 pub mod deepseek;
 pub mod endpoint;
+pub mod gemini;
 pub(crate) mod hydrate;
 pub mod prefix;
 pub mod image_cache;
@@ -53,7 +54,7 @@ pub use config::{
 pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, CouncilUsageExtra, OpenAiCompatUsageExtra,
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, CouncilUsageExtra, GeminiUsageExtra, OpenAiCompatUsageExtra,
     InlineToolResult, RetryDisposition, SpentUsage, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
@@ -299,6 +300,10 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Provider continuity signature attached to this tool call (e.g.
+        /// Gemini's `thoughtSignature` on `functionCall` parts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// Tool result for returning execution results.
     ToolResult {
@@ -477,6 +482,8 @@ pub enum ResponseBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// Result from a tool execution.
     ToolResult {
@@ -678,6 +685,8 @@ pub enum Provider {
     CodexApp(CodexAppClient),
     /// A council v2 server (see `llm/council/`).
     Council(council::Client),
+    /// Google Gemini API (see `llm/gemini/`).
+    Gemini(gemini::Client),
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
@@ -1052,6 +1061,16 @@ impl Provider {
                         .with_endpoint(endpoint()?),
                 ))
             }
+            BackendKind::Gemini => {
+                let api_key = resolve_key_or_placeholder(config, "Gemini")?;
+                let mut client = gemini::Client::new(config.name.clone(), api_key)?
+                    .with_request_timeout(resolve_request_timeout(config))
+                    .with_endpoint(endpoint()?);
+                if let Some(ref url) = config.base_url {
+                    client = client.with_base_url(url);
+                }
+                Ok(Self::Gemini(client))
+            }
             #[cfg(any(test, feature = "test-mock"))]
             BackendKind::Mock => {
                 let mock = MockClient::new(format!(
@@ -1086,6 +1105,7 @@ impl Provider {
             Self::OpenAi(c) => c.provider_name(),
             Self::CodexApp(c) => &c.name,
             Self::Council(c) => c.provider_name(),
+            Self::Gemini(c) => c.provider_name(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => "mock",
         }
@@ -1101,6 +1121,7 @@ impl Provider {
             Self::Alibaba(c) => c.endpoint(),
             Self::OpenAi(c) => c.endpoint(),
             Self::Council(c) => c.endpoint(),
+            Self::Gemini(c) => c.endpoint(),
             Self::CodexApp(_) => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => None,
@@ -1168,6 +1189,7 @@ impl Provider {
             Self::Alibaba(client) => client.one_shot_opts(opts),
             Self::OpenAi(client) => client.one_shot_opts(opts),
             Self::Council(client) => client.one_shot_opts(opts),
+            Self::Gemini(client) => client.one_shot_opts(opts),
             Self::CodexApp(_) => opts,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => opts,
@@ -1215,6 +1237,7 @@ impl Provider {
             }
             Self::CodexApp(client) => client.stream(opts, messages).await,
             Self::Council(client) => Ok(ProviderStream::Council(client.stream(opts, messages).await?)),
+            Self::Gemini(client) => Ok(ProviderStream::Gemini(client.stream(opts, messages).await?)),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 if let Some(sent) = &mock.sent {
@@ -1294,6 +1317,7 @@ impl Provider {
             Self::DeepSeek(c) => c.available_models(),
             Self::Alibaba(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
+            Self::Gemini(c) => c.available_models(),
             Self::CodexApp(_) | Self::Council(_) => Vec::new(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
@@ -1315,6 +1339,8 @@ pub enum ProviderStream {
     Codex(CodexStream),
     /// A council v2 generation stream.
     Council(council::Stream),
+    /// A native Google Gemini generation stream.
+    Gemini(gemini::Stream),
     /// Replays a pre-built event queue. Lets tests drive a real streaming
     /// turn (e.g. the autonomous fork-and-act path) without a live provider.
     #[cfg(any(test, feature = "test-mock"))]
@@ -1341,6 +1367,7 @@ impl ProviderStream {
             Self::OpenAi(s) => s.next_event().await,
             Self::Codex(s) => s.client.next_event().await,
             Self::Council(s) => s.next_event().await,
+            Self::Gemini(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(state) => {
                 if !state.event_delay.is_zero() { tokio::time::sleep(state.event_delay).await; }
@@ -1372,7 +1399,7 @@ impl ProviderStream {
                 .respond_inline_tool(id, result)
                 .await
                 .map_err(|error| error.to_string()),
-            Self::Claude(_) | Self::OpenAi(_) | Self::Council(_) => Err(format!(
+            Self::Claude(_) | Self::OpenAi(_) | Self::Council(_) | Self::Gemini(_) => Err(format!(
                 "provider does not support inline tool response for callback {id}"
             )),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1388,6 +1415,7 @@ impl ProviderStream {
             Self::Claude(s) => s.cancel(),
             Self::OpenAi(s) => s.cancel(),
             Self::Council(s) => s.cancel(),
+            Self::Gemini(s) => s.cancel(),
             // Phase 0 has no synchronous interrupt hook in ProviderStream;
             // dropping the stream closes the daemon connection at turn end.
             Self::Codex(_) => {}
@@ -2003,6 +2031,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "shell_write".to_string(),
                     input: serde_json::json!({"statement": "echo hi"}),
+                    signature: None,
                 },
                 stream::StreamEvent::TextStart,
                 stream::StreamEvent::TextDelta("done".to_string()),
@@ -2056,6 +2085,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "shell_write".to_string(),
                     input: serde_json::json!({"statement": "echo hi"}),
+                    signature: None,
                 },
                 stream::StreamEvent::TextStart,
                 stream::StreamEvent::TextDelta("done".to_string()),
@@ -4131,7 +4161,7 @@ mod tests {
             let first = format!("kj_system_{}_7", system().short());
             let second = format!("kj_system_{}_8", system().short());
             let call = |id: &str, text: &str| Message::with_reasoning_text_and_tool_uses(Vec::new(), Some(text.into()),
-                vec![ContentBlock::ToolUse { id: id.into(), name: "get_system_messages".into(), input: serde_json::json!({}) }]);
+                vec![ContentBlock::ToolUse { id: id.into(), name: "get_system_messages".into(), input: serde_json::json!({}), signature: None }]);
             let result = |id: &str, content: String| Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: id.into(), content, is_error: false }]);
             let expected = serde_json::to_value(vec![

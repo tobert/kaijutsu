@@ -367,7 +367,7 @@ fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, dialect: Di
                         }
                         text.push_str(t);
                     }
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         tool_calls.push(RequestToolCall {
                             id: id.clone(),
                             kind: "function",
@@ -560,6 +560,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "ls".into(),
                 input: serde_json::json!({}),
+                signature: None,
             }],
         );
         let req = build_request(&opts(), &[msg], false, true);
@@ -580,11 +581,13 @@ mod tests {
                     id: "c1".into(),
                     name: "read_file".into(),
                     input: serde_json::json!({}),
+                    signature: None,
                 },
                 ContentBlock::ToolUse {
                     id: "c2".into(),
                     name: "grep".into(),
                     input: serde_json::json!({}),
+                    signature: None,
                 },
             ],
         );
@@ -612,6 +615,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"location": "Tokyo"}),
+                signature: None,
             }],
         );
         let req = build_request(&opts(), &[msg], false, true);
@@ -635,6 +639,7 @@ mod tests {
                 id: "call_x".into(),
                 name: "ping".into(),
                 input: serde_json::json!({}),
+                signature: None,
             }],
         );
         let req = build_request(&opts(), &[msg], false, true);
@@ -748,6 +753,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "ls".into(),
                 input: serde_json::json!({}),
+                signature: None,
             }],
         );
         let req = build_request(&opts(), &[msg], false, false);
@@ -926,7 +932,7 @@ mod tests {
             let msg = Message::with_reasoning_text_and_tool_uses(
                 vec![("deepseek thought".into(), Some("openai-compat-reasoning".into()))],
                 Some("calling".into()),
-                vec![ContentBlock::ToolUse { id: "c1".into(), name: "ls".into(), input: serde_json::json!({}) }],
+                vec![ContentBlock::ToolUse { id: "c1".into(), name: "ls".into(), input: serde_json::json!({}), signature: None }],
             );
             let req = super::super::build_request(&opts(), &[msg], false, Dialect::HostedOpenAi, "gpt").unwrap();
             let v = serde_json::to_value(&req).unwrap();

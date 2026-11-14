@@ -39,6 +39,7 @@ impl InputStyle {
         match kind {
             BackendKind::Anthropic => Self::ExcludesCache,
             BackendKind::Alibaba => Self::IncludesCache,
+            BackendKind::Gemini => Self::IncludesCacheHit,
             _ => Self::IncludesCacheHit,
         }
     }

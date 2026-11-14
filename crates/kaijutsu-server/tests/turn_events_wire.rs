@@ -584,7 +584,7 @@ fn tool_failure_reaches_the_client_with_its_result_and_error_flag() {
         kj.join_context(context, "tool-error-settlement").await.unwrap();
         let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
         let mock = MockClient::new("").with_scripted_stream(vec![
-            vec![StreamEvent::ToolUse { id: "wire-tool-error".into(), name: "missing_tool".into(), input: serde_json::json!({}) }, done()],
+            vec![StreamEvent::ToolUse { id: "wire-tool-error".into(), name: "missing_tool".into(), input: serde_json::json!({}), signature: None }, done()],
             vec![StreamEvent::TextStart, StreamEvent::TextDelta("The tool is unavailable.".into()), StreamEvent::TextEnd, done()],
         ]);
         server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
@@ -628,7 +628,7 @@ fn a_shell_result_rehydrates_as_the_model_received_it() {
         let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "replay-shell".into(), name: "shell".into(),
-                input: serde_json::json!({"command": "echo hello from kaish"}) }, done("tool_use")],
+                input: serde_json::json!({"command": "echo hello from kaish"}), signature: None }, done("tool_use")],
             vec![StreamEvent::TextStart, StreamEvent::TextDelta("ack".into()), StreamEvent::TextEnd, done("end_turn")],
         ]).recording_sent_messages();
         server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
@@ -777,7 +777,7 @@ fn a_failing_shell_result_marks_stderr_and_sends_no_json() {
         let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "stderr-shell".into(), name: "shell".into(),
-                input: serde_json::json!({"command": "echo on stdout; cat /no-such-file-zq"}) }, done("tool_use")],
+                input: serde_json::json!({"command": "echo on stdout; cat /no-such-file-zq"}), signature: None }, done("tool_use")],
             vec![StreamEvent::TextStart, StreamEvent::TextDelta("ack".into()), StreamEvent::TextEnd, done("end_turn")],
         ]).recording_sent_messages();
         server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));

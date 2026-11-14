@@ -147,6 +147,7 @@ impl Reply {
                     id,
                     name,
                     input: serde_json::to_value(&arguments).map_err(|e| format!("tool call arguments: {e}"))?,
+                    signature: None,
                 },
                 Call::Unparsed { id, name: Some(name), raw, error } => {
                     StreamEvent::ToolUseInvalid { id, name, arguments: raw, error }
@@ -351,7 +352,7 @@ mod tests {
             ReplyToolCall::Unparsed { id: "c2".into(), name: None, raw: "<function=".into(), error: "no name".into(), stats: None },
         ];
         let events = run(false, &[], done).unwrap();
-        let [StreamEvent::ToolUse { id: a, name: n0, input }, StreamEvent::ToolUseInvalid { id: b, name: n1, .. }, StreamEvent::ToolUseInvalid { id: c, name: n2, error, .. }, StreamEvent::Done { .. }] =
+        let [StreamEvent::ToolUse { id: a, name: n0, input, .. }, StreamEvent::ToolUseInvalid { id: b, name: n1, .. }, StreamEvent::ToolUseInvalid { id: c, name: n2, error, .. }, StreamEvent::Done { .. }] =
             events.as_slice()
         else {
             panic!("{events:?}")

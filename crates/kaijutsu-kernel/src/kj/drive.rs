@@ -578,7 +578,7 @@ mod tests {
         d.kernel_db().lock().assign_test_review(lane, Some(coder), Some(judge)).unwrap();
         let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
         let mock = MockClient::new("").with_scripted_stream(vec![
-            vec![StreamEvent::ToolUse { id: s("probe-1"), name: s("probe"), input: serde_json::json!({}) }, done("tool_use")],
+            vec![StreamEvent::ToolUse { id: s("probe-1"), name: s("probe"), input: serde_json::json!({}), signature: None }, done("tool_use")],
             vec![StreamEvent::TextStart, StreamEvent::TextDelta(s("seen it")), StreamEvent::TextEnd, done("end_turn")],
         ]);
         {

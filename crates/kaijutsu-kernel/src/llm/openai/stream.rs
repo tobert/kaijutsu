@@ -387,7 +387,7 @@ impl StateMachine {
                     }
                 }
             };
-            out.push(StreamEvent::ToolUse { id, name, input });
+            out.push(StreamEvent::ToolUse { id, name, input, signature: None });
         }
     }
 }
@@ -677,7 +677,7 @@ data: [DONE]
             .collect();
         assert_eq!(tool_uses.len(), 1);
         match tool_uses[0] {
-            StreamEvent::ToolUse { id, name, input } => {
+            StreamEvent::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "call_abc");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["location"], "Tokyo");

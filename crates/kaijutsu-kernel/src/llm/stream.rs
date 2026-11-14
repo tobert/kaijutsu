@@ -76,6 +76,11 @@ pub enum StreamEvent {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Provider continuity signature attached to this tool call (e.g.
+        /// Gemini's `thoughtSignature` on `functionCall` parts). `None` for
+        /// providers that do not sign individual tool calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
 
     /// A tool call whose arguments did not parse as JSON, most often because
@@ -548,6 +553,8 @@ pub enum UsageExtra {
     OpenAiCompat(OpenAiCompatUsageExtra),
     /// A council v2 server (`llm/council/`).
     Council(CouncilUsageExtra),
+    /// Google Gemini API (`llm/gemini/`).
+    Gemini(GeminiUsageExtra),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,6 +603,20 @@ pub struct CouncilUsageExtra {
     pub seed: Option<u64>,
     pub model: String,
     pub weight_hash: String,
+}
+
+/// Usage extras for Google's Gemini API (`llm/gemini/`).
+///
+/// `input_tokens` (`promptTokenCount`) includes `cached_content_tokens`, so
+/// pricing uses [`crate::pricing::InputStyle::IncludesCacheHit`].
+/// `thoughts_tokens` are reasoning tokens billed as output alongside
+/// `output_tokens`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeminiUsageExtra {
+    pub cached_content_tokens: u64,
+    pub thoughts_tokens: u64,
+    #[serde(default)]
+    pub tool_use_prompt_tokens: u64,
 }
 
 /// Common finish reasons plus a typed provider escape hatch.

@@ -216,7 +216,7 @@ fn done(stop: &str) -> StreamEvent {
 /// One completion that calls `shell_write` with `command`.
 fn shell_write(id: &str, command: &str) -> Vec<StreamEvent> {
     vec![
-        StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input: json!({ "command": command }) },
+        StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input: json!({ "command": command }), signature: None },
         done("tool_use"),
     ]
 }

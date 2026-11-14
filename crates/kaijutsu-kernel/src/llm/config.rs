@@ -64,6 +64,10 @@ pub enum BackendKind {
     /// it). It serves chat turns, gate decisions and embeddings. No key;
     /// `base_url` is the server address.
     Council,
+    /// Google Gemini API (`llm/gemini/`). Defaults to Google AI Studio
+    /// (`generativelanguage.googleapis.com/v1beta`); optional `base_url` for a
+    /// proxy or Vertex gateway.
+    Gemini,
     /// Canned-response client for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock,
@@ -72,7 +76,7 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "codex-app", "council"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "codex-app", "council", "gemini"];
 
 impl BackendKind {
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -84,6 +88,7 @@ impl BackendKind {
             Self::OpenAi => "openai",
             Self::CodexApp => "codex-app",
             Self::Council => "council",
+            Self::Gemini => "gemini",
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => "mock",
         }
@@ -100,6 +105,7 @@ impl BackendKind {
             "openai" => Ok(Self::OpenAi),
             "codex-app" => Ok(Self::CodexApp),
             "council" => Ok(Self::Council),
+            "gemini" => Ok(Self::Gemini),
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => Ok(Self::Mock),
             other => Err(unknown_backend_kind_message(other)),
@@ -116,6 +122,7 @@ impl BackendKind {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
             Self::Alibaba => Some("ALIBABA_API_KEY"),
+            Self::Gemini => Some("GEMINI_API_KEY"),
             Self::OpenAi => base_url
                 .is_some_and(crate::llm::openai::is_hosted_openai)
                 .then_some("OPENAI_API_KEY"),
@@ -486,9 +493,12 @@ mod tests {
             let parsed = BackendKind::parse(k).expect("supported kind parses");
             assert_eq!(parsed.as_str(), *k);
         }
-        let err = BackendKind::parse("gemini").unwrap_err();
-        assert!(err.contains("unknown backend kind 'gemini'"), "{err}");
+        let err = BackendKind::parse("bogus-kind").unwrap_err();
+        assert!(err.contains("unknown backend kind 'bogus-kind'"), "{err}");
         assert!(err.contains("anthropic"), "error names the closed set: {err}");
+        assert_eq!(BackendKind::parse("gemini"), Ok(BackendKind::Gemini));
+        assert_eq!(BackendKind::Gemini.standard_env_var(None), Some("GEMINI_API_KEY"));
+        assert!(!BackendKind::Gemini.requires_base_url());
     }
 
     #[test]

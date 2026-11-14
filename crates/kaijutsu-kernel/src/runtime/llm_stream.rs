@@ -268,6 +268,7 @@ fn raw_usage(
         ),
         // A held prefix is the council server's cache hit.
         Some(UsageExtra::Council(m)) => (m.kept, 0, 0, 0),
+        Some(UsageExtra::Gemini(g)) => (g.cached_content_tokens, 0, 0, g.thoughts_tokens),
         None => (0, 0, 0, 0),
     };
     crate::RawUsage {
@@ -302,6 +303,10 @@ fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
             m.first_token_ms,
             m.wall_ms,
             m.seed.map(|s| format!(", seed={s}")).unwrap_or_default()
+        ),
+        Some(UsageExtra::Gemini(g)) => format!(
+            ", cached_tokens={}, thoughts_tokens={}",
+            g.cached_content_tokens, g.thoughts_tokens
         ),
         None => String::new(),
     }
@@ -1959,6 +1964,7 @@ struct PendingCall {
     id: String,
     name: String,
     input: serde_json::Value,
+    signature: Option<String>,
     call: kaijutsu_types::BlockId,
     unparsed: Option<String>,
 }
@@ -3344,12 +3350,15 @@ async fn run_llm_stream(
                     documents.set_status(context_id, &block_id, Status::Done)?;
                 }
 
-                StreamEvent::ToolUse { id, name, input } => {
+                StreamEvent::ToolUse { id, name, input, signature } => {
                     let call = documents.insert_tool_call_as(context_id, None, Some(&last_block_id), &name,
                         input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal), Some(id.clone()), None)?;
+                    if let Some(sig) = signature.as_deref().filter(|s| !s.is_empty()) {
+                        documents.set_signature(context_id, &call, Some(sig.to_string()))?;
+                    }
                     turn_lease.track_block(call);
                     last_block_id = call;
-                    tool_calls.push(PendingCall { id, name, input, call, unparsed: None });
+                    tool_calls.push(PendingCall { id, name, input, signature, call, unparsed: None });
                 }
 
                 StreamEvent::ToolUseInvalid { id, name, arguments, error } => {
@@ -3377,7 +3386,7 @@ async fn run_llm_stream(
                         Some(id.clone()), None)?;
                     turn_lease.track_block(call);
                     last_block_id = call;
-                    tool_calls.push(PendingCall { id, name, input, call, unparsed: Some(detail) });
+                    tool_calls.push(PendingCall { id, name, input, signature: None, call, unparsed: Some(detail) });
                 }
 
                 StreamEvent::InlineToolUse { id, name, input } => {
@@ -3731,6 +3740,7 @@ async fn run_llm_stream(
                 id: pending.id.clone(),
                 name: pending.name.clone(),
                 input: pending.input.clone(),
+                signature: pending.signature.clone(),
             })
             .collect();
 
@@ -3778,7 +3788,7 @@ async fn run_llm_stream(
         // Signal cancellation on the first persistence fault, but join every
         // admitted call before terminal cleanup. Dropping siblings here would
         // leave side effects without their final result.
-        let futures = tool_calls.into_iter().zip(placed).zip(file_order).map(|((PendingCall { id: tool_use_id, name: tool_name, input, call, unparsed }, placed), file_order)| {
+        let futures = tool_calls.into_iter().zip(placed).zip(file_order).map(|((PendingCall { id: tool_use_id, name: tool_name, input, call, unparsed, .. }, placed), file_order)| {
             let kernel = kernel.clone();
             let documents = documents.clone();
             let tool_ctx = tool_ctx.clone();
@@ -4092,7 +4102,7 @@ mod publish_tests {
     #[tokio::test]
     async fn provider_framing_rejects_missing_or_mismatched_content_boundaries() {
         let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
-        let tool = || StreamEvent::ToolUse { id: "unrun".into(), name: "missing_tool".into(), input: serde_json::json!({}) };
+        let tool = || StreamEvent::ToolUse { id: "unrun".into(), name: "missing_tool".into(), input: serde_json::json!({}), signature: None };
         let cases = vec![
             ("text delta without start", vec![StreamEvent::TextDelta("unframed bytes".into()), done()]),
             ("thinking delta without start", vec![StreamEvent::ThinkingDelta("unframed bytes".into()), done()]),
@@ -4290,6 +4300,7 @@ mod publish_tests {
                     id: "duplicate_call".into(),
                     name: "nonexistent_tool".into(),
                     input: serde_json::json!({}),
+                    signature: None,
                 };
                 let provider = Provider::Mock(MockClient::new("").with_scripted_stream(vec![
                     vec![call(), call(), StreamEvent::Done {
@@ -4728,7 +4739,7 @@ mod publish_tests {
         tokio::task::LocalSet::new().run_until(async {
             let kernel = Arc::new(Kernel::new_ephemeral("cut-step").await);
             let tool_round = vec![
-                crate::llm::StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(), input: serde_json::json!({}) },
+                crate::llm::StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(), input: serde_json::json!({}), signature: None },
                 crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
             ];
             let (mock, traces) = MockClient::new("unused")
@@ -4882,7 +4893,7 @@ mod publish_tests {
     fn done_call(id: &str) -> Vec<crate::llm::StreamEvent> {
         vec![
             crate::llm::StreamEvent::ToolUse { id: id.into(), name: "done".into(),
-                input: serde_json::json!({"status": "done", "feedback": "fixed the build"}) },
+                input: serde_json::json!({"status": "done", "feedback": "fixed the build"}), signature: None },
             crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(10), output_tokens: Some(5), extra: None },
         ]
     }
@@ -5029,9 +5040,9 @@ mod publish_tests {
     async fn done_beside_a_failed_call_does_not_end_the_turn() {
         tokio::task::LocalSet::new().run_until(async {
             let batch = vec![
-                crate::llm::StreamEvent::ToolUse { id: "c1".into(), name: "missing_tool".into(), input: serde_json::json!({}) },
+                crate::llm::StreamEvent::ToolUse { id: "c1".into(), name: "missing_tool".into(), input: serde_json::json!({}), signature: None },
                 crate::llm::StreamEvent::ToolUse { id: "c2".into(), name: "done".into(),
-                    input: serde_json::json!({"status": "done", "feedback": "all good"}) },
+                    input: serde_json::json!({"status": "done", "feedback": "all good"}), signature: None },
                 crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
             ];
             let (reason, blocks) = turn_offering_done("done-beside-failure",
@@ -5123,7 +5134,7 @@ mod publish_tests {
             kernel.broker().register(Arc::new(RecordingFileServer { id: id.clone(), log: log.clone(), notif_tx }),
                 crate::mcp::InstancePolicy::for_kernel(&kernel)).await.unwrap();
             let edit = |call: &str, path: &str, tag: &str| crate::llm::StreamEvent::ToolUse { id: call.into(), name: "edit".into(),
-                input: serde_json::json!({"path": path, "tag": tag}) };
+                input: serde_json::json!({"path": path, "tag": tag}), signature: None };
             let batch = vec![
                 edit("c1", "/app/x.c", "x1"), edit("c2", "/app/x.c", "x2"), edit("c3", "/app/y.c", "y1"),
                 crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
@@ -5160,7 +5171,7 @@ mod publish_tests {
             kernel.broker().register(b, crate::mcp::InstancePolicy::for_kernel(&kernel)).await.unwrap();
             // Both expose `edit`, so the roster qualifies each by instance.
             let edit = |call: &str, backend: &str, path: &str, tag: &str| crate::llm::StreamEvent::ToolUse {
-                id: call.into(), name: format!("{backend}__edit"), input: serde_json::json!({"path": path, "tag": tag}) };
+                id: call.into(), name: format!("{backend}__edit"), input: serde_json::json!({"path": path, "tag": tag}), signature: None };
             let batch = vec![
                 edit("c1", "rec_a", "/app/x.c", "x1"), edit("c2", "rec_a", "/app/x.c", "x2"),
                 crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
@@ -5228,6 +5239,7 @@ mod publish_tests {
                         id: "call_after_notice".into(),
                         name: "nonexistent_tool".into(),
                         input: serde_json::json!({}),
+                        signature: None,
                     },
                     crate::llm::StreamEvent::Done {
                         stop_reason: Some("tool_use".into()),
@@ -5736,6 +5748,7 @@ mod publish_tests {
                     id: "call_parsed".into(),
                     name: "missing_tool".into(),
                     input: serde_json::json!({}),
+                    signature: None,
                 };
                 let cases: Vec<(&str, Vec<crate::llm::StreamEvent>, Vec<&str>)> = vec![
                     ("cut off alone", vec![truncated_write_call()], vec!["call_truncated"]),
@@ -5747,6 +5760,7 @@ mod publish_tests {
                         id: "call_second".into(),
                         name: "missing_tool".into(),
                         input: serde_json::json!({}),
+                        signature: None,
                     }], vec!["call_parsed", "call_second"]),
                 ];
                 for (shape, mut calls, order) in cases {
@@ -7093,6 +7107,7 @@ mod usage_tests {
                                 id: "call_1".into(),
                                 name: "nonexistent_tool".into(),
                                 input: serde_json::json!({}),
+                                signature: None,
                             },
                             StreamEvent::Done {
                                 stop_reason: Some("tool_use".into()),
@@ -7159,6 +7174,7 @@ mod usage_tests {
                                 id: "call_1".into(),
                                 name: "nonexistent_tool".into(),
                                 input: serde_json::json!({}),
+                                signature: None,
                             },
                             StreamEvent::Done {
                                 stop_reason: Some("tool_use".into()),
@@ -7329,6 +7345,7 @@ mod usage_tests {
                                 id: "call_1".into(),
                                 name: "nonexistent_tool".into(),
                                 input: serde_json::json!({}),
+                                signature: None,
                             },
                             StreamEvent::Done {
                                 stop_reason: Some("tool_use".into()),
@@ -7508,6 +7525,7 @@ mod error_child_anchor_tests {
                             id: "call_1".into(),
                             name: "nonexistent_tool".into(),
                             input: serde_json::json!({}),
+                            signature: None,
                         },
                         StreamEvent::Done {
                             stop_reason: Some("tool_use".into()),
@@ -7628,6 +7646,7 @@ mod authorship_tests {
                         id: "call_1".into(),
                         name: "nonexistent_tool".into(),
                         input: serde_json::json!({}),
+                        signature: None,
                     },
                     StreamEvent::Done {
                         stop_reason: Some("tool_use".into()),
@@ -8934,7 +8953,7 @@ mod lifetime_tests {
             let partial = if thinking { "unfinished thought" } else { "unfinished text" };
             let mut events = vec![
                 StreamEvent::TextStart, StreamEvent::TextDelta("finished text".into()), StreamEvent::TextEnd,
-                StreamEvent::ToolUse { id: "not-run".into(), name: "missing_tool".into(), input: serde_json::json!({}) },
+                StreamEvent::ToolUse { id: "not-run".into(), name: "missing_tool".into(), input: serde_json::json!({}), signature: None },
             ];
             events.extend(if thinking { [StreamEvent::ThinkingStart, StreamEvent::ThinkingDelta(partial.into())] }
                 else { [StreamEvent::TextStart, StreamEvent::TextDelta(partial.into())] });
@@ -9018,7 +9037,7 @@ mod lifetime_tests {
             for refused in ["result", "call", "settlement"] {
                 let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
                 let first = if inline { vec![StreamEvent::InlineToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}) }] }
-                    else { vec![StreamEvent::ToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}) }, done()] };
+                    else { vec![StreamEvent::ToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}), signature: None }, done()] };
                 let mock = MockClient::new("").with_scripted_stream(vec![first,
                     vec![StreamEvent::TextStart, StreamEvent::TextDelta("continued past lost result".into()), StreamEvent::TextEnd, done()]]);
                 let (kernel, context, after, call) = fixture(Some(mock)).await;
@@ -9234,8 +9253,8 @@ mod lifetime_tests {
             }
         }
         let events = vec![
-            StreamEvent::ToolUse { id: "fault-call".into(), name: "fault".into(), input: serde_json::json!({}) },
-            StreamEvent::ToolUse { id: "pending-call".into(), name: "pending".into(), input: serde_json::json!({}) },
+            StreamEvent::ToolUse { id: "fault-call".into(), name: "fault".into(), input: serde_json::json!({}), signature: None },
+            StreamEvent::ToolUse { id: "pending-call".into(), name: "pending".into(), input: serde_json::json!({}), signature: None },
             StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None },
         ];
         let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![events]))).await;
@@ -9282,7 +9301,7 @@ mod lifetime_tests {
         }
         for inline in [false, true] {
             let events = if inline { vec![StreamEvent::InlineToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}) }] }
-            else { vec![StreamEvent::ToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}) },
+            else { vec![StreamEvent::ToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}), signature: None },
                 StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None }] };
             let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![events]))).await;
             let cancel = Arc::new(parking_lot::Mutex::new(None));
@@ -9448,7 +9467,7 @@ mod lifetime_tests {
         const ROUNDS: usize = 60;
         let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
         let mut script: Vec<Vec<StreamEvent>> = (0..ROUNDS).map(|i| vec![
-            StreamEvent::ToolUse { id: format!("poke-{i}"), name: "poke".into(), input: serde_json::json!({}) },
+            StreamEvent::ToolUse { id: format!("poke-{i}"), name: "poke".into(), input: serde_json::json!({}), signature: None },
             done(),
         ]).collect();
         script.push(vec![
@@ -9588,7 +9607,7 @@ mod lifetime_tests {
     async fn a_note_sent_during_a_tool_round_joins_the_next_request() {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
-                input: serde_json::json!({}) }, done("tool_use")],
+                input: serde_json::json!({}), signature: None }, done("tool_use")],
             text_reply("ack"),
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);
@@ -9746,7 +9765,7 @@ mod lifetime_tests {
     async fn a_note_sent_after_a_soft_interrupt_gets_a_turn_of_its_own() {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
-                input: serde_json::json!({}) }, done("tool_use")],
+                input: serde_json::json!({}), signature: None }, done("tool_use")],
             text_reply("ack"),
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);
@@ -9778,7 +9797,7 @@ mod lifetime_tests {
     async fn a_note_whose_inference_fails_gets_a_turn_of_its_own() {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
-                input: serde_json::json!({}) }, done("tool_use")],
+                input: serde_json::json!({}), signature: None }, done("tool_use")],
             vec![StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::Protocol, "provider fell over"))],
             text_reply("ack"),
         ]).recording_sent_messages();
@@ -9808,7 +9827,7 @@ mod lifetime_tests {
         use kaijutsu_types::{Tick, TrackId};
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
-                input: serde_json::json!({}) }, done("tool_use")],
+                input: serde_json::json!({}), signature: None }, done("tool_use")],
             text_reply("X:1\nK:C\nCDEF|\n"),
             text_reply("ack"),
         ]).recording_sent_messages();
@@ -9858,7 +9877,7 @@ mod lifetime_tests {
     async fn a_drift_during_a_tool_round_joins_the_next_request() {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
-                input: serde_json::json!({}) }, done("tool_use")],
+                input: serde_json::json!({}), signature: None }, done("tool_use")],
             text_reply("ack"),
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);
@@ -9907,7 +9926,7 @@ mod lifetime_tests {
             }
         }
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
-            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "snap".into(), input: serde_json::json!({}) },
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "snap".into(), input: serde_json::json!({}), signature: None },
                 done("tool_use")],
             text_reply("I see a pixel"),
         ]).recording_sent_messages();
@@ -10030,7 +10049,7 @@ mod lifetime_tests {
     /// and its result: `call` must end with the call, `result` answer it.
     fn system_messages(call: &LlmMessage, result: &LlmMessage) -> (String, Vec<serde_json::Value>) {
         let crate::llm::MessageContent::Blocks(calls) = &call.content else { panic!("no call: {call:?}") };
-        let Some(ContentBlock::ToolUse { id, name, input }) = calls.last() else { panic!("no call: {call:?}") };
+        let Some(ContentBlock::ToolUse { id, name, input, .. }) = calls.last() else { panic!("no call: {call:?}") };
         assert_eq!((call.role, name.as_str(), input), (crate::llm::Role::Assistant, SYSTEM_MESSAGES_TOOL, &serde_json::json!({})));
         let crate::llm::MessageContent::Blocks(results) = &result.content else { panic!("no result: {result:?}") };
         let [ContentBlock::ToolResult { tool_use_id, content, is_error: false }] = &results[..] else { panic!("{result:?}") };
@@ -10047,7 +10066,7 @@ mod lifetime_tests {
     async fn a_completion_and_a_drift_during_a_tool_round_are_one_get_system_messages_call() {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
-                input: serde_json::json!({}) }, done("tool_use")],
+                input: serde_json::json!({}), signature: None }, done("tool_use")],
             text_reply("ack"),
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);
@@ -10116,7 +10135,7 @@ mod lifetime_tests {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             text_reply("Next I'll run the tests."),
             vec![StreamEvent::ToolUse { id: "call_done".into(), name: "done".into(),
-                input: serde_json::json!({"status": "done", "feedback": "ran them"}) }, done("tool_use")],
+                input: serde_json::json!({"status": "done", "feedback": "ran them"}), signature: None }, done("tool_use")],
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);
         let (kernel, context, after, call) = fixture(Some(mock)).await;
@@ -10249,6 +10268,93 @@ mod lifetime_tests {
         let mut expected = sent[0].clone();
         expected.push(LlmMessage::assistant("answered both"));
         assert_same_wire(&rehydrated(&kernel, context), &expected);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_use_signature_persists_and_rehydrates() {
+        let done = |reason: &str| StreamEvent::Done {
+            stop_reason: Some(reason.into()),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            extra: None,
+        };
+        let (mock, sent) = MockClient::new("")
+            .with_scripted_stream(vec![
+                vec![
+                    StreamEvent::ToolUse {
+                        id: "call_sig".into(),
+                        name: "nonexistent_tool".into(),
+                        input: serde_json::json!({"x": 1}),
+                        signature: Some("gemini:sig-1".into()),
+                    },
+                    done("tool_use"),
+                ],
+                vec![
+                    StreamEvent::TextStart,
+                    StreamEvent::TextDelta("after tool".into()),
+                    StreamEvent::TextEnd,
+                    done("end_turn"),
+                ],
+            ])
+            .recording_sent_messages();
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+
+        start_fixture_turn(
+            &kernel,
+            kernel.admit_context(context).unwrap(),
+            &after,
+            call.clone(),
+            call.principal_id,
+            TurnOrigin::Interactive,
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), completed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
+        let tool_block = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolCall && b.tool_use_id.as_deref() == Some("call_sig"))
+            .expect("tool call block persisted");
+        assert_eq!(tool_block.signature.as_deref(), Some("gemini:sig-1"));
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let round2_sig = sent[1]
+            .iter()
+            .flat_map(|m| match &m.content {
+                crate::llm::MessageContent::Blocks(blocks) => blocks.as_slice(),
+                crate::llm::MessageContent::Text(_) => &[],
+            })
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { id, signature, .. } if id == "call_sig" => {
+                    Some(signature.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(round2_sig, Some(Some("gemini:sig-1".to_string())));
+
+        let rehydrated_msgs = rehydrated(&kernel, context);
+        let rehydrated_sig = rehydrated_msgs
+            .iter()
+            .flat_map(|m| match &m.content {
+                crate::llm::MessageContent::Blocks(blocks) => blocks.as_slice(),
+                crate::llm::MessageContent::Text(_) => &[],
+            })
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { id, signature, .. } if id == "call_sig" => {
+                    Some(signature.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(rehydrated_sig, Some(Some("gemini:sig-1".to_string())));
+
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
