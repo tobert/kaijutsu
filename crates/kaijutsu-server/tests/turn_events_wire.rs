@@ -502,6 +502,8 @@ fn timed_drives_keep_admission_targets_through_the_client() {
             ("KJ_TRACK".into(), track.as_str().into()), ("KJ_TICK".into(), admitted_at.get().to_string()),
             ("KJ_PHRASE_BEATS".into(), "8".into()), ("KJ_TEMPO".into(), "120".into()),
             ("KJ_PHRASE".into(), "1".into()), ("KJ_HEARD".into(), "[]".into()),
+            ("KJ_COST_MS".into(), "0".into()), ("KJ_LEAD_BEATS".into(), "0".into()),
+            ("KJ_OPEN_WORK".into(), "0".into()),
         ]);
         let cancel = tokio_util::sync::CancellationToken::new();
         kaijutsu_kernel::rc::run(&server.kj_dispatcher, kaijutsu_kernel::rc::RcInvocation {
@@ -875,7 +877,7 @@ fn the_page_turn_replaces_a_musician_with_a_fully_set_successor_on_the_same_trac
         let blocks = kj.get_blocks(successor, &BlockQuery::All).await.unwrap();
         for (name, text) in [
             ("stance", include_str!("../../../assets/defaults/rc/musician/create/S00-stance.md")),
-            ("chair", include_str!("../../../assets/defaults/rc/musician/create/S05-chair.md")),
+            ("chair", include_str!("../../../assets/defaults/rc/musician/chairs/bass.md")),
             ("primer", include_str!("../../../assets/defaults/rc/musician/create/S15-abc-primer.md")),
         ] {
             let first_line = text.lines().next().unwrap();
@@ -900,5 +902,193 @@ fn the_page_turn_replaces_a_musician_with_a_fully_set_successor_on_the_same_trac
         let listed = kj.execute_kj_quiet(operator, &transport(&["list"])).await.unwrap();
         assert!(listed.stdout.contains(track), "{}", listed.stdout);
         server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+/// Create `label` from the shipped `musician` rc directory with `--env` pairs,
+/// returning the new context.
+async fn create_musician_with_env(
+    kj: &KernelHandle,
+    performer: &str,
+    label: &str,
+    env: &[&str],
+) -> ContextId {
+    let contexts = kj.list_contexts().await.unwrap();
+    let parent = kaijutsu_client::choose_parent(None, &contexts).unwrap();
+    let mut argv = kaijutsu_client::context_create_argv(label, performer, None);
+    for pair in env {
+        argv.push("--env".to_string());
+        argv.push(pair.to_string());
+    }
+    let result = kj.execute_kj_quiet(parent.context_id, &argv).await.unwrap();
+    kaijutsu_client::context_id_from_create_result(&result).unwrap_or_else(|e| panic!("create {label}: {e}"))
+}
+
+/// Two musicians made from the one shipped `musician` rc directory sit on one
+/// band track: `KJ_BAND` names the track and `KJ_CHAIR` the chair, bass when
+/// unset. An unknown chair is an Error block that names it and the chairs that
+/// exist. The page turn keeps the chair and the band.
+#[test]
+fn two_musicians_share_a_band_track_with_their_own_chairs() {
+    run_local(async {
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let performer = common::rc_performer(&kj, "musician").await.unwrap();
+        let bass_chair = include_str!("../../../assets/defaults/rc/musician/chairs/bass.md");
+        let drums_chair = include_str!("../../../assets/defaults/rc/musician/chairs/drums.md");
+        let blocks_of = |context: ContextId| server.documents.block_snapshots(context).unwrap();
+        let has_chair = |context: ContextId, chair: &str| {
+            let first_line = chair.lines().next().unwrap();
+            blocks_of(context).iter().any(|block| block.content.contains(first_line))
+        };
+
+        let bass = create_musician_with_env(&kj, &performer, "bass", &["KJ_BAND=band"]).await;
+        let band_before = server.kernel_db.lock().get_track("band").unwrap().expect("the band track exists");
+        let drums = create_musician_with_env(&kj, &performer, "drums", &["KJ_BAND=band", "KJ_CHAIR=drums"]).await;
+
+        assert!(has_chair(bass, bass_chair), "no KJ_CHAIR plays bass");
+        assert!(!has_chair(bass, drums_chair), "bass carries no drum chair");
+        assert!(has_chair(drums, drums_chair), "KJ_CHAIR=drums plays drums");
+        assert!(!has_chair(drums, bass_chair), "drums carries no bass chair");
+
+        let track_of = |context: ContextId| -> Vec<String> {
+            server.kernel_db.lock().list_attachments_for_context(context).unwrap()
+                .into_iter().map(|row| row.track_id).collect()
+        };
+        assert_eq!(track_of(bass), vec!["band".to_string()]);
+        assert_eq!(track_of(drums), vec!["band".to_string()]);
+        let band_after = server.kernel_db.lock().get_track("band").unwrap().unwrap();
+        assert_eq!((band_after.period_ms, band_after.beats_per_phrase), (band_before.period_ms, band_before.beats_per_phrase),
+            "a second attachment leaves the track's clock alone");
+        assert_eq!(server.kernel_db.lock().list_tracks().unwrap().len(), 1, "one track, not one per label");
+
+        // An unknown chair fails the chair script loudly and names the choices.
+        let kazoo = create_musician_with_env(&kj, &performer, "kazoo", &["KJ_BAND=band", "KJ_CHAIR=kazoo"]).await;
+        let errors: Vec<String> = blocks_of(kazoo).into_iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content).collect();
+        assert!(errors.iter().any(|e| e.contains("kazoo") && e.contains("bass") && e.contains("drums")),
+            "an unknown chair is an Error block naming it and the chairs that exist: {errors:?}");
+        assert!(!has_chair(kazoo, bass_chair) && !has_chair(kazoo, drums_chair), "an unknown chair seats no chair");
+
+        // The page turn carries the env: the successor keeps the chair and the band.
+        common::context_verb(&kj, "rotate", drums, &[]).await;
+        let successor = kj.list_contexts().await.unwrap().into_iter()
+            .find(|row| row.label == "drums" && !row.archived && row.id != drums).expect("a live successor").id;
+        assert!(has_chair(successor, drums_chair), "the successor plays drums");
+        assert!(!has_chair(successor, bass_chair));
+        assert_eq!(track_of(successor), vec!["band".to_string()], "the successor re-attaches to the band");
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+/// Run the shipped `tick` rc with the variables the scheduler snapshots for the
+/// context, and return them.
+async fn run_shipped_tick(
+    server: &kaijutsu_server::SharedKernel,
+    scheduler: &kaijutsu_server::beat::BeatScheduler,
+    context: ContextId,
+    performer: PrincipalId,
+) -> std::collections::HashMap<String, String> {
+    let vars = scheduler.transport_env(context);
+    let admission = server.kernel.admit_context(context).unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    kaijutsu_kernel::rc::run(&server.kj_dispatcher, kaijutsu_kernel::rc::RcInvocation {
+        vars: vars.clone(), ..kaijutsu_kernel::rc::RcInvocation::new("tick", &admission, &cancel)
+    }, &kaijutsu_kernel::KjCaller {
+        principal_id: performer, actor_id: performer, reviewer_id: None, context_id: Some(context),
+        session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,
+        cancel,
+    }).await.unwrap();
+    vars
+}
+
+/// A performer slower than one phrase is planned for by what it measured: after
+/// a missed deadline the shipped tick script targets two phrases ahead and the
+/// work shows the estimate, and a tick that fires while that performer's work is
+/// still open admits nothing.
+#[test]
+fn a_slow_performer_gets_a_later_target_and_no_second_open_phrase() {
+    run_local(async {
+        use kaijutsu_hyoushigi::{WorkStatus};
+        use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider}};
+        use kaijutsu_server::beat::BeatScheduler;
+        use kaijutsu_types::TrackId;
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "slow-player").await.unwrap();
+        let performer = PrincipalId::new();
+        assign_turn_identity(&server, context, performer);
+        kj.join_context(context, "slow-player").await.unwrap();
+        let (callback, mut events) = turn_events_channel(64);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let abc = "X:1\nK:C\nCDEF|\n";
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(MockClient::new(abc))));
+        let track = TrackId::new("slow-score").unwrap();
+        let mut scheduler = BeatScheduler::new(server.kernel.clone(), server.documents.clone());
+        let mut attachment = Attachment::musician_default();
+        attachment.ooda_armed = false;
+        scheduler.attach(track.clone(), context, attachment, BeatPolicy {
+            period: Duration::from_secs(1), beats_per_phrase: 4,
+        }).unwrap();
+        let timeline = server.kernel.track_timeline(&track).unwrap();
+        let base = tokio::time::Instant::now();
+        scheduler.play(&track, base);
+        common::perform_with_rc_dir(&server, context, "musician");
+        let mut beat = 0u64;
+
+        let commits = || server.documents.block_snapshots(context).unwrap().into_iter()
+            .filter(|block| block.content.starts_with("Commit at tick ")).count();
+
+        // A tick with no measurement targets one phrase ahead. The turn waits on
+        // the conversation lock, so the work misses its deadline.
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let first = run_shipped_tick(&server, &scheduler, context, performer).await;
+        assert_eq!(first["KJ_COST_MS"], "0");
+        assert_eq!(first["KJ_OPEN_WORK"], "0");
+        let first_tick: i64 = first["KJ_TICK"].parse().unwrap();
+        assert_eq!(timeline.lock().future_len(), 1);
+        assert!(server.documents.block_snapshots(context).unwrap().iter()
+            .any(|block| block.content.starts_with(&format!("Commit at tick {}.", first_tick + 4))));
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        drop(held);
+        assert!(matches!(recv_turn_event(&mut events, context).await,
+            ServerEvent::TurnCompleted { stop_reason: TurnCompletedStopReason::CancelledImmediate, .. }));
+        assert!(timeline.lock().measured_cost(&kaijutsu_hyoushigi::ResolverId::new("model_output"), performer).is_some(),
+            "the missed deadline left a measured lower bound");
+
+        // The next tick plans for it: the target is at least two phrases ahead.
+        let second = run_shipped_tick(&server, &scheduler, context, performer).await;
+        let cost_ms: u64 = second["KJ_COST_MS"].parse().unwrap();
+        let lead: i64 = second["KJ_LEAD_BEATS"].parse().unwrap();
+        assert!(cost_ms > 0 && lead >= 4, "{second:?}");
+        assert_eq!(second["KJ_OPEN_WORK"], "0");
+        let second_tick: i64 = second["KJ_TICK"].parse().unwrap();
+        let target = second_tick + (lead / 4 + 1) * 4;
+        assert!(target >= second_tick + 8);
+        assert!(server.documents.block_snapshots(context).unwrap().iter()
+            .any(|block| block.content.starts_with(&format!("Commit at tick {target}."))));
+        assert_eq!(timeline.lock().future_len(), 1);
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+        let result = kj.execute_kj_quiet(context, &[
+            "transport".into(), "work".into(), "--track".into(), track.as_str().into(),
+        ]).await.unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        let rows: Vec<WorkStatus> = serde_json::from_value(result.data.unwrap()).unwrap();
+        let admitted = rows.iter().find(|row| row.start.get() == target).expect("the new work is listed");
+        assert!(admitted.estimate_wall > Duration::ZERO, "{admitted:?}");
+        assert!(admitted.estimate.get() > 0, "{admitted:?}");
+
+        // While that work is open, a tick admits nothing.
+        let (statuses, blocks) = (timeline.lock().statuses().len(), commits());
+        let third = run_shipped_tick(&server, &scheduler, context, performer).await;
+        assert_eq!(third["KJ_OPEN_WORK"], "1");
+        assert_eq!(timeline.lock().statuses().len(), statuses, "no work admitted");
+        assert_eq!(commits(), blocks, "no Commit block written");
+        assert!(!server.kernel.turn_in_flight(context));
     });
 }

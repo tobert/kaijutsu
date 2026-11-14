@@ -6,11 +6,17 @@
 # `lyricist_in_time_with_music`, etc. are pure rc bundles, no kernel edit.
 # See docs/chameleon.md.
 #
-# `kj transport attach` (no --context, no --track) targets THIS new context and
-# derives the beat lane (track) from the label. Attaches stopped + OODA-armed
-# (no surprise token spend — `kj transport play` starts the clock). An
-# empty/unsluggable label fails LOUD here (an rc Error block) rather than
+# `kj transport attach` targets THIS new context. KJ_BAND names the track, so
+# players made with the same KJ_BAND share one track and one clock; an existing
+# track keeps its clock. Without KJ_BAND the track comes from the context's
+# attachment row (a rotated successor) or its label. Attaches stopped +
+# OODA-armed (no surprise token spend — `kj transport play` starts the clock).
+# An empty/unsluggable label fails LOUD here (an rc Error block) rather than
 # attaching onto a silent shared lane. Runs privileged in the create lifecycle,
 # so it clears the Transport gate under the narrowed loadout.
 set -e
-kj transport attach
+if test -n "${KJ_BAND:-}"; then
+  kj transport attach --track "$KJ_BAND"
+else
+  kj transport attach
+fi

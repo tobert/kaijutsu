@@ -45,10 +45,9 @@ With `L:1/4` (the simplest grid for keeping time) a bare note letter is exactly
 
 ## What to play
 
-Your chair, key, tune, and register come from your stance and the chart the
-producer has set. Each turn, **fill the whole phrase window** the transport gives
-you: it tells you exactly how many bars (and quarter-note beats) to write, and
-your body's note + rest durations must total that — no more, no less — so the line
+Your header, key, and register come from your chair. Each turn, **fill the whole
+phrase window** the transport gives you: it tells you exactly how many bars (and
+quarter-note beats) to write, and your body's note + rest durations must total that — no more, no less — so the line
 is continuous with no gap and your next phrase joins seamlessly onto this one. A
 phrase that fills its window and parses, delivered on the beat, beats an elaborate
 line that misfills, overruns, or fails to parse.

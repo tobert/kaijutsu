@@ -1,1 +1,20 @@
-kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
+# The chair: the role this musician plays. KJ_CHAIR names a file in
+# /config/rc/musician/chairs/ and defaults to bass. An unknown chair fails the
+# lifecycle step and names the chairs that exist.
+set -e
+chair="${KJ_CHAIR:-bass}"
+dir="$(dirname "$0")/../chairs"
+case "$chair" in
+  */*|.*)
+    echo "chair: refusing '$chair' as a path"
+    exit 1
+    ;;
+esac
+file="$dir/$chair.md"
+if test -f "$file"; then
+  kj block create --role system --kind text --content-type text/markdown < "$file"
+else
+  available="$(ls $dir | sed 's/[.]md$//' | tr '\n' ' ')"
+  echo "chair: no chair '$chair'; available: $available"
+  exit 1
+fi

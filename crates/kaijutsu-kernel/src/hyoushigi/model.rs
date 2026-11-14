@@ -25,6 +25,9 @@ struct ModelOutput {
     seed: BlockId,
     interrupt: Arc<ContextInterruptState>,
     admitted: std::time::Instant,
+    /// What this performer's earlier model turns on the track measured, read at
+    /// admission; zero when none was measured.
+    estimate: Duration,
 }
 
 /// A model producer's timing: preparation measured only its own slot wait and
@@ -43,7 +46,7 @@ impl Drop for CancelOnDrop {
 
 impl Resolver for ModelOutput {
     fn id(&self) -> ResolverId { ResolverId::new("model_output") }
-    fn estimate_cost(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> Duration { Duration::ZERO }
+    fn estimate_cost(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> Duration { self.estimate }
     fn can_respeculate(&self) -> bool { false }
     fn source_block(&self) -> Option<BlockId> { Some(self.seed.clone()) }
 
@@ -171,7 +174,9 @@ pub(crate) fn admit(
         .ok_or_else(|| format!("score track '{}' is not armed", intent.track.as_str()))?;
     let (delivery, receiver) = tokio::sync::oneshot::channel();
     let admitted = std::time::Instant::now();
-    let work = timeline.lock().schedule_preparing(Cell::deferred_on(
+    let mut timeline_guard = timeline.lock();
+    let estimate = timeline_guard.measured_cost(&ResolverId::new("model_output"), performer).unwrap_or(Duration::ZERO);
+    let work = timeline_guard.schedule_preparing(Cell::deferred_on(
         Span::instant(intent.start), Recipe {
             resolver: ResolverId::new("model_output"),
             params: serde_json::json!({ "turn_id": lease.id() }),
@@ -179,8 +184,9 @@ pub(crate) fn admit(
         }, intent.track.clone(), performer,
     ), Box::new(ModelOutput {
         receiver: parking_lot::Mutex::new(Some(receiver)), documents: kernel.blocks().clone(),
-        context, seed, interrupt: lease.interrupt(), admitted,
+        context, seed, interrupt: lease.interrupt(), admitted, estimate,
     })).map_err(|error| format!("score admission refused: {error}"))?;
+    drop(timeline_guard);
     lease.deliver_to(OutputDelivery { sender: delivery, documents: kernel.blocks().clone(), context, performer, admitted });
     Ok((work, timeline))
 }
@@ -208,12 +214,34 @@ mod tests {
             receiver: parking_lot::Mutex::new(Some(receiver)), documents: kernel.blocks().clone(),
             context, seed: BlockId::new(context, PrincipalId::new(), 0), interrupt: interrupt.clone(),
             admitted: std::time::Instant::now() - Duration::from_millis(200),
+            estimate: Duration::ZERO,
         };
         let future = resolver.resolve(&serde_json::Value::Null, &Context);
         sender.send(Ok(Resolution::new(b"prepared", ABC_MIME))).unwrap();
         interrupt.hard();
         let error = future.now_or_never().unwrap().expect_err("hard cancellation must not deliver unobserved score bytes");
         assert!(error.timing.expect("an interrupted turn still reports what it cost").compute >= Duration::from_millis(200));
+    }
+
+    /// The estimate admission read from the timeline's measured cost is what
+    /// the resolver reports to the timeline.
+    #[tokio::test]
+    async fn the_resolver_reports_the_admitted_estimate() {
+        struct Context;
+        impl ResolverCtx for Context {
+            fn now(&self) -> Tick { Tick::ZERO }
+            fn ambient(&self, _: &str) -> Option<Vec<u8>> { None }
+            fn content_before(&self, _: Tick) -> Option<kaijutsu_hyoushigi::ContentRef> { None }
+        }
+        let kernel = crate::Kernel::new_ephemeral("score-estimate").await;
+        let context = ContextId::new();
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let resolver = ModelOutput {
+            receiver: parking_lot::Mutex::new(Some(receiver)), documents: kernel.blocks().clone(),
+            context, seed: BlockId::new(context, PrincipalId::new(), 0), interrupt: ContextInterruptState::new(),
+            admitted: std::time::Instant::now(), estimate: Duration::from_secs(20),
+        };
+        assert_eq!(resolver.estimate_cost(&serde_json::Value::Null, &Context), Duration::from_secs(20));
     }
 
     /// The preparation's slot wait is the queue; the rest since admission is

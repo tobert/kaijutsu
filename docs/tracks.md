@@ -118,10 +118,21 @@ the successor's `create` rc re-attaches it to the **same** track. The clock and
 score never pause. Lifecycle knowledge stays on the context side; the track
 stays a passive clock + score.
 
-`kj context rotate` copies the attachment rows to the successor, and the
-successor's `create` rc runs `kj transport attach` (no flags) to announce
-itself. The predecessor is archived. A `companion` context does this
+`kj context rotate` copies the attachment rows and the context's env to the
+successor, and the successor's `create` rc announces it to the track. The predecessor is archived. A `companion` context does this
 (`docs/companion.md`).
+
+### How a musician finds its track
+
+The shipped `musician` `create` rc runs `kj transport attach`. With `KJ_BAND` in
+the context's env it attaches to that track: `kj context create musician --name
+bass --env KJ_BAND=band` and `kj context create musician --name drums --env
+KJ_BAND=band --env KJ_CHAIR=drums` put two players on track `band`, one clock.
+An existing track keeps its clock and policy; the new attachment is added to
+it. Without `KJ_BAND`, a context that already has an attachment row (a rotated
+successor) keeps that track, and a fresh one gets a track named for its label.
+`KJ_BAND`, when set, wins over the row. `KJ_CHAIR` picks the chair text from
+`musician/chairs/<name>.md` (`bass` when unset); it does not affect the track.
 
 ### 5. Non-rotating attachments are first-class
 
@@ -208,6 +219,9 @@ convention, cf. `KJ_PARENT_BLOCK_COUNT`):
 | `KJ_HEARD` | the track's score context | recent committed notation — the **band view**, spanning all producers across rotations |
 | `KJ_PULSE` | per-attachment monotonic counter | ordering key *within a run* (resets on restart — the documented contract, consistent with conversation re-hydration) |
 | `KJ_EPOCH_NS` | wall clock, latched once per beat | human "when" + cross-context join — identical for every context woken on the same beat |
+| `KJ_COST_MS` | the track's timeline, for this context's performer | the largest `queued + compute` among the performer's newest 8 `model_output` samples, in whole milliseconds; a missed deadline counts at its lower bound; `0` with no sample |
+| `KJ_LEAD_BEATS` | `KJ_COST_MS` through the track's clock | beats for the cost times the clock's safety factor (1.5), rounded up as `Timeline::schedule` rounds a lead; `0` with no sample |
+| `KJ_OPEN_WORK` | the track's timeline, for this context's performer | the performer's admitted work on the track that no disposition has settled |
 
 `KJ_EPOCH_NS` (phase-align): the value is the beat's **scheduled**
 wallclock, not the actual wakeup's. `fire_due` computes it by back-dating the
@@ -219,6 +233,14 @@ nuance: a consumer now sees `KJ_EPOCH_NS` up to the wake-lateness *earlier*
 than it would have under the old actual-wakeup stamp — never later. Beyond the
 cap the grid re-seeds at the actual wakeup and the stamp reverts to that
 instant for one beat (the missed-beats-are-missed case).
+
+The shipped musician tick uses the three cost variables as policy. While
+`KJ_OPEN_WORK` is above 0 it admits nothing and exits 0. Otherwise it targets
+`KJ_TICK` plus `KJ_LEAD_BEATS / KJ_PHRASE_BEATS + 1` phrases, so a performer
+that needs more than one phrase is admitted that many phrases ahead; a lead
+under one phrase targets one phrase ahead. A performer slower than one phrase
+therefore plays every other phrase, and a phrase with no admitted work is
+silent (`last-good` covers only admitted work that failed).
 
 A **musician**'s tick behaviour produces ABC into the track's score; a
 **probe**'s tick behaviour runs a kaish script that writes `/run`

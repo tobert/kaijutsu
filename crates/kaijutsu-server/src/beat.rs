@@ -39,7 +39,8 @@ use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::BlockFlow;
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ClockKind,
-    ContentRef, DeriverRegistry, MaterializeCursor, Span, TrackSnapshot, materialize_committed,
+    ContentRef, DeriverRegistry, MaterializeCursor, ResolverId, Span, TickClock, TrackSnapshot,
+    WorkStatus, materialize_committed,
 };
 use kaijutsu_kernel::kernel_db::{
     ContextRow, DEFAULT_HYDRATION_WINDOW, PersistedAttachment, PersistedTrack,
@@ -269,6 +270,29 @@ fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(Str
         ("KJ_PHRASE".to_string(), phrase.to_string()),
         ("KJ_TEMPO".to_string(), bpm.to_string()),
     ]
+}
+
+/// The performer's measured cost, for the `tick` rc script to plan its target:
+/// `KJ_COST_MS` (whole milliseconds), `KJ_LEAD_BEATS` (the beats the clock gives
+/// that cost times its safety factor, rounded up as `Timeline::schedule` rounds
+/// a lead) and `KJ_OPEN_WORK` (the performer's unsettled work on the track).
+/// Cost and lead are 0 when the performer has no measured sample.
+fn cost_vars(
+    measured: Option<Duration>, open_work: usize, clock: &TickClock,
+) -> [(String, String); 3] {
+    let (cost_ms, lead) = measured.map_or((0, 0), |cost| {
+        (cost.as_millis(), clock.beats_for(cost.mul_f64(clock.safety_factor)).get())
+    });
+    [
+        ("KJ_COST_MS".to_string(), cost_ms.to_string()),
+        ("KJ_LEAD_BEATS".to_string(), lead.to_string()),
+        ("KJ_OPEN_WORK".to_string(), open_work.to_string()),
+    ]
+}
+
+/// The work items `performer` has admitted that no disposition has settled.
+fn open_work(statuses: &[WorkStatus], performer: PrincipalId) -> usize {
+    statuses.iter().filter(|s| s.played_by == performer && s.settled_at.is_none()).count()
 }
 
 /// How many phrases of recent committed notation `$HEARD` carries. Covers the
@@ -2057,12 +2081,14 @@ impl BeatScheduler {
     }
 
     /// Snapshot the transport heartbeat for `ctx` — `KJ_TICK`/`KJ_PHRASE`/`KJ_TEMPO`
-    /// plus `KJ_HEARD`, `KJ_PULSE`, `KJ_EPOCH_NS` (and `KJ_ROTATE_EVERY` when it
-    /// rotates) — read NOW, on the scheduler thread with the track + attachment in
+    /// plus `KJ_HEARD`, `KJ_PULSE`, `KJ_EPOCH_NS`, the performer's `KJ_COST_MS`,
+    /// `KJ_LEAD_BEATS` and `KJ_OPEN_WORK` (see `cost_vars`; all 0 when the context
+    /// has no performer or the track has no timeline), and `KJ_ROTATE_EVERY` when
+    /// it rotates — read NOW, on the scheduler thread with the track + attachment in
     /// hand, so a spawned lifecycle sees facts coherent with the beat that triggered
     /// it. The position facts come from the TRACK (it owns the clock now). Empty when
     /// the context isn't attached to a track.
-    fn transport_env(&self, ctx: ContextId) -> HashMap<String, String> {
+    pub fn transport_env(&self, ctx: ContextId) -> HashMap<String, String> {
         let Some(track_id) = self.track_of(ctx) else {
             return HashMap::new();
         };
@@ -2095,6 +2121,27 @@ impl BeatScheduler {
             .map(|blocks| heard_json(&blocks, playhead, window))
             .unwrap_or_else(|_| "[]".to_string());
         vars.insert("KJ_HEARD".to_string(), heard);
+        // The performer is the principal `kj drive --score-at` stamps on its work: the
+        // context row's performer. One timeline lock reads the measured cost and the
+        // open work together.
+        let performer = match self.kernel.kernel_db().lock().get_context(ctx) {
+            Ok(row) => row.and_then(|row| row.performer),
+            Err(error) => {
+                log::warn!("beat: tick env could not read the performer of {ctx}: {error}");
+                None
+            }
+        };
+        let (measured, open) = match (performer, self.kernel.track_timeline(&track_id)) {
+            (Some(performer), Some(timeline)) => {
+                let timeline = timeline.lock();
+                (
+                    timeline.measured_cost(&ResolverId::new("model_output"), performer),
+                    open_work(&timeline.statuses(), performer),
+                )
+            }
+            _ => (None, 0),
+        };
+        vars.extend(cost_vars(measured, open, &track.phrasing().clock()));
         // KJ_PULSE: this attachment's monotonic wakeup counter — the ordering key
         // *within a run* (`KJ_TICK` can repeat/freeze off-beat). It is NOT persisted,
         // so it resets to 0 on a kernel restart (like an uptime counter); that is
@@ -2397,7 +2444,7 @@ mod tests {
     use super::BeatScheduler;
     use super::{
         FAILURE_FEEDBACK_PULSE_BUDGET, MATERIALIZE_RETRY_BUDGET, PoisonAction, heard_json,
-        poison_action, render_instant, transport_vars,
+        cost_vars, poison_action, render_instant, transport_vars,
     };
     use kaijutsu_types::{
         BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, Role as BlockRole,
@@ -2516,6 +2563,117 @@ mod tests {
         };
         let m = vars_map(transport_vars(Tick::new(5), 5, &policy));
         assert_eq!(m["KJ_PHRASE"], "0", "no phrasing → phrase 0, never a divide-by-zero");
+    }
+
+    /// The cost variables convert the measured cost into whole milliseconds and
+    /// into beats at the clock's rate times its safety factor, rounding the lead up.
+    #[test]
+    fn cost_vars_convert_cost_to_milliseconds_and_lead_beats() {
+        let clock = BeatPolicy::musician_default().clock(); // 2 beats/s, safety 1.5
+        let m = vars_map(cost_vars(Some(Duration::from_secs(20)), 2, &clock));
+        assert_eq!(m["KJ_COST_MS"], "20000");
+        assert_eq!(m["KJ_LEAD_BEATS"], "60", "20 s x 1.5 = 30 s = 60 beats");
+        assert_eq!(m["KJ_OPEN_WORK"], "2");
+        let m = vars_map(cost_vars(Some(Duration::from_millis(1001)), 0, &clock));
+        assert_eq!(m["KJ_COST_MS"], "1001");
+        assert_eq!(m["KJ_LEAD_BEATS"], "4", "3.003 beats round up");
+    }
+
+    #[test]
+    fn cost_vars_are_zero_without_a_measured_cost() {
+        let m = vars_map(cost_vars(None, 0, &BeatPolicy::musician_default().clock()));
+        assert_eq!(m["KJ_COST_MS"], "0");
+        assert_eq!(m["KJ_LEAD_BEATS"], "0");
+        assert_eq!(m["KJ_OPEN_WORK"], "0");
+    }
+
+    /// A resolver under the model resolver's id that reports one fixed measured
+    /// time, so a performer's cost window holds a sample.
+    struct ReportsTime(Duration);
+    impl Resolver for ReportsTime {
+        fn id(&self) -> ResolverId { ResolverId::new("model_output") }
+        fn estimate_cost(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> Duration { Duration::ZERO }
+        fn compute_basis(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> ContextHash { ContextHash::of(b"stable") }
+        fn resolve(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> kaijutsu_hyoushigi::ResolveFuture {
+            let timing = kaijutsu_hyoushigi::Timing { queued: Duration::from_secs(1), compute: self.0 - Duration::from_secs(1) };
+            Box::pin(std::future::ready(Ok(Resolution::new(b"T".to_vec(), "text/plain").with_timing(timing))))
+        }
+    }
+
+    /// Work that never finishes before its deadline stays open.
+    struct StaysOpen;
+    impl Resolver for StaysOpen {
+        fn id(&self) -> ResolverId { ResolverId::new("stays_open") }
+        fn estimate_cost(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> Duration { Duration::ZERO }
+        fn compute_basis(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> ContextHash { ContextHash::of(b"stable") }
+        fn resolve(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> kaijutsu_hyoushigi::ResolveFuture {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The tick environment carries the context's own performer's measured cost
+    /// and open work: another performer's samples and work do not count, and a
+    /// settled item is not open.
+    #[tokio::test]
+    async fn transport_env_reports_the_performers_cost_and_open_work() {
+        use kaijutsu_kernel::kernel_db::ContextRow;
+        use kaijutsu_types::ContextState;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let a = ContextId::new();
+        let b = ContextId::new();
+        documents.create_document(a, DocumentKind::Conversation, None).unwrap();
+        documents.create_document(b, DocumentKind::Conversation, None).unwrap();
+        let (pa, pb) = (PrincipalId::new(), PrincipalId::new());
+        let track = TrackId::solo();
+        let policy = BeatPolicy::musician_default(); // 500 ms/beat
+        let tl = kernel.arm_track_timeline(track.clone(), policy.clock(), Tick::ZERO);
+        let cell = |resolver: &str, at: i64, by: PrincipalId| Cell::deferred_on(
+            Span::instant(Tick::new(at)),
+            Recipe {
+                resolver: ResolverId::new(resolver), params: serde_json::Value::Null,
+                query: ContextQuery::default(), fallback: Fallback::Skip,
+            },
+            track.clone(), by,
+        );
+        {
+            let mut g = tl.lock();
+            g.register_resolver(Box::new(ReportsTime(Duration::from_secs(20))));
+            g.register_resolver(Box::new(StaysOpen));
+            g.schedule(cell("model_output", 1, pa)).unwrap();
+            g.schedule(cell("stays_open", 500, pa)).unwrap();
+            g.schedule(cell("stays_open", 501, pb)).unwrap();
+            g.schedule(cell("stays_open", 502, pb)).unwrap();
+        }
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.attach(track.clone(), a, slow_attachment(), policy).unwrap();
+        sched.attach(track.clone(), b, slow_attachment(), policy).unwrap();
+        for (context, performer) in [(a, pa), (b, pb)] {
+            let db = kernel.kernel_db().lock();
+            let workspace = db.get_or_create_default_workspace(performer).unwrap();
+            db.insert_context_with_document(&ContextRow {
+                context_id: context, label: None, system_prompt: None,
+                context_state: ContextState::Live,
+                created_at: 0, created_by: performer,
+                forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
+                preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+                demoted_at: None, paused_at: None, origin_host: None,
+                performer: None, senpai_ctx: None, persona: None,
+            }, workspace).unwrap();
+            db.update_performer(context, Some(performer)).unwrap();
+        }
+        sched.play(&track, base);
+        sched.fire_due(base + Duration::from_millis(500)); // tick 1 settles pa's measured turn
+
+        let env_a = sched.transport_env(a);
+        assert_eq!(env_a["KJ_COST_MS"], "20000");
+        assert_eq!(env_a["KJ_LEAD_BEATS"], "60");
+        assert_eq!(env_a["KJ_OPEN_WORK"], "1", "the settled item is not open");
+        let env_b = sched.transport_env(b);
+        assert_eq!(env_b["KJ_COST_MS"], "0", "another performer's sample is not b's");
+        assert_eq!(env_b["KJ_LEAD_BEATS"], "0");
+        assert_eq!(env_b["KJ_OPEN_WORK"], "2");
     }
 
     /// The poison-cell retry budget: the bridge retries the SAME failing cell up to

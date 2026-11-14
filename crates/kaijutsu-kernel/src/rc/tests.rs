@@ -124,6 +124,11 @@
                 expected.push(String::from_utf8(data).unwrap());
             }
             assert!(!expected.is_empty(), "{dir} must exercise companion data");
+            if dir == "musician" {
+                // The chair script (S05) reads its text from `chairs/`, bass by default.
+                let bass = crate::seed_scripts::seed_body("/config/rc/musician/chairs/bass.md").unwrap();
+                expected.insert(1, bass.to_string());
+            }
             let mut caller = console_caller(&d);
             caller.actor_id = PrincipalId::new();
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
@@ -151,7 +156,7 @@
     }
 
     /// `bassist` merged into `musician` (`docs/chameleon.md`): the seed ships no `bassist` path at
-    /// all, and `musician`'s `create` bundle carries the folded chair voice.
+    /// all, and `musician` carries the folded chair voice in `chairs/bass.md`.
     #[test]
     fn bassist_retired_musician_carries_the_folded_chair() {
         let seeds = crate::seed_scripts::seed_files();
@@ -159,12 +164,38 @@
             seeds.iter().all(|(path, _)| !path.starts_with("/config/rc/bassist/")),
             "bassist must ship no seed after the merge into musician"
         );
-        let chair = crate::seed_scripts::seed_body("/config/rc/musician/create/S05-chair.md")
+        let chair = crate::seed_scripts::seed_body("/config/rc/musician/chairs/bass.md")
             .expect("musician must carry the folded chair voice");
         assert!(
             chair.contains("low register"),
             "the chair's register guidance must survive the fold: {chair}"
         );
+    }
+
+    /// A musician's chair comes from `chairs/<name>.md` by `KJ_CHAIR`, and the
+    /// tick prompt carries no chair facts: the key, title and register are the
+    /// chair's. A chair names its header; the drum chair names its channel.
+    #[test]
+    fn musician_chairs_carry_the_header_and_the_tick_prompt_carries_none() {
+        use crate::seed_scripts::seed_body;
+        assert!(seed_body("/config/rc/musician/create/S05-chair.md").is_none(), "the bass-only chair file is retired");
+        let bass = seed_body("/config/rc/musician/chairs/bass.md").expect("bass chair");
+        let drums = seed_body("/config/rc/musician/chairs/drums.md").expect("drums chair");
+        for (name, chair, header) in [
+            ("bass", bass, "X:1\nT:bass\nM:4/4\nL:1/4\nK:C\n"),
+            ("drums", drums, "X:1\nT:drums\nM:4/4\nL:1/4\n%%MIDI channel 10\nK:C\n"),
+        ] {
+            assert!(chair.contains(header), "the {name} chair writes out its header: {chair}");
+        }
+        let chair_script = seed_body("/config/rc/musician/create/S05-chair.kai").expect("chair script");
+        assert!(chair_script.contains("KJ_CHAIR:-bass"), "{chair_script}");
+        let tick = seed_body("/config/rc/musician/tick/S10-drive.kai").expect("tick script");
+        for chair_fact in ["K:C", "T:bass", "in C", "Low register", "comma"] {
+            assert!(!tick.contains(chair_fact), "the tick prompt names {chair_fact:?}, which is the chair's");
+        }
+        assert!(tick.contains("come from your chair"), "{tick}");
+        let attach = seed_body("/config/rc/musician/create/S20-arm.kai").expect("arm script");
+        assert!(attach.contains("kj transport attach --track \"$KJ_BAND\""), "{attach}");
     }
 
     #[tokio::test]
@@ -714,6 +745,31 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             "rc must carry the performer and its directory, and no context type, got: {}",
             trace.content
         );
+    }
+
+    /// A context's `--env` pairs reach its `create` scripts as shell
+    /// variables, and a context made without the pair reads the default.
+    #[tokio::test]
+    async fn rc_create_sees_the_context_env_as_shell_variables() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/test/create/S00-echo.kai",
+            "echo \"chair=${KJ_CHAIR:-none} band=${KJ_BAND:-none}\"").await;
+        let performer = rc_dir_performer(&d.kernel_db().lock(), "test");
+        let caller = console_caller(&d);
+        for (name, extra, expected) in [
+            ("env-set", vec!["--env", "KJ_CHAIR=drums", "--env", "KJ_BAND=band"], "chair=drums band=band"),
+            ("env-unset", vec![], "chair=none band=none"),
+        ] {
+            let mut args = vec!["context", "create", performer.as_str(), "--name", name];
+            args.extend(extra);
+            let result = d.dispatch(&argv(&args), &caller).await;
+            assert!(result.is_ok(), "create failed: {}", result.message());
+            let snapshots = d.block_store().block_snapshots(lookup_context_id(&d, name)).expect("snapshots");
+            let trace = snapshots.iter().find(|b| b.kind == kaijutsu_types::BlockKind::Trace)
+                .expect("the echoing script must produce a trace block");
+            assert!(trace.content.contains(expected), "{name}: expected {expected:?}, got: {}", trace.content);
+        }
     }
 
     /// The lifecycle runs the performer's rc directory, and the run records

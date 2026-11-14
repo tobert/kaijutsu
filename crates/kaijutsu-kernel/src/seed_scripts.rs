@@ -211,6 +211,7 @@ pub const RETIRED_RC_SEEDS: &[&str] = &[
     "mcp/create/S50-lfm2d.kai",
     "toolie/create/S50-lfm2d.kai",
     "toolie/create/S45-shell-guard.kai",
+    "musician/create/S05-chair.md",
 ];
 
 /// Directories, relative to the rc root, that earlier seeds installed and the

@@ -682,6 +682,23 @@ impl Classify for RcCommand {
 mod tests {
     use super::*;
 
+    /// `musician/chairs/` is data a create script reads, not a lifecycle
+    /// directory: `kj rc list` does not list its files, and the seed set
+    /// still carries them for reseed.
+    #[tokio::test]
+    async fn rc_list_skips_the_chairs_directory_that_the_seed_set_carries() {
+        use crate::kj::test_helpers::*;
+        let d = test_dispatcher_rc().await;
+        let listed = d.dispatch(&["rc", "list", "--dir", "musician"].map(String::from), &test_caller()).await;
+        assert!(listed.is_ok(), "{}", listed.message());
+        assert!(listed.message().contains("/config/rc/musician/create/S05-chair.kai"), "{}", listed.message());
+        assert!(!listed.message().contains("/chairs/"), "{}", listed.message());
+        let seeds: Vec<String> = crate::seed_scripts::seed_files().into_iter().map(|(p, _)| p).collect();
+        for chair in ["bass", "drums"] {
+            assert!(seeds.contains(&format!("/config/rc/musician/chairs/{chair}.md")), "{chair} ships as a seed");
+        }
+    }
+
     #[tokio::test]
     async fn markdown_data_is_distinct_from_executable_scripts() {
         use crate::kj::test_helpers::*;

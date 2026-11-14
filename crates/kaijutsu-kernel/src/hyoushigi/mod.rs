@@ -17,7 +17,7 @@ use kaijutsu_abc::ParseMode;
 use kaijutsu_audio::{Clip, CuePayload, RenderCue, CLIP_MIME, PREPARE_MIME};
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
 use kaijutsu_hyoushigi::{
-    ContextQuery, Fallback, Recipe, ResolverId, TickDelta, Timeline,
+    ContextQuery, Fallback, Recipe, TickDelta, Timeline,
 };
 use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshotBuilder, ContentType, ContextId, PrincipalId, Role, TrackId,
@@ -33,7 +33,7 @@ use crate::flows::BlockFlow;
 // Re-export the hyoushigi cell primitives the server's beat scheduler needs to
 // reconstruct a track's committed log (Stage 2 WI 7) — so `kaijutsu-server` reaches
 // them through this façade like the rest of the beat types, not a direct dep.
-pub use kaijutsu_hyoushigi::{Body, Cell, ContentRef, Span};
+pub use kaijutsu_hyoushigi::{Body, Cell, ContentRef, ResolverId, Span, TickClock, WorkStatus};
 
 use crate::block_store::SharedBlockStore;
 use crate::kernel::Kernel;

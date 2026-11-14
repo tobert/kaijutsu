@@ -19,6 +19,9 @@ use crate::{CostSample, Disposition, SampleOutcome, FallbackReason, Readiness, R
 /// How many measured attempts each resolver's cost window keeps.
 pub const COST_WINDOW: usize = 32;
 
+/// How many of a performer's newest samples [`Timeline::measured_cost`] reads.
+pub const MEASURED_COST_SAMPLES: usize = 8;
+
 /// Convert preparation costs into lead times at the external clock's tick rate.
 /// `safety_factor` widens the initial lead; `commit_margin` leaves time between
 /// the first commitment check and the intended start.
@@ -46,7 +49,7 @@ impl TickClock {
         assert!(self.commit_margin.get() >= 0, "commit margin must be nonnegative");
     }
     /// Convert a wall-clock duration into ticks, rounding up (never under-lead).
-    fn beats_for(&self, d: Duration) -> TickDelta {
+    pub fn beats_for(&self, d: Duration) -> TickDelta {
         let ticks = (d.as_secs_f64() * self.ticks_per_sec).ceil();
         assert!(ticks.is_finite() && ticks < i64::MAX as f64, "lead time exceeds the tick range");
         TickDelta::new(ticks as i64)
@@ -239,6 +242,18 @@ impl Timeline {
     /// The newest measured attempts of one resolver, oldest first.
     pub fn cost_samples(&self, resolver: &ResolverId) -> impl Iterator<Item = &CostSample> {
         self.costs.get(&resolver.0).into_iter().flatten()
+    }
+
+    /// What one performer's work through one resolver has recently cost in
+    /// wall-clock time: the largest `queued + compute` among that performer's
+    /// newest [`MEASURED_COST_SAMPLES`] samples. A `Missed` sample counts at
+    /// its lower bound. `None` when the performer has no sample.
+    pub fn measured_cost(&self, resolver: &ResolverId, played_by: PrincipalId) -> Option<Duration> {
+        let mine: Vec<_> = self.cost_samples(resolver).filter(|s| s.played_by == played_by).collect();
+        mine[mine.len().saturating_sub(MEASURED_COST_SAMPLES)..]
+            .iter()
+            .map(|s| s.timing.queued + s.timing.compute)
+            .max()
     }
 
     pub fn status(&self, id: WorkId) -> Option<&WorkStatus> {
@@ -1801,6 +1816,58 @@ mod tests {
         tl.advance_to(Tick::new(25));
         assert!(matches!(tl.status(never_started).unwrap().disposition, Some(Disposition::Fallback { reason: FallbackReason::DeadlineMissed, .. })));
         assert_eq!(tl.cost_samples(&ResolverId::new("timed")).count(), 1);
+    }
+
+    fn sample_for(played_by: PrincipalId, queued_ms: u64, compute_ms: u64, outcome: SampleOutcome) -> CostSample {
+        CostSample {
+            at: Tick::new(0),
+            played_by,
+            estimate: Duration::ZERO,
+            timing: Timing { queued: Duration::from_millis(queued_ms), compute: Duration::from_millis(compute_ms) },
+            outcome,
+        }
+    }
+
+    #[test]
+    fn measured_cost_is_none_without_samples() {
+        let tl = timed_timeline();
+        assert_eq!(tl.measured_cost(&ResolverId::new("timed"), PrincipalId::beat()), None);
+    }
+
+    #[test]
+    fn measured_cost_ignores_other_performers_and_resolvers() {
+        let mut tl = timed_timeline();
+        let me = PrincipalId::beat();
+        let other = PrincipalId::new();
+        tl.record_cost(ResolverId::new("timed"), sample_for(other, 0, 9000, SampleOutcome::Ready));
+        tl.record_cost(ResolverId::new("echo"), sample_for(me, 0, 8000, SampleOutcome::Ready));
+        assert_eq!(tl.measured_cost(&ResolverId::new("timed"), me), None);
+        tl.record_cost(ResolverId::new("timed"), sample_for(me, 100, 400, SampleOutcome::Ready));
+        assert_eq!(tl.measured_cost(&ResolverId::new("timed"), me), Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn measured_cost_reads_only_the_newest_samples() {
+        let mut tl = timed_timeline();
+        let me = PrincipalId::beat();
+        let resolver = ResolverId::new("timed");
+        tl.record_cost(resolver.clone(), sample_for(me, 0, 30_000, SampleOutcome::Ready));
+        for _ in 0..MEASURED_COST_SAMPLES - 1 {
+            tl.record_cost(resolver.clone(), sample_for(me, 0, 2000, SampleOutcome::Ready));
+        }
+        assert_eq!(tl.measured_cost(&resolver, me), Some(Duration::from_secs(30)));
+        tl.record_cost(resolver.clone(), sample_for(me, 0, 2000, SampleOutcome::Ready));
+        assert_eq!(tl.measured_cost(&resolver, me), Some(Duration::from_secs(2)), "the old large sample aged out");
+    }
+
+    #[test]
+    fn measured_cost_counts_a_missed_lower_bound() {
+        let mut tl = timed_timeline();
+        let me = PrincipalId::beat();
+        let resolver = ResolverId::new("timed");
+        tl.record_cost(resolver.clone(), sample_for(me, 0, 1000, SampleOutcome::Ready));
+        tl.record_cost(resolver.clone(), sample_for(me, 0, 16_000, SampleOutcome::Missed));
+        assert_eq!(tl.measured_cost(&resolver, me), Some(Duration::from_secs(16)));
     }
 
     /// The window keeps the newest samples, oldest first.
