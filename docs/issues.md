@@ -295,7 +295,9 @@ the running app. Left from the survey:
   timeout; the backend's `--idle-timeout` is the only lever
   (`docs/council-backend.md`, "Liveness").
 - **Media.** `lfm3-omni` reads images, audio and video and writes audio;
-  the provider sends text only and turns an image into a marker.
+  the provider sends images as objects, and nothing carries audio or video
+  in or audio out. Each turn asks the server whether it holds each image
+  (one HEAD per image per turn); a cache of held ids would save them.
 - **lfm3 on tool loops.** A 1.7B model is weaker than Gemma 4 on long tool
   loops (nagaya-85); nothing has measured it in a kaijutsu seat yet.
 
@@ -1013,9 +1015,10 @@ backend and `deepseek` (`docs/chameleon.md`, "What a live run looks like").
   zorak host `lfm3` itself?
 - **Nothing audible on zorak.** `kj audio devices --node audio/zorak` lists
   only PipeWire MIDI ports, no synth. `audio/moltar` has no connected node.
-- **The council provider sends text only**, so no omni experiment can run
-  through a kaijutsu turn yet (`docs/chameleon.md`, "Omni models"; also
-  "Council backend: what retiring mk leaves open").
+- **The council provider sends text and images only.** An image goes as an
+  object when the served model reads its type; audio and video never reach a
+  model, and an omni reply's audio has nowhere to go (`docs/chameleon.md`,
+  "Omni models").
 - **Test tracks pile up.** 19 dormant tracks on zorak, most from tests;
   `kj transport delete` works one at a time. The modeled track `ear` reports
   338 BPM.

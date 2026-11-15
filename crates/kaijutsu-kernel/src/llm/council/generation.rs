@@ -37,8 +37,9 @@ impl Client {
     /// identity with 404, 405, or 501, and is refused as one. A model the
     /// server does not serve by that name or alias, or serves without
     /// `generate`, is refused naming what it serves. The server answers a
-    /// model that is not ready.
-    pub(super) async fn served_model(&self, turn: &Turn, model: &str) -> LlmResult<ServedModel> {
+    /// model that is not ready. The flag says whether the server holds
+    /// objects.
+    pub(super) async fn served_model(&self, turn: &Turn, model: &str) -> LlmResult<(ServedModel, bool)> {
         let cell = {
             let mut cached = self.identity.lock();
             if cached.get().is_some_and(|(_, read)| read.elapsed() >= self.identity_max_age) {
@@ -72,7 +73,7 @@ impl Client {
                 served_list(identity)
             )));
         }
-        Ok(served.clone())
+        Ok((served.clone(), identity.has(Capability::Objects)))
     }
 
     /// Drops the cached council v2 identity, so the next turn reads it
@@ -88,12 +89,13 @@ impl Client {
         &self,
         opts: BuildOpts,
         history: Vec<Message>,
-        identity: ServedModel,
+        (identity, holds_objects): (ServedModel, bool),
         turn: Turn,
     ) -> LlmResult<Stream> {
         check_controls(&self.name, &opts.controls, &identity)?;
         let thinking = wants_thinking(&self.name, opts.effort.as_deref(), &identity)?;
-        let messages = build::messages(opts.system.as_deref(), &history)?;
+        let objects = self.place_images(&turn, &history, &identity, holds_objects).await?;
+        let messages = build::messages(opts.system.as_deref(), &history, &objects)?;
         let tools = build::tools(&opts.tools)
             .map_err(|e| LlmError::InvalidRequest(format!("council backend '{}': {e}", self.name)))?;
         if messages.last().is_none_or(|m| m.role == CouncilRole::Assistant) {
@@ -151,6 +153,58 @@ impl Client {
             reply_identity: Some(ReplyIdentity { model: identity.model, weight_hash: identity.weight_hash }),
         })
     }
+}
+
+impl Client {
+    /// The object each image of `history` goes as. An image goes as an
+    /// object when the server holds objects and the served model reads its
+    /// media type; the server is asked whether it holds the object, and it is
+    /// put when it does not. Any other image gets the reason it is left out.
+    /// A failed put fails the turn.
+    async fn place_images(&self, turn: &Turn, history: &[Message], model: &ServedModel, holds_objects: bool) -> LlmResult<build::Objects> {
+        use base64::Engine as _;
+        let mut placed = build::Objects::new();
+        for (hash, mime, data) in images(history) {
+            if placed.contains_key(hash) {
+                continue;
+            }
+            let why = if !holds_objects {
+                Some("the server holds no objects".to_string())
+            } else if !model.reads(mime) {
+                Some(format!("{} does not read {mime}", model.model))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                placed.insert(hash.to_string(), Err(why));
+                continue;
+            }
+            // No bytes: the builder's marker says they were not found.
+            let Some(data) = data else { continue };
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| {
+                LlmError::InvalidRequest(format!("council backend '{}': image {hash} holds bytes that are not base64: {e}", self.name))
+            })?;
+            let id = gogi_proto::content_id(&bytes);
+            let (_slot, held) = self.call(turn, false, |_| self.client.has_object(&id)).await?;
+            if !held {
+                self.call(turn, false, |left| self.client.put_object(mime, bytes.clone(), left)).await?;
+            }
+            placed.insert(hash.to_string(), Ok(id));
+        }
+        Ok(placed)
+    }
+}
+
+/// The CAS hash, media type, and resolved base64 bytes of each image a user
+/// message shows, in order.
+fn images(history: &[Message]) -> impl Iterator<Item = (&str, &str, Option<&str>)> {
+    history.iter().filter(|m| m.role == crate::llm::Role::User).flat_map(|m| match &m.content {
+        crate::llm::MessageContent::Blocks(blocks) => blocks.as_slice(),
+        crate::llm::MessageContent::Text(_) => &[],
+    }).filter_map(|b| match b {
+        crate::llm::ContentBlock::Image { hash, media_type, data_base64 } => Some((hash.as_str(), media_type.as_str(), data_base64.as_deref())),
+        _ => None,
+    })
 }
 
 /// A control list needs a served model that declares `control_vectors`; one

@@ -292,8 +292,10 @@ report.
   no MIME type. Nothing accepts a media part as the phrase.
 - **The conversation carries text and images only.** A model message is text,
   tool use, tool result, image, or reasoning. The Claude and OpenAI builders
-  send images; the council builder replaces one with a marker. No builder has
-  an audio part, and a media part needs all three.
+  send images, and the council builder sends one as an object when the served
+  model reads its type. No builder has an audio part, and a media part needs
+  all three. Gemini omni models will come later, so the media part and the
+  record of what a model reads belong to no one provider.
 - **A block has one content string and a closed content type.** `audio/wav`
   and a clip record both map to `Plain`. Hydration turns only image asset
   blocks into parts and skips every other asset, so an audio block in a

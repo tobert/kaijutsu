@@ -510,6 +510,130 @@ mod tests {
         assert_eq!(paths, ["/council/v2/identity"], "only the identity");
     }
 
+    /// An identity whose server lists `server_caps` and whose one model
+    /// lists `generate` and reads `inputs`.
+    fn serving_media(server_caps: serde_json::Value, inputs: serde_json::Value) -> kaijutsu_council::test_server::Reply {
+        http(
+            200,
+            json!({"models": [{"model": "lfm3-omni", "aliases": ["qwen"], "status": "ready", "weight_hash": "w",
+                               "tokenizer_hash": "t", "template": "x", "engine": "e",
+                               "limits": {"context_tokens": 32768, "decision_context_tokens": 3072, "snapshot_bytes": 1,
+                                          "contexts_per_decision": 8, "default_timeout_ms": 2000},
+                               "capabilities": ["generate"],
+                               "media": {"inputs": inputs, "outputs": []}}],
+                   "limits": {"case_bytes": 1000, "choice_options": 26},
+                   "capabilities": server_caps})
+            .to_string(),
+        )
+    }
+
+    /// The bytes of a test image, as text so the scripted server's captured
+    /// body compares directly.
+    const PICTURE: &[u8] = b"not really a png";
+
+    /// A user message that says `look` and shows [`PICTURE`] as a resolved
+    /// CAS image.
+    fn look_at_picture() -> Message {
+        use base64::Engine as _;
+        Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text { text: "look".into() },
+                ContentBlock::Image {
+                    hash: kaijutsu_cas::ContentHash::from_data(PICTURE).to_string(),
+                    media_type: "image/png".into(),
+                    data_base64: Some(base64::engine::general_purpose::STANDARD.encode(PICTURE)),
+                },
+            ]),
+            turn_scoped: false,
+        }
+    }
+
+    fn picture_put() -> kaijutsu_council::test_server::Reply {
+        let id = gogi_proto::content_id(PICTURE);
+        http(201, json!({"id": id, "mime": "image/png", "bytes": PICTURE.len()}).to_string())
+    }
+
+    /// An image the served model reads is put at its full content id and
+    /// sent as an object part, in place among the message's text.
+    ///
+    /// Falsified by a turn that keeps the marker, or sends the object without
+    /// putting it.
+    #[tokio::test]
+    async fn an_image_the_model_reads_is_put_and_sent_as_an_object() {
+        let (base, seen) = serve(vec![
+            serving_media(json!(["objects"]), json!(["image/png"])),
+            http(404, ""),
+            picture_put(),
+            generation("a cat", json!([]), 2),
+        ])
+        .await;
+        drain(&mut client(&base).stream(opts(64), vec![look_at_picture()]).await.unwrap()).await;
+        let id = gogi_proto::content_id(PICTURE);
+        let object = format!("/council/v2/objects/{id}");
+        let requests: Vec<(String, String)> = seen.lock().unwrap().iter().map(|c| (c.method.clone(), c.path.clone())).collect();
+        assert_eq!(
+            requests,
+            [
+                ("GET".to_string(), "/council/v2/identity".to_string()),
+                ("HEAD".to_string(), object.clone()),
+                ("PUT".to_string(), object.clone()),
+                ("POST".to_string(), "/council/v2/generations".to_string()),
+            ]
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[2].header("content-type"), Some("image/png"));
+            assert_eq!(seen[2].body.as_bytes(), PICTURE);
+        }
+        let body = &bodies(&seen, "/council/v2/generations")[0];
+        let user = body["context"]["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "user").unwrap().clone();
+        assert_eq!(user["content"], json!([{"type": "text", "text": "look"}, {"type": "object", "id": id, "mime": "image/png"}]));
+    }
+
+    /// An image the server already holds is not put again.
+    #[tokio::test]
+    async fn a_held_image_is_not_put_again() {
+        let (base, seen) = serve(vec![
+            serving_media(json!(["objects"]), json!(["image/png"])),
+            http(200, ""),
+            generation("a cat", json!([]), 2),
+        ])
+        .await;
+        drain(&mut client(&base).stream(opts(64), vec![look_at_picture()]).await.unwrap()).await;
+        let methods: Vec<String> = seen.lock().unwrap().iter().map(|c| c.method.clone()).collect();
+        assert_eq!(methods, ["GET", "HEAD", "POST"]);
+    }
+
+    /// An image the served model does not read, or that a server without
+    /// `objects` cannot hold, stays a marker that says why, and nothing is
+    /// put.
+    #[tokio::test]
+    async fn an_image_the_model_cannot_read_is_a_marker_that_says_why() {
+        for (server_caps, inputs, why) in [
+            (json!(["objects"]), json!(["audio/wav"]), "lfm3-omni does not read image/png"),
+            (json!([]), json!(["image/png"]), "the server holds no objects"),
+        ] {
+            let (base, seen) = serve(vec![serving_media(server_caps, inputs), generation("ok", json!([]), 2)]).await;
+            drain(&mut client(&base).stream(opts(64), vec![look_at_picture()]).await.unwrap()).await;
+            let methods: Vec<String> = seen.lock().unwrap().iter().map(|c| c.method.clone()).collect();
+            assert_eq!(methods, ["GET", "POST"], "{why}");
+            let body = &bodies(&seen, "/council/v2/generations")[0];
+            let user = body["context"]["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "user").unwrap().clone();
+            let text = user["content"].as_str().unwrap_or_default().to_string();
+            assert!(text.starts_with("look\n[image ") && text.contains(why), "{text}");
+        }
+    }
+
+    /// A put that fails fails the turn; the image is not quietly dropped.
+    #[tokio::test]
+    async fn a_failed_put_fails_the_turn() {
+        let (base, seen) = serve(vec![serving_media(json!(["objects"]), json!(["image/png"])), http(404, ""), http(413, "{}")]).await;
+        let err = client(&base).stream(opts(64), vec![look_at_picture()]).await.err().unwrap();
+        assert!(format!("{err}").contains("413"), "{err}");
+        assert!(seen.lock().unwrap().iter().all(|c| c.path != "/council/v2/generations"), "no generation was sent");
+    }
+
     /// A server without council v2 answers the identity with 404, and a
     /// turn on it is refused, saying so, and sends nothing else.
     ///
@@ -852,7 +976,7 @@ mod tests {
             },
             Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "a".into(), content: String::new(), is_error: false }]),
         ];
-        let messages = build::messages(None, &history).unwrap();
+        let messages = build::messages(None, &history, &build::Objects::new()).unwrap();
         let sent = serde_json::to_string(&messages[1].tool_calls[0].input).unwrap();
         assert_eq!(sent, r#"{"path":"/tmp","all":true}"#);
     }

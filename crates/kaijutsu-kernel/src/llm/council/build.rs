@@ -10,8 +10,13 @@
 //!   preceding calls is refused.
 //! - `Reasoning` blocks go back as `reasoning`; the template decides what to
 //!   keep.
-//! - The server takes text only. An image becomes a visible marker.
+//! - An image the served model reads goes as an object part, in place among
+//!   the message's text, named by the object id [`Objects`] gives it. Any other
+//!   image becomes a visible marker that says why it was left out.
 
+use std::collections::HashMap;
+
+use gogi_proto::message::{Content, Part};
 use gogi_proto::{Message as CouncilMessage, Role as CouncilRole, Tool as CouncilTool, ToolCall as CouncilToolCall};
 use kaijutsu_council::Json;
 
@@ -59,12 +64,16 @@ pub(super) fn tools(tools: &[ToolDefinition]) -> LlmResult<Vec<CouncilTool>> {
 /// last message of all. A later system message is marked as a user message
 /// is. A flag depends only on the messages up to the next
 /// assistant message, so a later turn never moves an earlier boundary.
-pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<CouncilMessage>> {
-    let mut out: Vec<CouncilMessage> = walk(system, history)?
+pub(super) fn messages(system: Option<&str>, history: &[Message], objects: &Objects) -> LlmResult<Vec<CouncilMessage>> {
+    let mut out: Vec<CouncilMessage> = walk(system, history, objects)?
         .into_iter()
         .map(|m| -> LlmResult<CouncilMessage> { Ok(match m {
             Walked::System(text) => CouncilMessage::system(text),
-            Walked::User(text) => CouncilMessage::user(text),
+            Walked::User(parts) => match <[Part; 1]>::try_from(parts) {
+                Ok([Part::Text { text }]) => CouncilMessage::user(text),
+                Ok(one) => CouncilMessage { content: Some(Content::Parts(one.into())), ..CouncilMessage::user("") },
+                Err(parts) => CouncilMessage { content: Some(Content::Parts(parts)), ..CouncilMessage::user("") },
+            },
             Walked::Assistant { content, reasoning, calls } => CouncilMessage {
                 content: content.filter(|c| !c.is_empty()).map(Into::into),
                 reasoning,
@@ -93,16 +102,22 @@ pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<V
     Ok(out)
 }
 
+/// How each image of a history reaches the served model, by the image's CAS
+/// hash: the id of the object the server holds for it, or why it is left
+/// out. An image with no entry is left out because its bytes were not found.
+pub(super) type Objects = HashMap<String, Result<String, String>>;
+
 /// One message of the walk the council v2 messages are built from.
 enum Walked {
     System(String),
-    User(String),
+    /// Text and object parts in order; adjacent text is one part.
+    User(Vec<Part>),
     /// Calls are `(id, name, arguments)`.
     Assistant { content: Option<String>, reasoning: Option<String>, calls: Vec<(String, String, Json)> },
     Tool { id: String, content: String, is_error: bool },
 }
 
-fn walk(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<Walked>> {
+fn walk(system: Option<&str>, history: &[Message], objects: &Objects) -> LlmResult<Vec<Walked>> {
     let mut out = Vec::new();
     if let Some(system) = system.filter(|s| !s.is_empty()) {
         out.push(Walked::System(system.to_string()));
@@ -119,7 +134,7 @@ fn walk(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<Walked>> {
                 calls = made;
                 out.push(reply);
             }
-            Role::User => user(index, &message.content, &mut calls, &mut out)?,
+            Role::User => user(index, &message.content, objects, &mut calls, &mut out)?,
             Role::System => {
                 if !calls.is_empty() {
                     return Err(pairing(index, format!("a system message follows {} unanswered call(s)", calls.len())));
@@ -173,28 +188,30 @@ fn assistant(index: usize, content: &MessageContent) -> LlmResult<(Walked, Vec<S
 
 /// A user message: first the `tool` messages answering `calls` in call order,
 /// then any text as one `user` message.
-fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &mut Vec<Walked>) -> LlmResult<()> {
+fn user(index: usize, content: &MessageContent, objects: &Objects, calls: &mut Vec<String>, out: &mut Vec<Walked>) -> LlmResult<()> {
     let blocks = match content {
         MessageContent::Text(text) => {
             if !calls.is_empty() {
                 return Err(pairing(index, format!("a text message follows {} unanswered call(s)", calls.len())));
             }
-            out.push(Walked::User(text.clone()));
+            out.push(Walked::User(vec![Part::Text { text: text.clone() }]));
             return Ok(());
         }
         MessageContent::Blocks(blocks) => blocks,
     };
     let mut results: Vec<(&str, String, bool)> = Vec::new();
-    let mut text = String::new();
+    let mut parts: Vec<Part> = Vec::new();
     for block in blocks {
         match block {
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                 results.push((tool_use_id.as_str(), content.clone(), *is_error));
             }
-            ContentBlock::Text { text: t } => join(&mut text, t),
-            ContentBlock::Image { hash, media_type, .. } => {
-                join(&mut text, &format!("[image {hash} ({media_type}) omitted: the council backend takes text only]"))
-            }
+            ContentBlock::Text { text: t } => push_text(&mut parts, t),
+            ContentBlock::Image { hash, media_type, .. } => match objects.get(hash) {
+                Some(Ok(id)) => parts.push(Part::Object { id: id.clone(), mime: media_type.clone() }),
+                Some(Err(why)) => push_text(&mut parts, &format!("[image {hash} ({media_type}) omitted: {why}]")),
+                None => push_text(&mut parts, &format!("[image {hash} ({media_type}) omitted: its bytes were not found]")),
+            },
             ContentBlock::ToolUse { .. } | ContentBlock::Reasoning { .. } => {}
         }
     }
@@ -208,10 +225,22 @@ fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &m
         let (_, content, is_error) = results.swap_remove(at);
         out.push(Walked::Tool { content, id, is_error });
     }
-    if !text.is_empty() {
-        out.push(Walked::User(text));
+    if !parts.is_empty() {
+        out.push(Walked::User(parts));
     }
     Ok(())
+}
+
+/// Appends `text` to the last text part, one per line, or starts a text part
+/// after an object.
+fn push_text(parts: &mut Vec<Part>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    match parts.last_mut() {
+        Some(Part::Text { text: last }) => join(last, text),
+        _ => parts.push(Part::Text { text: text.to_string() }),
+    }
 }
 
 /// The text blocks of `content`, one per line.
@@ -259,7 +288,7 @@ mod tests {
     }
 
     fn wire(system: Option<&str>, history: &[Message]) -> serde_json::Value {
-        serde_json::to_value(messages(system, history).unwrap()).unwrap()
+        serde_json::to_value(messages(system, history, &Objects::new()).unwrap()).unwrap()
     }
 
     #[test]
@@ -268,8 +297,8 @@ mod tests {
             wire(Some("rules"), &[Message::user("hi")]),
             json!([{"role": "system", "content": "rules", "snap": true}, {"role": "user", "content": "hi", "snap": true}])
         );
-        assert_eq!(messages(Some(""), &[Message::user("hi")]).unwrap().len(), 1);
-        assert_eq!(messages(None, &[Message::user("hi")]).unwrap().len(), 1);
+        assert_eq!(messages(Some(""), &[Message::user("hi")], &Objects::new()).unwrap().len(), 1);
+        assert_eq!(messages(None, &[Message::user("hi")], &Objects::new()).unwrap().len(), 1);
     }
 
     #[test]
@@ -305,7 +334,7 @@ mod tests {
                 ContentBlock::Text { text: "and hurry".into() },
             ]),
         ];
-        let first = messages(Some("rules"), &history).unwrap();
+        let first = messages(Some("rules"), &history, &Objects::new()).unwrap();
         assert_eq!(
             serde_json::to_value(&first).unwrap(),
             json!([
@@ -321,7 +350,7 @@ mod tests {
         );
         history.push(said(vec![ContentBlock::Text { text: "done".into() }]));
         history.push(Message::user("thanks"));
-        let second = messages(Some("rules"), &history).unwrap();
+        let second = messages(Some("rules"), &history, &Objects::new()).unwrap();
         assert_eq!(second[..first.len()], first[..], "appending a turn moves no earlier boundary");
         assert_eq!(serde_json::to_value(&second[6]).unwrap(), json!({"role": "assistant", "content": "done"}));
         assert!(second[7].snap);
@@ -347,7 +376,7 @@ mod tests {
             ])
         );
         let unanswered = [Message::user("x"), said(vec![call("a", "ls", json!({}))]), Message::system("s")];
-        assert!(matches!(messages(None, &unanswered), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(messages(None, &unanswered, &Objects::new()), Err(LlmError::InvalidRequest(_))));
     }
 
     #[test]
@@ -360,7 +389,7 @@ mod tests {
             vec![Message::user("x"), ask()],
             vec![Message::user("x"), ask(), ask()],
         ] {
-            assert!(matches!(messages(None, &history), Err(LlmError::InvalidRequest(_))), "{history:?}");
+            assert!(matches!(messages(None, &history, &Objects::new()), Err(LlmError::InvalidRequest(_))), "{history:?}");
         }
     }
 
@@ -389,7 +418,7 @@ mod tests {
             said(vec![call("a", "ls", json!("not an object"))]),
             Message::tool_results(vec![result("a", "", false)]),
         ];
-        assert!(matches!(messages(None, &history), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(messages(None, &history, &Objects::new()), Err(LlmError::InvalidRequest(_))));
     }
 
     #[test]

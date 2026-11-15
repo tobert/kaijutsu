@@ -128,6 +128,21 @@ endpoint's concurrency limit (`kj backend set --max-concurrent`). Reads take
 priority over generation on the server, so a chat turn yields to gate
 decisions. That is the intended order.
 
+## Images
+
+An image in a user message goes to the served model as an object part, in
+place among the message's text, when the server lists `objects` and the
+served model's `media.inputs` lists the image's type.
+
+- **The id.** Kaijutsu's CAS names bytes by 128 bits of BLAKE3; a council
+  object id is the whole 256-bit `blake3:` id. The provider hashes the
+  image's resolved bytes for the object id.
+- **Upload.** Each turn asks the server with `HEAD` whether it holds the
+  object and puts it when it does not. A put that fails fails the turn.
+- **Markers.** Any other image becomes a marker in the text that says why it
+  was left out: the server holds no objects, the model does not read the
+  type, or the bytes were not found.
+
 ## Control lists
 
 A context owns an ordered control list. Each item names a control vector by
@@ -182,7 +197,7 @@ kj context control clear
 - How does a small served model's window (32768 tokens for lfm3) interact
   with `kj fork` filters and rc instruction size?
 - `lfm3-omni` reads images, audio and video and writes audio; kaijutsu sends
-  text only so far.
+  images only so far (see "Images").
 
 Related: `docs/council.md`, gogi's `docs/council-api.md`, `docs/character.md`,
 `docs/retries-and-ratelimits.md`.
