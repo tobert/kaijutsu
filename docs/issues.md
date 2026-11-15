@@ -8,13 +8,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Context shadows: what the description slice leaves open
 
-- **An approved `kj context create` left nothing, silently.** 2026-11-15, live:
-  from an MCP seat, `kj context create --as shadow-probe --label
-  shadow-probe` raised an ask; Amy allowed it; gate-resume logged "running
-  approved ask" and then nothing. The ask's output block is empty (0 bytes),
-  no context exists, and no error or completion line was logged. Either the
-  resumed create fails without a word or its result lands where the seat
-  cannot see it. Reproduce from a console and from an MCP seat.
+- **A resumed ask's error is lost.** 2026-11-15, live: from an MCP seat,
+  `kj context create --as shadow-probe --label shadow-probe` (flags that no
+  longer exist; the character is positional and the label is `-n`) raised an
+  ask; Amy allowed it; gate-resume logged "running approved ask" and nothing
+  more. The ask's output block is empty (0 bytes) and no error was logged, so
+  a command that fails to parse after approval says nothing to anyone.
 
 - **No RPC and no asynchronous delivery.** `kj shadow describe` waits up to
   `DESCRIBE_TIMEOUT` (120 seconds) and prints the description. The app and tui
