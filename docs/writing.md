@@ -151,7 +151,7 @@ a collision appears in real prose, not in advance.
 | continuation window | noun | Policy window for automatically resuming a model conversation after it yields. It lasts 30 minutes from the last actual provider inference request, not a yield. It expresses KV-cache and cost expectations, not a guaranteed cache lifetime or an ask expiry; see `docs/approval-identity.md`, "Continuation windows and async work". |
 | fork | noun, verb | Making a child context. Its parent is `forked_from`; the context graph is a forest. |
 | drift | noun, verb | An overlay edge between contexts, deliberately cyclic. Never unify it with fork. |
-| shadow | noun | A context that follows a source context and holds renditions of its blocks (`docs/shadows.md`). The verb keeps kaish's sense: a builtin shadows a host command of the same name (`docs/system-verbs.md`). |
+| shadow | noun | Two kinds, named in full where either could be meant. A *context shadow* follows a source context and holds renditions of its blocks (`docs/shadows.md`). A *command shadow* is a builtin that hides a host command of the same name, as `ps` does (`docs/system-verbs.md`). |
 | rendition | noun | A block in a shadow made from a source block: speech, a description, an image, a swarm trace. Not "derivative" and not "projection", which is the council's word for a seat's context value. |
 | speech | noun | Audio a model or TTS engine makes from text. Not "voice", which names a musical voice. |
 | hydrate | verb | To build a conversation from a context. Happens only at a boundary event. |
