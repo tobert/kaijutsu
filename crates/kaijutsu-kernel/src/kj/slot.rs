@@ -493,7 +493,8 @@ fn slot_listing(
 ) -> KjResult {
     let mut lines = Vec::new();
     if slots.is_empty() {
-        lines.push(format!("{character} has no slots (`kj character slot set {character} distill|gate|describe BACKEND/MODEL`)"));
+        let roles = crate::model_resolution::CHARACTER_SLOT_ROLES.join("|");
+        lines.push(format!("{character} has no slots (`kj character slot set {character} {roles} BACKEND/MODEL`)"));
     }
     for s in slots {
         let backend = backends.get(&s.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
@@ -572,6 +573,22 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// An empty listing names the slot roles a character takes, so its fix
+    /// command is one `kj character slot set` accepts.
+    ///
+    /// Falsified by a listing that names a role the set refuses, or leaves one out.
+    #[tokio::test]
+    async fn an_empty_listing_names_every_slot_role() {
+        let d = seeded().await;
+        let r = d.dispatch(&argv(&["character", "slot", "list", "house"]), &test_caller()).await;
+        let roles = crate::model_resolution::CHARACTER_SLOT_ROLES.join("|");
+        assert!(
+            r.message().contains(&format!("kj character slot set house {roles} BACKEND/MODEL")),
+            "{}",
+            r.message()
+        );
     }
 
     /// A slot write lands on the character and invents no value: a parameter

@@ -293,7 +293,7 @@ Two things follow, and they are the ones to check a change against:
   drift address. The word fits the stage: a character is what an actor
   plays, and a context is one performance.
 - **A character has one model and three slots.** `kj character model set <name> <backend>/<model>` sets the model,
-  and `kj character slot set <name> distill|gate|describe <backend>/<model>` a slot (`unset` removes one, `list` shows them,
+  and `kj character slot set <name> distill|gate|image <backend>/<model>` a slot (`unset` removes one, `list` shows them,
   `kj character show` prints them). A context's model comes from its own `model` slot, copied from its performer's
   model when the context is made. A `gate` slot names the council server its gate decisions run on
   (`docs/council.md`, "Configuration"), a `distill` slot runs its forks' and pulls' distillation, and an `image` slot reads images for it (`kj shadow describe`). The judge is
