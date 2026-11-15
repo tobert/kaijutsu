@@ -49,6 +49,14 @@ From kaibo (deepseek) on `kaijutsu-council`:
 - **`refuses_thinking` misses `context.thinking`.** It matches `thinking` and
   `contexts[i].thinking`; a generation names its one context `context`.
   Unverified which name the nagaya sends.
+- **An image block reports `image/png` whatever it holds.** `ContentType` is
+  closed, and `ContentType::Image.as_mime()` is always `image/png`, so a JPEG
+  goes to the council labeled PNG. A block that names media needs an open
+  media type; omni audio blocks need the same (`docs/chameleon.md`, "What
+  assumes text").
+- **Kaijutsu's CAS ids are 128 bits.** `ContentHash` keeps half of BLAKE3,
+  so every council object id is computed again from the bytes. Amy,
+  2026-11-15: "at some point maybe kaijutsu should use the full blake3 ids".
 - **Continuations replay a cut reply as closed.** The contract marks a reply
   cut by `max_tokens` open, and a reply to an open message takes its place.
   The kernel sets `open: false` in its projection and ignores
