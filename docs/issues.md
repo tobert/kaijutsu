@@ -49,11 +49,11 @@ From kaibo (deepseek) on `kaijutsu-council`:
 - **`refuses_thinking` misses `context.thinking`.** It matches `thinking` and
   `contexts[i].thinking`; a generation names its one context `context`.
   Unverified which name the nagaya sends.
-- **An image block reports `image/png` whatever it holds.** `ContentType` is
-  closed, and `ContentType::Image.as_mime()` is always `image/png`, so a JPEG
-  goes to the council labeled PNG. A block that names media needs an open
-  media type; omni audio blocks need the same (`docs/chameleon.md`, "What
-  assumes text").
+- **Only images are media blocks.** `ContentType` is closed: an image block
+  holds a CAS hash and the turn path takes its real type from the CAS record
+  (`resolve_image_blocks_from_cas`), but audio or video has no content type
+  and maps to `Plain`, so omni audio cannot reach a model
+  (`docs/shadows.md`, "Media blocks").
 - **Kaijutsu's CAS ids are 128 bits.** `ContentHash` keeps half of BLAKE3,
   so every council object id is computed again from the bytes. Amy,
   2026-11-15: "at some point maybe kaijutsu should use the full blake3 ids".
