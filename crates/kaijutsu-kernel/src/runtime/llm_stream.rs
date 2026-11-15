@@ -3069,11 +3069,24 @@ async fn run_llm_stream(
             }
         };
 
+        // The control list is the other per-context carrier, with the
+        // opposite failure rule: a list that cannot be read, or a row that does
+        // not decode, fails the turn. Sending the turn without the list would
+        // change what the model does and say nothing. The refusal is built
+        // here and raised in the request loop below as a permanent
+        // `InvalidRequest`, so it is not sent again and lands as an error
+        // block like any other refusal.
+        let (controls, controls_refusal) = match kernel_db.lock().list_context_controls(context_id) {
+            Ok(controls) => (controls, None),
+            Err(e) => (Vec::new(), Some(format!("Could not read the control list of this context: {e}"))),
+        };
+
         let build_opts = apply_tunables(
             BuildOpts::new(&model_name, max_output_tokens)
                 .with_system(&system_prompt)
                 .with_tools(tools.clone())
-                .with_cache_breakpoints(cache_breakpoints),
+                .with_cache_breakpoints(cache_breakpoints)
+                .with_controls(controls),
             &tunables,
         );
 
@@ -3087,10 +3100,14 @@ async fn run_llm_stream(
             loop {
                 attempt += 1;
                 step_attempt += 1;
-                let stamp = continuation_epoch.map(|epoch| kernel_db.lock().admit_inference_request(
+                // A refused control list records no inference request.
+                let stamp = continuation_epoch.filter(|_| controls_refusal.is_none()).map(|epoch| kernel_db.lock().admit_inference_request(
                     context_id, epoch, kaijutsu_types::now_millis() as i64,
                 )).transpose();
                 let started = match stamp {
+                    Ok(_) if controls_refusal.is_some() => Err(LlmError::InvalidRequest(
+                        controls_refusal.clone().unwrap_or_default(),
+                    )),
                     Ok(Some(false)) => Err(LlmError::InvalidRequest(
                         "The continuation closed after performer reassignment; this inference request was not started.".into()
                     )),
@@ -4769,6 +4786,113 @@ mod publish_tests {
             assert!(elapsed >= Duration::from_secs(10), "{elapsed:?}");
             assert!(elapsed < Duration::from_millis(10_400),
                 "the retry's own cap would end it after the backoff too: {elapsed:?}");
+        }).await;
+    }
+
+    fn ablate_item() -> gogi_proto::control::Control {
+        gogi_proto::control::Control {
+            vector: gogi_proto::ContentId::parse(format!("blake3:{}", "a".repeat(64))).unwrap(),
+            op: gogi_proto::control::ControlOp::Ablate,
+            strength: 1.0,
+            layers: Some([(12, 1.0)].into()),
+        }
+    }
+
+    fn error_text(documents: &SharedBlockStore, ctx: ContextId) -> String {
+        documents.block_snapshots(ctx).unwrap().iter()
+            .filter(|b| b.kind == BlockKind::Error)
+            .map(|b| b.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A turn on a council backend sends the context's control list with the
+    /// generation, and completes.
+    ///
+    /// Falsified by a turn that reads no list from the database, which sends
+    /// `control: []`.
+    #[tokio::test]
+    async fn a_turn_on_a_council_backend_sends_the_contexts_control_list() {
+        use kaijutsu_council::test_server::{reply, serve, sse};
+        tokio::task::LocalSet::new().run_until(async {
+            let identity = serde_json::json!({
+                "models": [{"model": "mock-model", "aliases": [], "status": "ready", "weight_hash": "w",
+                    "tokenizer_hash": "t", "template": "x", "engine": "e",
+                    "limits": {"context_tokens": 32768, "decision_context_tokens": 3072, "snapshot_bytes": 1,
+                               "contexts_per_decision": 8, "default_timeout_ms": 2000},
+                    "capabilities": ["generate", "control_vectors"]}],
+                "limits": {"case_bytes": 1000, "choice_options": 26}, "capabilities": []
+            });
+            let done = serde_json::json!({
+                "model": "mock-model", "content": "ok", "reasoning": "", "tool_calls": [], "finish": "end_turn",
+                "usage": {"prompt": 5, "kept": 0, "fed": 5, "completion": 1, "reasoning": 0}, "head": null, "seed": 1,
+                "snapshots": []
+            });
+            let token = serde_json::json!({"id": 1, "piece": "ok", "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
+            let generation = sse(format!("event: token\ndata: {token}\n\nevent: done\ndata: {done}\n\n"));
+            let (base, seen) = serve(vec![reply(200, identity.to_string()), generation]).await;
+            let kernel = Arc::new(Kernel::new_ephemeral("council-controls").await);
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let provider = Provider::Council(
+                crate::llm::council::Client::new("nagaya", &base, std::time::Duration::from_secs(5)).unwrap(),
+            );
+            super::usage_tests::drive_turn_seeded(provider, 0, kernel, |db, ctx| {
+                db.add_context_control(ctx, &ablate_item()).unwrap();
+            }).await;
+            assert!(completed.try_recv().is_some(), "the turn completes");
+            let seen = seen.lock().unwrap();
+            let generation = seen.iter().find(|c| c.path.starts_with("/council/v2/generations")).expect("a generation was sent");
+            let body: serde_json::Value = serde_json::from_str(&generation.body).unwrap();
+            assert_eq!(body["context"]["control"], serde_json::json!([
+                {"vector": format!("blake3:{}", "a".repeat(64)), "op": "ablate", "strength": 1.0, "layers": {"12": 1.0}}
+            ]));
+        }).await;
+    }
+
+    /// A control list on a context whose backend is not council fails the
+    /// turn after one request attempt, with the refusal in an error block.
+    ///
+    /// Falsified by a provider that ignores the list and answers.
+    #[tokio::test]
+    async fn a_control_list_on_a_provider_that_cannot_apply_it_fails_the_turn() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("controls-refused").await);
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let (mock, sent) = MockClient::new("unused")
+                .with_scripted_stream(vec![text_reply("never")])
+                .recording_sent_messages();
+            let (documents, ctx, _, _) = super::usage_tests::drive_turn_seeded(Provider::Mock(mock), 0, kernel, |db, ctx| {
+                db.add_context_control(ctx, &ablate_item()).unwrap();
+            }).await;
+            assert!(completed.try_recv().is_none(), "the turn fails");
+            assert!(sent.lock().is_empty(), "nothing was sent");
+            let text = error_text(&documents, ctx);
+            assert!(text.contains("cannot apply control vectors") && text.contains("kj context control clear"), "{text}");
+        }).await;
+    }
+
+    /// A control list that cannot be read fails the turn, naming the row. A
+    /// turn that went on without it would run the plain model.
+    ///
+    /// Falsified by logging the read failure and sending the turn.
+    #[tokio::test]
+    async fn an_unreadable_control_list_fails_the_turn_and_sends_nothing() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("controls-corrupt").await);
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let (mock, sent) = MockClient::new("unused")
+                .with_scripted_stream(vec![text_reply("never")])
+                .recording_sent_messages();
+            let (documents, ctx, _, _) = super::usage_tests::drive_turn_seeded(Provider::Mock(mock), 0, kernel, |db, ctx| {
+                db.add_context_control(ctx, &ablate_item()).unwrap();
+                db.conn_for_test_mut()
+                    .execute("UPDATE context_controls SET op = 'erase'", [])
+                    .unwrap();
+            }).await;
+            assert!(completed.try_recv().is_none(), "the turn fails");
+            assert!(sent.lock().is_empty(), "nothing was sent");
+            let text = error_text(&documents, ctx);
+            assert!(text.contains("control list") && text.contains("position 0"), "{text}");
         }).await;
     }
 
@@ -6733,6 +6857,27 @@ mod usage_tests {
         PrincipalId,
         Arc<parking_lot::Mutex<KernelDb>>,
     ) {
+        drive_turn_seeded(provider, pre_seed_blocks, kernel, |db, ctx| {
+            for bp in breakpoints {
+                db.add_cache_breakpoint(ctx, bp).unwrap();
+            }
+        })
+        .await
+    }
+
+    /// Like `drive_turn_with`, but runs `seed` on the kernel database after the
+    /// context row exists and before the turn starts.
+    pub(super) async fn drive_turn_seeded(
+        provider: Provider,
+        pre_seed_blocks: usize,
+        kernel: Arc<Kernel>,
+        seed: impl FnOnce(&mut KernelDb, ContextId),
+    ) -> (
+        SharedBlockStore,
+        ContextId,
+        PrincipalId,
+        Arc<parking_lot::Mutex<KernelDb>>,
+    ) {
         let documents = kernel.blocks().clone();
         let ctx = ContextId::new();
         documents
@@ -6780,7 +6925,7 @@ mod usage_tests {
         let kernel_db = kernel.kernel_db().clone();
         // The journal created the document; usage also needs its context row.
         {
-            let db = kernel_db.lock();
+            let mut db = kernel_db.lock();
             db.insert_context(&crate::ContextRow {
                 context_id: ctx,
                 label: None,
@@ -6802,9 +6947,7 @@ mod usage_tests {
                 performer: None, senpai_ctx: None, persona: None,
             })
             .unwrap();
-            for bp in breakpoints {
-                db.add_cache_breakpoint(ctx, bp).unwrap();
-            }
+            seed(&mut db, ctx);
         }
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new();

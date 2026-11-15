@@ -337,6 +337,11 @@ enum ContextCommand {
         #[arg(long, conflicts_with_all = ["window", "mark"])]
         clear: bool,
     },
+    /// The control vectors the context sends with each turn on a council
+    /// backend: `kj context control add|rm|list|clear`. A change applies at
+    /// the next turn, and a fork copies the list.
+    #[command(subcommand)]
+    Control(super::context_control::ContextControlCommand),
 }
 
 /// Settable context configuration shared by `create` and `set`.
@@ -633,7 +638,8 @@ impl KjDispatcher {
         // `archive` and `rotate` take Operator, or a live root character
         // acting from any context (`docs/character.md`, "The console places
         // contexts").
-        if matches!(
+        let changes_controls = matches!(&parsed.command, ContextCommand::Control(c) if c.changes_list());
+        if (changes_controls || matches!(
             parsed.command,
             ContextCommand::Create { .. }
                 | ContextCommand::Set { .. }
@@ -643,7 +649,7 @@ impl KjDispatcher {
                 | ContextCommand::Rotate { .. }
                 | ContextCommand::Retag { .. }
                 | ContextCommand::Hydrate { .. }
-        ) && let Err(denied) =
+        )) && let Err(denied) =
             self.require_cap(caller, crate::mcp::Capability::Operator, "context")
         {
             let human = matches!(parsed.command, ContextCommand::Archive { .. } | ContextCommand::Rotate { .. })
@@ -724,6 +730,7 @@ impl KjDispatcher {
                 mark,
                 clear,
             } => self.context_hydrate(context.as_deref(), window, mark.as_deref(), clear, caller),
+            ContextCommand::Control(command) => self.context_control(command, caller),
         }
     }
 
@@ -928,6 +935,13 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj context info: {e}")),
         };
 
+        // A list that cannot be read is an error, never "none": an empty list
+        // claims the next turn runs the plain model.
+        let controls = match self.kernel_db().lock().list_context_controls(row.context_id) {
+            Ok(controls) => controls,
+            Err(e) => return KjResult::Err(format!("kj context info: {e}")),
+        };
+
         let mut info = format_context_info(
             &row,
             children_count,
@@ -975,6 +989,13 @@ impl KjDispatcher {
             info.push_str("\nEgress:");
             for h in &egress_hosts {
                 info.push_str(&format!("\n  {h}"));
+            }
+        }
+
+        if !controls.is_empty() {
+            info.push_str("\nControl:");
+            for (position, item) in controls.iter().enumerate() {
+                info.push_str(&format!("\n  {position}  {}", super::context_control::describe_item(item)));
             }
         }
 
@@ -1134,6 +1155,7 @@ impl KjDispatcher {
             // Always present (an empty array is the honest "none", never
             // omitted).
             "egress": egress_hosts,
+            "control": super::context_control::items_json(&controls),
             // `null` when this context has never completed an LLM call —
             // honest absence, not a fabricated zero. `context_window` /
             // `context_used_pct` are resolved kernel-side (never derived
@@ -2683,6 +2705,7 @@ impl KjDispatcher {
                 insert_new_context_rows(db, &successor, placement)?;
                 db.copy_context_env(predecessor.context_id, successor_id)?;
                 db.copy_context_egress(predecessor.context_id, successor_id)?;
+                db.copy_context_controls(predecessor.context_id, successor_id)?;
                 db.set_context_env(successor_id, "ROTATED_FROM", &predecessor.context_id.to_hex())?;
                 // The env copy carries a predecessor's own mark; only a
                 // migration sets it.
@@ -3563,6 +3586,7 @@ impl Classify for ContextCommand {
             | Self::Resume { .. }
             | Self::Hydrate { .. } => Effect::Write,
             Self::Archive { .. } | Self::Retag { .. } => Effect::Destroy,
+            Self::Control(command) => command.effect(),
         }
     }
 }
@@ -5264,6 +5288,38 @@ mod tests {
         assert_eq!(copied[0].rotate_every_phrases, Some(2700));
         assert_eq!(db.list_attachments_for_context(f.seat).unwrap().len(), 1,
             "the predecessor keeps its row for its own detach");
+    }
+
+    /// Rotation carries the control list to the successor, in order, with
+    /// layers, and the predecessor keeps its own.
+    ///
+    /// Falsified by a rotation that does not copy the list.
+    #[test]
+    fn rotation_copies_the_control_list_to_the_successor() {
+        crate::on_rc_thread(rotation_copies_the_control_list_to_the_successor_body);
+    }
+
+    async fn rotation_copies_the_control_list_to_the_successor_body() {
+        use gogi_proto::control::{Control, ControlOp};
+        let f = rotation_fixture().await;
+        let vector = |c: char| gogi_proto::ContentId::parse(format!("blake3:{}", c.to_string().repeat(64))).unwrap();
+        let items = vec![
+            Control { vector: vector('a'), op: ControlOp::Ablate, strength: 1.0, layers: Some([(12, 1.0), (3, 0.5)].into()) },
+            Control { vector: vector('b'), op: ControlOp::Add, strength: -2.0, layers: None },
+        ];
+        {
+            let db = f.d.kernel_db().lock();
+            for item in &items {
+                db.add_context_control(f.seat, item).unwrap();
+            }
+        }
+        let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
+        let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        let db = f.d.kernel_db().lock();
+        assert_eq!(db.list_context_controls(successor).unwrap(), items);
+        assert_eq!(db.list_context_controls(f.seat).unwrap(), items);
     }
 
     /// Rotation gives the successor a fresh copy of each watch: the same

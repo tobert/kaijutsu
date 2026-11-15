@@ -56,6 +56,7 @@ mod usage;
 mod context_bindings;
 mod context_env;
 mod cache_hydration;
+mod context_controls;
 mod tracks;
 mod documents;
 mod lineage;

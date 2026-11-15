@@ -1216,6 +1216,14 @@ impl Provider {
         messages: Vec<Message>,
     ) -> LlmResult<ProviderStream> {
         hydrate::validate_tool_pairing(&messages)?;
+        if !opts.controls.is_empty() && !matches!(self, Self::Council(_)) {
+            return Err(LlmError::InvalidRequest(format!(
+                "provider '{}' cannot apply control vectors, and this context has {} control item(s); \
+                 run `kj context control clear` to send none, or give the context a council backend",
+                self.name(),
+                opts.controls.len()
+            )));
+        }
         match self {
             Self::Claude(client) => {
                 let stream = client.stream(opts, messages).await?;
@@ -1702,6 +1710,51 @@ pub(crate) fn hydrate_in_form(blocks: &[kaijutsu_types::BlockSnapshot], form: hy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A control list rides to a council backend only. Every other provider
+    /// refuses it before any request leaves.
+    mod controls {
+        use super::*;
+        use gogi_proto::control::{Control, ControlOp};
+
+        fn ablate() -> Control {
+            Control {
+                vector: gogi_proto::ContentId::parse(format!("blake3:{}", "a".repeat(64))).unwrap(),
+                op: ControlOp::Ablate,
+                strength: 1.0,
+                layers: None,
+            }
+        }
+
+        /// Falsified by dropping the provider check, which lets the mock turn
+        /// run and sends the OpenAI and Claude requests to a closed port, a
+        /// connection error rather than this refusal.
+        #[tokio::test]
+        async fn a_provider_that_is_not_council_refuses_a_control_list_before_sending() {
+            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+            let base = format!("http://{closed}");
+            let providers = [
+                Provider::OpenAi(openai::Client::new("t").with_base_url(&base)),
+                Provider::Claude(claude::Client::new("k").unwrap().with_base_url(&base)),
+                Provider::Mock(MockClient::new("CANNED")),
+            ];
+            for provider in providers {
+                let opts = BuildOpts::new("m", 64).with_controls(vec![ablate()]);
+                let Err(error) = provider.stream(opts, vec![Message::user("hi")]).await else {
+                    panic!("{}: a control list was accepted", provider.name());
+                };
+                let LlmError::InvalidRequest(text) = &error else { panic!("{error:?}") };
+                assert!(text.contains(provider.name()), "{text}");
+                assert!(text.contains("kj context control clear"), "{text}");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_empty_control_list_is_not_refused() {
+            let provider = Provider::Mock(MockClient::new("CANNED"));
+            provider.stream(BuildOpts::new("m", 64), vec![Message::user("hi")]).await.unwrap();
+        }
+    }
 
     mod one_shot {
         use super::*;

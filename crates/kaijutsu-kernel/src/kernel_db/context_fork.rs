@@ -74,6 +74,7 @@ impl KernelDb {
         // the track never has to watch for forks. A non-musician parent has no
         // attachments — the copy is a clean no-op.
         Self::copy_attachments_for_fork(&tx, source, row.context_id)?;
+        Self::copy_controls_for_fork(&tx, source, row.context_id)?;
         // The child is the same character as its source, answering to it.
         super::context_characters::copy_character_into(&tx, source, row.context_id)?;
         tx.commit()?;

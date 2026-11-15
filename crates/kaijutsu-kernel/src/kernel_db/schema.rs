@@ -636,6 +636,32 @@ CREATE TABLE IF NOT EXISTS cache_breakpoints (
 CREATE INDEX IF NOT EXISTS idx_cache_breakpoints_ctx
     ON cache_breakpoints(context_id);
 
+-- ── Context control lists ───────────────────────────────────────
+-- The ordered control vectors a context sends with each turn on a council
+-- backend, edited with `kj context control`. One row per item, ordered by
+-- `seq`; a position is an index into the ordered list, so `seq` may have
+-- gaps. `vector` is the content id the council server resolves; no vector
+-- bytes live here. `op` is add, ablate, or clamp; the reader refuses any
+-- other value as corrupt. A layer row weights one layer of its item; an item
+-- with no layer rows acts on every layer of the vector. CASCADE on context
+-- delete, and on item delete for the layer rows.
+CREATE TABLE IF NOT EXISTS context_controls (
+    context_id BLOB    NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    vector     TEXT    NOT NULL,
+    op         TEXT    NOT NULL,
+    strength   REAL    NOT NULL,
+    PRIMARY KEY (context_id, seq)
+);
+CREATE TABLE IF NOT EXISTS context_control_layers (
+    context_id BLOB    NOT NULL,
+    seq        INTEGER NOT NULL,
+    layer      INTEGER NOT NULL,
+    weight     REAL    NOT NULL,
+    PRIMARY KEY (context_id, seq, layer),
+    FOREIGN KEY (context_id, seq) REFERENCES context_controls(context_id, seq) ON DELETE CASCADE
+);
+
 -- ── Context Hydration Marker (Chameleon batch 2) ────────────────
 -- The hydration-marker cost guard: a windowed context hydrates only
 -- `[0, marker] ∪ last-window_size` instead of its whole history, so a

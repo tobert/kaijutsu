@@ -361,6 +361,10 @@ pub struct BuildOpts {
     /// Cache breakpoint policy for Claude and Alibaba prompt caching.
     /// Empty = no `cache_control` applied. See [`CacheTarget`].
     pub cache_breakpoints: Vec<CacheTarget>,
+    /// The context's control list, in order. Empty = the plain model. Only a
+    /// `council` backend whose served model declares `control_vectors` takes a
+    /// non-empty list; every other provider refuses it rather than ignore it.
+    pub controls: Vec<gogi_proto::control::Control>,
     /// Which inference this request is, for the request sensors
     /// ([`crate::llm::request_dump`]). `None` for requests outside a turn.
     /// Boxed behind an `Arc` so `BuildOpts` stays small: it sits by value in
@@ -384,6 +388,7 @@ impl BuildOpts {
             thinking_style: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
+            controls: Vec::new(),
             trace: None,
         }
     }
@@ -435,6 +440,11 @@ impl BuildOpts {
 
     pub fn with_cache_breakpoints(mut self, breakpoints: Vec<CacheTarget>) -> Self {
         self.cache_breakpoints = breakpoints;
+        self
+    }
+
+    pub fn with_controls(mut self, controls: Vec<gogi_proto::control::Control>) -> Self {
+        self.controls = controls;
         self
     }
 }

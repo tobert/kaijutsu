@@ -8,7 +8,8 @@
 //! for a reply is the server's `context_full`, and a reply that stops at its
 //! output limit is never returned as a whole one. `cache_breakpoints`,
 //! `thinking_budget`, and `thinking_style` do not apply to this backend and
-//! are ignored.
+//! are ignored. `controls` ride in the generation's `context.control`; a served
+//! model that does not declare `control_vectors` is refused a non-empty list.
 
 mod build;
 mod reply;
@@ -331,6 +332,7 @@ mod tests {
             thinking_style: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
+            controls: Vec::new(),
             trace: None,
         }
     }
@@ -437,6 +439,71 @@ mod tests {
         assert!(
             matches!(&err, LlmError::InvalidRequest(m)
                 if m.contains("council backend 'nagaya'") && m.contains("gemma-4") && m.contains("generate")),
+            "{err:?}"
+        );
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, ["/council/v2/identity"], "only the identity");
+    }
+
+    fn ablate_and_add() -> Vec<gogi_proto::control::Control> {
+        use gogi_proto::control::{Control, ControlOp};
+        let vector = |c: char| gogi_proto::ContentId::parse(format!("blake3:{}", c.to_string().repeat(64))).unwrap();
+        vec![
+            Control { vector: vector('a'), op: ControlOp::Ablate, strength: 1.0, layers: None },
+            Control { vector: vector('b'), op: ControlOp::Add, strength: -0.5, layers: Some([(12, 1.0), (3, 0.25)].into()) },
+        ]
+    }
+
+    /// A turn on a served model that declares `control_vectors` sends the
+    /// context's control list, in order, with its layers, and the request dump
+    /// records the same body.
+    ///
+    /// Falsified by a generation that sends `control: []`, reorders the list,
+    /// or drops the layers.
+    #[tokio::test]
+    async fn a_turn_sends_the_control_list_in_order() {
+        use crate::llm::request_dump::{RequestTrace, wait_for_files};
+        use kaijutsu_types::{ContextId, TurnId};
+        let (base, seen) = serve(vec![serving(json!(["generate", "control_vectors"])), generation("hi", json!([]), 2)]).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut o = opts(64);
+        o.controls = ablate_and_add();
+        o.trace = Some(Arc::new(RequestTrace::new(ContextId::new(), TurnId::new(), 1, Some(tmp.path().to_path_buf()))));
+        drain(&mut client(&base).stream(o, vec![Message::user("u1")]).await.unwrap()).await;
+        let body = &bodies(&seen, "/council/v2/generations")[0];
+        let expected = json!([
+            {"vector": format!("blake3:{}", "a".repeat(64)), "op": "ablate", "strength": 1.0},
+            {"vector": format!("blake3:{}", "b".repeat(64)), "op": "add", "strength": -0.5, "layers": {"3": 0.25, "12": 1.0}},
+        ]);
+        assert_eq!(body["context"]["control"], expected);
+        let files = wait_for_files(tmp.path(), 1).await;
+        let dumped: serde_json::Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(dumped["body"]["context"]["control"], expected, "the dump shows the control list");
+    }
+
+    /// A turn with no control list sends none.
+    #[tokio::test]
+    async fn a_turn_with_no_control_list_sends_no_control_member() {
+        let (base, seen) = serve(vec![serving(json!(["generate", "control_vectors"])), generation("hi", json!([]), 2)]).await;
+        drain(&mut client(&base).stream(opts(64), vec![Message::user("u1")]).await.unwrap()).await;
+        assert!(bodies(&seen, "/council/v2/generations")[0]["context"].get("control").is_none());
+    }
+
+    /// A served model that does not declare `control_vectors` is refused a
+    /// control list, naming the backend, the model, and what it declares, and
+    /// no generation is sent.
+    ///
+    /// Falsified by dropping the list and sending the turn without it.
+    #[tokio::test]
+    async fn a_served_model_without_control_vectors_is_refused_a_control_list() {
+        let (base, seen) = serve(vec![serving(json!(["generate", "thinking"]))]).await;
+        let mut o = opts(64);
+        o.controls = ablate_and_add();
+        let err = client(&base).stream(o, vec![Message::user("hi")]).await.err().unwrap();
+        assert!(
+            matches!(&err, LlmError::InvalidRequest(m)
+                if m.contains("council backend 'nagaya'") && m.contains("gemma-4") && m.contains("control_vectors")
+                    && m.contains("generate, thinking") && m.contains("2 control item") && m.contains("kj context control clear")),
             "{err:?}"
         );
         let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();

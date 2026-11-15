@@ -6,6 +6,50 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Control lists: what the first slice leaves open
+
+- **No kernel-level check of the vector.** `kj context control add` checks the
+  id's shape only. A vector made for other weights, or an unknown id, reaches
+  the server and fails the turn there. A `check` against the council objects
+  route at `add` time would fail earlier.
+- **Fork filters do not name the list.** `kj fork` copies it in every preset;
+  a `spawn` preset child that should start plain has to `kj context control
+  clear`.
+- **No way to list the vectors a server holds.** Council v2 has no object
+  listing. The nagaya web UI keeps its vectors' names in browser storage and
+  leases the ids as keep owner `nagaya-web`, so `GET
+  /council/v2/keeps/nagaya-web` lists ids without names. A vector's
+  safetensors header names its `model` and `weight_hash`, which a ranged read
+  could show. Direction (Amy, 2026-11-15): the nagaya will store named
+  references, "probably simple kv style. needs some considerations so it'll
+  be later." Until then, `kj context control add` takes raw ids.
+- **Objects are per node.** A vector made on spaceghost is a 404 on zorak's
+  nagaya, and the control-vectors route is not in zorak's cluster forward
+  list. Whether a generation forwarded through zorak carries `control` to
+  spaceghost is untested.
+
+## Council client: what the objects slice leaves open (2026-11-15)
+
+From kaibo (deepseek) on `kaijutsu-council`:
+
+- **Object reads are whole.** `get_object` sends no `Range` and buffers the
+  whole object, while `object_bytes` on the nagaya is 8 GiB. Media for omni
+  turns is small; a large object needs ranged or streamed reads.
+- **A HEAD 404 has no body.** `has_object` cannot tell a server without the
+  objects route from an absent object; its caller checks the identity's
+  `objects` capability first.
+- **`send` panics on a capitalized header name.** It uses
+  `HeaderName::from_static`; callers pass lowercase names today.
+- **`refuses_thinking` misses `context.thinking`.** It matches `thinking` and
+  `contexts[i].thinking`; a generation names its one context `context`.
+  Unverified which name the nagaya sends.
+- **Continuations replay a cut reply as closed.** The contract marks a reply
+  cut by `max_tokens` open, and a reply to an open message takes its place.
+  The kernel sets `open: false` in its projection and ignores
+  `GenerationDone.context`, so the server appends a new message instead.
+
+---
+
 ## vi registers: what sharing leaves open (2026-11-10)
 
 A player's text registers are shared through the kernel's register store:

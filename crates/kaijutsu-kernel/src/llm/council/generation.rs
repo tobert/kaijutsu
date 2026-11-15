@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use gogi_proto::control::Control;
 use gogi_proto::generation::{GenerationRequest, Sample};
 use gogi_proto::identity::{Capability, ServedModel, ServerIdentity};
 use gogi_proto::{Context, Role as CouncilRole};
@@ -90,6 +91,7 @@ impl Client {
         identity: ServedModel,
         turn: Turn,
     ) -> LlmResult<Stream> {
+        check_controls(&self.name, &opts.controls, &identity)?;
         let thinking = wants_thinking(&self.name, opts.effort.as_deref(), &identity)?;
         let messages = build::messages(opts.system.as_deref(), &history)?;
         let tools = build::tools(&opts.tools)
@@ -106,7 +108,7 @@ impl Client {
             .then(|| Sample { temperature: opts.temperature, top_p: opts.top_p, ..Sample::default() });
         let request = GenerationRequest {
             model: identity.model.clone(),
-            context: Context { thinking, tools, queue: None, control: Vec::new(), messages },
+            context: Context { thinking, tools, queue: None, control: opts.controls.clone(), messages },
             max_tokens,
             sample,
             stream: Some(true),
@@ -149,6 +151,27 @@ impl Client {
             reply_identity: Some(ReplyIdentity { model: identity.model, weight_hash: identity.weight_hash }),
         })
     }
+}
+
+/// A control list needs a served model that declares `control_vectors`; one
+/// that does not is refused the list, not sent the turn without it.
+fn check_controls(name: &str, controls: &[Control], model: &ServedModel) -> LlmResult<()> {
+    if controls.is_empty() || model.has(Capability::ControlVectors) {
+        return Ok(());
+    }
+    let declared = model
+        .capabilities
+        .iter()
+        .map(|c| serde_json::to_value(c).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| format!("{c:?}")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(LlmError::InvalidRequest(format!(
+        "council backend '{name}': served model {} does not declare control_vectors, so it takes no control list, \
+         and this context has {} control item(s); it declares {declared}. Run `kj context control clear`, \
+         or name a model that declares control_vectors",
+        model.model,
+        controls.len()
+    )))
 }
 
 /// Whether a turn on served model `model` thinks. The turn wants

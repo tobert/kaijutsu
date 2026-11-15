@@ -56,14 +56,20 @@ impl Captured {
 }
 
 /// Serves `replies` in order, one connection each, and records each request.
+/// A request after the last reply is recorded too and answered 500, so a test
+/// that expects nothing sent sees any request that was.
 pub async fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Captured>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
     tokio::spawn(async move {
-        for r in replies {
+        let mut replies = replies.into_iter();
+        loop {
             let (mut sock, _) = listener.accept().await.unwrap();
+            let r = replies.next().unwrap_or_else(|| {
+                reply(500, r#"{"error": {"type": "internal", "message": "the test server has no reply for this request"}}"#)
+            });
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
             let (head_end, content_length) = loop {

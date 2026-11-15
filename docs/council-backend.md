@@ -128,6 +128,40 @@ endpoint's concurrency limit (`kj backend set --max-concurrent`). Reads take
 priority over generation on the server, so a chat turn yields to gate
 decisions. That is the intended order.
 
+## Control lists
+
+A context owns an ordered control list. Each item names a control vector by
+its content id (`blake3:` and 64 lowercase hex digits), an op (`add`, `ablate`,
+or `clamp`), a finite strength, and optionally per-layer weights. The council
+server holds the vectors; kaijutsu stores the ids and the numbers only, and
+makes no keeps.
+
+```
+kj context control add blake3:<64 hex digits> --op ablate --strength 1
+kj context control add blake3:<64 hex digits> --op add --strength -0.5 --layer 12=1 --layer 14=0.5
+kj context control list
+kj context control rm 0
+kj context control clear
+```
+
+- **When it applies.** The next turn reads the list and sends it as the
+  generation's `context.control`, in order. A changed list changes the model
+  state, so the server feeds the context again. `kj context info` shows the
+  list, and the request dump records it in the body.
+- **Which backend takes it.** Only a council backend whose served model
+  declares `control_vectors`. A model without it is refused before anything is
+  sent, naming the backend, the model, and what it declares. Every other
+  provider refuses a turn while the list is not empty; one check in
+  `Provider::stream` does it. Clear the list with `kj context control clear`.
+- **Failure.** A list that cannot be read, or a stored row that does not decode,
+  fails the turn with an error block. The turn is never sent without the list.
+- **Copies.** `kj fork` and `kj context rotate` copy the list into the new
+  context, so a fork followed by a change is an A/B against its parent.
+- **Validation.** `add` refuses an unknown op, a non-finite strength or
+  weight, a vector that is not a content id, a `--layer` that is not
+  `<layer>=<weight>`, and a layer named twice. The server checks the vector
+  against the served model's weights, width, and layer count.
+
 ## Tests
 
 - The crate's council tests run against `gogi_fake::Server`; a live run

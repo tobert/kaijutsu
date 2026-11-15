@@ -137,6 +137,7 @@ pub fn placeholder_for(arg: &clap::Arg) -> String {
         TypeId::of::<usize>(),
         TypeId::of::<i32>(),
         TypeId::of::<i64>(),
+        TypeId::of::<f64>(),
     ];
     if numeric.iter().any(|t| ty == *t) {
         return "1".to_string();
