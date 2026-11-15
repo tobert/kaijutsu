@@ -74,8 +74,8 @@ kaijutsu-council = { path = "crates/kaijutsu-council" }
 #   [patch."https://github.com/tobert/gogi"]
 #   gogi-proto = { path = "../gogi/crates/gogi-proto" }
 #   gogi-fake = { path = "../gogi/crates/gogi-fake" }
-gogi-proto = { git = "https://github.com/tobert/gogi", rev = "24ad402c7329db232ba30a8aac6fb509d8e817cd" }
-gogi-fake = { git = "https://github.com/tobert/gogi", rev = "24ad402c7329db232ba30a8aac6fb509d8e817cd" }
+gogi-proto = { git = "https://github.com/tobert/gogi", rev = "8830357260086202c76feda1ccce672d70921140" }
+gogi-fake = { git = "https://github.com/tobert/gogi", rev = "8830357260086202c76feda1ccce672d70921140" }
 
 # Kaish (execution engine + client), from crates.io.
 # `subprocess` compiles in host external-command execution; whether a given

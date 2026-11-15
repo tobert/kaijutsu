@@ -11,13 +11,15 @@ use gogi_proto::decision::{DecisionRequest, DecisionResponse};
 use gogi_proto::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use gogi_proto::generation::{GenerationDone, GenerationRequest, StreamEvent, TokenEvent};
 use gogi_proto::identity::ServerIdentity;
+use gogi_proto::objects::{check_put, KeepSet, KeepsPut, KeepsPutResult, ObjectPut};
 use gogi_proto::pins::{validate_owner, PinSet, PinsPut, PinsPutResult, SnapshotDetail};
 use gogi_proto::reads::{ReadsRequest, ReadsResponse};
 use gogi_proto::spec::{HeldSpec, Spec};
-use gogi_proto::{SnapshotId, SpecId};
+use gogi_proto::{content_id_problem, ErrorDetail, ErrorType, SnapshotId, SpecId};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Method;
 
-use crate::client::{excerpt, to_body, CouncilClient, CouncilError};
+use crate::client::{decode, excerpt, map_reqwest, to_body, CouncilClient, CouncilError};
 use crate::sse::{EventStream, Frame, StreamItem};
 
 /// One event of a streamed generation. A `ping`, the `output`, `progress`
@@ -68,8 +70,8 @@ impl CouncilClient {
     /// build would reuse without feeding. A context with no room is
     /// [`CouncilError::ContextFull`].
     pub async fn build_context(&self, model: &str, context: &Context, dry_run: bool) -> Result<ContextBuilt, CouncilError> {
-        context.check()?;
         let body = ContextBuild { model: model.to_string(), context: context.clone(), dry_run: dry_run.then_some(true), class: None, priority: None };
+        body.validate()?;
         self
             .json(Method::POST, "/council/v2/contexts", Some(to_body(&body)?), &[], self.timeout, 200, "context build")
             .await
@@ -99,6 +101,96 @@ impl CouncilClient {
     /// `DELETE /council/v2/pins/{owner}`. An owner with no pins is a 404.
     pub async fn delete_pins(&self, owner: &str) -> Result<(), CouncilError> {
         let path = pins_path(owner)?;
+        self.call(Method::DELETE, &path, None, &[], self.timeout, 204).await.map(|_| ())
+    }
+
+    /// `PUT /council/v2/objects/{id}` at the content id of `bytes`, with
+    /// `mime` as its `content-type`. A new object is a 201 and a held one a
+    /// 200; either answer names the media type of the object's first put.
+    /// Past `object_bytes` it is a 413 that holds nothing. `timeout` bounds
+    /// the whole upload.
+    pub async fn put_object(&self, mime: &str, bytes: Vec<u8>, timeout: Duration) -> Result<ObjectPut, CouncilError> {
+        let id = gogi_proto::content_id(&bytes);
+        check_put(&id, Some(mime), &bytes)?;
+        let path = format!("/council/v2/objects/{id}");
+        let headers = [("content-type", mime.to_string())];
+        let len = bytes.len() as u64;
+        let (_, body) = self.call_any(Method::PUT, &path, Some(bytes), &headers, timeout, &[200, 201]).await?;
+        let put: ObjectPut = decode(&body, "object put")?;
+        if put.id != id || put.bytes != len {
+            return Err(CouncilError::Decode {
+                what: "object put",
+                message: format!("the server holds {} of {} bytes for {len} bytes whose id is {id}", put.id, put.bytes),
+                body: excerpt(&body),
+            });
+        }
+        Ok(put)
+    }
+
+    /// `HEAD /council/v2/objects/{id}`: whether the server holds the object.
+    /// A 404 is `false`; the server may have evicted an object no keep holds.
+    /// A HEAD answer has no body, so a 404 from a server without objects also
+    /// reads as `false`: a caller checks the identity's `objects` capability
+    /// first.
+    pub async fn has_object(&self, id: &str) -> Result<bool, CouncilError> {
+        let path = object_path(id)?;
+        match self.call(Method::HEAD, &path, None, &[], self.timeout, 200).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.status() == Some(404) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `GET /council/v2/objects/{id}`: the object's media type and its whole
+    /// bytes, or `None` when the server answers 404 `not_found`. A 404 of any
+    /// other kind, such as a server without the route, is an error.
+    /// `timeout` bounds the whole download.
+    pub async fn get_object(&self, id: &str, timeout: Duration) -> Result<Option<(String, Vec<u8>)>, CouncilError> {
+        let path = object_path(id)?;
+        let resp = match self.send(Method::GET, &path, None, &[], Some(timeout)).await {
+            Ok(resp) => resp,
+            Err(CouncilError::Status { status: 404, error: Some(ErrorDetail { r#type: ErrorType::NotFound, .. }), .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let status = resp.status();
+        let mime = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
+        if status.as_u16() != 200 {
+            return Err(CouncilError::Decode { what: "status", message: format!("expected 200, got {status}"), body: excerpt(&bytes) });
+        }
+        let Some(mime) = mime else {
+            return Err(CouncilError::Decode { what: "content type", message: "an object came back with no content-type".into(), body: excerpt(&bytes) });
+        };
+        let actual = gogi_proto::content_id(&bytes);
+        if actual != id {
+            return Err(CouncilError::Decode {
+                what: "object",
+                message: format!("the bytes served for {id} hash to {actual}"),
+                body: String::new(),
+            });
+        }
+        Ok(Some((mime, bytes)))
+    }
+
+    /// `PUT /council/v2/keeps/{owner}`: replaces `owner`'s whole set with
+    /// `body` and renews it. An object the server does not hold is reported
+    /// `held: false`. Past `keep_bytes` it is a 413 that keeps nothing.
+    pub async fn put_keeps(&self, owner: &str, body: &KeepsPut) -> Result<KeepsPutResult, CouncilError> {
+        let path = owner_path("keeps", owner)?;
+        body.validate()?;
+        self.json(Method::PUT, &path, Some(to_body(body)?), &[], self.timeout, 200, "keeps").await
+    }
+
+    /// `GET /council/v2/keeps/{owner}`: the held objects only. An owner with
+    /// no keeps is a 404.
+    pub async fn get_keeps(&self, owner: &str) -> Result<KeepSet, CouncilError> {
+        let path = owner_path("keeps", owner)?;
+        self.json(Method::GET, &path, None, &[], self.timeout, 200, "keep set").await
+    }
+
+    /// `DELETE /council/v2/keeps/{owner}`. An owner with no keeps is a 404.
+    pub async fn delete_keeps(&self, owner: &str) -> Result<(), CouncilError> {
+        let path = owner_path("keeps", owner)?;
         self.call(Method::DELETE, &path, None, &[], self.timeout, 204).await.map(|_| ())
     }
 
@@ -183,8 +275,22 @@ impl CouncilClient {
 }
 
 fn pins_path(owner: &str) -> Result<String, CouncilError> {
+    owner_path("pins", owner)
+}
+
+/// The path of an object, after checking that `id` is a whole content id.
+fn object_path(id: &str) -> Result<String, CouncilError> {
+    if let Some(problem) = content_id_problem(id) {
+        return Err(CouncilError::Request(format!("invalid request: id: {problem}")));
+    }
+    Ok(format!("/council/v2/objects/{id}"))
+}
+
+/// The path of a pin or keep owner under `route`, escaped. Pins and keeps
+/// share the owner rules.
+fn owner_path(route: &str, owner: &str) -> Result<String, CouncilError> {
     validate_owner(owner)?;
-    let mut path = String::from("/council/v2/pins/");
+    let mut path = format!("/council/v2/{route}/");
     for b in owner.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => path.push(b as char),
@@ -223,6 +329,9 @@ mod tests {
 
     /// The fake's one served model.
     const TOY: &str = "gogi-toy-1";
+
+    /// The timeout of an object call in these tests.
+    const T: Duration = Duration::from_secs(5);
 
     fn greedy(context: Context) -> GenerationRequest {
         GenerationRequest {
@@ -322,7 +431,7 @@ mod tests {
     async fn pins_hold_list_and_drop() {
         let (_server, c) = fake();
         let head = c.build_context(TOY, &chat(), false).await.unwrap().head;
-        let put = c.put_pins("kernel 1", &PinsPut { snapshots: vec![head.to_string()], ttl_s: 60 }).await.unwrap();
+        let put = c.put_pins("kernel 1", &PinsPut { snapshots: vec![head.to_string()], contexts: vec![], ttl_s: 60 }).await.unwrap();
         assert!(put.snapshots[0].held && put.expires_in_s.is_some());
         assert_eq!(c.get_pins("kernel 1").await.unwrap().snapshots, [head.to_string()]);
         let detail = c.snapshot(&head).await.unwrap();
@@ -477,7 +586,7 @@ mod tests {
         assert!(matches!(c.build_context(TOY, &user_reasoning, false).await, Err(CouncilError::Request(_))));
         assert!(matches!(c.build_context(TOY, &Context::new(true, vec![]), false).await, Err(CouncilError::Request(_))));
         assert!(matches!(c.get_pins("a/b").await, Err(CouncilError::Request(_))));
-        let forever = PinsPut { snapshots: vec![], ttl_s: 86_401 };
+        let forever = PinsPut { snapshots: vec![], contexts: vec![], ttl_s: 86_401 };
         assert!(matches!(c.put_pins("k", &forever).await, Err(CouncilError::Request(_))));
         let empty = GenerationRequest { max_tokens: 0, ..greedy(chat()) };
         assert!(matches!(c.generate(&empty, Duration::from_secs(1)).await, Err(CouncilError::Request(_))));
@@ -612,5 +721,81 @@ mod tests {
             assert!(matches!(&err, CouncilError::Status { status: 429, request_id: Some(id), .. } if id == want), "{err:?}");
             assert!(err.to_string().ends_with(&format!("(request {want})")), "{err}");
         }
+    }
+
+    /// An object is put at the content id of its bytes with its media type,
+    /// is read back whole with that type, and keeps the type of its first put.
+    /// An object the server does not hold is absent, not an error.
+    #[tokio::test]
+    async fn objects_put_at_their_id_and_read_back_with_their_type() {
+        let (_server, c) = fake();
+        let wav = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+        let id = gogi_proto::content_id(&wav);
+        assert!(!c.has_object(&id).await.unwrap());
+        let put = c.put_object("audio/wav", wav.clone(), T).await.unwrap();
+        assert_eq!((put.id.as_str(), put.mime.as_str(), put.bytes), (id.as_str(), "audio/wav", wav.len() as u64));
+        assert!(c.has_object(&id).await.unwrap());
+        let again = c.put_object("audio/x-wav", wav.clone(), T).await.unwrap();
+        assert_eq!(again.mime, "audio/wav", "an object keeps the media type of its first put");
+        let (mime, bytes) = c.get_object(&id, T).await.unwrap().unwrap();
+        assert_eq!((mime.as_str(), bytes), ("audio/wav", wav));
+        let missing = gogi_proto::content_id(b"never put");
+        assert!(c.get_object(&missing, T).await.unwrap().is_none());
+    }
+
+    /// A media type the contract refuses, or an id that is not a whole
+    /// content id, is refused before anything is sent: the client points at a
+    /// closed port, so a sent request would be a connection error.
+    #[tokio::test]
+    async fn a_bad_object_request_never_reaches_the_server() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let c = client(&format!("http://{closed}"));
+        for mime in ["Audio/WAV", "audio", "text/plain; charset=utf-8"] {
+            let err = c.put_object(mime, b"x".to_vec(), T).await.unwrap_err();
+            assert!(matches!(err, CouncilError::Request(_)), "{mime}: {err:?}");
+        }
+        for id in ["blake3:aaaa", "sha256:00"] {
+            assert!(matches!(c.has_object(id).await, Err(CouncilError::Request(_))), "{id}");
+            assert!(matches!(c.get_object(id, T).await, Err(CouncilError::Request(_))), "{id}");
+        }
+        assert!(matches!(c.put_keeps("k", &KeepsPut { objects: vec![], ttl_s: 0 }).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.get_keeps("a/b").await, Err(CouncilError::Request(_))));
+    }
+
+    /// A build reads an open message only as a dry run; otherwise the
+    /// client refuses it before sending.
+    #[tokio::test]
+    async fn a_build_of_an_open_message_is_refused_unless_it_is_a_dry_run() {
+        let (_server, c) = fake();
+        let open = Context::new(true, vec![Message::system("s"), Message::user("u").snapped(), Message::assistant("half").opened()]);
+        let err = c.build_context(TOY, &open, false).await.unwrap_err();
+        assert!(matches!(&err, CouncilError::Request(m) if m.contains("continue")), "{err:?}");
+        c.build_context(TOY, &open, true).await.unwrap();
+    }
+
+    /// A 404 that is not `not_found`, as from a server without the objects
+    /// route, is an error, not an absent object.
+    #[tokio::test]
+    async fn a_404_without_not_found_is_not_an_absent_object() {
+        let (base, _) = serve(vec![reply(404, "no such route")]).await;
+        let err = client(&base).get_object(&gogi_proto::content_id(b"x"), T).await.unwrap_err();
+        assert_eq!(err.status(), Some(404), "{err:?}");
+    }
+
+    /// A keep holds the objects the server has and reports the rest as not
+    /// held; it is listed, then dropped. An owner with a space is escaped.
+    #[tokio::test]
+    async fn keeps_hold_list_and_drop() {
+        let (_server, c) = fake();
+        let held = c.put_object("application/x-safetensors", b"vector".to_vec(), T).await.unwrap().id;
+        let absent = gogi_proto::content_id(b"never put");
+        let body = KeepsPut { objects: vec![held.clone(), absent.clone()], ttl_s: 3600 };
+        let put = c.put_keeps("kaijutsu 1", &body).await.unwrap();
+        let report: Vec<_> = put.objects.iter().map(|k| (k.id.as_str(), k.held)).collect();
+        assert_eq!(report, [(held.as_str(), true), (absent.as_str(), false)]);
+        assert!(put.expires_in_s.is_some());
+        assert_eq!(c.get_keeps("kaijutsu 1").await.unwrap().objects, [held]);
+        c.delete_keeps("kaijutsu 1").await.unwrap();
+        assert_eq!(c.get_keeps("kaijutsu 1").await.unwrap_err().status(), Some(404));
     }
 }

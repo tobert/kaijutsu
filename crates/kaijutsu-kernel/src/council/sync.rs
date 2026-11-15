@@ -10,8 +10,8 @@
 //! (`llm::endpoint::council_call`), waiting no later than the caller's deadline,
 //! and a 429 is sent again after its cooldown.
 //!
-//! The server speaks council v2 (gogi's `docs/council-api.md`) and keeps
-//! no context records: a
+//! The server speaks council v2 (gogi's `docs/council-api.md`). The kernel
+//! uses no context records and names no `parent`: a
 //! seat is its context value, the projected context as a queue seat for the
 //! decision's spec (`super::seat`). A seat is built with
 //! `POST /council/v2/contexts` when its value changes, and each decision
@@ -745,7 +745,7 @@ impl Pinner {
             }
             return;
         }
-        let body = PinsPut { snapshots: heads, ttl_s: PIN_TTL.as_secs() };
+        let body = PinsPut { snapshots: heads, contexts: Vec::new(), ttl_s: PIN_TTL.as_secs() };
         let answer = council_call(&self.endpoint, deadline, &waits, || async { client.put_pins(&self.owner, &body).await }).await;
         let pinned = match answer {
             Ok((_slot, Ok(pinned))) => pinned,

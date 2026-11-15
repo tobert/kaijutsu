@@ -257,8 +257,8 @@ compacting."
 
 The kernel speaks council v2 (gogi's `docs/council-api.md`) and nothing
 else. A server whose `GET /council/v2/identity` fails, a 404 included, is a
-miss for every decision on it. The server keeps no context records: there
-are no server-side context ids, and a seat is sent whole each time.
+miss for every decision on it. The kernel uses no context records: it
+names no `parent`, and a seat is sent whole each time.
 
 - **A decision runs on one served model.** The `gate` slot's model names
   it by its `model` or an alias. Every build and decision sends the served

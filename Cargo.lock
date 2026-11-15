@@ -5424,7 +5424,7 @@ dependencies = [
 [[package]]
 name = "gogi-fake"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=24ad402c7329db232ba30a8aac6fb509d8e817cd#24ad402c7329db232ba30a8aac6fb509d8e817cd"
+source = "git+https://github.com/tobert/gogi?rev=8830357260086202c76feda1ccce672d70921140#8830357260086202c76feda1ccce672d70921140"
 dependencies = [
  "blake3",
  "gogi-proto",
@@ -5437,7 +5437,7 @@ dependencies = [
 [[package]]
 name = "gogi-proto"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=24ad402c7329db232ba30a8aac6fb509d8e817cd#24ad402c7329db232ba30a8aac6fb509d8e817cd"
+source = "git+https://github.com/tobert/gogi?rev=8830357260086202c76feda1ccce672d70921140#8830357260086202c76feda1ccce672d70921140"
 dependencies = [
  "blake3",
  "indexmap 2.14.0",
@@ -5449,7 +5449,7 @@ dependencies = [
 [[package]]
 name = "gogi-toy"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=24ad402c7329db232ba30a8aac6fb509d8e817cd#24ad402c7329db232ba30a8aac6fb509d8e817cd"
+source = "git+https://github.com/tobert/gogi?rev=8830357260086202c76feda1ccce672d70921140#8830357260086202c76feda1ccce672d70921140"
 dependencies = [
  "gogi-proto",
  "serde_json",

@@ -191,15 +191,30 @@ impl CouncilClient {
         timeout: Duration,
         expect: u16,
     ) -> Result<Vec<u8>, CouncilError> {
+        self.call_any(method, path, body, headers, timeout, &[expect]).await.map(|(_, bytes)| bytes)
+    }
+
+    /// A call whose whole reply is read within `timeout` and whose status is
+    /// one of `expect`. Returns the status with the body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_any(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        headers: &[(&'static str, String)],
+        timeout: Duration,
+        expect: &[u16],
+    ) -> Result<(u16, Vec<u8>), CouncilError> {
         let resp = self.send(method, path, body, headers, Some(timeout)).await?;
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
-        if status.as_u16() == expect {
-            return Ok(bytes);
+        if expect.contains(&status.as_u16()) {
+            return Ok((status.as_u16(), bytes));
         }
         Err(CouncilError::Decode {
             what: "status",
-            message: format!("expected {expect}, got {status}"),
+            message: format!("expected {}, got {status}", expect.iter().map(u16::to_string).collect::<Vec<_>>().join(" or ")),
             body: excerpt(&bytes),
         })
     }
@@ -207,7 +222,7 @@ impl CouncilClient {
     /// Sends a request and returns the response once its status is a
     /// success. An error status reads the body and becomes an error.
     /// With `timeout` of `None`, nothing bounds the call: a stream bounds each
-    /// read itself.
+    /// read itself. A body is JSON unless `headers` names its `content-type`.
     pub(crate) async fn send(
         &self,
         method: Method,
@@ -229,7 +244,10 @@ impl CouncilClient {
             req = req.header(HeaderName::from_static("traceparent"), header_value("traceparent", tp)?);
         }
         if let Some(body) = body {
-            req = req.header(CONTENT_TYPE, "application/json").body(body);
+            if !headers.iter().any(|(n, _)| *n == "content-type") {
+                req = req.header(CONTENT_TYPE, "application/json");
+            }
+            req = req.body(body);
         }
         let resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
