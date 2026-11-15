@@ -85,6 +85,25 @@ fn clearing_counts_the_items_and_leaves_other_contexts_alone() {
     assert!(db.list_context_controls(ctx).unwrap().is_empty());
     assert_eq!(db.list_context_controls(other.context_id).unwrap().len(), 1);
     assert_eq!(db.clear_context_controls(ctx).unwrap(), 0);
+    let layer_rows: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM context_control_layers WHERE context_id = ?1", params![blob_param(ctx.as_bytes())], |r| r.get(0))
+        .unwrap();
+    assert_eq!(layer_rows, 0, "clearing takes the layer rows too");
+    // The next item reuses position 0; it must not inherit the cleared item's layers.
+    let plain = control('d', ControlOp::Ablate, 1.0, None);
+    db.add_context_control(ctx, &plain).unwrap();
+    assert_eq!(db.list_context_controls(ctx).unwrap(), [plain]);
+}
+
+/// An empty `layers` names no layer, which the contract refuses. Stored, it
+/// would read back as no layer rows, which means every layer.
+#[test]
+fn an_item_whose_layers_name_no_layer_is_refused() {
+    let (db, ctx) = fixture();
+    let e = db.add_context_control(ctx, &control('a', ControlOp::Ablate, 1.0, Some(&[]))).unwrap_err();
+    assert!(e.to_string().contains("names no layer"), "{e}");
+    assert!(db.list_context_controls(ctx).unwrap().is_empty());
 }
 
 #[test]

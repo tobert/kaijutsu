@@ -15,6 +15,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **Fork filters do not name the list.** `kj fork` copies it in every preset;
   a `spawn` preset child that should start plain has to `kj context control
   clear`.
+- **A model that stops declaring `control_vectors` is found late.** The
+  identity is read again only after a `thinking` refusal or when it is 600 s
+  old, so for that long each turn reaches the server and fails there.
+- **The prefix sensor ignores the list.** `SentPrefix::of` fingerprints the
+  system, tools, and messages, so a turn whose only change is its control list
+  reports no divergence, although the server feeds the context again.
 - **No way to list the vectors a server holds.** Council v2 has no object
   listing. The nagaya web UI keeps its vectors' names in browser storage and
   leases the ids as keep owner `nagaya-web`, so `GET

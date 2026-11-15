@@ -11,15 +11,12 @@ impl KernelDb {
     /// after checking that `cd` enters it. `None` leaves the child without
     /// a cwd.
     ///
-    /// This folds `insert_context_with_document` + `fork_context_config` into a
-    /// single all-or-nothing write. Calling them separately left a gap: the
-    /// context insert committed first, so a failure copying the config stranded
-    /// a committed-but-misconfigured context (under deny-by-default, one with no
-    /// loadout — locked out). Here a failure on any write rolls the whole fork
-    /// back, leaving no context row behind.
+    /// One all-or-nothing write: a failure on any write rolls the whole fork
+    /// back and leaves no context row, so no fork is left committed without
+    /// its config (under deny-by-default, one with no loadout is locked out).
     ///
     /// The source config is read up front (SELECTs) so the transaction holds
-    /// only the writes, matching `fork_context_config`.
+    /// only the writes.
     pub fn insert_forked_context(
         &mut self,
         row: &ContextRow,
@@ -77,50 +74,6 @@ impl KernelDb {
         Self::copy_controls_for_fork(&tx, source, row.context_id)?;
         // The child is the same character as its source, answering to it.
         super::context_characters::copy_character_into(&tx, source, row.context_id)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Copy shell config + env vars + egress hosts + capability binding from
-    /// source context to target. Called during all fork operations. The
-    /// binding copy makes permissions follow the fork — under deny-by-default
-    /// a fork would otherwise start with no loadout and be locked out. Grants
-    /// for MCP servers declared for the source alone are not copied.
-    ///
-    /// Atomic: the four copies land in ONE transaction. A fork that fails
-    /// partway must leave NO partial config behind — a half-copied loadout
-    /// would lock the fork out (or grant a stale subset), and the caller has
-    /// already committed the context row, so a silent partial here would
-    /// strand a misconfigured context. The source is read up front so the
-    /// transaction holds only the writes.
-    pub fn fork_context_config(&mut self, source: ContextId, target: ContextId) -> KernelDbResult<()> {
-        let shell = self.get_context_shell(source)?;
-        let env = self.get_context_env(source)?;
-        let egress = self.list_context_egress(source)?;
-        let binding = self
-            .get_context_binding(source)?
-            .map(crate::mcp::ContextToolBinding::without_context_scoped);
-
-        let tx = self.conn.transaction()?;
-        if let Some(src) = shell {
-            Self::write_context_shell(
-                &tx,
-                &ContextShellRow {
-                    context_id: target,
-                    cwd: src.cwd,
-                    updated_at: now_millis(),
-                },
-            )?;
-        }
-        for var in &env {
-            Self::write_context_env(&tx, target, &var.key, &var.value)?;
-        }
-        for host in &egress {
-            Self::write_context_egress(&tx, target, host)?;
-        }
-        if let Some(binding) = binding {
-            Self::write_binding(&tx, target, &binding)?;
-        }
         tx.commit()?;
         Ok(())
     }

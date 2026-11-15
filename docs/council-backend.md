@@ -155,6 +155,9 @@ kj context control clear
   `Provider::stream` does it. Clear the list with `kj context control clear`.
 - **Failure.** A list that cannot be read, or a stored row that does not decode,
   fails the turn with an error block. The turn is never sent without the list.
+- **Scope.** The list rides the context's own turns. A distill runs on its
+  `distill` slot and sends no list, and a council decision about the context
+  reads it with the plain model.
 - **Copies.** `kj fork` and `kj context rotate` copy the list into the new
   context, so a fork followed by a change is an A/B against its parent.
 - **Validation.** `add` refuses an unknown op, a non-finite strength or

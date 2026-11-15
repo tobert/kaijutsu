@@ -23,8 +23,8 @@ impl KernelDb {
 
     /// Wholesale-replace a context's binding (parent flags + every child row)
     /// against `conn`. The caller owns the transaction: `upsert_context_binding`
-    /// wraps a fresh one, `fork_context_config` reuses its multi-write tx so
-    /// the binding lands atomically alongside the shell + env copy. Does NOT
+    /// wraps a fresh one, `insert_forked_context` reuses its multi-write tx so
+    /// the binding lands atomically alongside the rest of the fork. Does NOT
     /// commit — that is the caller's job.
     pub(super) fn write_binding(
         conn: &Connection,

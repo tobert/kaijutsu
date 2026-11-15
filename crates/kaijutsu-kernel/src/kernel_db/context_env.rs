@@ -21,7 +21,7 @@ pub struct ContextEnvRow {
 impl KernelDb {
     /// Write per-context shell config against `conn` — a bare `Connection`
     /// or an open `Transaction` (which derefs to one). Shared by
-    /// `upsert_context_shell` and the transactional `fork_context_config` so
+    /// `upsert_context_shell` and the transactional `insert_forked_context` so
     /// the SQL has a single home.
     pub(super) fn write_context_shell(conn: &Connection, row: &ContextShellRow) -> KernelDbResult<()> {
         conn.execute(
@@ -82,7 +82,7 @@ impl KernelDb {
     }
 
     /// Write one env var against `conn` (a `Connection` or an open
-    /// `Transaction`). Shared by `set_context_env` and `fork_context_config`.
+    /// `Transaction`). Shared by `set_context_env` and `insert_forked_context`.
     pub(super) fn write_context_env(
         conn: &Connection,
         context_id: ContextId,

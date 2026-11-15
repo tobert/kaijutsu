@@ -26,113 +26,6 @@ fn fork_copies_binding() {
     assert!(loaded.allows(&Capability::Facade("shell".into())));
 }
 
-// ── 26. Fork context config (composite) ──────────────────────────
-
-#[test]
-fn fork_context_config_full() {
-    let mut db = KernelDb::temporary().unwrap();
-    let ws_id = setup_test_db(&db);
-    let src = make_context_row(Some("fork-src"));
-    let tgt = make_context_row(Some("fork-tgt"));
-    insert_context_with_doc(&db, &src, ws_id);
-    insert_context_with_doc(&db, &tgt, ws_id);
-
-    // Set up source with shell config + env vars
-    db.upsert_context_shell(&ContextShellRow {
-        context_id: src.context_id,
-        cwd: Some("/home/user/src/kaijutsu".into()),
-        updated_at: now_millis(),
-    })
-    .unwrap();
-    db.set_context_env(src.context_id, "RUST_LOG", "debug")
-        .unwrap();
-    db.set_context_env(src.context_id, "EDITOR", "vim").unwrap();
-    db.set_context_env(src.context_id, "TERM", "xterm-256color")
-        .unwrap();
-
-    db.fork_context_config(src.context_id, tgt.context_id)
-        .unwrap();
-
-    // Shell config copied
-    let shell = db.get_context_shell(tgt.context_id).unwrap().unwrap();
-    assert_eq!(shell.cwd, Some("/home/user/src/kaijutsu".into()));
-
-    // Env vars copied
-    let vars = db.get_context_env(tgt.context_id).unwrap();
-    assert_eq!(vars.len(), 3);
-}
-
-#[test]
-fn fork_context_config_empty_source() {
-    let mut db = KernelDb::temporary().unwrap();
-    let ws_id = setup_test_db(&db);
-    let src = make_context_row(Some("empty-src"));
-    let tgt = make_context_row(Some("empty-tgt"));
-    insert_context_with_doc(&db, &src, ws_id);
-    insert_context_with_doc(&db, &tgt, ws_id);
-
-    // Fork from context with no config → no error, no data on target
-    db.fork_context_config(src.context_id, tgt.context_id)
-        .unwrap();
-
-    assert!(db.get_context_shell(tgt.context_id).unwrap().is_none());
-    assert!(db.get_context_env(tgt.context_id).unwrap().is_empty());
-}
-
-/// A fork that fails partway must leave NO partial config behind — a
-/// half-copied loadout strands a misconfigured (locked-out) context. The
-/// three copies share one transaction, so a failure on a later write must
-/// roll back the earlier ones. Force the env write (step 2) to abort after
-/// the shell write (step 1) has already executed, then prove the shell row
-/// never lands. Against the old per-write autocommit, the shell row would
-/// survive and this fails.
-#[test]
-fn fork_context_config_rolls_back_on_partial_failure() {
-    let mut db = KernelDb::temporary().unwrap();
-    let ws_id = setup_test_db(&db);
-    let src = make_context_row(Some("atomic-src"));
-    let tgt = make_context_row(Some("atomic-tgt"));
-    insert_context_with_doc(&db, &src, ws_id);
-    insert_context_with_doc(&db, &tgt, ws_id);
-
-    // Source has shell config (copied first) AND an env var (copied second).
-    db.upsert_context_shell(&ContextShellRow {
-        context_id: src.context_id,
-        cwd: Some("/work".into()),
-        updated_at: now_millis(),
-    })
-    .unwrap();
-    db.set_context_env(src.context_id, "RUST_LOG", "debug")
-        .unwrap();
-
-    // Booby-trap the env INSERT: a BEFORE INSERT trigger that aborts the
-    // statement. Source reads are SELECTs and unaffected — only the
-    // target's env write trips it, after the shell write has run in the tx.
-    db.conn
-        .execute_batch(
-            "CREATE TRIGGER boom BEFORE INSERT ON context_env
-             BEGIN SELECT RAISE(ABORT, 'forced'); END;",
-        )
-        .unwrap();
-
-    let result = db.fork_context_config(src.context_id, tgt.context_id);
-    assert!(result.is_err(), "the aborted env write must surface as an error");
-
-    // Remove the trap; SELECTs below don't fire it, but keep the db clean.
-    db.conn.execute_batch("DROP TRIGGER boom;").unwrap();
-
-    // The shell write succeeded *before* the abort, yet must be gone: the
-    // transaction rolled back on drop. No partial fork survived.
-    assert!(
-        db.get_context_shell(tgt.context_id).unwrap().is_none(),
-        "shell copy must roll back when a later fork write fails",
-    );
-    assert!(
-        db.get_context_env(tgt.context_id).unwrap().is_empty(),
-        "no env rows on a rolled-back fork",
-    );
-}
-
 /// The composite fork — document row + context row + shell/env/binding + attachment
 /// copy — lands in one shot. Insert a source with full config, fork it into a
 /// brand-new target via `insert_forked_context`, and prove every piece arrived.
@@ -196,8 +89,6 @@ fn insert_forked_context_creates_rows_and_copies_config() {
 /// transaction must roll back too. Otherwise a fork could strand a
 /// committed-but-misconfigured context — the exact gap this method closes.
 /// Booby-trap the target's env INSERT, then prove neither row survived.
-/// Against the old `insert_context_with_document` + `fork_context_config`
-/// pair (two separate autocommits), the context row would persist.
 #[test]
 fn insert_forked_context_rolls_back_rows_on_config_failure() {
     let mut db = KernelDb::temporary().unwrap();
