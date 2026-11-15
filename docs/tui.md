@@ -1487,7 +1487,7 @@ this screen does not.
 `docs/issues.md`, "The terminal client — `kaijutsu-tui` follow-ups".
 
 Blocks already carry everything the wire needs: `ContentType::Svg` is inline
-SVG text, `ContentType::Abc` is ABC notation, and a `ContentType::Image`
+SVG text, `ContentType::Abc` is ABC notation, and a `ContentType::Media`
 block's text is a CAS hash whose real MIME type lives in CAS sidecar metadata
 (`kaijutsu-types/src/block.rs`, `ContentType`). Images are a client rendering
 lane; nothing new would ride the wire.

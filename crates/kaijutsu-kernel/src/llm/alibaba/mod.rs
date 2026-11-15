@@ -429,7 +429,7 @@ mod tests {
         use crate::llm::ContentBlock;
         use crate::llm::stream::{CacheTarget, CacheTtl::Ephemeral};
         let text = |t: &str| ContentBlock::Text { text: t.into() };
-        let image = ContentBlock::Image { hash: "h".into(), media_type: "image/png".into(), data_base64: Some("QUJD".into()) };
+        let image = ContentBlock::Media { hash: "h".into(), media_type: "image/png".into(), data_base64: Some("QUJD".into()) };
         let history = vec![Message::tool_results(vec![text("a"), text("b")]), Message::tool_results(vec![text("look"), image])];
         let o = || {
             opts("glm-5.2")

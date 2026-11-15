@@ -58,7 +58,7 @@ pub enum RichKindInfo {
     Abc,
     Diff,
     Output,
-    Image,
+    Media,
 }
 
 impl RichKindInfo {
@@ -70,7 +70,7 @@ impl RichKindInfo {
             RichContentKind::Abc { .. } => Self::Abc,
             RichContentKind::Diff(_) => Self::Diff,
             RichContentKind::Output { .. } => Self::Output,
-            RichContentKind::Image { .. } => Self::Image,
+            RichContentKind::Media { .. } => Self::Media,
         }
     }
 
@@ -86,7 +86,7 @@ impl RichKindInfo {
     pub fn is_drawn(self) -> bool {
         matches!(
             self,
-            Self::Sparkline | Self::Svg | Self::Abc | Self::Diff | Self::Image
+            Self::Sparkline | Self::Svg | Self::Abc | Self::Diff | Self::Media
         )
     }
 }
@@ -560,7 +560,7 @@ struct Detected {
 ///   own, so `msdf_glyphs` stays empty for them. Drawing
 ///   them is entirely geometry (ABC's own glyphs come from the engraving IR,
 ///   not from parley) or a raster.
-/// - **Image** shapes its `[image: …]` placeholder label; the dark rectangle
+/// - **Media** shapes its `[media: …]` placeholder label; the dark rectangle
 ///   under it is geometry.
 fn detect(
     block: &kaijutsu_types::BlockSnapshot,
@@ -628,7 +628,7 @@ fn detect(
         RichContentKind::Abc { .. }
         | RichContentKind::Svg { .. }
         | RichContentKind::Sparkline(_) => (String::new(), Vec::new()),
-        RichContentKind::Image { hash } => (image_placeholder_label(hash), Vec::new()),
+        RichContentKind::Media { hash } => (media_placeholder_label(hash), Vec::new()),
     };
 
     Detected {
@@ -639,10 +639,10 @@ fn detect(
     }
 }
 
-/// The placeholder caption an `Image` block draws until there is a
+/// The placeholder caption a `Media` block draws until there is a
 /// CAS→decode pipeline behind it.
-pub fn image_placeholder_label(hash: &str) -> String {
-    format!("[image: {}]", &hash[..8.min(hash.len())])
+pub fn media_placeholder_label(hash: &str) -> String {
+    format!("[media: {}]", &hash[..8.min(hash.len())])
 }
 
 #[cfg(test)]
@@ -990,7 +990,7 @@ mod tests {
             RichKindInfo::Svg,
             RichKindInfo::Abc,
             RichKindInfo::Diff,
-            RichKindInfo::Image,
+            RichKindInfo::Media,
         ] {
             assert!(kind.is_drawn(), "{kind:?} draws something parley cannot");
         }

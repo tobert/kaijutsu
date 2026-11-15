@@ -118,19 +118,48 @@ it is ready.
 
 ## Media blocks
 
-Every kind needs a block that holds media other than images. Today
-`ContentType` is closed: an image block holds a CAS hash and the turn path
-takes its real media type from the CAS record, but audio or video has no
-content type and maps to `Plain`. The wire already carries `contentType` as
-text (`kaijutsu.capnp`).
+`ContentType::Media` is a block whose text is the CAS hash of an image, audio,
+or video object. The CAS record is the one owner of the object's real media
+type, and the turn path takes it from there. Stored blocks that say `image`
+still read as `Media`. On the wire, `contentType` carries
+`application/vnd.kaijutsu.media`, which names no particular type.
 
 This is the first step, and it is also the next omni step: an audio block a
-model can hear (`docs/chameleon.md`, "Omni models").
+model can hear (`docs/chameleon.md`, "Omni models"). A council turn sends any
+media part the served model reads as an object; Claude, the OpenAI-compatible
+providers, and Gemini send images and write a marker for the rest.
+
+## Transcodes
+
+A transcode is a copy of a media object in another format: a WAV resampled
+to 16 kHz, made mono, or encoded for an API's limits. It is not a rendition:
+no model makes it and no one reads it as a block.
+
+- **The source stays the truth.** The block names the original's hash, and a
+  transcode never replaces it.
+- **A transcode is a function of the bytes and a recipe:** the target format,
+  rate, and channels, and the transcoder's name and version. Its output is a
+  CAS object, and the index maps the source id and the recipe to it, as it
+  maps renditions.
+- **A transcode can be evicted; a source cannot.** The kernel can make a
+  transcode again and cannot make the source again.
+- **The seam that needs the format makes it:** a provider for its API, an
+  audio sink for its device rate. A transcode is work behind admission and
+  never runs on the beat path. An in-process Rust transcoder is ordinary code;
+  a subprocess such as `ffmpeg` is a new host execution path and needs a
+  design conversation (`AGENTS.md`).
+- **The nagaya needs none.** It resamples any `audio/wav` to 16 kHz mono
+  itself, and its recipe names the resampler's version
+  (`~/src/nagaya/docs/spec.md`, "Video, and audio at any rate"). A turn on
+  the nagaya sends the original, so the server's record of what it read stays
+  complete.
 
 ## Open questions
 
-- The shape of the media content type (see the proposal in the conversation of
-  2026-11-15, recorded here once chosen).
+- How a client learns a media block's type. It does not yet: the wire
+  `contentType` is the generic media marker, so the app draws `[media: <hash>]`
+  for every media block. Two ways: the client looks the hash up in CAS, or the
+  kernel fills the wire `contentType` from the CAS record.
 - Where a speech preset lives on the character sheet, and whether its model is
   a slot.
 - How a client asks for a rendition: an RPC, since requests come at

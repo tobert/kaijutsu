@@ -147,7 +147,7 @@ pub(crate) fn create_svg_raster_image(
 }
 
 /// Dark background for the image placeholder rect (no real CAS→decode
-/// pipeline yet — see the `RichContentKind::Image` arm in
+/// pipeline yet — see the `RichContentKind::Media` arm in
 /// `view::surface::rich`).
 ///
 /// `pub(crate)` so the conversation surface draws the identical placeholder

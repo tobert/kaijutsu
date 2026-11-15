@@ -94,7 +94,7 @@ impl Client {
     ) -> LlmResult<Stream> {
         check_controls(&self.name, &opts.controls, &identity)?;
         let thinking = wants_thinking(&self.name, opts.effort.as_deref(), &identity)?;
-        let objects = self.place_images(&turn, &history, &identity, holds_objects).await?;
+        let objects = self.place_media(&turn, &history, &identity, holds_objects).await?;
         let messages = build::messages(opts.system.as_deref(), &history, &objects)?;
         let tools = build::tools(&opts.tools)
             .map_err(|e| LlmError::InvalidRequest(format!("council backend '{}': {e}", self.name)))?;
@@ -156,20 +156,24 @@ impl Client {
 }
 
 impl Client {
-    /// The object each image of `history` goes as. An image goes as an
+    /// The object each media part of `history` goes as. A part goes as an
     /// object when the server holds objects and the served model reads its
     /// media type; the server is asked whether it holds the object, and it is
-    /// put when it does not. Any other image gets the reason it is left out.
+    /// put when it does not. Any other part gets the reason it is left out.
     /// A failed put fails the turn.
-    async fn place_images(&self, turn: &Turn, history: &[Message], model: &ServedModel, holds_objects: bool) -> LlmResult<build::Objects> {
+    async fn place_media(&self, turn: &Turn, history: &[Message], model: &ServedModel, holds_objects: bool) -> LlmResult<build::Objects> {
         use base64::Engine as _;
         let mut placed = build::Objects::new();
-        for (hash, mime, data) in images(history) {
+        for (hash, mime, data) in media(history) {
             if placed.contains_key(hash) {
                 continue;
             }
+            // No bytes: the builder's marker says they were not found.
+            let Some(data) = data else { continue };
             let why = if !holds_objects {
                 Some("the server holds no objects".to_string())
+            } else if !crate::llm::media_type_is_recorded(mime) {
+                Some(crate::llm::UNRECORDED_MEDIA_TYPE.to_string())
             } else if !model.reads(mime) {
                 Some(format!("{} does not read {mime}", model.model))
             } else {
@@ -179,10 +183,8 @@ impl Client {
                 placed.insert(hash.to_string(), Err(why));
                 continue;
             }
-            // No bytes: the builder's marker says they were not found.
-            let Some(data) = data else { continue };
             let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| {
-                LlmError::InvalidRequest(format!("council backend '{}': image {hash} holds bytes that are not base64: {e}", self.name))
+                LlmError::InvalidRequest(format!("council backend '{}': media {hash} holds bytes that are not base64: {e}", self.name))
             })?;
             let id = gogi_proto::content_id(&bytes);
             let (_slot, held) = self.call(turn, false, |_| self.client.has_object(&id)).await?;
@@ -195,14 +197,14 @@ impl Client {
     }
 }
 
-/// The CAS hash, media type, and resolved base64 bytes of each image a user
+/// The CAS hash, media type, and resolved base64 bytes of each media part a user
 /// message shows, in order.
-fn images(history: &[Message]) -> impl Iterator<Item = (&str, &str, Option<&str>)> {
+fn media(history: &[Message]) -> impl Iterator<Item = (&str, &str, Option<&str>)> {
     history.iter().filter(|m| m.role == crate::llm::Role::User).flat_map(|m| match &m.content {
         crate::llm::MessageContent::Blocks(blocks) => blocks.as_slice(),
         crate::llm::MessageContent::Text(_) => &[],
     }).filter_map(|b| match b {
-        crate::llm::ContentBlock::Image { hash, media_type, data_base64 } => Some((hash.as_str(), media_type.as_str(), data_base64.as_deref())),
+        crate::llm::ContentBlock::Media { hash, media_type, data_base64 } => Some((hash.as_str(), media_type.as_str(), data_base64.as_deref())),
         _ => None,
     })
 }

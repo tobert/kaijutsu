@@ -312,7 +312,7 @@ impl ConversationSession {
 pub struct ConversationCache {
     entries: parking_lot::Mutex<HashMap<ContextId, (Arc<ConversationSession>, std::time::Instant)>>,
     max_contexts: usize,
-    image_cache: Arc<crate::llm::image_cache::ImageBase64Cache>,
+    media_cache: Arc<crate::llm::media_cache::MediaBase64Cache>,
 }
 
 impl ConversationCache {
@@ -323,15 +323,15 @@ impl ConversationCache {
         Self {
             entries: parking_lot::Mutex::new(HashMap::new()),
             max_contexts,
-            image_cache: Arc::new(crate::llm::image_cache::ImageBase64Cache::new(
+            media_cache: Arc::new(crate::llm::media_cache::MediaBase64Cache::new(
                 max_images,
             )),
         }
     }
 
     /// Borrow the per-hash image cache shared across contexts.
-    pub fn image_cache(&self) -> &crate::llm::image_cache::ImageBase64Cache {
-        &self.image_cache
+    pub fn media_cache(&self) -> &crate::llm::media_cache::MediaBase64Cache {
+        &self.media_cache
     }
 
     /// Get the context's session. Hold its lock for the entire turn.

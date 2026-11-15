@@ -142,7 +142,7 @@ pub use llm::{
     // Hydration
     estimate_tokens,
     hydrate_from_blocks,
-    resolve_image_blocks_from_cas,
+    resolve_media_blocks_from_cas,
     // System prompt assembly
     SituationalContext,
     SenpaiFact,
@@ -196,6 +196,6 @@ pub use kernel_db::{
 pub use kj::{KjCaller, KjDispatcher, KjResult};
 
 // Re-export the CAS trait so downstream crates (kaijutsu-server) can
-// pass `kernel.cas()` into helpers like `resolve_image_blocks_from_cas`
+// pass `kernel.cas()` into helpers like `resolve_media_blocks_from_cas`
 // without taking a direct dependency on `kaijutsu-cas`.
 pub use kaijutsu_cas::ContentStore;

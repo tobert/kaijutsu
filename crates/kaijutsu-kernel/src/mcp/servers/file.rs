@@ -2239,7 +2239,7 @@ mod tests {
         assert!(!result.is_error, "{}", text_of(&result));
         let snaps = blocks.block_snapshots(ctx.context_id).unwrap();
         let image = snaps.iter().find(|b| b.role == Role::Asset).expect("an Asset block");
-        assert_eq!(image.content_type, ContentType::Image);
+        assert_eq!(image.content_type, ContentType::Media);
         assert_eq!(image.content, kaijutsu_cas::ContentHash::from_data(TEST_PNG).to_string());
     }
 

@@ -47,7 +47,7 @@ fn image_tool_reads_mounted_bytes_through_the_retained_shell() {
         let blocks = server.documents.block_snapshots(context).unwrap();
         let assets: Vec<_> = blocks.iter().filter(|block| block.role == Role::Asset).collect();
         assert_eq!(assets.len(), 1, "one import must create one asset");
-        assert_eq!(assets[0].content_type, ContentType::Image);
+        assert_eq!(assets[0].content_type, ContentType::Media);
         assert_eq!(assets[0].content, hash.to_string());
         assert_eq!(server.kernel.cas().retrieve(&hash).unwrap().unwrap(), bytes);
         server.kernel.shutdown_runtime_worker().await.unwrap();

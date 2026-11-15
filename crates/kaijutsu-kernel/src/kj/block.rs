@@ -253,10 +253,11 @@ struct BlockCreateArgs {
     /// Initial text. When omitted, reads stdin in kaish; empty without input.
     #[arg(long, allow_hyphen_values = true)]
     content: Option<String>,
-    /// Content MIME type. Raster image content must be a CAS hash.
+    /// Content MIME type. Image, audio, and video content must be a CAS hash.
     #[arg(long, default_value = "text/plain", value_parser = [
         "text/plain", "text/markdown", "image/svg+xml", "text/vnd.abc", "text/x-diff",
         "image/png", "image/jpeg", "image/webp", "image/gif", "image/avif",
+        "audio/wav", "audio/mpeg", "audio/ogg", "audio/flac", "video/mp4", "video/webm",
     ])]
     content_type: String,
     /// Parent block id for DAG relationship (omit for root)
@@ -911,10 +912,9 @@ impl KjDispatcher {
     }
 
     /// The block's "real" mime for `--latest` matching: for a CAS-ref block,
-    /// the mime recorded in the CAS sidecar (the actual bytes' type — a
-    /// derived sibling's `content_type` is often `Plain` because
-    /// `ContentType::from_mime` has no closed variant for e.g. `audio/midi`
-    /// yet); for a literal-content block, the block's own declared
+    /// the mime recorded in the CAS sidecar (the actual bytes' type: a media
+    /// block's `content_type` is the generic `Media`, and a capture record's
+    /// is `Plain`); for a literal-content block, the block's own declared
     /// content_type mime. `None` for a dangling CAS hash — never silently
     /// treated as a match.
     fn block_resolved_mime(&self, snap: &kaijutsu_types::BlockSnapshot) -> Option<String> {
@@ -1341,7 +1341,7 @@ impl KjDispatcher {
         let ctx_id = block_id.context_id;
 
         // A CAS-ref Asset block's `content` is the hash, not the payload —
-        // an Image block is the concrete case, but the mechanism is general
+        // a Media block is the concrete case, but the mechanism is general
         // to any CAS-ref block (`block_cas_hash`'s convention). Appending
         // text would corrupt the reference; crashing (refusing) is preferred
         // over corrupting the hash.
@@ -1354,7 +1354,7 @@ impl KjDispatcher {
         {
             return KjResult::Err(format!(
                 "kj block append: '{id_str}' is a CAS-ref block (content is the hash {hash}, \
-                 e.g. an Image block) — appending text would corrupt the reference; create a \
+                 e.g. a Media block) — appending text would corrupt the reference; create a \
                  new block instead"
             ));
         }
@@ -1771,13 +1771,13 @@ impl KjDispatcher {
         let content_str = content.unwrap_or_default();
         let declared_content_type = ContentType::from_mime(&content_type);
 
-        // Raster image content is a CAS-hash reference, never inline bytes
+        // Media content is a CAS-hash reference, never inline bytes
         // (see `BlockCreateArgs::content_type`'s doc). A caller can declare
-        // any `--content-type` and point `--content` at any string; sniff
-        // the referenced object's actual bytes and refuse loudly rather
-        // than label something that isn't a matching image as
-        // `ContentType::Image`.
-        if declared_content_type == ContentType::Image {
+        // any `--content-type` and point `--content` at any string; check
+        // the referenced object (an image's bytes by magic number, an audio
+        // or video object by its CAS-recorded type) and refuse loudly rather
+        // than label something that does not match as `ContentType::Media`.
+        if declared_content_type == ContentType::Media {
             if let Err(e) = self.validate_image_block_content(&content_type, &content_str) {
                 return KjResult::Err(format!("kj block create: {e}"));
             }
@@ -1812,10 +1812,12 @@ impl KjDispatcher {
         )
     }
 
-    /// Refuse `block create --content-type <image mime>` unless `content`
-    /// is a CAS hash whose referenced bytes actually sniff as that image
-    /// format. Header sniffing only — reads a small prefix off disk via
-    /// `ContentStore::path`, never the full object.
+    /// Refuse `block create --content-type <media mime>` unless `content`
+    /// is a CAS hash whose object is that media type. An image's bytes must
+    /// sniff as that image format (header sniffing only — reads a small
+    /// prefix off disk via `ContentStore::path`, never the full object). No
+    /// audio or video sniffer exists, so those types are checked against the
+    /// type the CAS recorded at store time.
     fn validate_image_block_content(
         &self,
         content_type: &str,
@@ -1828,6 +1830,20 @@ impl KjDispatcher {
             )
         })?;
         let cas = self.kernel().cas();
+        if content_type.starts_with("audio/") || content_type.starts_with("video/") {
+            let recorded = cas
+                .inspect(&hash)
+                .map_err(|e| format!("reading CAS record {hash}: {e}"))?
+                .ok_or_else(|| format!("CAS hash {hash} not found — cannot verify it is {content_type}"))?;
+            return if recorded.mime_type == content_type {
+                Ok(())
+            } else {
+                Err(format!(
+                    "declared type '{content_type}' but the CAS recorded '{}' for {hash}",
+                    recorded.mime_type
+                ))
+            };
+        }
         let obj_path = cas.path(&hash).ok_or_else(|| {
             format!("CAS hash {hash} not found — cannot verify it is a {content_type} image")
         })?;
@@ -3822,7 +3838,35 @@ mod tests {
 
         let snaps = d.block_store().block_snapshots(ctx).unwrap();
         assert_eq!(snaps.len(), 2, "both genuine images must have created blocks");
-        assert!(snaps.iter().all(|b| b.content_type == ContentType::Image));
+        assert!(snaps.iter().all(|b| b.content_type == ContentType::Media));
+    }
+
+    /// An audio object is accepted when the CAS recorded the declared type,
+    /// and refused when it recorded another.
+    #[tokio::test]
+    async fn block_create_checks_audio_against_the_cas_record() {
+        let d = test_dispatcher().await;
+        let ctx = register_context_with_doc(&d, Some("aud"), PrincipalId::new());
+        let caller = caller_with_context(ctx);
+        let wav = d.kernel().cas().store(b"RIFFfakewav", "audio/wav").expect("cas store");
+        let ogg = d.kernel().cas().store(b"OggSfake", "audio/ogg").expect("cas store");
+
+        let result = d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("asset"), s("--kind"), s("file"),
+            s("--content-type"), s("audio/wav"), s("--content"), ogg.to_string(),
+        ], &caller).await;
+        assert!(!result.is_ok(), "ogg declared as wav must be refused");
+        assert!(result.message().contains("audio/ogg"), "msg: {}", result.message());
+        assert!(d.block_store().block_snapshots(ctx).unwrap().is_empty());
+
+        let result = d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("asset"), s("--kind"), s("file"),
+            s("--content-type"), s("audio/wav"), s("--content"), wav.to_string(),
+        ], &caller).await;
+        assert!(result.is_ok(), "genuine wav create failed: {}", result.message());
+        let snaps = d.block_store().block_snapshots(ctx).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].content_type, ContentType::Media);
     }
 
     /// A caller-declared image type whose `--content` isn't even a CAS

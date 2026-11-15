@@ -4809,7 +4809,7 @@ mod tests {
         result.model_content = Some(serde_json::json!({"stdout": stdout, "exit_code": 0}).to_string());
         let result = put(result);
         let mut image = BlockSnapshot::text(BlockId::new(f.seat, f.banto, 1), None, Role::Asset, "cafebeef");
-        image.content_type = ContentType::Image;
+        image.content_type = ContentType::Media;
         put(image);
         let answer = put(BlockSnapshot::text(BlockId::new(f.seat, f.banto, 2), None, Role::Model, "the log is all Ls"));
 
@@ -4828,7 +4828,7 @@ mod tests {
         assert_eq!(carried(answer).map(|b| b.content).as_deref(), Some("the log is all Ls"));
         assert!(carried(call).is_some(), "the call is carried");
         assert!(!blocks.iter().any(|b| b.content == "OLD STANCE"), "the old instructions stay behind");
-        assert!(!blocks.iter().any(|b| b.content_type == ContentType::Image), "the image is dropped");
+        assert!(!blocks.iter().any(|b| b.content_type == ContentType::Media), "the image is dropped");
         assert!(
             blocks.iter().any(|b| b.role == Role::System && b.kind == BlockKind::Text && b.status == Status::Done),
             "the create lifecycle wrote fresh instructions"
@@ -4882,7 +4882,7 @@ mod tests {
             false, Some(0), Some(s("toolu_1")),
         ));
         let mut image = BlockSnapshot::text(BlockId::new(f.seat, f.banto, 2), None, Role::Asset, "cafebeef");
-        image.content_type = ContentType::Image;
+        image.content_type = ContentType::Media;
         put(image);
         put(BlockSnapshot::text(BlockId::new(f.seat, f.amy, 1), None, Role::User, "next"));
         result
@@ -4896,7 +4896,7 @@ mod tests {
         let carried = BlockId::new(successor, result.principal_id, result.seq);
         (
             blocks.iter().any(|b| b.kind == BlockKind::Thinking),
-            blocks.iter().any(|b| b.content_type == ContentType::Image),
+            blocks.iter().any(|b| b.content_type == ContentType::Media),
             blocks.iter().find(|b| b.id == carried).expect("the result is carried").content.clone(),
         )
     }

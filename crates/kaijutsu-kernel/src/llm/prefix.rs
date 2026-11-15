@@ -97,9 +97,9 @@ pub fn edit_cost_note(tokens: u64, thinking: usize) -> String {
     )
 }
 
-/// One message's fingerprint. An image counts by its content hash, not the
-/// bytes a provider resolved for it, so resolving an image again is not a
-/// change.
+/// One message's fingerprint. A media part counts by its content hash, not
+/// the bytes or the type the resolver filled from CAS, so resolving it again
+/// is not a change.
 fn fingerprint(message: &Message) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (message.role as u8).hash(&mut h);
@@ -113,10 +113,9 @@ fn fingerprint(message: &Message) -> u64 {
             1u8.hash(&mut h);
             for block in blocks {
                 match block {
-                    ContentBlock::Image { hash, media_type, .. } => {
-                        "image".hash(&mut h);
+                    ContentBlock::Media { hash, .. } => {
+                        "media".hash(&mut h);
                         hash.hash(&mut h);
-                        media_type.hash(&mut h);
                     }
                     other => serde_json::to_string(other).unwrap_or_default().hash(&mut h),
                 }
@@ -202,7 +201,7 @@ mod tests {
 
         let image = |data: Option<&str>| Message {
             role: super::super::Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::Image {
+            content: MessageContent::Blocks(vec![ContentBlock::Media {
                 hash: "abc".into(),
                 media_type: "image/png".into(),
                 data_base64: data.map(str::to_string),

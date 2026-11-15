@@ -462,16 +462,17 @@ impl HydrationState {
                 });
             }
             (BlockRole::Asset, BlockKind::Text) => {
-                // img_block / img_block_from_path — Asset role, content_type
-                // Image, content holds the CAS hash. Surface to vision-capable
-                // models as an Image content block; the server-side path
-                // resolves the hash to bytes before the request goes out.
-                if block.content_type == ContentType::Image {
+                // Asset role, content_type Media, content holds the CAS hash
+                // (image, audio, or video). Surface it as a Media content
+                // block; the server-side path resolves the hash to bytes and
+                // the CAS-recorded type before the request goes out, and each
+                // provider sends what its API reads.
+                if block.content_type == ContentType::Media {
                     let message = Message {
                         role: Role::User,
-                        content: MessageContent::Blocks(vec![ContentBlock::Image {
+                        content: MessageContent::Blocks(vec![ContentBlock::Media {
                             hash: block.content.clone(),
-                            media_type: ContentType::Image.as_mime().to_string(),
+                            media_type: ContentType::Media.as_mime().to_string(),
                             data_base64: None,
                         }]),
                         turn_scoped: false,
@@ -824,8 +825,13 @@ impl HydrationState {
     }
 }
 
+/// Flat token cost of one audio or video object in [`estimate_tokens`], used
+/// when the block's media type says audio or video. A placeholder: audio
+/// costs tokens by the second, and the estimator does not read the bytes.
+pub(crate) const ESTIMATED_TOKENS_PER_AUDIO_VIDEO: u64 = 6000;
+
 /// Flat per-image token cost used by [`estimate_tokens`]. Hydration leaves
-/// `data_base64` unresolved (`None`) on every `ContentBlock::Image` — the
+/// `data_base64` unresolved (`None`) on every `ContentBlock::Media` — the
 /// bytes live in CAS and aren't reachable from a pure `&[Message]` walk — so
 /// counting an image as 0 tokens would just lie about its real cost. ~1600
 /// tokens is a defensible flat estimate for a typical image attachment
@@ -862,7 +868,13 @@ fn estimate_block(block: &ContentBlock) -> u64 {
             bytes_to_tokens(name.len() + input_len)
         }
         ContentBlock::ToolResult { content, .. } => bytes_to_tokens(content.len()),
-        ContentBlock::Image { .. } => ESTIMATED_TOKENS_PER_IMAGE,
+        ContentBlock::Media { media_type, .. } => {
+            if media_type.starts_with("audio/") || media_type.starts_with("video/") {
+                ESTIMATED_TOKENS_PER_AUDIO_VIDEO
+            } else {
+                ESTIMATED_TOKENS_PER_IMAGE
+            }
+        }
     }
 }
 
@@ -1050,7 +1062,7 @@ mod pairing_repair_tests {
         let call = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 1), BlockKind::ToolCall)
             .role(BlockRole::Model).tool_name("view_image").tool_input("{}").tool_use_id("t1").build();
         let image = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 2), BlockKind::Text)
-            .role(BlockRole::Asset).content_type(ContentType::Image).content("deadbeef").build();
+            .role(BlockRole::Asset).content_type(ContentType::Media).content("deadbeef").build();
         let result = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 3), BlockKind::ToolResult)
             .role(BlockRole::Tool).parent_id(call.id).tool_call_id(call.id).tool_use_id("t1")
             .content("image attached").build();
@@ -1062,7 +1074,7 @@ mod pairing_repair_tests {
         assert!(matches!(&results[..], [ContentBlock::ToolResult { content, is_error: false, .. }]
             if content == "image attached"), "the real result, not a synthesized one: {wire:#}");
         let MessageContent::Blocks(tail) = &messages[2].content else { panic!("{wire:#}") };
-        assert!(matches!(&tail[..], [ContentBlock::Image { hash, .. }] if hash == "deadbeef"), "{wire:#}");
+        assert!(matches!(&tail[..], [ContentBlock::Media { hash, .. }] if hash == "deadbeef"), "{wire:#}");
         assert_eq!(messages.len(), 3, "{wire:#}");
     }
 
@@ -1465,7 +1477,7 @@ mod estimate_tokens_tests {
     fn image_block_uses_flat_constant_regardless_of_resolution() {
         let messages = vec![Message {
             role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::Image {
+            content: MessageContent::Blocks(vec![ContentBlock::Media {
                 hash: "deadbeef".to_string(),
                 media_type: "image/png".to_string(),
                 data_base64: None, // unresolved, as it always is at hydration time
@@ -1476,6 +1488,26 @@ mod estimate_tokens_tests {
             estimate_tokens(&messages),
             PER_MESSAGE_TOKEN_OVERHEAD + ESTIMATED_TOKENS_PER_IMAGE
         );
+    }
+
+    #[test]
+    fn audio_and_video_blocks_use_their_own_flat_constant() {
+        for media_type in ["audio/wav", "video/mp4"] {
+            let messages = vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Media {
+                    hash: "deadbeef".to_string(),
+                    media_type: media_type.to_string(),
+                    data_base64: None,
+                }]),
+                turn_scoped: false,
+            }];
+            assert_eq!(
+                estimate_tokens(&messages),
+                PER_MESSAGE_TOKEN_OVERHEAD + ESTIMATED_TOKENS_PER_AUDIO_VIDEO,
+                "{media_type}"
+            );
+        }
     }
 
     #[test]
@@ -1498,7 +1530,7 @@ mod estimate_tokens_tests {
                     input: tool_input,
                     signature: None,
                 },
-                ContentBlock::Image {
+                ContentBlock::Media {
                     hash: "abc123".to_string(),
                     media_type: "image/jpeg".to_string(),
                     data_base64: None,
@@ -1714,7 +1746,7 @@ mod withheld_thinking_tests {
                 ContentBlock::ToolUse { .. } => "tool_use",
                 ContentBlock::ToolResult { .. } => "tool_result",
                 ContentBlock::Text { .. } => "text",
-                ContentBlock::Image { .. } => "image",
+                ContentBlock::Media { .. } => "image",
             }).collect(),
         }).collect();
         assert_eq!(shapes, vec![

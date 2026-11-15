@@ -82,7 +82,7 @@ pub fn openable_diff(content_type: ContentType, text: &str) -> Option<OpenAs> {
                 inner: inner.to_string(),
             })
         }
-        ContentType::Markdown | ContentType::Abc | ContentType::Svg | ContentType::Image => None,
+        ContentType::Markdown | ContentType::Abc | ContentType::Svg | ContentType::Media => None,
     }
 }
 
@@ -560,7 +560,7 @@ mod tests {
             ContentType::Markdown,
             ContentType::Abc,
             ContentType::Svg,
-            ContentType::Image,
+            ContentType::Media,
         ] {
             assert_eq!(openable_diff(ct, &diffy), None, "{ct:?} must not open");
         }

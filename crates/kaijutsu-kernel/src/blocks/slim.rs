@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 /// The kinds of content a fork drops (`kj fork --drop`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DropSpec {
-    /// Asset image blocks.
+    /// Asset media blocks (image, audio, and video).
     pub images: bool,
     /// Thinking blocks, except those after the last person's text: that
     /// turn may be an open tool loop that must send them back.
@@ -69,7 +69,7 @@ impl DropReport {
 impl DropSpec {
     /// Whether the block leaves the child entirely.
     pub fn drops_block(&self, snap: &BlockSnapshot) -> bool {
-        (self.images && snap.role == Role::Asset && snap.content_type == ContentType::Image)
+        (self.images && snap.role == Role::Asset && snap.content_type == ContentType::Media)
             || (self.thinking && snap.kind == BlockKind::Thinking)
     }
 
@@ -351,7 +351,7 @@ mod tests {
     fn images_and_thinking_are_dropped_when_named() {
         let id = BlockId::new(ContextId::new(), PrincipalId::new(), 3);
         let mut image = BlockSnapshot::text(id, None, Role::Asset, "hash");
-        image.content_type = ContentType::Image;
+        image.content_type = ContentType::Media;
         let mut thinking = BlockSnapshot::text(id, None, Role::Model, "hmm");
         thinking.kind = BlockKind::Thinking;
         let text = BlockSnapshot::text(id, None, Role::Model, "hello");

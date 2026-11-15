@@ -49,11 +49,41 @@ From kaibo (deepseek) on `kaijutsu-council`:
 - **`refuses_thinking` misses `context.thinking`.** It matches `thinking` and
   `contexts[i].thinking`; a generation names its one context `context`.
   Unverified which name the nagaya sends.
-- **Only images are media blocks.** `ContentType` is closed: an image block
-  holds a CAS hash and the turn path takes its real type from the CAS record
-  (`resolve_image_blocks_from_cas`), but audio or video has no content type
-  and maps to `Plain`, so omni audio cannot reach a model
-  (`docs/shadows.md`, "Media blocks").
+- **Media blocks: producers still make images only.** `ContentType::Media`
+  holds a CAS hash of an image, audio, or video object, and the turn path takes
+  its real type from the CAS record (`resolve_media_blocks_from_cas`). The
+  attach paths (`img_block`, `img_block_from_path`, the view-image attach, and
+  `kj block create` for images) validate image bytes by magic number; no
+  producer sniffs audio or video bytes. `kj block create --content-type
+  audio/*|video/*` takes a hash whose CAS record has that type, and is the
+  only way an audio block reaches a model today. A derived sibling of an
+  `audio/*` timeline cell (including `audio/midi`) is a `Media` block, but it
+  is stamped ephemeral, so hydration never shows it to a model.
+- **No byte limit on audio or video blocks.** The 5 MiB cap lives only in the
+  image attach path (`MAX_ATTACHED_IMAGE_BYTES`, `mcp/servers/block.rs`);
+  `kj block create --content-type video/mp4` checks the CAS record and no
+  size, and the resolver encodes the whole object.
+- **Audio and video bytes sit base64 in memory per turn.** The resolver fills
+  `data_base64` for every media block, and `MediaBase64Cache` is bounded by
+  entry count, not bytes, so a few long clips can hold far more than a few
+  screenshots.
+- **Audio costs tokens by the second.** `estimate_tokens` charges every audio
+  or video block the flat `ESTIMATED_TOKENS_PER_AUDIO_VIDEO`, and it sees the
+  type only once the resolver has run; an unresolved block counts as an image.
+  `prefix::edit_cost`, behind the cost notes of `kj stage exclude` and
+  `kj fork`, estimates unresolved hydration, so it charges audio and video as
+  images.
+- **The request dump keeps Gemini's media.** `request_dump::elide_images`
+  knows Anthropic's base64 source and `data:` URLs, not Gemini's
+  `inlineData`, so a Gemini dump holds the whole base64 body under a header
+  that says images are elided.
+- **Gemini sends images only.** Its API reads audio and video inline; the
+  builder (`llm/gemini/build.rs`) writes a marker for them. Gemini omni models
+  will want them (Amy, 2026-11-15: "keep in mind we will add gemini based omni
+  models down the road").
+- **The `images` fork filter drops audio and video too.** `kj fork --drop
+  images` matches every Asset `Media` block; the filter name and
+  `docs/fork-filters.md` still say image.
 - **Kaijutsu's CAS ids are 128 bits.** `ContentHash` keeps half of BLAKE3,
   so every council object id is computed again from the bytes. Amy,
   2026-11-15: "at some point maybe kaijutsu should use the full blake3 ids".

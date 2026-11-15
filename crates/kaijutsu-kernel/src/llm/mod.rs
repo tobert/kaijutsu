@@ -38,7 +38,7 @@ pub mod endpoint;
 pub mod gemini;
 pub(crate) mod hydrate;
 pub mod prefix;
-pub mod image_cache;
+pub mod media_cache;
 pub mod mailbox;
 pub mod openai;
 pub mod request_dump;
@@ -311,14 +311,17 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
-    /// Image content referenced by CAS hash.
+    /// Media content (image, audio, or video) referenced by CAS hash.
+    ///
+    /// `media_type` is the CAS-recorded type once resolved; before that it is
+    /// the hydrator's `ContentType::Media` marker, which names no real type.
     ///
     /// `data_base64` is `None` immediately after hydration — the hydrator
     /// is a pure function of `BlockSnapshot` and has no CAS access. The
     /// server-side path resolves the hash and fills `data_base64` before
     /// the request hits the LLM provider. Provider `build()` falls back to a
     /// text marker when resolution failed.
-    Image {
+    Media {
         hash: String,
         media_type: String,
         data_base64: Option<String>,
@@ -887,8 +890,8 @@ fn flatten_codex_content(content: &MessageContent) -> String {
                 ContentBlock::ToolResult { content, is_error, .. } => {
                     format!("tool result (error={is_error}): {content}")
                 }
-                ContentBlock::Image { hash, media_type, .. } => {
-                    format!("[image {media_type}, CAS {hash}]")
+                ContentBlock::Media { hash, media_type, .. } => {
+                    format!("[media {media_type}, CAS {hash}]")
                 }
                 ContentBlock::Reasoning { text, .. } => format!("[reasoning] {text}"),
             })
@@ -1570,30 +1573,64 @@ impl LlmRegistry {
 // Hydration: BlockSnapshot[] → Message[]
 // ============================================================================
 
-/// Resolve `ContentBlock::Image` placeholders against a content store.
+/// The image bytes of a media part a provider that reads only images can
+/// send, or the marker text that stands in for the part and says why it was
+/// left out. Bytes that were not found, and a type that is not an image,
+/// each get their own reason.
+pub(crate) fn image_or_marker<'a>(
+    hash: &str,
+    media_type: &str,
+    data_base64: Option<&'a str>,
+) -> Result<&'a str, String> {
+    match data_base64 {
+        Some(data) if !data.is_empty() && !media_type_is_recorded(media_type) => Err(format!(
+            "[media {hash} ({media_type}) omitted: {UNRECORDED_MEDIA_TYPE}]"
+        )),
+        Some(data) if !data.is_empty() && media_type.starts_with("image/") => Ok(data),
+        Some(data) if !data.is_empty() => Err(format!(
+            "[media {hash} ({media_type}) omitted: this provider reads images only]"
+        )),
+        _ => Err(format!(
+            "[media {hash} ({media_type}) omitted: its bytes were not found]"
+        )),
+    }
+}
+
+/// Why a media part whose CAS record names no type is left out. The block
+/// carries no type of its own, so the bytes cannot be labeled for a provider.
+pub(crate) const UNRECORDED_MEDIA_TYPE: &str = "its media type is not recorded in CAS";
+
+/// Whether `media_type` is a type the CAS record named. The hydrator's
+/// generic marker survives when the record cannot be read, and a record
+/// written without a type reads as `application/octet-stream`.
+pub(crate) fn media_type_is_recorded(media_type: &str) -> bool {
+    media_type != kaijutsu_types::ContentType::Media.as_mime() && media_type != "application/octet-stream"
+}
+
+/// Resolve `ContentBlock::Media` placeholders against a content store.
 ///
-/// The hydrator emits image blocks with `data_base64: None` because it has no
+/// The hydrator emits media blocks with `data_base64: None` because it has no
 /// CAS access. Callers (typically the LLM stream pipeline) invoke this
 /// helper to fill the data before passing messages to the provider. Unknown
 /// hashes and CAS errors are tolerated: the block stays unfilled, and
 /// the provider's `build()` falls back to a text marker so the model knows
-/// an image existed at that turn.
+/// a media object existed at that turn.
 ///
 /// CAS reads use blocking `std::fs` (see `kaijutsu_cas::FileStore`), so each
-/// image is read on a `spawn_blocking` worker — keeps the tokio runtime
-/// responsive when a long-history conversation re-encodes many images per
+/// media object is read on a `spawn_blocking` worker — keeps the tokio runtime
+/// responsive when a long-history conversation re-encodes many objects per
 /// prompt.
 ///
 /// When `cache` is `Some`, already-resolved hashes skip the disk read and
 /// base64 encode entirely. Hashes are content-addressed, so a global cache
 /// across contexts is correct.
-pub async fn resolve_image_blocks_from_cas(
+pub async fn resolve_media_blocks_from_cas(
     messages: &mut [Message],
     cas: std::sync::Arc<dyn kaijutsu_cas::ContentStore>,
-    cache: Option<&image_cache::ImageBase64Cache>,
+    cache: Option<&media_cache::MediaBase64Cache>,
 ) {
     use base64::Engine;
-    use image_cache::ResolvedImage;
+    use media_cache::ResolvedMedia;
     use kaijutsu_cas::ContentHash;
 
     for msg in messages.iter_mut() {
@@ -1601,7 +1638,7 @@ pub async fn resolve_image_blocks_from_cas(
             continue;
         };
         for block in blocks.iter_mut() {
-            let ContentBlock::Image {
+            let ContentBlock::Media {
                 hash,
                 media_type,
                 data_base64,
@@ -1625,7 +1662,7 @@ pub async fn resolve_image_blocks_from_cas(
             }
             // Both inspect (sidecar mime) and retrieve (object bytes) are
             // blocking std::fs reads — bundle them into one spawn_blocking
-            // so the runtime stays responsive even for stacks of images.
+            // so the runtime stays responsive even for stacks of media.
             let cas_for_task = cas.clone();
             let parsed_for_task = parsed.clone();
             let join = tokio::task::spawn_blocking(move || {
@@ -1648,7 +1685,7 @@ pub async fn resolve_image_blocks_from_cas(
                 if let Some(cache) = cache {
                     cache.insert(
                         parsed,
-                        ResolvedImage {
+                        ResolvedMedia {
                             mime_type: media_type.clone(),
                             data_base64: encoded.clone(),
                         },
@@ -1710,6 +1747,20 @@ pub(crate) fn hydrate_in_form(blocks: &[kaijutsu_types::BlockSnapshot], form: hy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider sends an image whose type CAS recorded, and names the real
+    /// reason for any other part: an unrecorded type is not called "not an
+    /// image".
+    #[test]
+    fn image_or_marker_names_why_a_part_is_left_out() {
+        assert_eq!(image_or_marker("h", "image/jpeg", Some("AAAA")), Ok("AAAA"));
+        for unrecorded in [kaijutsu_types::ContentType::Media.as_mime(), "application/octet-stream"] {
+            let why = image_or_marker("h", unrecorded, Some("AAAA")).unwrap_err();
+            assert!(why.contains("its media type is not recorded in CAS"), "{why}");
+        }
+        assert!(image_or_marker("h", "audio/wav", Some("AAAA")).unwrap_err().contains("reads images only"));
+        assert!(image_or_marker("h", "image/png", None).unwrap_err().contains("bytes were not found"));
+    }
 
     /// A control list rides to a council backend only. Every other provider
     /// refuses it before any request leaves.
@@ -4560,7 +4611,31 @@ mod tests {
             );
         }
 
-        // ── Role::Asset image hydration (A2) ──
+        // ── Role::Asset media hydration (A2) ──
+
+        /// An audio object's block, typed from its mime, hydrates as a
+        /// Media part like an image does.
+        #[test]
+        fn asset_audio_block_hydrates_as_media_content_block() {
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(ctx(), model(), 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Asset)
+            .content("abcdef0123456789")
+            .content_type(kaijutsu_types::ContentType::from_mime("audio/wav"))
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "an audio Asset block must hydrate");
+            let MessageContent::Blocks(blocks) = &msgs[0].content else {
+                panic!("Expected Blocks, got {:?}", msgs[0].content)
+            };
+            assert!(matches!(
+                &blocks[..],
+                [ContentBlock::Media { hash, data_base64: None, .. }] if hash == "abcdef0123456789"
+            ), "{blocks:?}");
+        }
 
         #[test]
         fn asset_image_block_hydrates_as_image_content_block() {
@@ -4574,7 +4649,7 @@ mod tests {
             )
             .role(BlockRole::Asset)
             .content("abcdef0123456789")
-            .content_type(kaijutsu_types::ContentType::Image)
+            .content_type(kaijutsu_types::ContentType::Media)
             .build();
 
             let msgs = hydrate_from_blocks(&[block]);
@@ -4584,22 +4659,23 @@ mod tests {
                 MessageContent::Blocks(blocks) => {
                     assert_eq!(blocks.len(), 1);
                     match &blocks[0] {
-                        ContentBlock::Image {
+                        ContentBlock::Media {
                             hash,
                             media_type,
                             data_base64,
                         } => {
                             assert_eq!(hash, "abcdef0123456789");
-                            assert!(
-                                media_type.starts_with("image/"),
-                                "media_type should look like a MIME image type, got: {media_type}"
+                            assert_eq!(
+                                media_type,
+                                kaijutsu_types::ContentType::Media.as_mime(),
+                                "the hydrator names no real type; the CAS record does"
                             );
                             assert!(
                                 data_base64.is_none(),
                                 "hydrator emits hash only; CAS resolution happens later"
                             );
                         }
-                        other => panic!("Expected ContentBlock::Image, got {other:?}"),
+                        other => panic!("Expected ContentBlock::Media, got {other:?}"),
                     }
                 }
                 other => panic!("Expected Blocks, got {other:?}"),
@@ -4607,7 +4683,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn resolve_image_blocks_fills_data_from_cas() {
+        async fn resolve_media_blocks_fills_data_from_cas() {
             use kaijutsu_cas::{ContentStore, FileStore};
             let tmp = tempfile::tempdir().unwrap();
             let cas: std::sync::Arc<dyn ContentStore> =
@@ -4623,17 +4699,17 @@ mod tests {
             let hash = cas.store(png_bytes, "image/png").unwrap();
             let mut messages = vec![Message {
                 role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::Image {
+                content: MessageContent::Blocks(vec![ContentBlock::Media {
                     hash: hash.to_string(),
                     media_type: "image/png".to_string(),
                     data_base64: None,
                 }]),
                 turn_scoped: false,
             }];
-            resolve_image_blocks_from_cas(&mut messages, cas, None).await;
+            resolve_media_blocks_from_cas(&mut messages, cas, None).await;
             match &messages[0].content {
                 MessageContent::Blocks(blocks) => match &blocks[0] {
-                    ContentBlock::Image { data_base64, .. } => {
+                    ContentBlock::Media { data_base64, .. } => {
                         assert!(
                             data_base64.is_some(),
                             "data_base64 must be filled after resolve"
@@ -4646,25 +4722,52 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn resolve_image_blocks_tolerates_missing_hash() {
+        async fn resolve_media_blocks_fills_audio_type_and_bytes_from_cas() {
+            use kaijutsu_cas::{ContentStore, FileStore};
+            let tmp = tempfile::tempdir().unwrap();
+            let cas: std::sync::Arc<dyn ContentStore> =
+                std::sync::Arc::new(FileStore::at_path(tmp.path()));
+            let hash = cas.store(b"RIFFfakewav", "audio/wav").unwrap();
+            let mut messages = vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Media {
+                    hash: hash.to_string(),
+                    media_type: kaijutsu_types::ContentType::Media.as_mime().to_string(),
+                    data_base64: None,
+                }]),
+                turn_scoped: false,
+            }];
+            resolve_media_blocks_from_cas(&mut messages, cas, None).await;
+            let MessageContent::Blocks(blocks) = &messages[0].content else { panic!() };
+            match &blocks[0] {
+                ContentBlock::Media { media_type, data_base64, .. } => {
+                    assert_eq!(media_type, "audio/wav");
+                    assert!(data_base64.as_deref().is_some_and(|d| !d.is_empty()));
+                }
+                other => panic!("expected Media, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn resolve_media_blocks_tolerates_missing_hash() {
             use kaijutsu_cas::{ContentStore, FileStore};
             let tmp = tempfile::tempdir().unwrap();
             let cas: std::sync::Arc<dyn ContentStore> =
                 std::sync::Arc::new(FileStore::at_path(tmp.path()));
             let mut messages = vec![Message {
                 role: Role::User,
-                content: MessageContent::Blocks(vec![ContentBlock::Image {
-                    hash: "0".repeat(64),
+                content: MessageContent::Blocks(vec![ContentBlock::Media {
+                    hash: "0".repeat(32),
                     media_type: "image/png".to_string(),
                     data_base64: None,
                 }]),
                 turn_scoped: false,
             }];
             // Should not panic, should leave block unresolved.
-            resolve_image_blocks_from_cas(&mut messages, cas, None).await;
+            resolve_media_blocks_from_cas(&mut messages, cas, None).await;
             match &messages[0].content {
                 MessageContent::Blocks(blocks) => match &blocks[0] {
-                    ContentBlock::Image { data_base64, .. } => {
+                    ContentBlock::Media { data_base64, .. } => {
                         assert!(data_base64.is_none(), "missing hash stays unresolved");
                     }
                     _ => panic!(),
@@ -4734,7 +4837,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn resolve_image_blocks_uses_cache_on_second_call() {
+        async fn resolve_media_blocks_uses_cache_on_second_call() {
             use kaijutsu_cas::{ContentStore, FileStore};
             let tmp = tempfile::tempdir().unwrap();
             let backing: std::sync::Arc<dyn ContentStore> =
@@ -4749,12 +4852,12 @@ mod tests {
             let hash = backing.store(png_bytes, "image/png").unwrap();
             let counting = std::sync::Arc::new(CountingStore::new(backing));
             let cas: std::sync::Arc<dyn ContentStore> = counting.clone();
-            let cache = image_cache::ImageBase64Cache::new(8);
+            let cache = media_cache::MediaBase64Cache::new(8);
 
             let make_msgs = || {
                 vec![Message {
                     role: Role::User,
-                    content: MessageContent::Blocks(vec![ContentBlock::Image {
+                    content: MessageContent::Blocks(vec![ContentBlock::Media {
                         hash: hash.to_string(),
                         media_type: "image/png".to_string(),
                         data_base64: None,
@@ -4764,18 +4867,18 @@ mod tests {
             };
 
             let mut first = make_msgs();
-            resolve_image_blocks_from_cas(&mut first, cas.clone(), Some(&cache)).await;
+            resolve_media_blocks_from_cas(&mut first, cas.clone(), Some(&cache)).await;
             assert_eq!(counting.retrieves(), 1, "first resolve must read CAS once");
             assert_eq!(counting.inspects(), 1, "first resolve must inspect once");
 
             let mut second = make_msgs();
-            resolve_image_blocks_from_cas(&mut second, cas.clone(), Some(&cache)).await;
+            resolve_media_blocks_from_cas(&mut second, cas.clone(), Some(&cache)).await;
             assert_eq!(counting.retrieves(), 1, "cached resolve must skip CAS");
             assert_eq!(counting.inspects(), 1, "cached resolve must skip inspect");
 
             match &second[0].content {
                 MessageContent::Blocks(blocks) => match &blocks[0] {
-                    ContentBlock::Image { data_base64, .. } => assert!(
+                    ContentBlock::Media { data_base64, .. } => assert!(
                         data_base64.is_some(),
                         "cached resolve must still fill data_base64"
                     ),
@@ -4787,7 +4890,7 @@ mod tests {
 
         #[test]
         fn asset_text_plain_still_skipped() {
-            // Asset role with non-Image content_type is not produced by any
+            // Asset role with non-Media content_type is not produced by any
             // current engine; skip to avoid surfacing arbitrary asset prose.
             let c = ctx();
             let m = model();

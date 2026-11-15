@@ -140,16 +140,20 @@ fn build_user_block(
                 ..Default::default()
             })
         }
-        ContentBlock::Image { hash, media_type, data_base64 } => match data_base64.as_deref() {
-            Some(data) if !data.is_empty() => Some(Part {
-                inline_data: Some(InlineData {
-                    mime_type: media_type.clone(),
-                    data: data.to_string(),
+        // Gemini's API reads audio and video inline too; this builder sends
+        // images only until a Gemini omni model needs the rest.
+        ContentBlock::Media { hash, media_type, data_base64 } => {
+            match crate::llm::image_or_marker(hash, media_type, data_base64.as_deref()) {
+                Ok(data) => Some(Part {
+                    inline_data: Some(InlineData {
+                        mime_type: media_type.clone(),
+                        data: data.to_string(),
+                    }),
+                    ..Default::default()
                 }),
-                ..Default::default()
-            }),
-            _ => Some(Part::text(format!("[image hash={hash} mime={media_type} unavailable]"))),
-        },
+                Err(marker) => Some(Part::text(marker)),
+            }
+        }
         ContentBlock::ToolUse { .. } | ContentBlock::Reasoning { .. } => None,
     }
 }
@@ -192,7 +196,7 @@ fn build_assistant_block(
                 ..Default::default()
             })
         }
-        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => None,
+        ContentBlock::ToolResult { .. } | ContentBlock::Media { .. } => None,
     }
 }
 

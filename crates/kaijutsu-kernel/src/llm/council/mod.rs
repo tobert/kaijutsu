@@ -539,7 +539,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Blocks(vec![
                 ContentBlock::Text { text: "look".into() },
-                ContentBlock::Image {
+                ContentBlock::Media {
                     hash: kaijutsu_cas::ContentHash::from_data(PICTURE).to_string(),
                     media_type: "image/png".into(),
                     data_base64: Some(base64::engine::general_purpose::STANDARD.encode(PICTURE)),
@@ -591,6 +591,87 @@ mod tests {
         assert_eq!(user["content"], json!([{"type": "text", "text": "look"}, {"type": "object", "id": id, "mime": "image/png"}]));
     }
 
+    /// A user message that says `listen` and carries `CLIP` as a resolved
+    /// CAS audio object.
+    const CLIP: &[u8] = b"not really a wav";
+
+    fn listen_to_clip() -> Message {
+        use base64::Engine as _;
+        Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text { text: "listen".into() },
+                ContentBlock::Media {
+                    hash: kaijutsu_cas::ContentHash::from_data(CLIP).to_string(),
+                    media_type: "audio/wav".into(),
+                    data_base64: Some(base64::engine::general_purpose::STANDARD.encode(CLIP)),
+                },
+            ]),
+            turn_scoped: false,
+        }
+    }
+
+    /// An audio object the served model reads goes as an object part with its
+    /// own media type.
+    ///
+    /// Falsified by a place step that only sends images.
+    #[tokio::test]
+    async fn audio_the_model_reads_is_put_and_sent_as_an_object() {
+        let id = gogi_proto::content_id(CLIP);
+        let (base, seen) = serve(vec![
+            serving_media(json!(["objects"]), json!(["audio/wav"])),
+            http(404, ""),
+            http(201, json!({"id": id, "mime": "audio/wav", "bytes": CLIP.len()}).to_string()),
+            generation("a tone", json!([]), 2),
+        ])
+        .await;
+        drain(&mut client(&base).stream(opts(64), vec![listen_to_clip()]).await.unwrap()).await;
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[2].header("content-type"), Some("audio/wav"));
+            assert_eq!(seen[2].body.as_bytes(), CLIP);
+        }
+        let body = &bodies(&seen, "/council/v2/generations")[0];
+        let user = body["context"]["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "user").unwrap().clone();
+        assert_eq!(user["content"], json!([{"type": "text", "text": "listen"}, {"type": "object", "id": id, "mime": "audio/wav"}]));
+    }
+
+    /// Media whose CAS record names no type keeps the resolver's bytes but
+    /// no label, so it is a marker that says the type is not recorded, not a
+    /// claim about what the model reads, and nothing is put.
+    #[tokio::test]
+    async fn media_whose_type_is_not_recorded_is_a_marker_that_says_so() {
+        for unrecorded in [kaijutsu_types::ContentType::Media.as_mime(), "application/octet-stream"] {
+            let mut message = look_at_picture();
+            if let MessageContent::Blocks(blocks) = &mut message.content
+                && let Some(ContentBlock::Media { media_type, .. }) = blocks.get_mut(1)
+            {
+                *media_type = unrecorded.to_string();
+            }
+            let (base, seen) = serve(vec![serving_media(json!(["objects"]), json!(["image/png"])), generation("ok", json!([]), 2)]).await;
+            drain(&mut client(&base).stream(opts(64), vec![message]).await.unwrap()).await;
+            let methods: Vec<String> = seen.lock().unwrap().iter().map(|c| c.method.clone()).collect();
+            assert_eq!(methods, ["GET", "POST"], "{unrecorded}");
+            let body = &bodies(&seen, "/council/v2/generations")[0];
+            let user = body["context"]["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "user").unwrap().clone();
+            let text = user["content"].as_str().unwrap_or_default().to_string();
+            assert!(text.contains("its media type is not recorded in CAS"), "{unrecorded}: {text}");
+        }
+    }
+
+    /// Audio the served model does not read is a marker that names its type.
+    #[tokio::test]
+    async fn audio_the_model_cannot_read_is_a_marker_naming_its_type() {
+        let (base, seen) = serve(vec![serving_media(json!(["objects"]), json!(["image/png"])), generation("ok", json!([]), 2)]).await;
+        drain(&mut client(&base).stream(opts(64), vec![listen_to_clip()]).await.unwrap()).await;
+        let methods: Vec<String> = seen.lock().unwrap().iter().map(|c| c.method.clone()).collect();
+        assert_eq!(methods, ["GET", "POST"]);
+        let body = &bodies(&seen, "/council/v2/generations")[0];
+        let user = body["context"]["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "user").unwrap().clone();
+        let text = user["content"].as_str().unwrap_or_default().to_string();
+        assert!(text.starts_with("listen\n[media ") && text.contains("(audio/wav)") && text.contains("does not read audio/wav"), "{text}");
+    }
+
     /// An image the server already holds is not put again.
     #[tokio::test]
     async fn a_held_image_is_not_put_again() {
@@ -621,7 +702,7 @@ mod tests {
             let body = &bodies(&seen, "/council/v2/generations")[0];
             let user = body["context"]["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "user").unwrap().clone();
             let text = user["content"].as_str().unwrap_or_default().to_string();
-            assert!(text.starts_with("look\n[image ") && text.contains(why), "{text}");
+            assert!(text.starts_with("look\n[media ") && text.contains(why), "{text}");
         }
     }
 

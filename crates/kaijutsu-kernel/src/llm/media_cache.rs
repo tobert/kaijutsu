@@ -1,11 +1,11 @@
-//! Per-hash cache of CAS image bytes encoded as base64 + their stored MIME.
+//! Per-hash cache of CAS media bytes encoded as base64 + their stored MIME.
 //!
-//! `resolve_image_blocks_from_cas` is called once per turn. Without a cache,
-//! every screenshot in a long conversation is read from disk and
+//! `resolve_media_blocks_from_cas` is called once per turn. Without a cache,
+//! every image, audio clip, or video in a long conversation is read from disk and
 //! base64-encoded again on every prompt. Hashes are content-addressed, so a
 //! global per-kernel cache is correct (the same hash never maps to different
 //! bytes), and bounding the entry count keeps memory predictable even when
-//! a long-lived process accumulates novel images.
+//! a long-lived process accumulates novel media.
 
 use dashmap::DashMap;
 use kaijutsu_cas::ContentHash;
@@ -13,26 +13,26 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-/// Resolved image payload — what the resolver needs to fill into a
-/// `ContentBlock::Image`.
+/// Resolved media payload — what the resolver needs to fill into a
+/// `ContentBlock::Media`.
 #[derive(Debug, Clone)]
-pub struct ResolvedImage {
+pub struct ResolvedMedia {
     pub mime_type: String,
     pub data_base64: String,
 }
 
-/// Bounded cache of resolved images keyed by content hash.
+/// Bounded cache of resolved media keyed by content hash.
 ///
 /// Eviction is FIFO insertion-order — fine for the workload (a turn either
-/// re-encodes every image in the conversation or it doesn't; access
+/// re-encodes every media object in the conversation or it doesn't; access
 /// patterns don't favour LRU enough to justify the bookkeeping).
-pub struct ImageBase64Cache {
-    entries: DashMap<ContentHash, ResolvedImage>,
+pub struct MediaBase64Cache {
+    entries: DashMap<ContentHash, ResolvedMedia>,
     order: Mutex<VecDeque<ContentHash>>,
     capacity: usize,
 }
 
-impl ImageBase64Cache {
+impl MediaBase64Cache {
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: DashMap::new(),
@@ -43,13 +43,13 @@ impl ImageBase64Cache {
 
     /// Read a cached entry. Returns a clone so callers can drop the dashmap
     /// guard before doing async work.
-    pub fn get(&self, hash: &ContentHash) -> Option<ResolvedImage> {
+    pub fn get(&self, hash: &ContentHash) -> Option<ResolvedMedia> {
         self.entries.get(hash).map(|e| e.clone())
     }
 
     /// Insert a freshly resolved entry. If the cache is at capacity, the
     /// oldest entry is evicted.
-    pub fn insert(&self, hash: ContentHash, image: ResolvedImage) {
+    pub fn insert(&self, hash: ContentHash, image: ResolvedMedia) {
         if self.entries.contains_key(&hash) {
             // Don't bump order on overwrite — duplicate inserts of the same
             // hash always carry the same bytes (content-addressed), so the
@@ -84,7 +84,7 @@ impl ImageBase64Cache {
 
 /// Shared handle, since the cache is owned by server state and threaded
 /// into the resolver from per-stream tasks.
-pub type SharedImageBase64Cache = Arc<ImageBase64Cache>;
+pub type SharedMediaBase64Cache = Arc<MediaBase64Cache>;
 
 #[cfg(test)]
 mod tests {
@@ -99,11 +99,11 @@ mod tests {
 
     #[test]
     fn insert_then_get_returns_payload() {
-        let cache = ImageBase64Cache::new(4);
+        let cache = MediaBase64Cache::new(4);
         let h = sample_hash(1);
         cache.insert(
             h.clone(),
-            ResolvedImage {
+            ResolvedMedia {
                 mime_type: "image/png".into(),
                 data_base64: "AAAA".into(),
             },
@@ -115,17 +115,17 @@ mod tests {
 
     #[test]
     fn miss_returns_none() {
-        let cache = ImageBase64Cache::new(4);
+        let cache = MediaBase64Cache::new(4);
         assert!(cache.get(&sample_hash(2)).is_none());
     }
 
     #[test]
     fn fifo_eviction_when_over_capacity() {
-        let cache = ImageBase64Cache::new(2);
+        let cache = MediaBase64Cache::new(2);
         let a = sample_hash(1);
         let b = sample_hash(2);
         let c = sample_hash(3);
-        let mk = |s: &str| ResolvedImage {
+        let mk = |s: &str| ResolvedMedia {
             mime_type: "image/png".into(),
             data_base64: s.into(),
         };
@@ -145,10 +145,10 @@ mod tests {
     fn duplicate_insert_is_noop() {
         // Same hash means same bytes by CAS invariant — a second insert
         // must not consume an extra slot or reorder eviction.
-        let cache = ImageBase64Cache::new(2);
+        let cache = MediaBase64Cache::new(2);
         let a = sample_hash(1);
         let b = sample_hash(2);
-        let mk = |s: &str| ResolvedImage {
+        let mk = |s: &str| ResolvedMedia {
             mime_type: "image/png".into(),
             data_base64: s.into(),
         };

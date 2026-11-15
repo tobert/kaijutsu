@@ -90,7 +90,7 @@ fn image_blocks(kernel: &Kernel, context: ContextId) -> Vec<BlockSnapshot> {
         .block_snapshots(context)
         .expect("read the blocks")
         .into_iter()
-        .filter(|b| b.role == Role::Asset && b.content_type == ContentType::Image)
+        .filter(|b| b.role == Role::Asset && b.content_type == ContentType::Media)
         .collect()
 }
 
@@ -128,7 +128,7 @@ async fn a_typed_image_becomes_an_image_block_and_a_short_line() {
     let blocks = kernel.blocks().block_snapshots(context).unwrap();
     let hydrated = serde_json::to_string(&kaijutsu_kernel::llm::hydrate_from_blocks(&blocks)).unwrap();
     assert!(
-        hydrated.contains(&images[0].content) && hydrated.contains("\"Image\""),
+        hydrated.contains(&images[0].content) && hydrated.contains("\"Media\""),
         "the conversation carries an image content block: {hydrated}"
     );
 }

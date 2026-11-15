@@ -176,7 +176,7 @@ pub fn diff_profile_for(content_type: ContentType) -> kaijutsu_diff::DiffProfile
         ContentType::Diff | ContentType::Plain => DiffProfile::LineWord,
         ContentType::Markdown => DiffProfile::LineWord,
         ContentType::Abc => DiffProfile::LineWord,
-        ContentType::Svg | ContentType::Image => DiffProfile::LineWord,
+        ContentType::Svg | ContentType::Media => DiffProfile::LineWord,
     }
 }
 

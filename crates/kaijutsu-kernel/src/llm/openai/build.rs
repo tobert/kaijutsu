@@ -288,19 +288,19 @@ fn translate_user(msg: &Message, out: &mut Vec<RequestMessage>) {
                         out.push(RequestMessage::tool_result(tool_use_id.clone(), body));
                     }
                     ContentBlock::Text { text } => parts.push(ContentPart::text(text.clone())),
-                    ContentBlock::Image {
+                    ContentBlock::Media {
                         hash,
                         media_type,
                         data_base64,
-                    } => match data_base64 {
-                        Some(data) => parts.push(ContentPart::ImageUrl {
+                    } => match crate::llm::image_or_marker(hash, media_type, data_base64.as_deref()) {
+                        Ok(data) => parts.push(ContentPart::ImageUrl {
                             image_url: ImageUrl {
                                 url: format!("data:{media_type};base64,{data}"),
                             },
                         }),
-                        // Unresolved CAS hash — surface a marker instead of
-                        // dropping the turn's reference silently.
-                        None => parts.push(ContentPart::text(format!("[image {hash} unavailable]"))),
+                        // Unresolved or non-image media — surface a marker
+                        // instead of dropping the turn's reference silently.
+                        Err(marker) => parts.push(ContentPart::text(marker)),
                     },
                     // A user turn carrying ToolUse / Reasoning is nonsensical
                     // (those are assistant-side); ignore defensively.
@@ -392,7 +392,7 @@ fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, dialect: Di
                     }
                     // Tool results never appear in an assistant turn.
                     ContentBlock::ToolResult { .. } => {}
-                    ContentBlock::Image { .. } => {}
+                    ContentBlock::Media { .. } => {}
                 }
             }
             // Real reasoning rides verbatim, except to hosted OpenAI, which
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn resolved_image_becomes_data_url_part() {
-        let msg = Message::tool_results(vec![ContentBlock::Image {
+        let msg = Message::tool_results(vec![ContentBlock::Media {
             hash: "abc123".into(),
             media_type: "image/png".into(),
             data_base64: Some("QUJD".into()),
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn unresolved_image_surfaces_marker_not_silent_drop() {
-        let msg = Message::tool_results(vec![ContentBlock::Image {
+        let msg = Message::tool_results(vec![ContentBlock::Media {
             hash: "deadbeef".into(),
             media_type: "image/png".into(),
             data_base64: None,
@@ -706,7 +706,20 @@ mod tests {
         // single text part collapses to a plain string
         let content = v["messages"][0]["content"].as_str().unwrap();
         assert!(content.contains("deadbeef"));
-        assert!(content.contains("unavailable"));
+        assert!(content.contains("omitted"));
+    }
+
+    #[test]
+    fn audio_surfaces_a_marker_naming_its_type() {
+        let msg = Message::tool_results(vec![ContentBlock::Media {
+            hash: "deadbeef".into(),
+            media_type: "audio/wav".into(),
+            data_base64: Some("QUJD".into()),
+        }]);
+        let req = build_request(&opts(), &[msg], false, true);
+        let v = serde_json::to_value(&req).unwrap();
+        let content = v["messages"][0]["content"].as_str().unwrap();
+        assert!(content.contains("audio/wav") && content.contains("images only"), "{content}");
     }
 
     /// The request carries the `max_tokens` its caller built it with and

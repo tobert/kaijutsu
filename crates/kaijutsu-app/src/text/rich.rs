@@ -52,7 +52,7 @@ pub struct SpanBrush {
 /// conversation surface (`view::surface::rich`/`shape_cache`) turns it into
 /// MSDF glyphs (Markdown, Output), MSDF glyphs + geometry (Abc), a cached
 /// CPU raster drawn as a textured quad (Svg, via `text::svg_raster`), or
-/// chrome-drawn placeholder geometry (Sparkline, Image).
+/// chrome-drawn placeholder geometry (Sparkline, Media).
 #[derive(Component)]
 pub struct RichContent {
     pub kind: RichContentKind,
@@ -105,9 +105,9 @@ pub enum RichContentKind {
         /// Whitespace-padded measurement text (same as UiVelloText.value).
         plain_text: String,
     },
-    /// Raster image stored in CAS by hash. The block text is the 32-char hex hash.
+    /// Media object (image, audio, or video) stored in CAS by hash. The block text is the 32-char hex hash.
     /// Actual decoding happens in the render pass where Bevy Commands are available.
-    Image {
+    Media {
         hash: String,
     },
 }
@@ -545,7 +545,7 @@ fn hash_output_nodes<H: std::hash::Hasher>(nodes: &[OutputNode], hasher: &mut H)
 /// - `ContentType::Markdown` → parse as markdown directly (cannot fail)
 /// - `ContentType::Abc` → parse as ABC notation directly (generous parser,
 ///   never fails; kernel attaches errors as child blocks)
-/// - `ContentType::Image` → CAS hash; an invalid hash falls through to the
+/// - `ContentType::Media` → CAS hash; an invalid hash falls through to the
 ///   heuristics
 /// - `ContentType::Diff` → **always** returns `Some`, even for content that
 ///   does not parse (error preview, never falls through — see the arm's
@@ -615,11 +615,11 @@ pub fn detect_rich_content_typed(
                 },
             });
         }
-        ContentType::Image => {
+        ContentType::Media => {
             let hash = text.trim().to_string();
             if hash.len() == 32 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Some(RichContent {
-                    kind: RichContentKind::Image { hash },
+                    kind: RichContentKind::Media { hash },
                 });
             }
         }

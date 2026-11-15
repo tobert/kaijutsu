@@ -280,15 +280,21 @@ impl std::fmt::Display for Role {
     }
 }
 
+/// The MIME text `ContentType::Media` writes on the wire. It claims no
+/// particular image, audio, or video type, and `ContentType::from_mime` maps
+/// it back to `Media`.
+pub const MEDIA_MIME: &str = "application/vnd.kaijutsu.media";
+
 /// Content type for block rendering.
 ///
 /// `Ord` is implemented manually in terms of [`ContentType::richness`] — see
 /// that method for why. Declaration order below no longer has merge meaning;
 /// it's purely presentational (roughly least → most structured).
 ///
-/// For `Image`, the block's text content is a CAS hash (32 hex chars), not the
-/// image bytes. The real MIME type lives in CAS sidecar metadata; `as_mime()`
-/// returns a generic fallback (`"image/png"`).
+/// For `Media`, the block's text content is a CAS hash (32 hex chars), not the
+/// object's bytes. The CAS record is the one owner of the object's real media
+/// type (image, audio, or video); the block carries no second copy. `as_mime()`
+/// returns a generic marker that `from_mime` maps back to `Media`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentType {
@@ -304,8 +310,10 @@ pub enum ContentType {
     /// text/x-diff — a unified diff (`docs/diff.md`). Content is standard
     /// unified-diff text; old clients degrade to plain text.
     Diff,
-    /// Raster image (PNG, JPEG, WebP, etc.) stored in CAS by hash.
-    Image,
+    /// A media object (raster image, audio, or video) stored in CAS by hash.
+    /// Stored blocks written as `image` still decode.
+    #[serde(alias = "image")]
+    Media,
 }
 
 impl ContentType {
@@ -326,10 +334,10 @@ impl ContentType {
     /// comparison.
     ///
     /// Higher rank = "richer". Current order:
-    /// `Plain < Markdown < Svg < Abc < Diff < Image`. `Diff`'s placement is
+    /// `Plain < Markdown < Svg < Abc < Diff < Media`. `Diff`'s placement is
     /// `docs/diff.md` Decision 7 (Amy, 2026-08-01): a deliberate diff typing
     /// is highly structured and beats almost any competing claim in a tie;
-    /// it ranks just under `Image` because a diff may someday *contain*
+    /// it ranks just under `Media` because a diff may someday *contain*
     /// image diffing. When adding a variant, choose its rank deliberately
     /// and update `content_type_richness_order_is_pinned` below — that test
     /// exists so a future insertion can't reorder this silently.
@@ -340,7 +348,7 @@ impl ContentType {
             ContentType::Svg => 2,
             ContentType::Abc => 3,
             ContentType::Diff => 4,
-            ContentType::Image => 5,
+            ContentType::Media => 5,
         }
     }
 
@@ -351,17 +359,20 @@ impl ContentType {
             "image/svg+xml" => ContentType::Svg,
             "text/vnd.abc" => ContentType::Abc,
             "text/x-diff" => ContentType::Diff,
+            MEDIA_MIME => ContentType::Media,
             "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/avif" => {
-                ContentType::Image
+                ContentType::Media
             }
+            m if m.starts_with("audio/") || m.starts_with("video/") => ContentType::Media,
             _ => ContentType::Plain,
         }
     }
 
     /// Convert to a MIME type string.
     ///
-    /// For `Image`, this returns a generic fallback. The real MIME type
-    /// lives in CAS sidecar metadata keyed by the content hash.
+    /// For `Media`, this returns [`MEDIA_MIME`], a marker that names no
+    /// real media type. The real type lives in CAS sidecar metadata keyed by
+    /// the content hash.
     pub fn as_mime(&self) -> &'static str {
         match self {
             ContentType::Plain => "text/plain",
@@ -369,7 +380,7 @@ impl ContentType {
             ContentType::Svg => "image/svg+xml",
             ContentType::Abc => "text/vnd.abc",
             ContentType::Diff => "text/x-diff",
-            ContentType::Image => "image/png",
+            ContentType::Media => MEDIA_MIME,
         }
     }
 }
@@ -3562,7 +3573,7 @@ mod tests {
         assert_eq!(ContentType::Svg.richness(), 2);
         assert_eq!(ContentType::Abc.richness(), 3);
         assert_eq!(ContentType::Diff.richness(), 4);
-        assert_eq!(ContentType::Image.richness(), 5);
+        assert_eq!(ContentType::Media.richness(), 5);
 
         let ascending = [
             ContentType::Plain,
@@ -3570,7 +3581,7 @@ mod tests {
             ContentType::Svg,
             ContentType::Abc,
             ContentType::Diff,
-            ContentType::Image,
+            ContentType::Media,
         ];
         for pair in ascending.windows(2) {
             assert!(
@@ -3593,6 +3604,31 @@ mod tests {
         assert_eq!(ContentType::from_mime("bogus/unknown"), ContentType::Plain);
     }
 
+    /// A stored `image` content type still decodes, as `Media`.
+    #[test]
+    fn content_type_old_image_decodes_as_media() {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&"image", &mut buf).unwrap();
+        let ct: ContentType = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(ct, ContentType::Media);
+        let ct: ContentType = serde_json::from_str("\"image\"").unwrap();
+        assert_eq!(ct, ContentType::Media);
+        assert_eq!(serde_json::to_string(&ContentType::Media).unwrap(), "\"media\"");
+    }
+
+    /// Image, audio, and video types are all `Media`; `Media`'s own MIME
+    /// text reads back as `Media`; SVG stays `Svg`.
+    #[test]
+    fn content_type_media_mime_round_trips() {
+        for m in ["image/jpeg", "image/png", "audio/wav", "video/mp4"] {
+            assert_eq!(ContentType::from_mime(m), ContentType::Media, "{m}");
+        }
+        assert_eq!(ContentType::from_mime("image/svg+xml"), ContentType::Svg);
+        let wire = ContentType::Media.as_mime();
+        assert!(!wire.starts_with("image/"), "must not claim an image type: {wire}");
+        assert_eq!(ContentType::from_mime(wire), ContentType::Media);
+    }
+
     /// `Ord` must agree with `richness()` in both directions, not just the
     /// ascending-list spot check above.
     #[test]
@@ -3603,7 +3639,7 @@ mod tests {
             ContentType::Svg,
             ContentType::Abc,
             ContentType::Diff,
-            ContentType::Image,
+            ContentType::Media,
         ];
         for &a in &all {
             for &b in &all {

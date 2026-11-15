@@ -282,7 +282,7 @@ impl KjDispatcher {
 }
 
 /// A raster image format this workspace claims to support
-/// ([`kaijutsu_types::ContentType::Image`], the `block create --content-type`
+/// ([`kaijutsu_types::ContentType::Media`], the `block create --content-type`
 /// value list) and can sniff by magic number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SniffedImageFormat {

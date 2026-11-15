@@ -109,7 +109,7 @@ fn block_chars(b: &ContentBlock) -> usize {
         ContentBlock::ToolUse { input, .. } => input.to_string().chars().count(),
         ContentBlock::ToolResult { content, .. } => content.chars().count(),
         ContentBlock::Reasoning { text, .. } => text.chars().count(),
-        ContentBlock::Image { .. } => 0,
+        ContentBlock::Media { .. } => 0,
     }
 }
 

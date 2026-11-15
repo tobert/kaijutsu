@@ -1456,7 +1456,7 @@ mod tests {
         );
         let (_, small_result) = insert_tool_pair(&d, source, model, "shell", "tiny", Some(r#"{"stdout":"tiny","exit_code":0}"#));
         let mut image = BlockSnapshot::text(BlockId::new(source, model, 200), None, Role::Asset, "cafebeef");
-        image.content_type = ContentType::Image;
+        image.content_type = ContentType::Media;
         insert_snapshot(&d, source, image);
         insert_text(&d, source, model, "the file is all Bs");
 
@@ -1472,7 +1472,7 @@ mod tests {
             blocks.iter().find(|b| b.id == BlockId::new(child, id.principal_id, id.seq)).cloned()
         };
         assert!(!blocks.iter().any(|b| b.kind == BlockKind::Thinking), "thinking is dropped");
-        assert!(!blocks.iter().any(|b| b.content_type == ContentType::Image), "the image is dropped");
+        assert!(!blocks.iter().any(|b| b.content_type == ContentType::Media), "the image is dropped");
         assert!(in_child(big_call).is_some(), "the call stays");
 
         let slim = in_child(big_result).expect("the big result stays as a stub");

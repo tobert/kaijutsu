@@ -327,7 +327,7 @@ impl ImageStore {
         }
         crate::kj::cas::validate_image_bytes(mime, data)?;
         let hash = self.cas.store(data, mime).map_err(|e| format!("CAS error: {e}"))?.to_string();
-        let block = append_to(&self.documents, context_id, actor_id, Role::Asset, &hash, ContentType::Image)
+        let block = append_to(&self.documents, context_id, actor_id, Role::Asset, &hash, ContentType::Media)
             .map_err(|e| e.to_string())?;
         let input = crate::runtime::turn_state::LiveInput { block, wake: crate::runtime::turn_state::Wake::Attachment };
         self.turns.offer_input(context_id, input);
@@ -940,7 +940,7 @@ impl McpServerLike for BlockToolsServer {
                 // holds under it. Read back the type recorded at store time
                 // (`ContentStore::inspect`, the same lookup `kj cas info`
                 // uses) and refuse anything that is not a raster image
-                // rather than label arbitrary bytes `ContentType::Image`.
+                // rather than label arbitrary bytes `ContentType::Media`.
                 let reference = self
                     .cas
                     .inspect(&hash)
@@ -954,7 +954,9 @@ impl McpServerLike for BlockToolsServer {
                         )));
                     }
                 };
-                if ContentType::from_mime(&reference.mime_type) != ContentType::Image {
+                if ContentType::from_mime(&reference.mime_type) != ContentType::Media
+                    || !reference.mime_type.starts_with("image/")
+                {
                     return Ok(from_exec_result(ExecResult::failure(
                         1,
                         format!(
@@ -964,7 +966,7 @@ impl McpServerLike for BlockToolsServer {
                     )));
                 }
 
-                let key = self.append_block(&tool_ctx, Role::Asset, &p.hash, ContentType::Image)?;
+                let key = self.append_block(&tool_ctx, Role::Asset, &p.hash, ContentType::Media)?;
                 let res_json = serde_json::json!({ "block_id": key });
                 ExecResult::success(res_json.to_string())
             }
@@ -988,7 +990,7 @@ impl McpServerLike for BlockToolsServer {
                 let hash = self.cas.store(&data, mime).map_err(|e| McpError::Protocol(format!("CAS error: {e}")))?;
                 let hash_str = hash.to_string();
 
-                let key = self.append_block(&tool_ctx, Role::Asset, &hash_str, ContentType::Image)?;
+                let key = self.append_block(&tool_ctx, Role::Asset, &hash_str, ContentType::Media)?;
                 let res_json = serde_json::json!({ "block_id": key });
                 ExecResult::success(res_json.to_string())
             }
@@ -1410,7 +1412,7 @@ mod tests {
         let block = kaijutsu_types::BlockId::from_key(response["block_id"].as_str().unwrap()).unwrap();
         let snapshot = store.get_block_snapshot(ctx.context_id, &block).unwrap().unwrap();
         assert_eq!(snapshot.role, Role::Asset);
-        assert_eq!(snapshot.content_type, ContentType::Image);
+        assert_eq!(snapshot.content_type, ContentType::Media);
         assert_eq!(
             snapshot.content,
             kaijutsu_cas::ContentHash::from_data(MOUNTED_PNG).to_string(),
@@ -2417,7 +2419,7 @@ mod tests {
 
     /// `img_block` takes a hash, not bytes, so a well-formed hash can still
     /// point at anything already in the CAS. Storing `text/plain` under a
-    /// hash and asking `img_block` to label it `ContentType::Image` must be
+    /// hash and asking `img_block` to label it `ContentType::Media` must be
     /// refused, naming the recorded type it actually found.
     #[tokio::test]
     async fn img_block_refuses_a_cas_object_whose_recorded_type_is_not_an_image() {
@@ -2449,6 +2451,31 @@ mod tests {
             before,
             "a refused import appends no block"
         );
+    }
+
+    /// `img_block` attaches images only: an audio object under the hash is
+    /// refused, though its block type would be `Media`.
+    #[tokio::test]
+    async fn img_block_refuses_a_cas_object_recorded_as_audio() {
+        let (_broker, ctx, _db, store) = setup().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Arc::new(FileStore::at_path(tmp.path().join("cas")));
+        let hash = cas.store(b"RIFFfakewav", "audio/wav").unwrap();
+        let server = BlockToolsServer::new(store.clone(), cas, Arc::new(MountTable::new()));
+        let result = server
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(BlockToolsServer::INSTANCE),
+                    tool: "img_block".to_string(),
+                    arguments: serde_json::json!({ "hash": hash.to_string() }),
+                },
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert!(text_of(&result).contains("audio/wav"));
     }
 
     /// The CAS-recorded-type check must also refuse a hash the CAS has
@@ -2506,7 +2533,7 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
         let block = kaijutsu_types::BlockId::from_key(response["block_id"].as_str().unwrap()).unwrap();
         let snapshot = store.get_block_snapshot(ctx.context_id, &block).unwrap().unwrap();
-        assert_eq!(snapshot.content_type, ContentType::Image);
+        assert_eq!(snapshot.content_type, ContentType::Media);
         assert_eq!(snapshot.content, hash.to_string());
     }
 

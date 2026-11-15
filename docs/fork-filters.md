@@ -63,7 +63,7 @@ kj fork --drop mcp:shots
 ```
 
 `--drop` thins the blocks a selection keeps, and every turn keeps its shape.
-`images` drops Asset image blocks. A result that attached an image still names
+`images` drops Asset media blocks: images, and audio and video too. A result that attached an image still names
 the image's CAS hash, so the model can attach it again. `thinking` drops
 thinking blocks, except those after the last person's text: that turn may be
 an open tool loop, and its next request must send its signed thinking back.

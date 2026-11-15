@@ -72,8 +72,8 @@ use crate::view::ui_rtt::ui_rtt_texture_dims;
 use super::content::{BlockContentCache, RichKindInfo};
 use super::shape_cache::{SHAPE_SLACK_SCREENS, ShapeOutput, ShapedChunk, collect_fonts};
 
-/// Height of the `Image` placeholder rectangle.
-pub const IMAGE_PLACEHOLDER_HEIGHT: f32 = 120.0;
+/// Height of the `Media` placeholder rectangle.
+pub const MEDIA_PLACEHOLDER_HEIGHT: f32 = 120.0;
 
 /// Padding the sparkline plot keeps inside its box.
 pub const SPARKLINE_PADDING: f32 = 4.0;
@@ -143,7 +143,7 @@ impl RichShaper<'_> {
                     .unwrap_or(0.0);
                 finish(Vec::new(), Vec::new(), Vec::new(), draw_h, text.len())
             }
-            RichContentKind::Image { .. } => self.shape_image(text, style, wrap_width),
+            RichContentKind::Media { .. } => self.shape_media(text, style, wrap_width),
             // Markdown and Output are rich only in their coloring — they never
             // reach here (`RichKindInfo::is_drawn` is false for both), and if
             // a future kind forgets to say which half it is in, shaping its
@@ -263,17 +263,17 @@ impl RichShaper<'_> {
         out
     }
 
-    /// Image placeholder: a dark rectangle with its `[image: …]` caption
+    /// Media placeholder: a dark rectangle with its `[media: …]` caption
     /// centred on it. The rectangle is geometry rather than a chrome quad
     /// because it is *content* — it scrolls, wraps and re-shapes with the
     /// block, and chrome instances are keyed to borders.
-    fn shape_image(
+    fn shape_media(
         &mut self,
         label: &str,
         style: &VelloTextStyle,
         wrap_width: f32,
     ) -> ShapeOutput {
-        let height = IMAGE_PLACEHOLDER_HEIGHT;
+        let height = MEDIA_PLACEHOLDER_HEIGHT;
         let geometry = rect_quad(
             0.0,
             0.0,
@@ -613,24 +613,24 @@ mod tests {
         assert!(out.chunks[0].geometry.is_empty());
     }
 
-    /// The image placeholder: one filled rectangle (two triangles) plus its
+    /// The media placeholder: one filled rectangle (two triangles) plus its
     /// caption's glyphs, centred vertically inside the rect.
     #[test]
-    fn an_image_placeholder_is_a_rect_plus_a_centred_label() {
-        let label = super::super::content::image_placeholder_label("0123456789abcdef");
-        assert_eq!(label, "[image: 01234567]");
+    fn a_media_placeholder_is_a_rect_plus_a_centred_label() {
+        let label = super::super::content::media_placeholder_label("0123456789abcdef");
+        assert_eq!(label, "[media: 01234567]");
 
         let out = shape_one(
-            &RichContentKind::Image { hash: "0123456789abcdef".into() },
+            &RichContentKind::Media { hash: "0123456789abcdef".into() },
             &label,
             300.0,
         );
-        assert_eq!(out.text_height, IMAGE_PLACEHOLDER_HEIGHT);
+        assert_eq!(out.text_height, MEDIA_PLACEHOLDER_HEIGHT);
         assert_eq!(out.chunks[0].geometry.len(), 6, "one quad, two triangles");
         assert!(!out.chunks[0].glyphs.is_empty(), "the caption must be drawn");
         let top = out.chunks[0].glyphs.iter().map(|g| g.y).fold(f32::MAX, f32::min);
         assert!(
-            top > 0.0 && top < IMAGE_PLACEHOLDER_HEIGHT,
+            top > 0.0 && top < MEDIA_PLACEHOLDER_HEIGHT,
             "the caption sits inside the placeholder, not on its top edge: {top}",
         );
     }

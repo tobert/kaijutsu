@@ -344,7 +344,7 @@ async fn deliver_live_input(
     context_id: ContextId,
     turn_id: kaijutsu_types::TurnId,
     mailbox: &crate::ConversationMailbox,
-    image_cache: &crate::llm::image_cache::ImageBase64Cache,
+    media_cache: &crate::llm::media_cache::MediaBase64Cache,
     messages: &mut Vec<LlmMessage>,
     write_point: &mut kaijutsu_types::BlockId,
     carried: &mut Vec<kaijutsu_types::BlockId>,
@@ -370,7 +370,7 @@ async fn deliver_live_input(
     if delivered.is_empty() {
         return Ok(false);
     }
-    crate::resolve_image_blocks_from_cas(&mut delivered, kernel.cas().clone(), Some(image_cache)).await;
+    crate::resolve_media_blocks_from_cas(&mut delivered, kernel.cas().clone(), Some(media_cache)).await;
     tracing::info!(%context_id, blocks = tail.delivered.len(), messages = delivered.len(),
         "Delivered input to the running turn");
     crate::llm::hydrate::append_delivered(messages, delivered);
@@ -928,7 +928,7 @@ async fn instruct(
     context_id: ContextId,
     turn_id: kaijutsu_types::TurnId,
     mailbox: &crate::ConversationMailbox,
-    image_cache: &crate::llm::image_cache::ImageBase64Cache,
+    media_cache: &crate::llm::media_cache::MediaBase64Cache,
     messages: &mut Vec<LlmMessage>,
     write_point: &mut kaijutsu_types::BlockId,
     carried: &mut Vec<kaijutsu_types::BlockId>,
@@ -940,7 +940,7 @@ async fn instruct(
     let after = pending.delivered.last().copied().unwrap_or(*write_point);
     documents.insert_block_as(context_id, None, Some(&after), Role::System, BlockKind::Notification, text,
         Status::Done, ContentType::Plain, Some(PrincipalId::system()))?;
-    deliver_live_input(kernel, documents, context_id, turn_id, mailbox, image_cache, messages, write_point,
+    deliver_live_input(kernel, documents, context_id, turn_id, mailbox, media_cache, messages, write_point,
         carried, Delivery::Instruction).await?;
     Ok(())
 }
@@ -2909,7 +2909,7 @@ async fn run_llm_stream(
     // appends don't write through to the mailbox. The next turn's
     // catch_up picks up the assistant blocks via the block log.
 
-    // Resolve any (Asset, Text, Image) blocks against CAS so
+    // Resolve any (Asset, Text, Media) blocks against CAS so
     // vision-capable providers receive the actual bytes. CAS reads
     // are blocking std::fs; the resolver delegates each to
     // spawn_blocking so the runtime stays responsive on stacks of
@@ -2921,10 +2921,10 @@ async fn run_llm_stream(
     // so a 20-image conversation doesn't re-encode every turn.
     {
         let cas: std::sync::Arc<dyn crate::ContentStore> = kernel.cas().clone();
-        crate::resolve_image_blocks_from_cas(
+        crate::resolve_media_blocks_from_cas(
             &mut messages,
             cas,
-            Some(conversation_cache.image_cache()),
+            Some(conversation_cache.media_cache()),
         )
         .await;
     }
@@ -3684,7 +3684,7 @@ async fn run_llm_stream(
                 // writes above): the notice and the message sent are one
                 // fact, and continuing with only the wire copy would send an
                 // instruction no later hydration can reproduce.
-                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.image_cache(),
+                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.media_cache(),
                     &mut messages, &mut last_block_id, &mut carried_input, &notice).await?;
                 continue 'agentic;
             }
@@ -3725,7 +3725,7 @@ async fn run_llm_stream(
                     continue with a tool call.";
                 tracing::info!(%context_id, nudge = done_nudges, limit = MAX_DONE_NUDGES,
                     "Text-only reply in a context offered `done`; continuing the turn with a notice");
-                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.image_cache(),
+                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.media_cache(),
                     &mut messages, &mut last_block_id, &mut carried_input, notice).await?;
                 continue 'agentic;
             }
@@ -3733,7 +3733,7 @@ async fn run_llm_stream(
             // another one when its wake says so. A stopping turn, or one a
             // beat waits on, leaves input pending for the turn's end.
             if takes_live_input(&interrupt, turn_lease) && deliver_live_input(&kernel, &documents,
-                context_id, turn_id, mailbox, conversation_cache.image_cache(), &mut messages,
+                context_id, turn_id, mailbox, conversation_cache.media_cache(), &mut messages,
                 &mut last_block_id, &mut carried_input, Delivery::FinalInference).await?
             {
                 continue 'agentic;
@@ -3880,7 +3880,7 @@ async fn run_llm_stream(
         // results: the next request already extends the cached prefix here.
         if takes_live_input(&interrupt, turn_lease) {
             deliver_live_input(&kernel, &documents, context_id, turn_id, mailbox,
-                conversation_cache.image_cache(), &mut messages, &mut last_block_id,
+                conversation_cache.media_cache(), &mut messages, &mut last_block_id,
                 &mut carried_input, Delivery::ToolRound).await?;
         }
 
@@ -10085,7 +10085,7 @@ mod lifetime_tests {
         let hash = kaijutsu_cas::ContentHash::from_data(PNG).to_string();
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
-        let image_at = sent[1].iter().position(|m| serde_json::to_string(m).unwrap().contains("\"Image\""));
+        let image_at = sent[1].iter().position(|m| serde_json::to_string(m).unwrap().contains("\"Media\""));
         let result_at = sent[1].iter().position(|m| mentions(std::slice::from_ref(m), &format!("attached {hash}")));
         assert!(image_at.is_some() && result_at < image_at,
             "the image follows the round's result in the next request: {:#?}", sent[1]);
@@ -10095,8 +10095,10 @@ mod lifetime_tests {
         for message in &mut expected {
             if let crate::llm::MessageContent::Blocks(blocks) = &mut message.content {
                 for block in blocks {
-                    if let crate::llm::ContentBlock::Image { data_base64, .. } = block {
+                    if let crate::llm::ContentBlock::Media { media_type, data_base64, .. } = block {
                         assert!(data_base64.take().is_some(), "the request carried the bytes");
+                        assert_eq!(media_type, "image/png", "the request carried the CAS-recorded type");
+                        *media_type = kaijutsu_types::ContentType::Media.as_mime().to_string();
                     }
                 }
             }

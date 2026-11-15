@@ -10,9 +10,10 @@
 //!   preceding calls is refused.
 //! - `Reasoning` blocks go back as `reasoning`; the template decides what to
 //!   keep.
-//! - An image the served model reads goes as an object part, in place among
-//!   the message's text, named by the object id [`Objects`] gives it. Any other
-//!   image becomes a visible marker that says why it was left out.
+//! - A media part (image, audio, or video) the served model reads goes as an
+//!   object part, in place among the message's text, named by the object id
+//!   [`Objects`] gives it. Any other media part becomes a visible marker that
+//!   says why it was left out.
 
 use std::collections::HashMap;
 
@@ -177,7 +178,7 @@ fn assistant(index: usize, content: &MessageContent) -> LlmResult<(Walked, Vec<S
                         calls.push((id.clone(), name.clone(), arguments));
                         ids.push(id.clone());
                     }
-                    ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
+                    ContentBlock::ToolResult { .. } | ContentBlock::Media { .. } => {}
                 }
             }
             Walked::Assistant { content: Some(text), reasoning: (!reasoning.is_empty()).then_some(reasoning), calls }
@@ -207,10 +208,10 @@ fn user(index: usize, content: &MessageContent, objects: &Objects, calls: &mut V
                 results.push((tool_use_id.as_str(), content.clone(), *is_error));
             }
             ContentBlock::Text { text: t } => push_text(&mut parts, t),
-            ContentBlock::Image { hash, media_type, .. } => match objects.get(hash) {
+            ContentBlock::Media { hash, media_type, .. } => match objects.get(hash) {
                 Some(Ok(id)) => parts.push(Part::Object { id: id.clone(), mime: media_type.clone() }),
-                Some(Err(why)) => push_text(&mut parts, &format!("[image {hash} ({media_type}) omitted: {why}]")),
-                None => push_text(&mut parts, &format!("[image {hash} ({media_type}) omitted: its bytes were not found]")),
+                Some(Err(why)) => push_text(&mut parts, &format!("[media {hash} ({media_type}) omitted: {why}]")),
+                None => push_text(&mut parts, &format!("[media {hash} ({media_type}) omitted: its bytes were not found]")),
             },
             ContentBlock::ToolUse { .. } | ContentBlock::Reasoning { .. } => {}
         }
@@ -399,7 +400,7 @@ mod tests {
             Message::user("x"),
             said(vec![call("a", "shot", json!({}))]),
             Message::tool_results(vec![
-                ContentBlock::Image { hash: "h1".into(), media_type: "image/png".into(), data_base64: None },
+                ContentBlock::Media { hash: "h1".into(), media_type: "image/png".into(), data_base64: None },
                 result("a", "done", false),
                 ContentBlock::Text { text: "and look".into() },
             ]),
@@ -408,7 +409,7 @@ mod tests {
         assert_eq!(w[2], json!({"role": "tool", "tool_call_id": "a", "content": "done", "snap": true}));
         assert_eq!(w[3]["role"], json!("user"));
         let text = w[3]["content"].as_str().unwrap();
-        assert!(text.contains("[image h1 (image/png) omitted") && text.ends_with("\nand look"), "{text}");
+        assert!(text.contains("[media h1 (image/png) omitted") && text.ends_with("\nand look"), "{text}");
     }
 
     #[test]

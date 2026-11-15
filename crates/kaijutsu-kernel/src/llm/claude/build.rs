@@ -675,12 +675,12 @@ fn build_block(block: &ContentBlock, dialect: Dialect) -> Option<RequestContent>
             is_error: is_error.then_some(true),
             cache_control: None,
         }),
-        ContentBlock::Image {
+        ContentBlock::Media {
             hash,
             media_type,
             data_base64,
-        } => match data_base64.as_deref() {
-            Some(data) if !data.is_empty() => Some(RequestContent::Image {
+        } => match crate::llm::image_or_marker(hash, media_type, data_base64.as_deref()) {
+            Ok(data) => Some(RequestContent::Image {
                 source: ImageSource {
                     kind: "base64",
                     media_type: media_type.clone(),
@@ -688,13 +688,9 @@ fn build_block(block: &ContentBlock, dialect: Dialect) -> Option<RequestContent>
                 },
                 cache_control: None,
             }),
-            // Resolution failed — surface a text marker so the model
-            // sees that an image existed at this turn rather than
-            // silently dropping the block.
-            _ => Some(RequestContent::Text {
-                text: format!("[image hash={hash} mime={media_type} unavailable]"),
-                cache_control: None,
-            }),
+            // Not sent — a text marker tells the model that media existed at
+            // this turn and why it is not here.
+            Err(marker) => Some(RequestContent::Text { text: marker, cache_control: None }),
         },
         ContentBlock::Reasoning { text, signature } => build_reasoning(text, signature.as_deref(), dialect),
     }
@@ -994,7 +990,7 @@ mod tests {
     fn image_with_data_serializes_as_base64_source() {
         let messages = vec![Message {
             role: Role::User,
-            content: KaiContent::Blocks(vec![ContentBlock::Image {
+            content: KaiContent::Blocks(vec![ContentBlock::Media {
                 hash: "abc".into(),
                 media_type: "image/png".into(),
                 data_base64: Some("AAAA".into()),
@@ -1020,7 +1016,7 @@ mod tests {
     fn image_without_data_falls_back_to_text_marker() {
         let messages = vec![Message {
             role: Role::User,
-            content: KaiContent::Blocks(vec![ContentBlock::Image {
+            content: KaiContent::Blocks(vec![ContentBlock::Media {
                 hash: "abc".into(),
                 media_type: "image/png".into(),
                 data_base64: None,
@@ -1036,7 +1032,31 @@ mod tests {
             RequestContent::Text { text, .. } => {
                 assert!(text.contains("abc"), "marker must include hash");
                 assert!(text.contains("image/png"));
-                assert!(text.contains("unavailable"));
+                assert!(text.contains("omitted"));
+            }
+            other => panic!("expected text marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_becomes_a_marker_naming_its_type() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: KaiContent::Blocks(vec![ContentBlock::Media {
+                hash: "abc".into(),
+                media_type: "audio/wav".into(),
+                data_base64: Some("AAAA".into()),
+            }]),
+            turn_scoped: false,
+        }];
+        let req = build_request(&opts("claude-haiku-4-5"), &messages, false);
+        let blocks = match &req.messages[0].content {
+            MessageContent::Blocks(b) => b,
+            other => panic!("expected blocks, got {other:?}"),
+        };
+        match &blocks[0] {
+            RequestContent::Text { text, .. } => {
+                assert!(text.contains("audio/wav") && text.contains("images only"), "{text}");
             }
             other => panic!("expected text marker, got {other:?}"),
         }
