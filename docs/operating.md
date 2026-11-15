@@ -67,7 +67,10 @@ shape, and the rows it writes before the restart are the ones that fail to
 decode. `SCHEMA` and `apply_additive_migrations` stay the mechanism; there is
 no migration framework.
 
-A deploy does not touch the host rc tree or `/config/kernel`. The council's
+A deploy does not touch the host rc tree or `/config/kernel`, and a start
+does not add a new shipped file to an existing `/config/kernel`: after a
+deploy that ships one (`description.md` on 2026-11-15), write it with
+`kj config reset <file>`, which installs the embedded default. The council's
 specs live under `/config/kernel/council/`; copy any missing ones from
 `assets/defaults/council/` before enabling the council (no seed step
 installs them on an existing host yet). Run
