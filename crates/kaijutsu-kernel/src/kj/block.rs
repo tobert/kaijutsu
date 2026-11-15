@@ -156,7 +156,9 @@ enum BlockCommand {
         /// `--latest audio/midi` for "the rendered artifact for this turn".
         #[arg(long, conflicts_with = "block_id")]
         latest: Option<String>,
-        /// Context to search with `--latest` (defaults to the active context)
+        /// Context a short block id resolves against, or that `--latest`
+        /// searches: . (default) | .parent | <label> | <hex prefix>. A full
+        /// block id already names its own context.
         #[arg(long, short = 'c')]
         context: Option<String>,
         /// Write the payload to this path instead of stdout
@@ -959,7 +961,7 @@ impl KjDispatcher {
     ) -> KjResult {
         let (ctx_id, snap) = match (block_id_arg, latest_mime) {
             (Some(id_str), None) => {
-                let block_id = match self.resolve_block_id(id_str, None, caller) {
+                let block_id = match self.resolve_block_id(id_str, ctx_ref, caller) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
                 };
@@ -3209,6 +3211,22 @@ mod tests {
         let hash = d.kernel().cas().store(data, mime).expect("cas store");
         let id = insert_block_ordered(d, ctx, TypesRole::Asset, hash.as_str(), after);
         (id, hash.to_string())
+    }
+
+    #[tokio::test]
+    async fn block_cat_dash_c_redirects_short_id_to_another_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx_a = register_context_with_doc(&d, Some("ctx-a"), principal);
+        let ctx_b = register_context_with_doc(&d, Some("ctx-b"), principal);
+        let bid_a = insert_text_block(&d, ctx_a, "in a");
+        let bid_b = insert_text_block(&d, ctx_b, "in b");
+        let short = super::short_key(&bid_b);
+        assert_eq!(super::short_key(&bid_a), short, "test setup requires a short-id collision across contexts");
+
+        let result = d.dispatch(&[s("block"), s("cat"), s(&short), s("-c"), s("ctx-b")], &caller_with_context(ctx_a)).await;
+        assert!(result.is_ok(), "cat failed: {}", result.message());
+        assert_eq!(result.message(), "in b", "-c names the context a short id resolves against");
     }
 
     #[tokio::test]
