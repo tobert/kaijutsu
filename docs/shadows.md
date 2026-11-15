@@ -52,7 +52,14 @@ Both are one mechanism for the judge shadow and the description shadow:
   when the served model reads the type and the other providers send images. A
   model that would get only a marker is refused before the call, naming the
   model and the type. The call waits at most `DESCRIBE_TIMEOUT`, 120 seconds, and
-  is recorded as a turn of role `image` on the shadow.
+  is recorded as a turn of role `image` on the shadow. A reply with no text
+  closes the turn as failed and writes nothing. A source context that is
+  archived is refused before any shadow is made, naming `kj context promote`.
+- **The commit.** A rendition block, its link, and its index row commit in one
+  journal transaction, for a fresh description and for a reused copy: all of
+  them or none. A request that finds its key taken by a simultaneous request
+  keeps its own description, linked and not indexed; the key keeps naming the
+  first.
 
 The rest of what exists:
 

@@ -105,13 +105,11 @@ impl KernelDb {
         self.mark_shadow(id, JUDGE)
     }
 
-    /// The live shadows of `source`, each with its kind, oldest first.
+    /// The live shadows of `source`, each with its kind, oldest first. A shadow
+    /// that is archived is not listed: `fork_children` lists live children only.
     pub fn shadows_of(&self, source: ContextId) -> KernelDbResult<Vec<(ContextRow, String)>> {
         let mut out = Vec::new();
         for child in self.fork_children(source)? {
-            if child.archived_at.is_some() {
-                continue;
-            }
             if let Some(kind) = self.shadow_kind(&child)? {
                 out.push((child, kind));
             }
@@ -168,6 +166,22 @@ impl KernelDb {
                 )?;
             }
             Ok(())
+        })
+    }
+
+    /// Link a rendition and index it under `key`, in one transaction, unless
+    /// the index already names a rendition for `key`: then the link alone is
+    /// written and the index keeps the earlier one. Returns whether `key` now
+    /// names `rendition`. Two requests that made the same rendition at once
+    /// both land: one is indexed and both are linked.
+    pub fn record_rendition_unless_indexed(&self, rendition: &Rendition, key: &IndexKey) -> KernelDbResult<bool> {
+        self.atomically_in_shadows(|db| {
+            if db.indexed_rendition(key)?.is_some() {
+                db.record_rendition(rendition, None)?;
+                return Ok(false);
+            }
+            db.record_rendition(rendition, Some(key))?;
+            Ok(true)
         })
     }
 

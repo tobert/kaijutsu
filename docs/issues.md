@@ -25,9 +25,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **A refused marker leaves an empty shadow.** The shadow is made before the
   provider says it cannot read the type, because the maker comes from the
   shadow's slot. The request writes no rendition and calls no model.
-- **Index writes can race.** Two simultaneous misses on one key both call the
-  model, and the second link refuses on the unique key after its block is
-  written. The orphan block stays in the shadow.
+- **Simultaneous misses both call the model.** Two requests for one key that
+  both miss the index each pay for a description. The second one is linked
+  and not indexed, so its shadow holds a rendition the key does not name.
+- **A failed commit stops the shadow's document.** A rendition whose link or
+  index row cannot be written fails the request and leaves no block, and the
+  shadow's document refuses writes until the kernel restarts (the rule of
+  `BlockStore::append_block_recorded`).
+- **A failed `create_document` strands a shadow's document.**
+  `ensure_description_shadow` returns the live shadow before it creates the
+  document, so after one failed `create_document` every later describe of that
+  source fails with DocumentNotFound until the kernel restarts.
+- **A reused copy names no original.** The copy has its own link to its source
+  block and no row that names the rendition it was copied from. The index keeps
+  naming the original rendition after its shadow is archived; it still serves,
+  since archive keeps blocks.
 - **Presets and spans have no writer.** `preset` in `rendition_index` is empty,
   and `span_start` and `span_end` are NULL.
 - **Video reads only on a council backend that lists it.** Claude, the

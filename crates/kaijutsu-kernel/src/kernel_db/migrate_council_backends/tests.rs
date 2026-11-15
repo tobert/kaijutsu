@@ -49,6 +49,7 @@ struct Old {
     shadow: ContextId,
     elsewhere: ContextId,
     chat_child: ContextId,
+    archived: ContextId,
 }
 
 fn old() -> Old {
@@ -85,18 +86,22 @@ fn old() -> Old {
     let shadow = context("judge-seat", Some(seat), Some(seat), judge);
     let elsewhere = context("judge-elsewhere", Some(seat), Some(other), judge);
     let chat_child = context("coder-child", Some(seat), Some(seat), coder);
+    let archived = context("judge-archived", Some(seat), Some(seat), judge);
+    db.conn
+        .execute("UPDATE contexts SET archived_at = 1 WHERE context_id = ?1", params![blob_param(archived.as_bytes())])
+        .unwrap();
     forget(&db);
-    Old { db, mk, deepseek, shadow, elsewhere, chat_child }
+    Old { db, mk, deepseek, shadow, elsewhere, chat_child, archived }
 }
 
 /// The migration renames kind `mk` to `council` and gives the shadows the
 /// old rule told a `judge` row in `context_shadows`: a context that answers to its parent,
 /// performed by a character whose model was on an `mk` backend. A context
 /// that answers elsewhere, and a child performed by a chat character, stay
-/// unmarked. Other kinds keep theirs.
+/// unmarked, and so does an archived one. Other kinds keep theirs.
 ///
-/// Falsified by renaming before the backfill reads the old kind, or by
-/// marking every child that answers to its parent.
+/// Falsified by renaming before the backfill reads the old kind, by
+/// marking every child that answers to its parent, or by marking archived ones.
 #[test]
 fn mk_backends_become_council_and_the_old_shadows_are_marked() {
     let o = old();
@@ -106,6 +111,7 @@ fn mk_backends_become_council_and_the_old_shadows_are_marked() {
     assert!(marked(&o.db, o.shadow), "the judge's child that answers to its seat is its shadow");
     assert!(!marked(&o.db, o.elsewhere), "a judge's context that answers elsewhere is no shadow");
     assert!(!marked(&o.db, o.chat_child), "a chat character's child is no shadow");
+    assert!(!marked(&o.db, o.archived), "an archived judge context is no live shadow");
     assert!(recorded(&o.db));
 }
 

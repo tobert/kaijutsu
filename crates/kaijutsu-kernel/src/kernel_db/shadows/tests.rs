@@ -85,16 +85,22 @@ fn archiving_a_source_archives_all_its_shadows() {
     assert!(db.get_context(plain.context_id).unwrap().unwrap().archived_at.is_none());
 }
 
-/// A source has at most one live shadow of a kind to find, and the finder
-/// skips an archived one.
+/// The live shadow of a kind is found by its source, and a shadow archived by
+/// itself no longer is: a later shadow of that kind takes its place.
+///
+/// Falsified by `fork_children` listing archived children: the archived
+/// shadow is the older one, so it would be found first.
 #[test]
 fn the_live_shadow_of_a_kind_is_found_by_its_source() {
     let (db, source, describe) = fixture();
     db.mark_shadow(describe.context_id, DESCRIBE).unwrap();
     assert_eq!(db.live_shadow(source.context_id, DESCRIBE).unwrap().unwrap().context_id, describe.context_id);
     assert!(db.live_shadow(source.context_id, JUDGE).unwrap().is_none());
-    db.archive_with_shadows(source.context_id).unwrap();
+    db.archive_context(describe.context_id).unwrap();
     assert!(db.live_shadow(source.context_id, DESCRIBE).unwrap().is_none());
+    let newer = shadow_of(&db, &source, "newer");
+    db.mark_shadow(newer.context_id, DESCRIBE).unwrap();
+    assert_eq!(db.live_shadow(source.context_id, DESCRIBE).unwrap().unwrap().context_id, newer.context_id);
 }
 
 /// A rendition link names its source block and leaves the span empty, and the
@@ -137,6 +143,24 @@ fn a_key_names_one_rendition() {
     assert!(error.to_string().to_lowercase().contains("unique") || error.to_string().contains("constraint"), "{error}");
     assert_eq!(db.rendition_count(shadow.context_id).unwrap(), 1, "the refused link is not left behind");
     assert_eq!(db.indexed_rendition(&key).unwrap(), Some(block(shadow.context_id, 1)));
+}
+
+/// A second rendition for an indexed key is linked and not indexed: the first
+/// stays the one the key names, and nothing is refused.
+///
+/// Falsified by indexing without looking at the index first (the second
+/// request is refused by the key).
+#[test]
+fn a_rendition_that_lost_the_key_is_linked_and_not_indexed() {
+    let (db, source, shadow) = fixture();
+    db.mark_shadow(shadow.context_id, DESCRIBE).unwrap();
+    let key = IndexKey::new("abc", DESCRIBE, "ds/flash");
+    let from = block(source.context_id, 7);
+    let (first, second) = (block(shadow.context_id, 1), block(shadow.context_id, 2));
+    assert!(db.record_rendition_unless_indexed(&Rendition { block: first, source: from, span: None }, &key).unwrap());
+    assert!(!db.record_rendition_unless_indexed(&Rendition { block: second, source: from, span: None }, &key).unwrap());
+    assert_eq!(db.rendition_count(shadow.context_id).unwrap(), 2);
+    assert_eq!(db.indexed_rendition(&key).unwrap(), Some(first));
 }
 
 /// The link and the index are rows, so they survive closing and opening the file.

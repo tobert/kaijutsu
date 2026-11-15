@@ -1,5 +1,5 @@
 //! Migration `council-backends-v1`: backend kind `mk` becomes `council`,
-//! and the judge shadows it told by their judge's backend get the
+//! and the live judge shadows it told by their judge's backend get the
 //! `context_shadows` rows that now tell them (`docs/character.md`,
 //! "Migrations").
 //!
@@ -33,7 +33,8 @@ impl KernelDb {
              SELECT c.context_id, 'judge' FROM contexts c
              JOIN character_models m ON m.principal_id = c.performer
              JOIN backends b ON b.backend_id = m.backend_id
-             WHERE b.kind = 'mk' AND c.forked_from IS NOT NULL AND c.senpai_ctx = c.forked_from",
+             WHERE b.kind = 'mk' AND c.archived_at IS NULL AND c.forked_from IS NOT NULL
+               AND c.senpai_ctx = c.forked_from",
             [],
         )?;
         let backends = tx.execute("UPDATE backends SET kind = 'council' WHERE kind = 'mk'", [])?;

@@ -69,18 +69,53 @@ fn the_migration_runs_once() {
 }
 
 /// A database that has not run `council-backends-v1` either still opens: that
-/// migration writes the shadows the old rule told into `context_shadows`, and
-/// the old table's rows join them.
+/// migration writes the shadows the old rule told into `context_shadows`
+/// (a child of a seat that answers to it, performed by a character whose model
+/// is on an `mk` backend, and in no `judge_shadows` row), and the old table's
+/// rows join them.
+///
+/// Falsified by `council-backends-v1` writing no `context_shadows` rows.
 #[test]
 fn the_older_migration_still_runs_on_an_old_database() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kernel.db");
-    let (_, shadow) = old_database(&path);
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::COUNCIL_BACKENDS_MIGRATION]).unwrap();
-    }
+    let (seat, shadow) = old_database(&path);
+    let told = {
+        let db = KernelDb::open(&path).unwrap();
+        let ws = db.get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let backend = BackendId::new();
+        db.conn
+            .execute(
+                "INSERT INTO backends (backend_id, name, kind, key_optional, created_by) VALUES (?1, 'mk-zorak', 'mk', 1, ?2)",
+                params![blob_param(backend.as_bytes()), blob_param(PrincipalId::system().as_bytes())],
+            )
+            .unwrap();
+        let judge = PrincipalId::new();
+        db.insert_character(&CharacterRow {
+            rc_dir: Some("judge".into()), console_ctx: None, mcp_hub_ctx: None, principal_id: judge, name: "judge".into(),
+            created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        })
+        .unwrap();
+        db.set_character_model(&CharacterModelRow {
+            principal_id: judge, backend_id: backend, model: "m".into(), max_tokens: Some(512), temperature: None,
+            top_p: None, effort: None, thinking_budget: None, thinking_style: None,
+        })
+        .unwrap();
+        let mut told = make_context_row(Some("judge-told"));
+        told.forked_from = Some(seat);
+        insert_context_with_doc(&db, &told, ws);
+        db.conn
+            .execute(
+                "UPDATE contexts SET performer = ?1, senpai_ctx = ?2 WHERE context_id = ?3",
+                params![blob_param(judge.as_bytes()), blob_param(seat.as_bytes()), blob_param(told.context_id.as_bytes())],
+            )
+            .unwrap();
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::COUNCIL_BACKENDS_MIGRATION]).unwrap();
+        told.context_id
+    };
     let db = KernelDb::open(&path).unwrap();
-    let row = db.get_context(shadow).unwrap().unwrap();
-    assert!(db.is_judge_shadow(&row).unwrap());
+    for id in [shadow, told] {
+        let row = db.get_context(id).unwrap().unwrap();
+        assert!(db.is_judge_shadow(&row).unwrap(), "{id} is a judge shadow");
+    }
 }

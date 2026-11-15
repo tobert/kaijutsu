@@ -228,12 +228,7 @@ impl KjDispatcher {
             let rendition = if held_here {
                 earlier
             } else {
-                let copy = self.write_rendition_block(shadow.context_id, performer, &text)?;
-                self.kernel_db()
-                    .lock()
-                    .record_rendition(&Rendition { block: copy, source: id, span: None }, None)
-                    .map_err(|e| format!("the copied rendition {} could not be linked: {e}", copy.to_key()))?;
-                copy
+                self.write_rendition(shadow.context_id, performer, &text, id, None)?.0
             };
             return Ok(Described { text, rendition, shadow: shadow.context_id, maker, media_type, hash: hash_text, reused: true });
         }
@@ -285,14 +280,9 @@ impl KjDispatcher {
 
         let reply = self.call_describer(&provider, &bound, shadow.context_id, performer, max_tokens, &instruction, messages, timeout).await?;
         let text = reply.trim().to_string();
-        if text.is_empty() {
-            return Err(format!("{maker} returned an empty description; no rendition was written"));
-        }
-        let rendition = self.write_rendition_block(shadow.context_id, performer, &text)?;
-        self.kernel_db()
-            .lock()
-            .record_rendition(&Rendition { block: rendition, source: id, span: None }, Some(&key))
-            .map_err(|e| format!("the rendition {} was written but could not be linked and indexed: {e}", rendition.to_key()))?;
+        // A request that made the same description at the same time may have
+        // taken the key first; this one is then linked and not indexed.
+        let (rendition, _) = self.write_rendition(shadow.context_id, performer, &text, id, Some(&key))?;
         Ok(Described { text, rendition, shadow: shadow.context_id, maker, media_type, hash: hash_text, reused: false })
     }
 
@@ -337,6 +327,14 @@ impl KjDispatcher {
                 .get_context(source)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("context {} has no row", source.short()))?;
+            if source_row.is_archived() {
+                return Err(format!(
+                    "{} is archived, and a shadow of it would be a live context under an archived senpai. \
+                     Bring it back first with `kj context promote {}`",
+                    db.context_name(source),
+                    source.to_hex()
+                ));
+            }
             let performer = source_row.performer.ok_or_else(|| {
                 format!("{} has no performer, so it has no image slot", db.context_name(source))
             })?;
@@ -403,21 +401,44 @@ impl KjDispatcher {
             .ok_or_else(|| format!("the index names rendition {} but that block is not in its context", block.to_key()))
     }
 
-    fn write_rendition_block(&self, shadow: ContextId, performer: kaijutsu_types::PrincipalId, text: &str) -> Result<BlockId, String> {
-        self.blocks
-            .insert_block_marked(
+    /// A rendition block of `source` in `shadow`, its link, and (with `key`)
+    /// its index row, committed in one journal transaction: all of them or
+    /// none. Returns the block and whether `key` names it; a `key` that
+    /// another rendition already holds stays with that one.
+    fn write_rendition(
+        &self,
+        shadow: ContextId,
+        performer: kaijutsu_types::PrincipalId,
+        text: &str,
+        source: BlockId,
+        key: Option<&IndexKey>,
+    ) -> Result<(BlockId, bool), String> {
+        let indexed = std::cell::Cell::new(false);
+        let block = self
+            .blocks
+            .append_block_recorded(
                 shadow,
-                None,
-                None,
-                Role::Model,
-                BlockKind::Text,
-                text.to_string(),
-                Status::Done,
-                ContentType::Plain,
-                Some(performer),
-                false,
+                crate::block_store::RecordedBlockInsert {
+                    role: Role::Model,
+                    kind: BlockKind::Text,
+                    content: text.to_string(),
+                    status: Status::Done,
+                    content_type: ContentType::Plain,
+                    author: performer,
+                    ansi: None,
+                    shell: None,
+                },
+                |db, block| {
+                    let rendition = Rendition { block: *block, source, span: None };
+                    match key {
+                        Some(key) => indexed.set(db.record_rendition_unless_indexed(&rendition, key)?),
+                        None => db.record_rendition(&rendition, None)?,
+                    }
+                    Ok(())
+                },
             )
-            .map_err(|e| format!("could not write the rendition block: {e}"))
+            .map_err(|e| format!("could not write the rendition: {e}"))?;
+        Ok((block, indexed.get()))
     }
 
     /// One model call on the shadow's `model` slot, recorded as a turn of the
@@ -470,7 +491,9 @@ impl KjDispatcher {
                 "no description within {timeout:?} (DESCRIBE_TIMEOUT)"
             )))),
         };
+        let empty = matches!(&reply, Ok(reply) if reply.text.trim().is_empty());
         let (usage, stop_reason) = match &reply {
+            Ok(reply) if empty => (Some(&reply.usage), "failed"),
             Ok(reply) => (
                 Some(&reply.usage),
                 crate::runtime::llm_stream::turn_stop_reason(reply.stop_reason.as_deref()).as_str(),
@@ -491,6 +514,9 @@ impl KjDispatcher {
         }
         let reply = reply.map_err(|e| format!("{}/{model} failed: {e}", bound.backend))?;
         record?;
+        if empty {
+            return Err(format!("{}/{model} returned an empty description; no rendition was written", bound.backend));
+        }
         Ok(reply.text)
     }
 }
@@ -828,6 +854,139 @@ mod tests {
         let err = w.d.describe_block(&image.to_key(), None, &caller, Duration::from_millis(300)).await.err().expect("a timeout");
         assert!(err.contains("DESCRIBE_TIMEOUT") && err.contains("300ms"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(4), "the call is bounded");
+        let shadow = shadow_of(&w.d, w.source);
+        assert_eq!(w.d.kernel_db().lock().rendition_count(shadow.context_id).unwrap(), 0);
+        let turns = w.d.kernel_db().lock().list_turns(shadow.context_id, 10).unwrap();
+        assert_eq!(turns[0].stop_reason.as_deref(), Some("failed"), "{turns:?}");
+    }
+
+    /// The journal rows of a document.
+    fn journal_rows(d: &KjDispatcher, ctx: ContextId) -> i64 {
+        let db = d.kernel_db().lock();
+        db.conn_for_ledger()
+            .query_row("SELECT COUNT(*) FROM oplog WHERE document_id = ?1", [ctx.as_bytes().to_vec()], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Make every link insert fail, as a database fault would.
+    fn break_links(d: &KjDispatcher) {
+        d.kernel_db()
+            .lock()
+            .conn_for_ledger()
+            .execute_batch(
+                "CREATE TRIGGER break_links BEFORE INSERT ON shadow_renditions
+                 BEGIN SELECT RAISE(ABORT, 'injected link failure'); END;",
+            )
+            .unwrap();
+    }
+
+    /// A rendition block, its link, and its index row commit together: when the
+    /// link cannot be written, the request fails and the journal holds no block
+    /// of the shadow, on the fresh path and on the reuse path.
+    ///
+    /// Falsified by writing the block in its own transaction before the link.
+    #[tokio::test]
+    async fn a_rendition_block_is_not_kept_without_its_link() {
+        let (base, seen) = serve(vec![
+            identity(json!(["image/png"])),
+            http(404, ""),
+            object_put(PICTURE, "image/png"),
+            generation("a red square on white", "lfm3-omni"),
+        ])
+        .await;
+        let w = world(&base, Some("qwen")).await;
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        // Fresh path: the model answers, and the link fails.
+        let shadow = w.d.ensure_description_shadow(w.source).unwrap().context_id;
+        let before = journal_rows(&w.d, shadow);
+        break_links(&w.d);
+        let r = describe(&w.d, w.source, image).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("injected link failure")), "{r:?}");
+        assert_eq!(journal_rows(&w.d, shadow), before, "the block was not journaled");
+        assert_eq!(w.d.kernel_db().lock().rendition_count(shadow).unwrap(), 0);
+        w.d.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER break_links").unwrap();
+
+        // Reuse path: a rendition exists elsewhere, and the copy's link fails.
+        let other_ctx = context_of(&w.d, "other", w.performer);
+        let again = media(&w.d, other_ctx, PICTURE, "image/png");
+        let key = IndexKey::new(&w.d.kernel().cas().store(PICTURE, "image/png").unwrap().to_string(), DESCRIBE_SHADOW, "nagaya/qwen");
+        // A failed commit leaves its document refusing writes until restart, so
+        // the earlier rendition lives in a shadow of a third context.
+        let third = context_of(&w.d, "third", w.performer);
+        let third_shadow = w.d.ensure_description_shadow(third).unwrap().context_id;
+        let kept = w.d.write_rendition(third_shadow, w.performer, "kept", image, Some(&key)).unwrap();
+        assert!(kept.1);
+        let other = w.d.ensure_description_shadow(other_ctx).unwrap().context_id;
+        let before = journal_rows(&w.d, other);
+        break_links(&w.d);
+        let r = describe(&w.d, other_ctx, again).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("injected link failure")), "{r:?}");
+        assert_eq!(journal_rows(&w.d, other), before, "the copy was not journaled");
+        assert_eq!(requests(&seen).len(), 4, "the reuse path made no model call");
+    }
+
+    /// A request that finds its key taken after it made its description keeps
+    /// the description, linked and not indexed, and the key keeps naming the
+    /// first rendition; the shadow takes further writes.
+    ///
+    /// Falsified by indexing without checking the key, which fails the request
+    /// on the key.
+    #[tokio::test]
+    async fn a_request_that_loses_the_key_still_gets_its_description() {
+        let (base, _) = serve(vec![]).await;
+        let w = world(&base, Some("qwen")).await;
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        let shadow = w.d.ensure_description_shadow(w.source).unwrap().context_id;
+        let key = IndexKey::new("abc", DESCRIBE_SHADOW, "nagaya/qwen");
+        let (first, first_indexed) = w.d.write_rendition(shadow, w.performer, "first", image, Some(&key)).unwrap();
+        let (second, second_indexed) = w.d.write_rendition(shadow, w.performer, "second", image, Some(&key)).unwrap();
+        assert!(first_indexed && !second_indexed);
+        assert_ne!(first, second);
+        assert_eq!(rendition_text(&w.d, second), "second");
+        let db = w.d.kernel_db().lock();
+        assert_eq!(db.rendition_count(shadow).unwrap(), 2, "both are linked");
+        assert_eq!(db.indexed_rendition(&key).unwrap(), Some(first), "the key keeps the first");
+        drop(db);
+        w.d.write_rendition(shadow, w.performer, "third", image, None).expect("the shadow's document takes further writes");
+    }
+
+    /// A source context that is archived is refused before any shadow is made,
+    /// saying it is archived and naming `kj context promote`.
+    ///
+    /// Falsified by leaving out the check, which makes a live shadow under an
+    /// archived senpai.
+    #[tokio::test]
+    async fn an_archived_source_gets_no_shadow() {
+        let (base, seen) = serve(vec![]).await;
+        let w = world(&base, Some("qwen")).await;
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        assert!(w.d.kernel_db().lock().archive_context(w.source).unwrap());
+        let r = describe(&w.d, w.source, image).await;
+        assert!(
+            matches!(&r, KjResult::Err(m) if m.contains("archived") && m.contains(&format!("kj context promote {}", w.source.to_hex()))),
+            "{r:?}"
+        );
+        assert!(w.d.kernel_db().lock().fork_children(w.source).unwrap().is_empty(), "no shadow was made");
+        assert!(requests(&seen).is_empty());
+    }
+
+    /// A reply with no text closes its turn as failed, writes no rendition,
+    /// and says the description was empty.
+    ///
+    /// Falsified by closing the turn as `end_turn` before the text is checked.
+    #[tokio::test]
+    async fn an_empty_description_fails_its_turn_and_writes_nothing() {
+        let (base, _) = serve(vec![
+            identity(json!(["image/png"])),
+            http(404, ""),
+            object_put(PICTURE, "image/png"),
+            generation("", "lfm3-omni"),
+        ])
+        .await;
+        let w = world(&base, Some("qwen")).await;
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        let r = describe(&w.d, w.source, image).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("empty description")), "{r:?}");
         let shadow = shadow_of(&w.d, w.source);
         assert_eq!(w.d.kernel_db().lock().rendition_count(shadow.context_id).unwrap(), 0);
         let turns = w.d.kernel_db().lock().list_turns(shadow.context_id, 10).unwrap();
