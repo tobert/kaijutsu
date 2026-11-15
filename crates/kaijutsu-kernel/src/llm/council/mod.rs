@@ -591,6 +591,27 @@ mod tests {
         assert_eq!(user["content"], json!([{"type": "text", "text": "look"}, {"type": "object", "id": id, "mime": "image/png"}]));
     }
 
+    /// A served model that does not read a type is refused it before any
+    /// generation: the answer names the model and the type, and only the
+    /// identity is fetched. A type the model reads, and a type the server holds
+    /// no objects for, are told apart.
+    ///
+    /// Falsified by an answer that reads the type from the file name, or that
+    /// skips the object check.
+    #[tokio::test]
+    async fn media_the_served_model_does_not_read_is_refused_before_any_request() {
+        let (base, seen) = serve(vec![serving_media(json!(["objects"]), json!(["image/png"]))]).await;
+        let c = client(&base);
+        assert_eq!(c.media_refusal("qwen", "image/png").await.unwrap(), None);
+        let why = c.media_refusal("qwen", "video/mp4").await.unwrap().expect("a refusal");
+        assert!(why.contains("lfm3-omni") && why.contains("video/mp4"), "{why}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "one identity read, cached for the second answer");
+
+        let (base, _) = serve(vec![serving_media(json!([]), json!(["image/png"]))]).await;
+        let why = client(&base).media_refusal("qwen", "image/png").await.unwrap().expect("a refusal");
+        assert!(why.contains("holds no objects"), "{why}");
+    }
+
     /// A user message that says `listen` and carries `CLIP` as a resolved
     /// CAS audio object.
     const CLIP: &[u8] = b"not really a wav";

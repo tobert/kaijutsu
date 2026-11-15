@@ -6,10 +6,11 @@
 //! `distill` when the character has no `distill` slot. A root character runs
 //! no model.
 //!
-//! A character also holds up to two **slots**: `distill`, a cheaper model
-//! that summarizes for `kj fork --compact` and `kj drift pull|merge`, and
+//! A character also holds up to three **slots**: `distill`, a cheaper model
+//! that summarizes for `kj fork --compact` and `kj drift pull|merge`,
 //! `gate`, the council server (a backend of kind `council`) that judges the gate
-//! (`docs/council.md`, "Configuration"). No other role exists: the judge is
+//! (`docs/council.md`, "Configuration"), and `image`, the model that reads
+//! images for the character (`docs/shadows.md`). No other role exists: the judge is
 //! a character of its own, whose model is its council server.
 //!
 //! A slot names a backend + model and may set any request parameter. A
@@ -35,9 +36,11 @@ pub(super) enum CharacterSlotCommand {
         /// The character's name
         character: String,
         /// Role: `distill` for the model that summarizes for `kj fork
-        /// --compact` and `kj drift pull|merge`, or `gate` for the council
-        /// server (a council backend) that judges the gate. The character's chat
-        /// model is `kj character model set`
+        /// --compact` and `kj drift pull|merge`, `gate` for the council
+        /// server (a council backend) that judges the gate, or `image` for the
+        /// model that reads images for the character, which `kj shadow
+        /// describe` asks for a description. The character's chat model is
+        /// `kj character model set`
         role: String,
         /// The model as `<backend>/<model>`, split at the first `/`, as `kj
         /// character show` prints it (for example `deepseek/deepseek-flash`).
@@ -47,7 +50,8 @@ pub(super) enum CharacterSlotCommand {
         /// Maximum RESPONSE tokens. Omit to read it from the model's
         /// `kj backend model set` row when a context's slots are copied;
         /// making a context refuses a `distill` slot with neither. A council
-        /// server needs none
+        /// server needs none, except in an `image` slot, whose request
+        /// carries one
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0
@@ -71,7 +75,7 @@ pub(super) enum CharacterSlotCommand {
     Unset {
         /// The character's name
         character: String,
-        /// Role: `distill` or `gate`
+        /// Role: `distill`, `gate`, or `image`
         role: String,
     },
     /// List a character's slots.
@@ -489,7 +493,7 @@ fn slot_listing(
 ) -> KjResult {
     let mut lines = Vec::new();
     if slots.is_empty() {
-        lines.push(format!("{character} has no slots (`kj character slot set {character} distill|gate BACKEND/MODEL`)"));
+        lines.push(format!("{character} has no slots (`kj character slot set {character} distill|gate|describe BACKEND/MODEL`)"));
     }
     for s in slots {
         let backend = backends.get(&s.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
@@ -883,7 +887,7 @@ mod tests {
         }
     }
 
-    /// A character's slots are `distill` and `gate`. `slot set` and `slot
+    /// A character's slots are `distill`, `gate`, and `describe`. `slot set` and `slot
     /// unset` refuse any other role and name the verb that holds it: `kj
     /// character model set` for `model`, the judge character for
     /// `judge`. A `gate` slot names a council server, so a backend of
@@ -923,6 +927,25 @@ mod tests {
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
         assert!(db.list_character_slots(house.principal_id).unwrap().is_empty(), "nothing was written");
+    }
+
+    /// An `image` slot names the model that reads images for the character.
+    /// Any backend kind may hold one, and a context made afterward copies it
+    /// under role `image`.
+    ///
+    /// Falsified by leaving `image` out of the role allow-list.
+    #[tokio::test]
+    async fn slot_set_takes_an_image_slot() {
+        let d = seeded().await;
+        let c = test_caller();
+        let set = d
+            .dispatch(&argv(&["character", "slot", "set", "house", "image", "anthropic/claude-opus-5", "--max-tokens", "512"]), &c)
+            .await;
+        assert!(set.is_ok(), "{}", set.message());
+        let db = d.kernel_db().lock();
+        let house = db.get_character_by_name("house").unwrap().unwrap();
+        let slot = db.get_character_slot(house.principal_id, "image").unwrap().expect("the slot is written");
+        assert_eq!((slot.model.as_str(), slot.max_tokens), ("claude-opus-5", Some(512)));
     }
 
     #[tokio::test]

@@ -6,6 +6,37 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Context shadows: what the description slice leaves open
+
+- **No RPC and no asynchronous delivery.** `kj shadow describe` waits up to
+  `DESCRIBE_TIMEOUT` (120 seconds) and prints the description. The app and tui
+  need a request that returns at once, and a rendition that arrives through the
+  change feed when it is ready (`docs/shadows.md`, "Open questions").
+- **Turns do not follow the media slots yet.** A turn sends an image
+  whenever its provider can; the rule in `docs/shadows.md`, "Slots per media
+  kind", says the character's `image` slot decides: native when it names the
+  character's model, a description in place when it names another, a marker
+  when absent.
+- **A shadow keeps the `image` slot it was made with.** A character's later
+  `kj character slot set <name> image ...` reaches a new shadow only after
+  the old one is archived. The maker in the index is the shadow's own slot, so
+  the key stays truthful. A rotation of the source does not yet carry its
+  description shadow to the successor (`docs/shadows.md`, "Lifecycle").
+- **A refused marker leaves an empty shadow.** The shadow is made before the
+  provider says it cannot read the type, because the maker comes from the
+  shadow's slot. The request writes no rendition and calls no model.
+- **Index writes can race.** Two simultaneous misses on one key both call the
+  model, and the second link refuses on the unique key after its block is
+  written. The orphan block stays in the shadow.
+- **Presets and spans have no writer.** `preset` in `rendition_index` is empty,
+  and `span_start` and `span_end` are NULL.
+- **Video reads only on a council backend that lists it.** Claude, the
+  OpenAI-compatible providers, and Gemini send images only, so `describe` of a
+  video on them is refused before the call.
+- **The turn path guards one kind.** `chat_turn_refusal` refuses a description
+  shadow's chat turn; a judge shadow still relies on its slot having no
+  `max_tokens`.
+
 ## Control lists: what the first slice leaves open
 
 - **No kernel-level check of the vector.** `kj context control add` checks the
@@ -31,8 +62,10 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   be later." Until then, `kj context control add` takes raw ids.
 - **Objects are per node.** A vector made on spaceghost is a 404 on zorak's
   nagaya, and the control-vectors route is not in zorak's cluster forward
-  list. Whether a generation forwarded through zorak carries `control` to
-  spaceghost is untested.
+  list. A generation forwarded through zorak does read an object put on
+  zorak: on 2026-11-15 a PNG put on zorak reached `lfm3-omni` on spaceghost
+  (`usage.media.read` 1 object, 6,479 bytes). Whether a forwarded generation
+  carries `control` is untested.
 
 ## Council client: what the objects slice leaves open (2026-11-15)
 

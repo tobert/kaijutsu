@@ -70,6 +70,10 @@ pub const DEFAULT_DISTILLATION_PROMPT: &str =
 pub const DEFAULT_CONTINUATION_PROMPT: &str =
     include_str!("../../../assets/defaults/prompts/continuation.md");
 
+/// Embedded media-description instruction. The host file is the live body.
+pub const DEFAULT_DESCRIPTION_PROMPT: &str =
+    include_str!("../../../assets/defaults/prompts/description.md");
+
 /// Embedded default metronome click config (TOML). The shared *client* default;
 /// see [`CLIENT_VFS_ROOT`] and `docs/config-namespace.md`.
 pub const DEFAULT_METRONOME: &str = include_str!("../../../assets/defaults/metronome.toml");
@@ -115,6 +119,7 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("continuation.toml"), DEFAULT_CONTINUATION_CONFIG),
         (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
         (config_path("continuation.md"), DEFAULT_CONTINUATION_PROMPT),
+        (config_path("description.md"), DEFAULT_DESCRIPTION_PROMPT),
     ]
 }
 
@@ -225,6 +230,11 @@ pub async fn load_continuation_prompt(vfs: &dyn crate::vfs::VfsOps) -> Result<St
     load_auxiliary_prompt(vfs, "continuation.md").await
 }
 
+/// Read the live media-description instruction from the ordinary config tree.
+pub async fn load_description_prompt(vfs: &dyn crate::vfs::VfsOps) -> Result<String, String> {
+    load_auxiliary_prompt(vfs, "description.md").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +288,10 @@ mod tests {
         assert_eq!(
             config_seed_body(&config_path("continuation.md")),
             Some(DEFAULT_CONTINUATION_PROMPT)
+        );
+        assert_eq!(
+            config_seed_body(&config_path("description.md")),
+            Some(DEFAULT_DESCRIPTION_PROMPT)
         );
     }
 
@@ -529,6 +543,8 @@ mod auxiliary_prompt_loader_tests {
 
         assert_eq!(load_distillation_prompt(vfs.as_ref()).await.unwrap(), "LIVE-DRIFT-BRIEF");
         assert_eq!(load_continuation_prompt(vfs.as_ref()).await.unwrap(), "LIVE-CONTINUATION");
+        std::fs::write(dir.path().join("description.md"), "LIVE-DESCRIPTION").unwrap();
+        assert_eq!(load_description_prompt(vfs.as_ref()).await.unwrap(), "LIVE-DESCRIPTION");
     }
 
     #[tokio::test]

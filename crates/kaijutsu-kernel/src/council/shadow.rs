@@ -506,7 +506,7 @@ fn name_of(row: &ContextRow) -> String {
 
 /// The seat's live judge shadow, created when the seat's council names a
 /// judge character and no shadow exists yet. The shadow is found by its fork
-/// edge, its performer, and its `judge_shadows` row, never by its label. Returns the judge and
+/// edge, its performer, and its `context_shadows` row of kind `judge`, never by its label. Returns the judge and
 /// whether this call created its shadow.
 fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad) -> KernelDbResult<Option<(Judge, bool)>> {
     let _create = CREATE.lock();
@@ -534,7 +534,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
         }
         // A shadow is performed by the judge character, a child of its seat
         // that answers to it, with the judge character's slots.
-        let row = shadow_row(&db, &seat_row)?;
+        let row = shadow_row(&db, &seat_row, JUDGE)?;
         db.in_transaction(|db| {
             crate::kj::context::insert_new_context_rows(
                 db,
@@ -625,11 +625,11 @@ pub(crate) fn judge_labels(
     super::reviewer_contexts::ReviewerContextChain::default().decision_labels(council, spec)
 }
 
-/// A judge shadow's row: a child of the seat, labeled `judge-<seat>`, or
-/// the first free `judge-<seat>-<n>` when a live context holds that. The
+/// A shadow's row: a child of its source, labeled `<kind>-<source>`, or
+/// the first free `<kind>-<source>-<n>` when a live context holds that. The
 /// caller gives it its performer and senpai.
-fn shadow_row(db: &crate::kernel_db::KernelDb, seat: &ContextRow) -> KernelDbResult<ContextRow> {
-    let label = crate::kj::context::first_free_label(db, &shadow_label(&name_of(seat)))?;
+pub(crate) fn shadow_row(db: &crate::kernel_db::KernelDb, seat: &ContextRow, kind: &str) -> KernelDbResult<ContextRow> {
+    let label = crate::kj::context::first_free_label(db, &format!("{kind}-{}", name_of(seat)))?;
     Ok(ContextRow {
         context_id: ContextId::new(),
         label: Some(label),

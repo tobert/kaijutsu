@@ -50,7 +50,7 @@ pub enum PromoteOutcome {
 pub struct Archived {
     /// The context was live before the archive.
     pub context: bool,
-    /// The live judge shadows of the context that the same transaction
+    /// The live shadows of the context that the same transaction
     /// archived, oldest first.
     pub shadows: Vec<ContextId>,
 }
@@ -60,7 +60,7 @@ pub struct Archived {
 pub struct RotationCommit {
     /// How many characters' `handoff_ctx` moved to the successor.
     pub handoffs_moved: usize,
-    /// The predecessor's judge shadows, archived with it.
+    /// The predecessor's shadows, archived with it.
     pub shadows: Vec<ContextId>,
 }
 
@@ -69,7 +69,7 @@ pub struct RotationCommit {
 pub struct Retirement {
     /// The contexts the character performed, concluded and archived.
     pub archived: Vec<ContextId>,
-    /// Their judge shadows, archived with them.
+    /// Their shadows, archived with them.
     pub shadows: Vec<ContextId>,
 }
 
@@ -79,20 +79,20 @@ pub struct Demotion {
     /// The live contexts the sheet's `root_ctx`, `console_ctx` and
     /// `mcp_hub_ctx` named, archived in that order.
     pub archived: Vec<ContextId>,
-    /// Their judge shadows, archived with them.
+    /// Their shadows, archived with them.
     pub shadows: Vec<ContextId>,
 }
 
 impl KernelDb {
     /// Archive a context while retaining its history. Returns true if it was
-    /// active. Its live judge shadows are archived with it;
+    /// active. Its live shadows are archived with it;
     /// [`Self::archive_with_shadows`] also returns them, for a caller that
     /// keeps the drift router in step.
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
         Ok(self.archive_with_shadows(id)?.context)
     }
 
-    /// Archive a context and its live judge shadows in one transaction, while
+    /// Archive a context and its live shadows in one transaction, while
     /// retaining their history. Clears ring placement and abandons unresolved
     /// asks without deleting their records. Decided asks retain their
     /// answers. State and sweep commit together; an already archived row
@@ -198,30 +198,6 @@ impl KernelDb {
         )))
     }
 
-    /// Whether `row` is a judge shadow: the council made it as one
-    /// ([`Self::mark_judge_shadow`]), and it still answers to its parent.
-    pub fn is_judge_shadow(&self, row: &ContextRow) -> KernelDbResult<bool> {
-        let Some(parent) = row.forked_from else { return Ok(false) };
-        if row.senpai_ctx != Some(parent) {
-            return Ok(false);
-        }
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM judge_shadows WHERE context_id = ?1)",
-            params![blob_param(row.context_id.as_bytes())],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// Record that the council made `id` as a judge shadow. The caller writes
-    /// it in the transaction that inserts the shadow's row.
-    pub fn mark_judge_shadow(&self, id: ContextId) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO judge_shadows (context_id) VALUES (?1)",
-            params![blob_param(id.as_bytes())],
-        )?;
-        Ok(())
-    }
-
     pub(super) fn archive_context_writes(
         &self,
         id: ContextId,
@@ -235,12 +211,12 @@ impl KernelDb {
         let context = self.archive_one_context(id)?;
         let mut shadows = Vec::new();
         for child in self.fork_children(id)? {
-            if self.is_judge_shadow(&child)? && self.archive_one_context(child.context_id)? {
+            if self.shadow_kind(&child)?.is_some() && self.archive_one_context(child.context_id)? {
                 shadows.push(child.context_id);
             }
         }
         if !shadows.is_empty() {
-            info!(context = %id.short(), shadows = shadows.len(), "archived the context's judge shadows with it");
+            info!(context = %id.short(), shadows = shadows.len(), "archived the context's shadows with it");
         }
         Ok(Archived { context, shadows })
     }
@@ -288,7 +264,7 @@ impl KernelDb {
     }
 
     /// Finish a rotation in one transaction: archive `predecessor` and its
-    /// judge shadows ([`Self::archive_with_shadows`], give
+    /// shadows ([`Self::archive_with_shadows`], give
     /// `successor` its label and ring placement, and point a character's
     /// `handoff_ctx` at the successor when it named the predecessor. A
     /// predecessor that is missing or already archived refuses. Moves a
@@ -458,7 +434,7 @@ impl KernelDb {
 
     /// Make the person `principal_id` an ordinary character on behalf of
     /// `by`, in one transaction: archive each live context its `root_ctx`,
-    /// `console_ctx` and `mcp_hub_ctx` name, with their judge shadows
+    /// `console_ctx` and `mcp_hub_ctx` name, with their shadows
     /// ([`Self::archive_with_shadows_by`]), clear the three
     /// pointers and the `root` flag, and set `rc_dir` when one is given. The
     /// `root_ctx` pointer clears first, so the root console archives; every
@@ -678,7 +654,7 @@ impl KernelDb {
 
     /// Push a context outward one step on the demote ladder (kernel-owned
     /// policy, one place): already demoted → archives it (reuses
-    /// [`Self::archive_context`]'s write — the context and its judge shadows,
+    /// [`Self::archive_context`]'s write — the context and its shadows,
     /// no other subtree recursion, no latch); promoted → clears `promoted_at` (back to
     /// automatic placement); neither → sets `demoted_at`. Each call is
     /// exactly one step outward. Errors if the context is unknown or already
@@ -696,7 +672,7 @@ impl KernelDb {
     }
 
     /// [`Self::demote_context`], whose archive step archives the context's
-    /// judge shadows with it ([`Self::archive_with_shadows_by`], with
+    /// shadows with it ([`Self::archive_with_shadows_by`], with
     /// `by`) and returns them. `archives` is the step the caller
     /// decided on and prepared for: true for the archive step, whose checks
     /// and archive lifecycle the caller ran. A row whose next step is no

@@ -21,7 +21,7 @@ fn kind(db: &KernelDb, backend: BackendId) -> String {
 fn marked(db: &KernelDb, id: ContextId) -> bool {
     db.conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM judge_shadows WHERE context_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM context_shadows WHERE context_id = ?1 AND kind = 'judge')",
             params![blob_param(id.as_bytes())],
             |r| r.get(0),
         )
@@ -90,7 +90,7 @@ fn old() -> Old {
 }
 
 /// The migration renames kind `mk` to `council` and gives the shadows the
-/// old rule told a `judge_shadows` row: a context that answers to its parent,
+/// old rule told a `judge` row in `context_shadows`: a context that answers to its parent,
 /// performed by a character whose model was on an `mk` backend. A context
 /// that answers elsewhere, and a child performed by a chat character, stay
 /// unmarked. Other kinds keep theirs.
@@ -118,7 +118,7 @@ fn the_migration_runs_once() {
     let o = old();
     KernelDb::migrate_council_backends(&o.db.conn).unwrap();
     o.db.conn.execute("UPDATE backends SET kind = 'mk' WHERE backend_id = ?1", params![blob_param(o.mk.as_bytes())]).unwrap();
-    o.db.conn.execute("DELETE FROM judge_shadows", []).unwrap();
+    o.db.conn.execute("DELETE FROM context_shadows", []).unwrap();
     KernelDb::migrate_council_backends(&o.db.conn).unwrap();
     assert_eq!(kind(&o.db, o.mk), "mk");
     assert!(!marked(&o.db, o.shadow));

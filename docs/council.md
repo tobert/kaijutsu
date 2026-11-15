@@ -510,7 +510,7 @@ shipped. A fresh session resumes at the first step not marked done.
    archive`, a rotation's commit, a demote past the rim, and a character's
    retirement (`KernelDb::archive_with_shadows`). No rc script takes part.
    A judge shadow is a context the council made as one, recorded in
-   `judge_shadows` when it is made, whose parent is still its senpai. A
+   `context_shadows` (kind `judge`) when it is made, whose parent is still its senpai. A
    character's model on a council server is no sign of a judge: council
    models run chat turns too. A new shadow
    takes the first free label of `judge-<seat>`, `judge-<seat>-2`, and so

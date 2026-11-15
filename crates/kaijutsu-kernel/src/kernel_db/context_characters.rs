@@ -358,18 +358,32 @@ impl KernelDb {
     /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`;
     /// a council server (a backend of kind `council`) is exempt from both. A
     /// character slot of any other role is corruption and refuses.
-    fn copy_character_slots(&self, context_id: ContextId, principal_id: PrincipalId) -> KernelDbResult<()> {
+    ///
+    /// With `model_role`, the `model` slot is copied from the character's slot
+    /// of that role, not from its model, and a character with none refuses.
+    fn copy_character_slots(&self, context_id: ContextId, principal_id: PrincipalId, model_role: Option<&str>) -> KernelDbResult<()> {
         use crate::model_resolution::{CHARACTER_SLOT_ROLES, DISTILL, MODEL};
         let who = self.name_for(principal_id);
         let slots = self.list_character_slots(principal_id)?;
         if let Some(stray) = slots.iter().find(|slot| !CHARACTER_SLOT_ROLES.contains(&slot.role.as_str())) {
             return Err(KernelDbError::Validation(format!(
-                "character {who} holds a `{}` slot, and a character's slots are `distill` and `gate`; \
+                "character {who} holds a `{}` slot, and a character's slots are `distill`, `gate`, and `describe`; \
                  `kj character slot unset {who} {}` removes it",
                 stray.role, stray.role
             )));
         }
-        if let Some(model) = self.get_character_model(principal_id)? {
+        if let Some(role) = model_role {
+            let Some(slot) = slots.iter().find(|slot| slot.role == role) else {
+                return Err(KernelDbError::Validation(format!(
+                    "character {who} has no `{role}` slot; `kj character slot set {who} {role} <backend>/<model>`"
+                )));
+            };
+            let subject = format!("slot {role} of character {who}");
+            self.copy_one_slot(context_id, MODEL, &subject, slot.backend_id, &slot.model, slot_tunables(slot))?;
+            if !slots.iter().any(|slot| slot.role == DISTILL) {
+                self.copy_one_slot(context_id, DISTILL, &subject, slot.backend_id, &slot.model, slot_tunables(slot))?;
+            }
+        } else if let Some(model) = self.get_character_model(principal_id)? {
             let subject = format!("the model of character {who}");
             let tunables = ModelTunablesRow {
                 max_tokens: model.max_tokens,
@@ -473,6 +487,21 @@ impl KernelDb {
         senpai: Option<ContextId>,
         persona: Option<&str>,
     ) -> KernelDbResult<ContextCharacterRow> {
+        self.write_context_character_modeled(context_id, principal_id, senpai, persona, None)
+    }
+
+    /// [`Self::write_context_character`] for a context whose `model` slot is
+    /// copied from the character's slot of `model_role` instead of the
+    /// character's model: a description shadow runs on the `image` slot.
+    /// A character with no such slot refuses, naming the verb that sets it.
+    pub fn write_context_character_modeled(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        senpai: Option<ContextId>,
+        persona: Option<&str>,
+        model_role: Option<&str>,
+    ) -> KernelDbResult<ContextCharacterRow> {
         self.atomically(|db| {
             if db.get_context(context_id)?.is_none() {
                 return Err(KernelDbError::NotFound(format!("context {}", context_id.short())));
@@ -496,7 +525,7 @@ impl KernelDb {
                     persona,
                 ],
             )?;
-            db.copy_character_slots(context_id, principal_id)?;
+            db.copy_character_slots(context_id, principal_id, model_role)?;
             db.context_character(context_id)?.ok_or_else(|| {
                 KernelDbError::NotFound(format!("context {}", context_id.short()))
             })

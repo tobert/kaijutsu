@@ -5,7 +5,7 @@
 //! archives every live context the character performs.
 //!
 //! `model set|unset|show` and `slot set|unset|list` (`kj/slot.rs`) hold the
-//! one model a character runs and its `distill` and `gate` slots. `unset` and
+//! one model a character runs and its `distill`, `gate`, and `image` slots. `unset` and
 //! `list` work on a retired character too, so its slots can be tidied; `set`
 //! refuses one.
 
@@ -117,8 +117,9 @@ enum CharacterCommand {
     /// change reaches a running context at `kj context rotate`.
     #[command(subcommand)]
     Model(super::slot::CharacterModelCommand),
-    /// A character's `distill` slot (the model that summarizes) and `gate`
-    /// slot (its council server). A context copies the slots when it is made,
+    /// A character's `distill` slot (the model that summarizes), `gate`
+    /// slot (its council server), and `image` slot (the model that reads
+    /// images for it). A context copies the slots when it is made,
     /// so a change reaches a running context at `kj context rotate`.
     #[command(subcommand)]
     Slot(super::slot::CharacterSlotCommand),

@@ -1183,11 +1183,53 @@ CREATE TABLE IF NOT EXISTS context_watches (
 );
 CREATE INDEX IF NOT EXISTS idx_context_watches_host_path ON context_watches(host_path);
 
--- The contexts the council made as judge shadows (`docs/council.md`, "The
--- judge"). A shadow is archived with the seat it answers to; nothing else
--- tells a shadow from an ordinary kohai of the judge character.
-CREATE TABLE IF NOT EXISTS judge_shadows (
-    context_id BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE
+-- Context shadows (`docs/shadows.md`): a child context that follows its
+-- source, which is its parent and its senpai, and holds renditions of the
+-- source's blocks. `kind` names what it renders: `judge` for the council's
+-- judge shadow of a seat, `describe` for descriptions of media. A shadow is
+-- archived with its source; nothing else tells a shadow from an ordinary
+-- kohai of the same character.
+CREATE TABLE IF NOT EXISTS context_shadows (
+    context_id BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL CHECK (kind != '')
+);
+
+-- The source block each rendition block renders. A block id is its context,
+-- principal, and sequence. `span_start` and `span_end` are a half-open byte
+-- range of the source block, both set or both NULL for the whole block.
+CREATE TABLE IF NOT EXISTS shadow_renditions (
+    shadow_context_id   BLOB    NOT NULL REFERENCES context_shadows(context_id) ON DELETE CASCADE,
+    rendition_principal BLOB    NOT NULL,
+    rendition_seq       INTEGER NOT NULL,
+    source_context_id   BLOB    NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    source_principal    BLOB    NOT NULL,
+    source_seq          INTEGER NOT NULL,
+    span_start          INTEGER CHECK (span_start IS NULL OR span_start >= 0),
+    span_end            INTEGER,
+    created_at          INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (shadow_context_id, rendition_principal, rendition_seq),
+    CHECK ((span_start IS NULL) = (span_end IS NULL)),
+    CHECK (span_end IS NULL OR span_end >= span_start)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_renditions_source
+    ON shadow_renditions(source_context_id, source_principal, source_seq);
+
+-- Which rendition holds the result for a source's content id (the CAS hash of
+-- the source block), a kind, and a maker (`<backend>/<model>`). `preset` is
+-- empty when the maker has none. The text lives in the rendition block, not
+-- here.
+CREATE TABLE IF NOT EXISTS rendition_index (
+    content_id          TEXT NOT NULL,
+    kind                TEXT NOT NULL,
+    maker               TEXT NOT NULL,
+    preset              TEXT NOT NULL DEFAULT '',
+    shadow_context_id   BLOB NOT NULL,
+    rendition_principal BLOB NOT NULL,
+    rendition_seq       INTEGER NOT NULL,
+    created_at          INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (content_id, kind, maker, preset),
+    FOREIGN KEY (shadow_context_id, rendition_principal, rendition_seq)
+        REFERENCES shadow_renditions(shadow_context_id, rendition_principal, rendition_seq) ON DELETE CASCADE
 );
 
 -- A retired table is dropped, not left behind. Child before parent: this

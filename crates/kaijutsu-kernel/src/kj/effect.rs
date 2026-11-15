@@ -130,6 +130,7 @@ pub(crate) enum KjCommand {
     Cache(super::cache::CacheArgs),
     Vfs(super::vfs::VfsArgs),
     Diff(super::diff::DiffArgs),
+    Shadow(super::shadow::ShadowArgs),
     /// Synthesize context keywords or inspect the semantic index.
     #[command(after_help = "Unchanged synthesis is reused. --force recomputes synthesis.\nTargets: a context reference, all, status, rebuild, or help.\nContext references: . (current), .parent, label, hex prefix.")]
     Synth {
@@ -189,6 +190,7 @@ impl Classify for KjCommand {
             KjCommand::Cache(a) => a.effect(),
             KjCommand::Vfs(a) => a.effect(),
             KjCommand::Diff(a) => a.effect(),
+            KjCommand::Shadow(a) => a.effect(),
             KjCommand::Synth { target, .. } => match target.as_str() {
                 "status" | "help" => Effect::Read,
                 _ => Effect::Write,

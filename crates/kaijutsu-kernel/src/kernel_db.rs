@@ -66,6 +66,7 @@ mod approvals;
 mod review;
 mod contexts;
 mod context_ring;
+mod shadows;
 #[cfg(any(test, feature = "test-util"))]
 mod fixtures;
 mod context_fork;
@@ -78,6 +79,7 @@ mod migrate_rc_dir;
 mod migrate_slot_roles;
 mod migrate_type_melt;
 mod migrate_council_backends;
+mod migrate_context_shadows;
 mod migrate_cast;
 mod migrate;
 #[cfg(test)]
@@ -104,6 +106,7 @@ pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};
 pub use contexts::ContextRow;
+pub use shadows::{IndexKey, Rendition, DESCRIBE as DESCRIBE_SHADOW, JUDGE as JUDGE_SHADOW};
 pub use editor_recovery::{CorruptRecovery, RecoveryEntry, RecoveryFile, RecoveryId, RecoverySession};
 pub use context_ring::{ACTIVE_RING_CAPACITY, Archived, DemoteOutcome, Demotion, PromoteOutcome, Retirement, RotationCommit};
 use schema::SCHEMA;

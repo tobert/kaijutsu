@@ -1,0 +1,871 @@
+//! `kj shadow` — the context shadows of a context (`docs/shadows.md`).
+//!
+//! ```text
+//! kj shadow list [--context <ctx>]
+//! kj shadow describe <block> [--context <ctx>]
+//! ```
+//!
+//! `describe` writes a text description of an image block into the
+//! description shadow of the block's context: a child that the source's own
+//! performer plays, whose `model` slot is the performer's `image` slot. A
+//! description is a rendition block in the shadow, linked to the source block
+//! and indexed by the media's CAS hash, the kind, and the maker
+//! (`<backend>/<model>`), so a second request for the same image by the same
+//! maker, from any context, copies the first rendition and calls no model.
+
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
+
+use crate::kernel_db::{ContextRow, IndexKey, Rendition, DESCRIBE_SHADOW};
+use crate::llm::{ContentBlock, Message, MessageContent};
+
+use super::effect::{Classify, Effect};
+use super::refs::resolve_context_arg;
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+/// How long `kj shadow describe` waits for the model's description. A request
+/// that has not answered by then is an error and writes no rendition.
+pub(crate) const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Serializes the check-then-create of a description shadow, so two requests
+/// for one source make one shadow.
+static CREATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "shadow",
+    about = "List a context's shadows, or ask for a description of its images",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+pub(crate) struct ShadowArgs {
+    #[command(subcommand)]
+    command: ShadowCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ShadowCommand {
+    /// List the live shadows of a context: kind, id, performer, model, and how
+    /// many renditions each holds.
+    #[command(alias = "ls")]
+    List {
+        /// Source context: . (default) | .parent | <label> | <hex prefix>
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+    },
+    /// Write a text description of an image block, and print it with the id
+    /// of the rendition block that holds it. The block is a media block of the
+    /// context whose CAS type is image/*. The context's performer needs an
+    /// `image` slot (`kj character slot set <character> image
+    /// <backend>/<model> --max-tokens <n>`). A description of the same
+    /// image by the same model that any context already holds is copied
+    /// without a model call, and the output says it was reused. Waits at most
+    /// 120 seconds for the model.
+    Describe {
+        /// Block id: the full context_principal_seq id, or `<principal8>#<seq>`
+        /// as `kj block list` prints it (quote it, since kaish eats a bare `#`)
+        block: String,
+        /// Context the block is in: . (default) | .parent | <label> | <hex prefix>
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+    },
+}
+
+impl Classify for ShadowArgs {
+    fn effect(&self) -> Effect {
+        match &self.command {
+            ShadowCommand::List { .. } => Effect::Read,
+            // Makes the shadow if needed, writes blocks and index rows, and
+            // spends a model call; all of it can be archived.
+            ShadowCommand::Describe { .. } => Effect::Write,
+        }
+    }
+}
+
+/// What a `describe` request produced.
+struct Described {
+    text: String,
+    rendition: BlockId,
+    shadow: ContextId,
+    maker: String,
+    media_type: String,
+    hash: String,
+    /// The text came from a rendition that already existed.
+    reused: bool,
+}
+
+impl KjDispatcher {
+    pub(crate) async fn dispatch_shadow(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        if argv.is_empty() {
+            return clap_help_for::<ShadowArgs>();
+        }
+        let parsed = match ShadowArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj shadow: {e}"));
+            }
+        };
+        match parsed.command {
+            ShadowCommand::List { context } => self.shadow_list(context.as_deref(), caller),
+            ShadowCommand::Describe { block, context } => {
+                // A description is a new block, so it takes the capability
+                // `kj block create` takes.
+                let cap = crate::mcp::Capability::Tool {
+                    instance: crate::mcp::InstanceId::new("builtin.block"),
+                    tool: "block_create".to_string(),
+                };
+                if let Err(denied) = self.require_cap(caller, cap, "shadow") {
+                    return denied;
+                }
+                match self.describe_block(&block, context.as_deref(), caller, DESCRIBE_TIMEOUT).await {
+                    Ok(done) => describe_result(&done),
+                    Err(e) => KjResult::Err(format!("kj shadow describe: {e}")),
+                }
+            }
+        }
+    }
+
+    fn shadow_list(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
+        let db = self.kernel_db().lock();
+        let source = match resolve_context_arg(context, caller, &db) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj shadow list: {e}")),
+        };
+        let shadows = match db.shadows_of(source) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj shadow list: {e}")),
+        };
+        if shadows.is_empty() {
+            return KjResult::ok(format!("{} has no shadows\n", db.context_name(source)));
+        }
+        let mut text = String::new();
+        let mut data = Vec::new();
+        for (row, kind) in &shadows {
+            let performer = row.performer.map_or_else(|| "(none)".to_string(), |p| db.name_for(p));
+            let model = match db.context_slot(row.context_id, crate::model_resolution::MODEL) {
+                Ok(Some(slot)) => match db.get_backend(slot.backend_id) {
+                    Ok(Some(backend)) => format!("{}/{}", backend.name, slot.model),
+                    Ok(None) => format!("(backend {} missing)/{}", slot.backend_id, slot.model),
+                    Err(e) => return KjResult::Err(format!("kj shadow list: {e}")),
+                },
+                Ok(None) => "(none)".to_string(),
+                Err(e) => return KjResult::Err(format!("kj shadow list: {e}")),
+            };
+            let renditions = match db.rendition_count(row.context_id) {
+                Ok(n) => n,
+                Err(e) => return KjResult::Err(format!("kj shadow list: {e}")),
+            };
+            text.push_str(&format!(
+                "{kind:<9} {}  performer {performer}  model {model}  {renditions} rendition(s)\n",
+                row.context_id.to_hex()
+            ));
+            data.push(serde_json::json!({
+                "kind": kind,
+                "context_id": row.context_id.to_hex(),
+                "label": row.label,
+                "performer": performer,
+                "model": model,
+                "renditions": renditions,
+            }));
+        }
+        KjResult::ok_with_data(text, serde_json::Value::Array(data))
+    }
+
+    /// The whole of `kj shadow describe`.
+    async fn describe_block(
+        &self,
+        block: &str,
+        context: Option<&str>,
+        caller: &KjCaller,
+        timeout: Duration,
+    ) -> Result<Described, String> {
+        let id = self.resolve_block_id(block, context, caller)?;
+        let source = id.context_id;
+        if context.is_some() {
+            let named = {
+                let db = self.kernel_db().lock();
+                resolve_context_arg(context, caller, &db)?
+            };
+            if named != source {
+                return Err(format!("block {} is in context {}, not {}", id.to_key(), source.short(), named.short()));
+            }
+        }
+        let (hash, media_type) = self.describable_media(id)?;
+        let hash_text = hash.to_string();
+        let shadow = self.ensure_description_shadow(source)?;
+        let bound = {
+            let db = self.kernel_db().lock();
+            crate::model_resolution::role_slot(&db, shadow.context_id, crate::model_resolution::MODEL)
+                .map_err(|e| format!("could not read the description shadow's model: {e}"))?
+        };
+        let bound = match bound {
+            crate::model_resolution::RoleSlot::Slot(bound) => bound,
+            crate::model_resolution::RoleSlot::None(none) => return Err(none.refusal_as("cannot describe")),
+        };
+        let maker = format!("{}/{}", bound.backend, bound.slot.model);
+        let key = IndexKey::new(&hash_text, DESCRIBE_SHADOW, &maker);
+        let performer = shadow.performer.ok_or_else(|| format!("description shadow {} has no performer", shadow.context_id.short()))?;
+
+        let hit = self.kernel_db().lock().indexed_rendition(&key).map_err(|e| e.to_string())?;
+        if let Some(earlier) = hit {
+            let text = self.rendition_text(earlier)?;
+            let held_here = earlier.context_id == shadow.context_id
+                && self
+                    .kernel_db()
+                    .lock()
+                    .renditions_of(shadow.context_id)
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|r| r.block == earlier && r.source == id);
+            let rendition = if held_here {
+                earlier
+            } else {
+                let copy = self.write_rendition_block(shadow.context_id, performer, &text)?;
+                self.kernel_db()
+                    .lock()
+                    .record_rendition(&Rendition { block: copy, source: id, span: None }, None)
+                    .map_err(|e| format!("the copied rendition {} could not be linked: {e}", copy.to_key()))?;
+                copy
+            };
+            return Ok(Described { text, rendition, shadow: shadow.context_id, maker, media_type, hash: hash_text, reused: true });
+        }
+
+        let max_tokens = bound
+            .slot
+            .max_tokens
+            .and_then(|m| u64::try_from(m).ok())
+            .filter(|m| *m > 0)
+            .ok_or_else(|| {
+                format!(
+                    "the image slot {maker} of {} has no max_tokens, which every request carries; \
+                     `kj character slot set {} describe {maker} --max-tokens <n>`, then archive {} so the next request makes a new shadow",
+                    bound.context, bound.character, bound.context
+                )
+            })?;
+        let provider = self.kernel.llm().read().await.get(&bound.backend).ok_or_else(|| {
+            format!(
+                "backend '{}' of the image slot is not registered (missing key? see `kj backend show {}`)",
+                bound.backend, bound.backend
+            )
+        })?;
+        if let Some(why) = provider.media_refusal(&bound.slot.model, &media_type).await.map_err(|e| e.to_string())? {
+            return Err(format!(
+                "{maker} cannot read {media_type} ({why}), so the request would send a marker instead of the media. No model was called"
+            ));
+        }
+        let instruction = crate::config_seed::load_description_prompt(self.kernel().vfs().as_ref())
+            .await
+            .map_err(|e| format!("description prompt: {e}"))?;
+        let mut messages = vec![Message {
+            role: crate::llm::Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::Media {
+                hash: hash_text.clone(),
+                media_type: media_type.clone(),
+                data_base64: None,
+            }]),
+            turn_scoped: false,
+        }];
+        let cas: std::sync::Arc<dyn kaijutsu_cas::ContentStore> = self.kernel().cas().clone();
+        crate::llm::resolve_media_blocks_from_cas(&mut messages, cas, None).await;
+        let resolved = matches!(
+            &messages[0].content,
+            MessageContent::Blocks(parts) if matches!(parts.first(), Some(ContentBlock::Media { data_base64: Some(d), .. }) if !d.is_empty())
+        );
+        if !resolved {
+            return Err(format!("the bytes of {hash_text} were not found in CAS, so there is nothing to describe"));
+        }
+
+        let reply = self.call_describer(&provider, &bound, shadow.context_id, performer, max_tokens, &instruction, messages, timeout).await?;
+        let text = reply.trim().to_string();
+        if text.is_empty() {
+            return Err(format!("{maker} returned an empty description; no rendition was written"));
+        }
+        let rendition = self.write_rendition_block(shadow.context_id, performer, &text)?;
+        self.kernel_db()
+            .lock()
+            .record_rendition(&Rendition { block: rendition, source: id, span: None }, Some(&key))
+            .map_err(|e| format!("the rendition {} was written but could not be linked and indexed: {e}", rendition.to_key()))?;
+        Ok(Described { text, rendition, shadow: shadow.context_id, maker, media_type, hash: hash_text, reused: false })
+    }
+
+    /// The CAS hash and recorded media type of `id`, a media block whose
+    /// object is an image or video, or why it is not one.
+    fn describable_media(&self, id: BlockId) -> Result<(kaijutsu_cas::ContentHash, String), String> {
+        let key = id.to_key();
+        let snapshots = self.blocks.non_draft_snapshots(id.context_id).map_err(|e| e.to_string())?;
+        let snap = snapshots.into_iter().find(|b| b.id == id).ok_or_else(|| format!("block {key} not found"))?;
+        if snap.content_type != ContentType::Media {
+            return Err(format!(
+                "block {key} is a {} block of type {}, not a media block; describe takes an image or video block",
+                snap.kind.as_str(),
+                snap.content_type.as_mime()
+            ));
+        }
+        let hash = snap
+            .content
+            .trim()
+            .parse::<kaijutsu_cas::ContentHash>()
+            .map_err(|_| format!("block {key} is a media block whose content {:?} is not a CAS hash", snap.content))?;
+        let reference = kaijutsu_cas::ContentStore::inspect(self.kernel().cas().as_ref(), &hash)
+            .map_err(|e| format!("reading the CAS record of {hash}: {e}"))?
+            .ok_or_else(|| format!("CAS has no object {hash}, which block {key} names"))?;
+        let media_type = reference.mime_type;
+        if !media_type.starts_with("image/") {
+            return Err(format!(
+                "block {key} holds {media_type}, which describe does not read; it takes image/* (video waits for a `video` slot)"
+            ));
+        }
+        Ok((hash, media_type))
+    }
+
+    /// The live description shadow of `source`, made when it has none. The
+    /// source's performer needs an `image` slot; one with none refuses and
+    /// names the verb that sets it.
+    fn ensure_description_shadow(&self, source: ContextId) -> Result<ContextRow, String> {
+        let _create = CREATE.lock();
+        let (row, source_row) = {
+            let db = self.kernel_db().lock();
+            let source_row = db
+                .get_context(source)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("context {} has no row", source.short()))?;
+            let performer = source_row.performer.ok_or_else(|| {
+                format!("{} has no performer, so it has no image slot", db.context_name(source))
+            })?;
+            let sheet = db
+                .get_character(performer)
+                .map_err(|e| e.to_string())?
+                .filter(|sheet| sheet.retired_at.is_none())
+                .ok_or_else(|| format!("the performer of {} is not a live character", db.context_name(source)))?;
+            if let Some(existing) = db.live_shadow(source, DESCRIBE_SHADOW).map_err(|e| e.to_string())? {
+                return Ok(existing);
+            }
+            if db
+                .get_character_slot(performer, crate::model_resolution::IMAGE)
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                return Err(format!(
+                    "{} cannot get a description: its performer {} has no `image` slot. \
+                     Fix: `kj character slot set {} image <backend>/<model> --max-tokens <n>`",
+                    db.context_name(source),
+                    sheet.name,
+                    sheet.name
+                ));
+            }
+            let row = crate::council::shadow::shadow_row(&db, &source_row, DESCRIBE_SHADOW).map_err(|e| e.to_string())?;
+            db.in_transaction(|db| {
+                super::context::insert_new_context_rows(
+                    db,
+                    &row,
+                    super::context::CharacterPlacement::Shadow {
+                        performer,
+                        senpai: source,
+                        model_role: crate::model_resolution::IMAGE,
+                    },
+                )?;
+                db.mark_shadow(row.context_id, DESCRIBE_SHADOW)
+            })
+            .map_err(|e| e.to_string())?;
+            (row, source_row)
+        };
+        self.blocks
+            .create_document(row.context_id, kaijutsu_types::DocKind::Conversation, None)
+            .map_err(|e| format!("shadow document: {e}"))?;
+        let registered = self.drift.write().register(row.context_id, row.label.as_deref(), Some(source), row.created_by);
+        if let Err(error) = registered {
+            tracing::error!(source = %source_row.context_id, shadow = %row.context_id, "shadow: label not registered: {error}");
+        }
+        self.kernel_db()
+            .lock()
+            .get_context(row.context_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("shadow {} has no row after it was made", row.context_id.short()))
+    }
+
+    /// The text of a rendition block, or why it cannot be read.
+    fn rendition_text(&self, block: BlockId) -> Result<String, String> {
+        let snapshots = self.blocks.non_draft_snapshots(block.context_id).map_err(|e| {
+            format!("the index names rendition {} but its context cannot be read: {e}", block.to_key())
+        })?;
+        snapshots
+            .into_iter()
+            .find(|b| b.id == block)
+            .map(|b| b.content)
+            .ok_or_else(|| format!("the index names rendition {} but that block is not in its context", block.to_key()))
+    }
+
+    fn write_rendition_block(&self, shadow: ContextId, performer: kaijutsu_types::PrincipalId, text: &str) -> Result<BlockId, String> {
+        self.blocks
+            .insert_block_marked(
+                shadow,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                text.to_string(),
+                Status::Done,
+                ContentType::Plain,
+                Some(performer),
+                false,
+            )
+            .map_err(|e| format!("could not write the rendition block: {e}"))
+    }
+
+    /// One model call on the shadow's `model` slot, recorded as a turn of the
+    /// shadow's performer before it is made, and bounded by
+    /// `timeout`. The reply is the description text.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_describer(
+        &self,
+        provider: &crate::llm::Provider,
+        bound: &crate::model_resolution::BoundSlot,
+        shadow: ContextId,
+        performer: kaijutsu_types::PrincipalId,
+        max_tokens: u64,
+        instruction: &str,
+        messages: Vec<Message>,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let model = bound.slot.model.clone();
+        let db = self.kernel_db().clone();
+        let turn_id = kaijutsu_types::TurnId::new();
+        let row = db
+            .lock()
+            .begin_turn(&crate::TurnStart {
+                turn_id,
+                context_id: shadow,
+                performer,
+                role: crate::model_resolution::IMAGE.to_string(),
+                provider: bound.backend.clone(),
+                model: model.clone(),
+                started_at: kaijutsu_types::now_millis() as i64,
+            })
+            .map(|()| super::OpenTurnRow { db: db.clone(), turn_id, open: true })
+            .map_err(|e| format!("could not write the description's turn record: {e}. The call was not made."))?;
+        let slot = &bound.slot;
+        let tunables = crate::llm::SlotTunables {
+            max_tokens: None,
+            temperature: slot.temperature,
+            top_p: slot.top_p,
+            effort: slot.effort.clone(),
+            thinking_budget: slot.thinking_budget.and_then(|v| u64::try_from(v).ok()),
+            thinking_style: slot.thinking_style.clone(),
+        };
+        let opts = crate::llm::apply_tunables(
+            crate::llm::BuildOpts::new(&model, max_tokens).with_system(instruction),
+            &tunables,
+        );
+        let reply = match tokio::time::timeout(timeout, provider.prompt_messages(opts, messages)).await {
+            Ok(reply) => reply,
+            Err(_) => Err(crate::llm::OneShotError::from(crate::llm::LlmError::NetworkError(format!(
+                "no description within {timeout:?} (DESCRIBE_TIMEOUT)"
+            )))),
+        };
+        let (usage, stop_reason) = match &reply {
+            Ok(reply) => (
+                Some(&reply.usage),
+                crate::runtime::llm_stream::turn_stop_reason(reply.stop_reason.as_deref()).as_str(),
+            ),
+            Err(failed) => (failed.usage.as_ref(), "failed"),
+        };
+        let recorded = usage.map_or(Ok(()), |usage| {
+            crate::runtime::llm_stream::record_turn_spend(
+                &db, Some(turn_id), provider.name(), &model,
+                usage.input_tokens, usage.output_tokens, &usage.extra,
+            ).map(|_| ())
+        });
+        let record = recorded
+            .and(row.finish(stop_reason))
+            .map_err(|e| format!("could not write the description's turn record: {e}"));
+        if let Err(error) = &record {
+            tracing::error!(context = %shadow, turn = %turn_id, "{error}");
+        }
+        let reply = reply.map_err(|e| format!("{}/{model} failed: {e}", bound.backend))?;
+        record?;
+        Ok(reply.text)
+    }
+}
+
+fn describe_result(done: &Described) -> KjResult {
+    let origin = if done.reused { "reused an existing description" } else { "described" };
+    let text = format!(
+        "{origin} of {} ({}) by {}\n{}\nrendition: {}\n",
+        done.hash,
+        done.media_type,
+        done.maker,
+        done.text,
+        done.rendition.to_key()
+    );
+    KjResult::ok_with_data(
+        text,
+        serde_json::json!({
+            "description": done.text,
+            "rendition": done.rendition.to_key(),
+            "shadow": done.shadow.to_hex(),
+            "maker": done.maker,
+            "media_type": done.media_type,
+            "content_id": done.hash,
+            "reused": done.reused,
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kaijutsu_cas::ContentStore;
+    use kaijutsu_council::test_server::{reply as http, serve, sse, Captured, Reply};
+    use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
+    use serde_json::json;
+
+    use super::*;
+    use crate::kj::test_helpers::*;
+    use crate::llm::{council, Provider};
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    const PICTURE: &[u8] = b"not really a png";
+
+    /// A council identity serving two models that read `image/png` and give
+    /// the first the alias `qwen`.
+    fn identity(inputs: serde_json::Value) -> Reply {
+        let model = |name: &str, aliases: serde_json::Value| {
+            json!({"model": name, "aliases": aliases, "status": "ready", "weight_hash": "w",
+                   "tokenizer_hash": "t", "template": "x", "engine": "e",
+                   "limits": {"context_tokens": 32768, "decision_context_tokens": 3072, "snapshot_bytes": 1,
+                              "contexts_per_decision": 8, "default_timeout_ms": 2000},
+                   "capabilities": ["generate"],
+                   "media": {"inputs": inputs, "outputs": []}})
+        };
+        http(
+            200,
+            json!({"models": [model("lfm3-omni", json!(["qwen"])), model("lfm3-vl", json!([]))],
+                   "limits": {"case_bytes": 1000, "choice_options": 26},
+                   "capabilities": ["objects"]})
+            .to_string(),
+        )
+    }
+
+    fn object_put(bytes: &[u8], mime: &str) -> Reply {
+        http(201, json!({"id": gogi_proto::content_id(bytes), "mime": mime, "bytes": bytes.len()}).to_string())
+    }
+
+    fn generation(content: &str, model: &str) -> Reply {
+        let token = json!({"id": 1, "piece": content, "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
+        let done = json!({"model": model, "content": content, "reasoning": "", "tool_calls": [], "finish": "end_turn",
+                          "usage": {"prompt": 47, "kept": 40, "fed": 7, "completion": 3, "reasoning": 0}, "head": null, "seed": 11,
+                          "snapshots": []});
+        sse(format!("event: token\ndata: {token}\n\nevent: done\ndata: {done}\n\n"))
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<Captured>>>;
+
+    fn requests(seen: &Seen) -> Vec<String> {
+        seen.lock().unwrap().iter().map(|c| format!("{} {}", c.method, c.path)).collect()
+    }
+
+    /// A kernel with a council backend `nagaya` at `base`, and a character
+    /// `describer` that plays a context `src`. `describe` is the model of its
+    /// `image` slot, when it has one.
+    struct World {
+        d: KjDispatcher,
+        performer: PrincipalId,
+        source: ContextId,
+    }
+
+    async fn world(base: &str, describe: Option<&str>) -> World {
+        let d = test_dispatcher().await;
+        let set = d
+            .dispatch(&[s("backend"), s("set"), s("nagaya"), s("--kind"), s("council"), s("--base-url"), s(base), s("--key-optional")], &test_caller())
+            .await;
+        assert!(set.is_ok(), "{}", set.message());
+        d.kernel()
+            .llm()
+            .write()
+            .await
+            .register("nagaya", Arc::new(Provider::Council(council::Client::new("nagaya", base, Duration::from_secs(5)).unwrap())));
+        let performer = character(&d, "describer", describe);
+        let source = context_of(&d, "src", performer);
+        World { d, performer, source }
+    }
+
+    fn character(d: &KjDispatcher, name: &str, image: Option<&str>) -> PrincipalId {
+        let performer = PrincipalId::new();
+        let db = d.kernel_db().lock();
+        db.insert_character(&crate::kernel_db::CharacterRow {
+            rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, principal_id: performer,
+            name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        })
+        .unwrap();
+        let mut entries = vec![("model", "mock", "mock-model")];
+        if let Some(model) = image {
+            entries.push(("image", "nagaya", model));
+        }
+        db.seed_test_slot_entries(performer, &entries).unwrap();
+        performer
+    }
+
+    fn context_of(d: &KjDispatcher, label: &str, performer: PrincipalId) -> ContextId {
+        let ctx = register_rooted_context(d, Some(label), performer);
+        d.block_store().create_document(ctx, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        ctx
+    }
+
+    /// A media block in `ctx` that holds `bytes` as `mime`.
+    fn media(d: &KjDispatcher, ctx: ContextId, bytes: &[u8], mime: &str) -> BlockId {
+        let hash = d.kernel().cas().store(bytes, mime).unwrap();
+        d.block_store()
+            .insert_block(ctx, None, None, Role::Asset, BlockKind::File, hash.to_string(), Status::Done, ContentType::Media)
+            .unwrap()
+    }
+
+    async fn describe(d: &KjDispatcher, ctx: ContextId, block: BlockId) -> KjResult {
+        d.dispatch(&[s("shadow"), s("describe"), block.to_key()], &confirmed_caller(ctx)).await
+    }
+
+    fn shadow_of(d: &KjDispatcher, ctx: ContextId) -> ContextRow {
+        d.kernel_db().lock().live_shadow(ctx, DESCRIBE_SHADOW).unwrap().expect("a description shadow")
+    }
+
+    fn rendition_text(d: &KjDispatcher, block: BlockId) -> String {
+        d.block_store().block_snapshots(block.context_id).unwrap().into_iter().find(|b| b.id == block).unwrap().content
+    }
+
+    /// With no `image` slot on the performer, a request is refused naming
+    /// the verb that sets one, makes no shadow, and calls no model.
+    ///
+    /// Falsified by a fallback to the performer's chat model.
+    #[tokio::test]
+    async fn describe_without_an_image_slot_names_the_fix() {
+        let (base, seen) = serve(vec![]).await;
+        let w = world(&base, None).await;
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        let r = describe(&w.d, w.source, image).await;
+        assert!(
+            matches!(&r, KjResult::Err(m) if m.contains("kj character slot set describer image <backend>/<model>")),
+            "{r:?}"
+        );
+        assert!(w.d.kernel_db().lock().live_shadow(w.source, DESCRIBE_SHADOW).unwrap().is_none(), "no shadow is made");
+        assert!(requests(&seen).is_empty());
+    }
+
+    /// A text block and an audio block are refused, saying what they are, and
+    /// nothing is made.
+    ///
+    /// Falsified by accepting any media block, or any block with a hash.
+    #[tokio::test]
+    async fn a_block_that_is_not_an_image_is_refused() {
+        let (base, seen) = serve(vec![]).await;
+        let w = world(&base, Some("qwen")).await;
+        let text = w
+            .d
+            .block_store()
+            .insert_block(w.source, None, None, Role::User, BlockKind::Text, "hello", Status::Done, ContentType::Plain)
+            .unwrap();
+        let r = describe(&w.d, w.source, text).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("not a media block") && m.contains("text/plain")), "{r:?}");
+        let audio = media(&w.d, w.source, b"RIFFfakewav", "audio/wav");
+        let r = describe(&w.d, w.source, audio).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("audio/wav") && m.contains("it takes image/*")), "{r:?}");
+        let video = media(&w.d, w.source, b"fake mp4", "video/mp4");
+        let r = describe(&w.d, w.source, video).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("video/mp4") && m.contains("`video` slot")), "{r:?}");
+        assert!(w.d.kernel_db().lock().live_shadow(w.source, DESCRIBE_SHADOW).unwrap().is_none());
+        assert!(requests(&seen).is_empty());
+    }
+
+    /// A describe on a council backend puts the image as an object, sends it
+    /// in one user message under the kernel's instruction, and writes a
+    /// rendition block in a shadow that the source's performer plays and whose
+    /// `model` slot is the `image` slot. The rendition is linked to the
+    /// source block and indexed, and the model call is a recorded turn.
+    ///
+    /// Falsified by sending a marker, by writing the text to the source
+    /// context, or by leaving the rendition out of the link or the index.
+    #[tokio::test]
+    async fn a_description_is_written_linked_and_indexed() {
+        let (base, seen) = serve(vec![
+            identity(json!(["image/png"])),
+            http(404, ""),
+            object_put(PICTURE, "image/png"),
+            generation("a red square on white", "lfm3-omni"),
+        ])
+        .await;
+        let w = world(&base, Some("qwen")).await;
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        let r = describe(&w.d, w.source, image).await;
+        assert!(r.is_ok(), "{}", r.message());
+        assert!(r.message().contains("a red square on white") && r.message().contains("rendition: "), "{}", r.message());
+
+        let id = gogi_proto::content_id(PICTURE);
+        assert_eq!(
+            requests(&seen),
+            ["GET /council/v2/identity", &format!("HEAD /council/v2/objects/{id}"), &format!("PUT /council/v2/objects/{id}"), "POST /council/v2/generations"]
+        );
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[3].body).unwrap();
+        let messages = body["context"]["messages"].as_array().unwrap();
+        let user = messages.iter().rfind(|m| m["role"] == "user").unwrap();
+        assert_eq!(user["content"], json!([{"type": "object", "id": id, "mime": "image/png"}]));
+        assert!(messages[0]["content"].to_string().contains("Describe the attached image"), "{}", messages[0]);
+
+        let shadow = shadow_of(&w.d, w.source);
+        assert_eq!((shadow.forked_from, shadow.senpai_ctx, shadow.performer), (Some(w.source), Some(w.source), Some(w.performer)));
+        let db = w.d.kernel_db().lock();
+        let model = db.context_slot(shadow.context_id, "model").unwrap().unwrap();
+        assert_eq!(model.model, "qwen", "the shadow's model slot is the image slot, not the chat model");
+        let links = db.renditions_of(shadow.context_id).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].source, links[0].span), (image, None));
+        let hash = db.indexed_rendition(&IndexKey::new(&w.d.kernel().cas().store(PICTURE, "image/png").unwrap().to_string(), "describe", "nagaya/qwen")).unwrap();
+        assert_eq!(hash, Some(links[0].block));
+        let turns = db.list_turns(shadow.context_id, 10).unwrap();
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert_eq!((turns[0].start.role.as_str(), turns[0].stop_reason.as_deref()), ("image", Some("end_turn")));
+        drop(db);
+        assert_eq!(rendition_text(&w.d, links_block(&w.d, shadow.context_id)), "a red square on white");
+        assert!(
+            w.d.block_store().block_snapshots(w.source).unwrap().iter().all(|b| b.content != "a red square on white"),
+            "the source context holds no rendition"
+        );
+    }
+
+    fn links_block(d: &KjDispatcher, shadow: ContextId) -> BlockId {
+        d.kernel_db().lock().renditions_of(shadow).unwrap()[0].block
+    }
+
+    /// The same image by the same maker, asked for in another context, copies
+    /// the first rendition into that context's own shadow with its own link
+    /// and calls no model; a different maker calls the model again.
+    ///
+    /// Falsified by an index that ignores the maker, or a reuse that calls
+    /// the model anyway.
+    #[tokio::test]
+    async fn a_description_is_reused_across_contexts_and_another_maker_asks_again() {
+        let (base, seen) = serve(vec![
+            identity(json!(["image/png"])),
+            http(404, ""),
+            object_put(PICTURE, "image/png"),
+            generation("a red square on white", "lfm3-omni"),
+            http(200, ""),
+            generation("a small red square", "lfm3-vl"),
+        ])
+        .await;
+        let w = world(&base, Some("qwen")).await;
+        let first = media(&w.d, w.source, PICTURE, "image/png");
+        assert!(describe(&w.d, w.source, first).await.is_ok());
+        assert_eq!(requests(&seen).len(), 4);
+
+        // Another context of the same performer, with the same image.
+        let other = context_of(&w.d, "other", w.performer);
+        let again = media(&w.d, other, PICTURE, "image/png");
+        let r = describe(&w.d, other, again).await;
+        assert!(r.is_ok(), "{}", r.message());
+        assert!(r.message().contains("reused"), "{}", r.message());
+        assert_eq!(requests(&seen).len(), 4, "no model call, no object traffic: {:?}", requests(&seen));
+        let (a, b) = (shadow_of(&w.d, w.source), shadow_of(&w.d, other));
+        assert_ne!(a.context_id, b.context_id, "each source has its own shadow");
+        let copy = w.d.kernel_db().lock().renditions_of(b.context_id).unwrap();
+        assert_eq!(copy.len(), 1);
+        assert_eq!(copy[0].source, again, "the copy links its own source block");
+        assert_eq!(copy[0].block.context_id, b.context_id);
+        assert_eq!(rendition_text(&w.d, copy[0].block), "a red square on white");
+
+        // A performer whose image slot is another model does not reuse it.
+        let second = character(&w.d, "describer2", Some("lfm3-vl"));
+        let third = context_of(&w.d, "third", second);
+        let image = media(&w.d, third, PICTURE, "image/png");
+        let r = describe(&w.d, third, image).await;
+        assert!(r.is_ok(), "{}", r.message());
+        assert!(!r.message().contains("reused") && r.message().contains("a small red square"), "{}", r.message());
+        assert_eq!(requests(&seen).len(), 6);
+    }
+
+    /// A served model that does not read the media's type is refused before
+    /// any generation, naming the model and the type.
+    ///
+    /// Falsified by calling the model and describing the marker.
+    #[tokio::test]
+    async fn media_the_model_cannot_read_is_refused_before_the_model_is_called() {
+        let (base, seen) = serve(vec![identity(json!(["image/png"]))]).await;
+        let w = world(&base, Some("qwen")).await;
+        let jpeg = media(&w.d, w.source, b"fake jpeg", "image/jpeg");
+        let r = describe(&w.d, w.source, jpeg).await;
+        assert!(
+            matches!(&r, KjResult::Err(m) if m.contains("nagaya/qwen") && m.contains("image/jpeg") && m.contains("No model was called")),
+            "{r:?}"
+        );
+        assert_eq!(requests(&seen), ["GET /council/v2/identity"]);
+        let shadow = shadow_of(&w.d, w.source);
+        assert_eq!(w.d.kernel_db().lock().rendition_count(shadow.context_id).unwrap(), 0);
+        assert!(w.d.kernel_db().lock().list_turns(shadow.context_id, 10).unwrap().is_empty(), "no turn was recorded");
+    }
+
+    /// A model that does not answer within the timeout is an error that names
+    /// the timeout, writes no rendition, and closes its turn as failed.
+    ///
+    /// Falsified by a call with no bound.
+    #[tokio::test]
+    async fn a_model_that_does_not_answer_in_time_writes_nothing() {
+        let slow = Reply { delay: Duration::from_secs(5), ..generation("late", "lfm3-omni") };
+        let (base, _) = serve(vec![identity(json!(["image/png"])), http(404, ""), object_put(PICTURE, "image/png"), slow]).await;
+        let w = world(&base, Some("qwen")).await;
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        let caller = confirmed_caller(w.source);
+        let started = std::time::Instant::now();
+        let err = w.d.describe_block(&image.to_key(), None, &caller, Duration::from_millis(300)).await.err().expect("a timeout");
+        assert!(err.contains("DESCRIBE_TIMEOUT") && err.contains("300ms"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(4), "the call is bounded");
+        let shadow = shadow_of(&w.d, w.source);
+        assert_eq!(w.d.kernel_db().lock().rendition_count(shadow.context_id).unwrap(), 0);
+        let turns = w.d.kernel_db().lock().list_turns(shadow.context_id, 10).unwrap();
+        assert_eq!(turns[0].stop_reason.as_deref(), Some("failed"), "{turns:?}");
+    }
+
+    /// `kj shadow list` shows each live shadow with its kind, id, performer,
+    /// model, and rendition count.
+    #[tokio::test]
+    async fn list_shows_the_shadows_of_a_context() {
+        let (base, _) = serve(vec![
+            identity(json!(["image/png"])),
+            http(404, ""),
+            object_put(PICTURE, "image/png"),
+            generation("a red square", "lfm3-omni"),
+        ])
+        .await;
+        let w = world(&base, Some("qwen")).await;
+        let caller = confirmed_caller(w.source);
+        let none = w.d.dispatch(&[s("shadow"), s("list")], &caller).await;
+        assert!(none.is_ok() && none.message().contains("no shadows"), "{}", none.message());
+        let image = media(&w.d, w.source, PICTURE, "image/png");
+        assert!(describe(&w.d, w.source, image).await.is_ok());
+        let listed = w.d.dispatch(&[s("shadow"), s("list")], &caller).await;
+        let shadow = shadow_of(&w.d, w.source);
+        let line = listed.message();
+        assert!(
+            line.starts_with("describe") && line.contains(&shadow.context_id.to_hex()) && line.contains("describer")
+                && line.contains("nagaya/qwen") && line.contains("1 rendition"),
+            "{line}"
+        );
+    }
+
+    /// A `kj shadow` verb is classified: listing reads, describing writes.
+    #[test]
+    fn list_reads_and_describe_writes() {
+        use crate::kj::effect::{classify, Effect};
+        assert_eq!(classify(&[s("shadow"), s("list")]).unwrap(), Effect::Read);
+        assert_eq!(classify(&[s("shadow"), s("describe"), s("abc#1")]).unwrap(), Effect::Write);
+    }
+}

@@ -423,11 +423,13 @@ provider usage; bytes alone do not measure token cost or effectiveness.
 |---|---|---|
 | Drift briefing | `/config/kernel/distillation.md` | [distillation.md](../assets/defaults/prompts/distillation.md) |
 | Compact-fork continuation | `/config/kernel/continuation.md` | [continuation.md](../assets/defaults/prompts/continuation.md) |
+| Image and video description | `/config/kernel/description.md` | [description.md](../assets/defaults/prompts/description.md) |
 
 Each operation reads its host instruction file. Missing, empty, unreadable, or
 invalid UTF-8 content fails explicitly; an embedded body is only a seed/reset
 source, never a silent runtime fallback. `kj config reset distillation.md` and
-`kj config reset continuation.md` install the shipped defaults.
+`kj config reset continuation.md` install the shipped defaults. `kj shadow describe` sends the description
+instruction as the system text of one request whose user message is the media (`docs/shadows.md`).
 
 Briefing answers another context's need. Continuation preserves the active
 objective, corrections, constraints, decisions, evidence status, pending

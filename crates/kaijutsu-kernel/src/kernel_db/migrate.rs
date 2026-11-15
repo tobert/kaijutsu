@@ -204,6 +204,7 @@ impl KernelDb {
         Self::migrate_slot_roles(conn)?;
         Self::migrate_type_melt(conn)?;
         Self::migrate_council_backends(conn)?;
+        Self::migrate_context_shadows(conn)?;
         Self::ensure_context_guards(conn)?;
         Ok(())
     }

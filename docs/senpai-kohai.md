@@ -151,11 +151,13 @@ model.
 - A judge shadow belongs to one context. The gate makes it as a context performed by the judge character the
   council block names, with K as its parent and its senpai, and slots copied from the judge character. It is
   found as K's live child that character performs and the gate made as its shadow. A context is a judge shadow
-  when the gate made it as one, recorded in `judge_shadows`, and its parent is still its senpai. A kohai of a
+  when the gate made it as one, recorded in `context_shadows` with kind `judge`, and its parent is still its senpai. A kohai of a
   character whose model is on a council server is an ordinary context. `kj context set --senpai` refuses to move a
   shadow. The kernel archives K's
   judge shadows in the same transaction that archives K, at `kj context archive`, a rotation's commit, a demote
-  past the rim and a character's retirement, and the successor's first gate call makes a new one.
+  past the rim and a character's retirement, and the successor's first gate call makes a new one. Every context
+  shadow is stored the same way, one `context_shadows` row with its kind, and the archive takes all of a source's
+  shadows, whatever their kind (`docs/shadows.md`).
 - A fork's distillation runs on the forking context's `distill` slot, and `kj drift pull|merge` on the caller's
   `distill` slot, so a cheap model can summarize for an expensive conversation. A character with a model and no
   `distill` slot distills on its model. With no `distill` slot in the context, a fork that asks for distillation

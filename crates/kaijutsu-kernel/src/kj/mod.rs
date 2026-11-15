@@ -8,6 +8,7 @@
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared
 //! kernel state and is constructed once per server.
 
+mod shadow;
 mod slot;
 pub mod alias;
 pub mod attach;
@@ -677,6 +678,11 @@ impl KjDispatcher {
         // run without an active context.
         if cmd == "block" {
             return self.dispatch_block(&argv[1..], caller);
+        }
+        // `kj shadow` names its source with `--context` and defaults to the
+        // active context, like `kj block`.
+        if cmd == "shadow" {
+            return Box::pin(async { self.dispatch_shadow(&argv[1..], caller).await }).await;
         }
         // `kj binding` / `kj policy` take an optional <ctx>/<instance> arg and
         // default to the active context, so rc scripts (which run with an

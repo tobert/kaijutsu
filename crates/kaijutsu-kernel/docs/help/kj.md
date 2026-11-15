@@ -45,6 +45,7 @@ cc              list live Claude Code sessions; send one a message
 
 ```
 block           read, append to, and edit the blocks of a context
+shadow          describe an image block; list shadows
 search          regex search across blocks
 diff            unified diff of a kernel-held file against disk, another file, or its history
 vi              kernel-owned vi editor sessions for agents and scripts

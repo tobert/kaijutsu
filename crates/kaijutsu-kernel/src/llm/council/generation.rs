@@ -170,16 +170,7 @@ impl Client {
             }
             // No bytes: the builder's marker says they were not found.
             let Some(data) = data else { continue };
-            let why = if !holds_objects {
-                Some("the server holds no objects".to_string())
-            } else if !crate::llm::media_type_is_recorded(mime) {
-                Some(crate::llm::UNRECORDED_MEDIA_TYPE.to_string())
-            } else if !model.reads(mime) {
-                Some(format!("{} does not read {mime}", model.model))
-            } else {
-                None
-            };
-            if let Some(why) = why {
+            if let Some(why) = left_out(holds_objects, model, mime) {
                 placed.insert(hash.to_string(), Err(why));
                 continue;
             }
@@ -194,6 +185,32 @@ impl Client {
             placed.insert(hash.to_string(), Ok(id));
         }
         Ok(placed)
+    }
+}
+
+/// Why a media part of type `mime` is not sent to `model` as an object, or
+/// `None` when it is: the server holds objects and the model reads the type.
+fn left_out(holds_objects: bool, model: &ServedModel, mime: &str) -> Option<String> {
+    if !holds_objects {
+        Some("the server holds no objects".to_string())
+    } else if !crate::llm::media_type_is_recorded(mime) {
+        Some(crate::llm::UNRECORDED_MEDIA_TYPE.to_string())
+    } else if !model.reads(mime) {
+        Some(format!("{} does not read {mime}", model.model))
+    } else {
+        None
+    }
+}
+
+impl Client {
+    /// Why a media part of `media_type` would not go to the served model
+    /// `model` as an object: the server holds no objects, the type is not
+    /// recorded, or the model does not read it. Reads the identity, cached as
+    /// for a turn, and sends nothing else.
+    pub async fn media_refusal(&self, model: &str, media_type: &str) -> LlmResult<Option<String>> {
+        let turn = self.turn();
+        let (served, holds_objects) = self.served_model(&turn, model).await?;
+        Ok(left_out(holds_objects, &served, media_type))
     }
 }
 

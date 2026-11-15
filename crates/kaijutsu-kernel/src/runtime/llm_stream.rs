@@ -658,6 +658,9 @@ pub(super) async fn spawn_admitted_turn(
     // context with no `model` slot refuses here, before any provider work.
     let bound = {
         let db = kernel_db.lock();
+        if let Some(why) = db.chat_turn_refusal(context_id).map_err(|e| format!("Could not read this context's shadow record: {e}"))? {
+            return Err(why);
+        }
         crate::model_resolution::context_model(&db, context_id)
             .map_err(|e| format!("Could not read this context's model binding: {e}"))?
             .into_model()?

@@ -379,6 +379,10 @@ pub(crate) enum CharacterPlacement {
     /// `senpai`, with the character's model and slots copied fresh (a
     /// created context, or a judge shadow under its seat).
     Start { performer: kaijutsu_types::PrincipalId, senpai: Option<ContextId> },
+    /// The context is a shadow performed by `performer` under `senpai`, with
+    /// the slots copied fresh and its `model` slot taken from the
+    /// character's slot of `model_role`.
+    Shadow { performer: kaijutsu_types::PrincipalId, senpai: ContextId, model_role: &'static str },
     /// The context is the successor of `predecessor`: its character, with
     /// the character's model and slots copied fresh and the predecessor's senpai.
     Rotate { predecessor: ContextId },
@@ -431,6 +435,10 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
             }
             Some(performer)
         }
+        CharacterPlacement::Shadow { performer, .. } => {
+            live_character(performer)?;
+            Some(performer)
+        }
         CharacterPlacement::Rotate { predecessor } => {
             let performer = db.require_context_character(predecessor)?.principal_id;
             live_character(performer)?;
@@ -446,6 +454,9 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
         }
         CharacterPlacement::Start { performer, senpai } => {
             db.write_context_character(row.context_id, performer, senpai, None)?;
+        }
+        CharacterPlacement::Shadow { performer, senpai, model_role } => {
+            db.write_context_character_modeled(row.context_id, performer, Some(senpai), None, Some(model_role))?;
         }
         CharacterPlacement::Rotate { predecessor } => {
             // The successor rides the predecessor's beat tracks, as a fork does.
@@ -2391,7 +2402,10 @@ impl KjDispatcher {
             let db = self.kernel_db().lock();
             match db.archive_with_shadows_by(target_id, Some(caller.actor_id)) {
                 Ok(v) => {
-                    let shadows: Vec<String> = v.shadows.iter().map(|id| db.context_name(*id)).collect();
+                    let shadows: Vec<String> = v.shadows.iter().map(|id| {
+                        let kind = db.get_context(*id).ok().flatten().and_then(|row| db.shadow_kind(&row).ok().flatten());
+                        format!("{} shadow {}", kind.as_deref().unwrap_or("context"), db.context_name(*id))
+                    }).collect();
                     (v, shadows)
                 }
                 Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
@@ -2408,7 +2422,7 @@ impl KjDispatcher {
             format!("{target_label} already archived")
         };
         if !shadows.is_empty() {
-            msg.push_str(&format!("; archived its judge shadow {}", shadows.join(", ")));
+            msg.push_str(&format!("; archived its {}", shadows.join(", ")));
         }
         KjResult::ok(msg)
     }
@@ -3494,9 +3508,9 @@ fn set_senpai(
             db.context_name(target)
         ));
     }
-    if db.is_judge_shadow(&row).map_err(|e| e.to_string())? {
+    if let Some(kind) = db.shadow_kind(&row).map_err(|e| e.to_string())? {
         return Err(format!(
-            "{} is a judge shadow, which answers to the context it shadows; archive it with that context instead",
+            "{} is a {kind} shadow, which answers to the context it shadows; archive it with that context instead",
             db.context_name(target)
         ));
     }

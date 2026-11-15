@@ -17,11 +17,16 @@ pub const MODEL: &str = "model";
 /// The slot role a fork's distillation runs on.
 pub const DISTILL: &str = "distill";
 
+/// The slot role that reads images for a character: the model of its
+/// description shadow (`docs/shadows.md`).
+pub const IMAGE: &str = "image";
+
 /// The roles a character's slots may hold: `distill` (a cheaper model for
-/// `kj fork --compact` and `kj drift pull|merge`) and `gate` (the council
-/// server that judges the gate). The character's chat model is its one
-/// model (`character_models`), not a slot.
-pub const CHARACTER_SLOT_ROLES: &[&str] = &[DISTILL, crate::council::gate::GATE];
+/// `kj fork --compact` and `kj drift pull|merge`), `gate` (the council
+/// server that judges the gate), and `image` (the model that reads images for
+/// the character). The character's chat model is its one model
+/// (`character_models`), not a slot.
+pub const CHARACTER_SLOT_ROLES: &[&str] = &[DISTILL, crate::council::gate::GATE, IMAGE];
 
 /// The backend kind of a council server. A slot on such a backend names a
 /// served model, needs no `max_tokens`, and is never a chat model.
@@ -48,7 +53,7 @@ pub fn refuse_character_slot_role(role: &str, character: &str) -> Result<(), Str
     }
     Err(format!(
         "a character has one model; `kj character model set {character} <backend>/<model>`. \
-         A character's slots are `distill` and `gate`, not `{role}`"
+         A character's slots are `distill`, `gate`, and `image`, not `{role}`"
     ))
 }
 

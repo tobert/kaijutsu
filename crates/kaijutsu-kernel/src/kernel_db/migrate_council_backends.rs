@@ -1,6 +1,6 @@
 //! Migration `council-backends-v1`: backend kind `mk` becomes `council`,
 //! and the judge shadows it told by their judge's backend get the
-//! `judge_shadows` rows that now tell them (`docs/character.md`,
+//! `context_shadows` rows that now tell them (`docs/character.md`,
 //! "Migrations").
 //!
 //! Before it, a character whose model was on an `mk` backend was a judge,
@@ -29,8 +29,8 @@ impl KernelDb {
         }
         let tx = conn.unchecked_transaction()?;
         let shadows = tx.execute(
-            "INSERT OR IGNORE INTO judge_shadows (context_id)
-             SELECT c.context_id FROM contexts c
+            "INSERT OR IGNORE INTO context_shadows (context_id, kind)
+             SELECT c.context_id, 'judge' FROM contexts c
              JOIN character_models m ON m.principal_id = c.performer
              JOIN backends b ON b.backend_id = m.backend_id
              WHERE b.kind = 'mk' AND c.forked_from IS NOT NULL AND c.senpai_ctx = c.forked_from",

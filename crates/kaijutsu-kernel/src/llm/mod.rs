@@ -1149,7 +1149,22 @@ impl Provider {
         opts: BuildOpts,
         prompt: &str,
     ) -> Result<OneShotReply, OneShotError> {
-        let mut stream = self.stream(self.one_shot_opts(opts), vec![Message::user(prompt)]).await?;
+        self.prompt_messages(opts, vec![Message::user(prompt)]).await
+    }
+
+    /// [`Self::prompt_with_system`] for a prompt that is already messages, such
+    /// as one user message that holds an image. The caller resolves media
+    /// bytes first ([`resolve_media_blocks_from_cas`]).
+    #[tracing::instrument(
+        skip(self, opts, messages),
+        fields(llm.model = %opts.model, llm.provider = self.name(), llm.slot_wait_ms = tracing::field::Empty)
+    )]
+    pub async fn prompt_messages(
+        &self,
+        opts: BuildOpts,
+        messages: Vec<Message>,
+    ) -> Result<OneShotReply, OneShotError> {
+        let mut stream = self.stream(self.one_shot_opts(opts), messages).await?;
         let mut text = String::new();
         while let Some(event) = stream.next_event().await {
             match event {
@@ -1176,6 +1191,21 @@ impl Provider {
             }
         }
         Err(LlmError::CompletionError("the one-shot stream ended before the provider said it was done".into()).into())
+    }
+
+    /// Why a media part of `media_type` would reach `model` as a marker
+    /// instead of its bytes, or `None` when the provider sends it. A council
+    /// backend reads the served model's identity; any other provider sends
+    /// images and marks the rest. A request for a marker is refused before
+    /// the model is called.
+    pub async fn media_refusal(&self, model: &str, media_type: &str) -> LlmResult<Option<String>> {
+        match self {
+            Self::Council(client) => client.media_refusal(model, media_type).await,
+            Self::CodexApp(_) => Ok(Some(format!("{model} on codex-app is sent no media, so it cannot read {media_type}"))),
+            _ if !media_type_is_recorded(media_type) => Ok(Some(UNRECORDED_MEDIA_TYPE.to_string())),
+            _ if media_type.starts_with("image/") => Ok(None),
+            _ => Ok(Some(format!("{model} on provider {} reads images only, so it cannot read {media_type}", self.name()))),
+        }
     }
 
     /// The request options a one-shot prompt runs with. A one-shot wants the
@@ -1883,6 +1913,42 @@ mod tests {
 
             let reply = Provider::Mock(MockClient::new("CANNED")).prompt_with_system(BuildOpts::new("m", 64), "hi").await.unwrap();
             assert_eq!(reply.text, "CANNED");
+        }
+
+        /// A one-shot message may carry media parts: the request holds the
+        /// image where the message put it, and the text of the reply comes back.
+        ///
+        /// Falsified by a one-shot that rebuilds the message from its text.
+        #[tokio::test]
+        async fn a_one_shot_sends_the_messages_it_is_given() {
+            let (base, seen) = serve(vec![sse(openai_sse("a cat", Some("stop")))]).await;
+            let message = Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text { text: "describe".into() },
+                    ContentBlock::Media { hash: "h".into(), media_type: "image/png".into(), data_base64: Some("AAAA".into()) },
+                ]),
+                turn_scoped: false,
+            };
+            let reply = openai(&base).prompt_messages(BuildOpts::new("m", 64), vec![message]).await.unwrap();
+            assert_eq!(reply.text, "a cat");
+            let body = seen.lock().unwrap()[0].body.clone();
+            assert!(body.contains("data:image/png;base64,AAAA"), "{body}");
+        }
+
+        /// A provider that reads images only refuses any other type, and a
+        /// provider that reads images does not refuse one.
+        ///
+        /// Falsified by a refusal that depends on the model name.
+        #[tokio::test]
+        async fn a_provider_that_reads_images_only_refuses_other_media_before_sending() {
+            for provider in [openai("http://127.0.0.1:1"), claude("http://127.0.0.1:1"), Provider::Mock(MockClient::new("x"))] {
+                assert_eq!(provider.media_refusal("m", "image/webp").await.unwrap(), None, "{}", provider.name());
+                for other in ["video/mp4", "audio/wav"] {
+                    let why = provider.media_refusal("m", other).await.unwrap().expect("a refusal");
+                    assert!(why.contains(other) && why.contains("images only"), "{}: {why}", provider.name());
+                }
+            }
         }
 
         /// A reply at the output limit is the text it reached. A filtered,
