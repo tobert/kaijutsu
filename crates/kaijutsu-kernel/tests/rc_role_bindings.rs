@@ -252,12 +252,10 @@ async fn toolie_role_seeds_one_read_only_shell_and_refuses_writes_body() {
         ),
         "toolie's RPC shell must be the read-only shell"
     );
+    // A person talks to the toolie, so a typed submit must reach it.
     assert!(
-        matches!(
-            fx_broker_check(&h, &ctx, "submit_input").await,
-            Err(McpError::FacadeDenied { .. })
-        ),
-        "toolie submit_input facade must be refused"
+        fx_broker_check(&h, &ctx, "submit_input").await.is_ok(),
+        "toolie must hold facade:submit_input, or a person's submit fails"
     );
 
     // Enforced at the call path: a write is refused, not silently dropped.
