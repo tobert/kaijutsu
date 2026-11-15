@@ -65,7 +65,8 @@ enum ShadowCommand {
     /// 120 seconds for the model.
     Describe {
         /// Block id: the full context_principal_seq id, or `<principal8>#<seq>`
-        /// as `kj block list` prints it (quote it, since kaish eats a bare `#`)
+        /// as `kj block list` prints it. In kaish, quote the short form,
+        /// since kaish reads `#` as a comment
         block: String,
         /// Context the block is in: . (default) | .parent | <label> | <hex prefix>
         #[arg(long, short = 'c')]

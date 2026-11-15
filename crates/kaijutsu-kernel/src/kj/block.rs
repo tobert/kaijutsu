@@ -450,6 +450,16 @@ impl KjDispatcher {
             return Ok(id);
         }
 
+        // Quotes around the whole id mean the caller's client passed them
+        // through as text (kaish strips them), so advice to quote it would
+        // send the person in a circle.
+        if let Some(inner) = ['\'', '"'].iter().find_map(|q| id_str.strip_prefix(*q).and_then(|rest| rest.strip_suffix(*q))) {
+            return Err(format!(
+                "malformed id {id_str}: its quotes reached kj, because this client passes \
+                 quotes through as text; give the id without them: {inner}"
+            ));
+        }
+
         let Some((prefix, seq_str)) = id_str.split_once('#') else {
             // A bare 8-hex word with no `#seq` is almost always the kaish
             // comment trap, not a typo: kaish starts a comment at a `#` even
@@ -2899,6 +2909,25 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("malformed"));
+    }
+
+    /// An id that arrives wrapped in quotes came from a client that passes
+    /// quotes through as text, not from kaish. The error says so instead of
+    /// the advice to quote it.
+    #[tokio::test]
+    async fn a_quoted_id_says_its_quotes_reached_kj() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let full = kaijutsu_types::BlockId::new(ctx, principal, 4).to_key();
+        for quoted in [format!("'{full}'"), format!("\"{full}\"")] {
+            let result = d.dispatch(&[s("block"), s("read"), quoted.clone()], &c).await;
+            assert!(!result.is_ok());
+            let message = result.message();
+            assert!(message.contains("its quotes reached kj"), "{quoted}: {message}");
+            assert!(message.contains(&full) && !message.contains("quote it"), "{quoted}: {message}");
+        }
     }
 
     /// Regression: `kj block list`'s plain-text table prints
