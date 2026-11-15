@@ -230,6 +230,37 @@ pub async fn load_continuation_prompt(vfs: &dyn crate::vfs::VfsOps) -> Result<St
     load_auxiliary_prompt(vfs, "continuation.md").await
 }
 
+/// The instruction a rotation's summary runs under, and the path it came from.
+pub struct RotationInstruction {
+    pub path: String,
+    pub body: String,
+}
+
+/// Read the instruction for the summary of a rotation: the performer's
+/// `/config/rc/<rc_dir>/rotation.md` when that file exists, else the
+/// continuation instruction. A file that cannot be read for any reason but
+/// being absent is an error; it does not fall back.
+pub async fn load_rotation_prompt(vfs: &dyn crate::vfs::VfsOps, rc_dir: &str) -> Result<RotationInstruction, String> {
+    if rc_dir.is_empty() || rc_dir.contains('/') || rc_dir == "." || rc_dir == ".." {
+        return Err(format!("rc directory name '{rc_dir}' is not a single directory name"));
+    }
+    let own = format!("{}/{rc_dir}/rotation.md", kaijutsu_types::paths::RC_ROOT);
+    match vfs.read_all(std::path::Path::new(&own)).await {
+        Ok(bytes) => {
+            let body = String::from_utf8(bytes).map_err(|e| format!("{own} is not UTF-8: {e}"))?;
+            if body.trim().is_empty() {
+                return Err(format!("{own} is empty"));
+            }
+            Ok(RotationInstruction { path: own, body })
+        }
+        Err(e) if e.is_not_found() => Ok(RotationInstruction {
+            path: kaijutsu_types::paths::config_path("continuation.md"),
+            body: load_continuation_prompt(vfs).await?,
+        }),
+        Err(e) => Err(format!("read {own}: {e}")),
+    }
+}
+
 /// Read the live media-description instruction from the ordinary config tree.
 pub async fn load_description_prompt(vfs: &dyn crate::vfs::VfsOps) -> Result<String, String> {
     load_auxiliary_prompt(vfs, "description.md").await

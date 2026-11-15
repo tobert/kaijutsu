@@ -392,6 +392,36 @@ what was dropped. The rotation sets `ROTATED_MIGRATED=1`, and
 `S17-predecessor.kai` then injects no excerpt, since the prose is already
 there. `--drop` without `--migrate` is refused.
 
+### Compacting at rotation
+
+```sh
+kj context rotate storyteller --compact --keep 6
+```
+
+`--compact` carries a summary of the earlier conversation and the last `--keep`
+turns (default 6) into the successor. A turn starts with the person's text.
+The turns come over as native user and model text; tool calls, tool results,
+thinking, and file blocks stay behind, and the predecessor's system
+instructions stay behind as they do with `--migrate`.
+
+The summary covers only what came before those turns, and none is written when
+the context has no more turns than `--keep`. An earlier summary is no turn, so
+the next compact rotation summarizes it again with the turns after it. The
+context's `distill` slot writes the summary under
+`/config/rc/<rc dir>/rotation.md` when the character's rc directory has that
+file, else `/config/kernel/continuation.md`. When a summary is needed, a
+rotation.md that cannot be read refuses the rotation. The summary reads the
+newest earlier turns that fit `KJ_DISTILL_INPUT_BYTES`; the oldest that do not
+fit are left out, and the note says how many.
+
+The summary comes first in the successor and the carried turns follow. A
+kernel notification after them names the instruction file, counts what was
+left out, and names the files those turns named (a file block's path, or a
+tool call's `path` argument) without their content. The rotation sets
+`ROTATED_MIGRATED=1`. When the summary fails, the rotation refuses and the
+predecessor stays live. `--compact` and `--migrate` are alternatives; `--keep`
+needs `--compact`.
+
 `kj fork --compact` is the alternative when retaining recent working state
 and a generated continuation is useful. It keeps the source's performer
 metadata and runs the fork lifecycle, not creation.
@@ -424,6 +454,7 @@ provider usage; bytes alone do not measure token cost or effectiveness.
 |---|---|---|
 | Drift briefing | `/config/kernel/distillation.md` | [distillation.md](../assets/defaults/prompts/distillation.md) |
 | Compact-fork continuation | `/config/kernel/continuation.md` | [continuation.md](../assets/defaults/prompts/continuation.md) |
+| Rotation summary (`kj context rotate --compact`) | `/config/rc/<rc dir>/rotation.md` when present, else `continuation.md` | a character's rc directory owns it; [storyteller](../assets/defaults/rc/storyteller/rotation.md) ships one |
 | Image and video description | `/config/kernel/description.md` | [description.md](../assets/defaults/prompts/description.md) |
 
 Each operation reads its host instruction file. Missing, empty, unreadable, or
@@ -431,6 +462,10 @@ invalid UTF-8 content fails explicitly; an embedded body is only a seed/reset
 source, never a silent runtime fallback. `kj config reset distillation.md` and
 `kj config reset continuation.md` install the shipped defaults. `kj shadow describe` sends the description
 instruction as the system text of one request whose user message is the media (`docs/shadows.md`).
+
+The rotation summary is the one exception to "missing fails": a missing
+`rotation.md` selects `continuation.md`, and the rotation notification names
+the file it used. An empty or unreadable `rotation.md` fails.
 
 Briefing answers another context's need. Continuation preserves the active
 objective, corrections, constraints, decisions, evidence status, pending

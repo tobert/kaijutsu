@@ -19,11 +19,12 @@ Both clones are read-only references. We do not install or run them.
   greeting and example dialogue, and a rolling summary. Files we read:
   `public/scripts/world-info.js`, `public/scripts/extensions/memory/index.js`,
   `public/scripts/group-chats.js`, `public/scripts/PromptManager.js`.
-- **Megumin Suite**: `~/src/research/Megumin-Suite-Beta`, at `87493c2`
-  (2026-10-28, its V11 beta). A SillyTavern extension by KazumaONIISAN
-  (Arif-salah), under CC BY-NC 4.0. Its README is a dated changelog that
-  records why each feature exists. The engine text is in
-  `data/modes/v11taina.js`, and the background jobs are under `src/features/`.
+- **Megumin Suite**: `~/src/research/Megumin-Suite`, at `b3656d1`
+  (2026-10-31). The first read was of its V11 beta (`87493c2`). A SillyTavern
+  extension by KazumaONIISAN (Arif-salah), under CC BY-NC 4.0. Its README is
+  a dated changelog that records why each feature exists. The engine text is
+  in `data/modes/v11taina.js`, the background jobs are under `src/features/`,
+  and the memory tiers are in `src/features/memory/index.js`.
 
 The license lets us borrow Megumin text for personal, noncommercial use with
 credit. Borrowed text stays in host rc and never goes into `assets/defaults`.
@@ -39,17 +40,26 @@ credit. Borrowed text stays in host rc and never goes into `assets/defaults`.
   - The stance carries the roleplay rules: never write the person's
     character, stop where the person can act, and `((...))` is out-of-character
     talk.
-- **Local, on spaceghost**, in `/config/rc/storyteller/`:
-  - `megumin/` holds six V11 Тайна (Taina) sections, taken word for word:
-    reader, characters, world, story, narration, and dialogue. It also holds
-    the "V11 Inside" style in `style.md`. `megumin/SOURCE.md` records the
-    source and what was left out.
+- **Local, from the adapter fork**: `~/src/megumin-suite`, branch
+  `kaijutsu`, is a clone of Megumin Suite with an adapter under `kaijutsu/`
+  (its README). `extract.mjs` reads the upstream data modules, so a merge
+  from `upstream/main` and `install.sh --apply` refresh the text. It installs
+  into `/config/rc/storyteller/`:
+  - `megumin/`: six V11 Тайна (Taina) sections, word for word: reader,
+    characters, world, story, narration, and dialogue, with the three
+    notebook paragraphs of `<story>` left out. It also holds the "V11 Inside"
+    style in `style.md`, and `SOURCE.md` records the source and what was
+    left out.
   - `create/S03-local-megumin.kai` composes those sections into one
     instruction block between the stance and the card.
-  - `cards/kotone.megumin` turns it on for one performer and sets its names.
-  - The performer is Kotone, the night watch of Sawari Lane. Her cast,
-    `kotone`, gives the storyteller slot `anthropic/claude-haiku-5-5`, so a
-    rotation keeps her model.
+  - `cards/kotone.md`, its reminder, and `cards/kotone.megumin`, which turns
+    the sections on for one performer and sets its names.
+  - `rotation.md`, Megumin's memory condenser prompt, as the summary
+    instruction for `kj context rotate --compact`, with a `.keep` sidecar.
+  - The performer is Kotone, the night watch of Sawari Lane, first played on
+    spaceghost. On zorak, `kotone` plays `anthropic/claude-haiku-5-5` and has
+    a `distill` slot on `deepseek/deepseek-flash`.
+  - The fork has no push remote. Amy decides whether it is published.
 - **Fixed in play** (commit `04f7f5e6`): a block inserted with no anchor, such
   as the reminder `kj block create` writes, went to the top of every live
   client's view, and the turn's reply followed it there. The tui looked
@@ -225,9 +235,18 @@ helps long stories on small models, which repeat themselves.
 
 ### Continuity past the context limit
 
-- **Rolling summary** (SillyTavern summarizes every 10 messages): we use
-  rotation with a handoff, and `kj fork --compact`. The storyteller has no
-  tools, so it cannot write its own handoff note (`docs/issues.md`).
+- **Summary and tail at rotation**: built. `kj context rotate --compact`
+  summarizes everything before the last 6 turns on the character's `distill`
+  slot, under the rc directory's `rotation.md`, and carries those turns as
+  text (`docs/prompts.md`, "Compacting at rotation"). The storyteller needs
+  no tools for it. The storyteller seed ships our own `rotation.md`; the
+  adapter installs Megumin's condenser prompt over it.
+- **Megumin's memory tiers**, for comparison: the newest 30 messages stay raw
+  (our hydration window), the next 70 are summarized in chunks of 10 by
+  Chomusuke, and older chunks go raw into a vault that a keyword or vector
+  search reads back. We summarize only at rotation, and nothing reads old
+  turns back into a turn automatically. A rolling summary needs the scribe
+  seat above; the vault maps onto the kernel's semantic index.
 - **Swipes** (regenerating a reply): `kj stage exclude` on the reply, then
   `kj fork`. Megumin also undoes the state changes a swiped reply made. Our
   state would need the same rule.

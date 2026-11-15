@@ -925,7 +925,7 @@ impl BlockStore {
 
         if expected_version.is_some_and(|version| source_entry.doc.version() != version) {
             return Err(BlockStoreError::Validation(
-                "Source changed during compaction; retry the compact fork".to_string(),
+                "the source changed while it was summarized; run the command again".to_string(),
             ));
         }
 

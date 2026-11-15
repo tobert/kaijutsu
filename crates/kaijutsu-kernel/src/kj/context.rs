@@ -237,6 +237,24 @@ enum ContextCommand {
         /// `images,tool_results,thinking`; `none` carries everything
         #[arg(long, value_delimiter = ',', requires = "migrate")]
         drop: Vec<String>,
+        /// Carry a summary and the recent conversation into the successor,
+        /// not the whole conversation, without the predecessor's system
+        /// instructions: the successor's create lifecycle writes fresh ones.
+        /// The summary covers everything before the last `--keep` turns,
+        /// written by the context's `distill` slot under
+        /// `/config/rc/<rc dir>/rotation.md` when the character's rc
+        /// directory has one, else `/config/kernel/continuation.md`. Those
+        /// turns come over as native user and model text, without tool
+        /// calls, tool results, thinking, or file blocks; a note counts what
+        /// was left out and names the files those turns named. Sets
+        /// `ROTATED_MIGRATED=1`. Refuses, leaving the context live, when the
+        /// summary fails.
+        #[arg(long, conflicts_with_all = ["migrate", "drop"])]
+        compact: bool,
+        /// With --compact, how many of the most recent turns to carry
+        /// (default 6, at least 1).
+        #[arg(long, requires = "compact", value_parser = clap::value_parser!(u64).range(1..))]
+        keep: Option<u64>,
     },
     /// Archive one context, retaining its history (latched). Needs the
     /// operator capability, or a person's live root character acting from
@@ -721,8 +739,9 @@ impl KjDispatcher {
                 ))
                 .await
             }
-            ContextCommand::Rotate { context, migrate, drop } => {
-                self.context_rotate(context.as_deref(), migrate.then_some(drop.as_slice()), caller).await
+            ContextCommand::Rotate { context, migrate, drop, compact, keep } => {
+                let compact = compact.then(|| keep.map_or(DEFAULT_ROTATE_KEEP, |keep| keep as usize));
+                self.context_rotate(context.as_deref(), migrate.then_some(drop.as_slice()), compact, caller).await
             }
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
             ContextCommand::Promote { context } => self.context_promote(&context, caller).await,
@@ -2563,6 +2582,102 @@ impl KjDispatcher {
         Ok(())
     }
 
+    /// Carry a summary and the recent conversation of `predecessor` into the
+    /// new `successor` document for `kj context rotate --compact`, as
+    /// `kj fork --compact` does. The selection, the summary, and the copy all
+    /// come from one version of the predecessor's blocks, and the model call
+    /// runs before the successor's document exists: a failed summary leaves
+    /// nothing behind. The summary block comes first in the successor.
+    async fn compact_conversation(
+        &self,
+        predecessor: &ContextRow,
+        performer: Option<PrincipalId>,
+        successor: ContextId,
+        keep: usize,
+        caller: &KjCaller,
+    ) -> Result<CompactCarry, String> {
+        let source = predecessor.context_id;
+        let store = self.block_store();
+        let (version, blocks) = {
+            let entry = store.get(source).ok_or("the predecessor's document is missing")?;
+            (entry.doc.version(), entry.doc.blocks_ordered())
+        };
+        let selection = select_compact_tail(&blocks, keep);
+
+        let mut instruction_path = None;
+        let summary = if selection.earlier.is_empty() {
+            None
+        } else {
+            let performer = performer.ok_or("a context with no performer has no distill slot to write the summary")?;
+            let sheet = self.kernel_db().lock().get_character(performer).map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("performer {} has no character sheet, so no rc directory names its rotation instruction", performer.short()))?;
+            let rc_dir = crate::rc::performer_rc_dir(&sheet)?;
+            let instruction = crate::config_seed::load_rotation_prompt(self.kernel().vfs().as_ref(), &rc_dir)
+                .await
+                .map_err(|e| format!("rotation instruction: {e}"))?;
+            instruction_path = Some(instruction.path);
+            Some(self.summarize_for_rotation(source, selection.earlier.clone(), instruction.body).await?)
+        };
+        let omitted_turns = summary.as_ref().map_or(0, |(_, omitted)| *omitted);
+
+        let filter = crate::blocks::ForkBlockFilter {
+            exclude_block_ids: blocks.iter().filter(|b| !selection.carried.contains(&b.id)).map(|b| b.id.to_key()).collect(),
+            ..Default::default()
+        };
+        store
+            .fork_document_filtered_checked(source, successor, kaijutsu_types::now_millis(), &filter, Some(version))
+            .map_err(|e| e.to_string())?;
+        store
+            .abandon_open_blocks(successor, "left open in the predecessor when this context was rotated; nothing is being retried here")
+            .map_err(|e| e.to_string())?;
+        if let Some((summary, _)) = &summary {
+            // The summary is the performer's, as a compact fork's is; the
+            // successor's `created_by` names the requester
+            // (`docs/approval-identity.md`, "Three identities").
+            let id = store
+                .insert_drift_block_as(
+                    successor,
+                    None,
+                    None,
+                    summary,
+                    source,
+                    self.bound_model_name(source),
+                    kaijutsu_types::DriftKind::Distill,
+                    Some(performer.unwrap_or(caller.actor_id)),
+                )
+                .map_err(|e| format!("failed to insert the summary: {e}"))?;
+            store.move_block(successor, &id, None).map_err(|e| format!("failed to order the summary: {e}"))?;
+        }
+        Ok(CompactCarry {
+            turns: selection.turns,
+            summarized: summary.is_some(),
+            omitted_turns,
+            instruction_path,
+            left_out: selection.left_out,
+        })
+    }
+
+    /// Record in the successor what `kj context rotate --compact` carried.
+    fn note_compaction(&self, predecessor: ContextId, successor: ContextId, carry: &CompactCarry, name: &str) -> Result<(), String> {
+        let store = self.block_store();
+        let note = compaction_note(name, &predecessor.short(), carry);
+        let after = store.last_block_id(successor);
+        store
+            .insert_block_as(
+                successor,
+                None,
+                after.as_ref(),
+                kaijutsu_types::Role::System,
+                kaijutsu_types::BlockKind::Notification,
+                note,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+                Some(PrincipalId::system()),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// `kj context rotate [<ctx>]` — replace a context with a successor that
     /// carries its configuration (`docs/character.md`, "Roots and
     /// rotation"; `docs/senpai-kohai.md`, "Creating, forking, rotating").
@@ -2584,10 +2699,14 @@ impl KjDispatcher {
     /// system instructions and dropping what the `--drop` entries name. The
     /// lifecycle's blocks follow the carried conversation.
     ///
+    /// `compact` carries a summary and the last `keep` turns instead
+    /// ([`Self::compact_conversation`]), settled the same way and before
+    /// anything is created.
+    ///
     /// A character's handoff log has no performer: its rotation
     /// points `characters.handoff_ctx` at the successor and checks no loadout.
     /// Any other context with no performer refuses.
-    async fn context_rotate(&self, ctx_ref: Option<&str>, migrate: Option<&[String]>, caller: &KjCaller) -> KjResult {
+    async fn context_rotate(&self, ctx_ref: Option<&str>, migrate: Option<&[String]>, compact: Option<usize>, caller: &KjCaller) -> KjResult {
         let (predecessor, character, handoff_owner) = {
             let db = self.kernel_db().lock();
             let id = match super::refs::resolve_context_arg(ctx_ref, caller, &db) {
@@ -2696,6 +2815,13 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context rotate: could not carry the conversation: {e}; {name} stays live")),
             },
         };
+        let compacted = match compact {
+            None => None,
+            Some(keep) => match self.compact_conversation(&predecessor, character.as_ref().map(|c| c.principal_id), successor_id, keep, caller).await {
+                Ok(carry) => Some(carry),
+                Err(e) => return KjResult::Err(format!("kj context rotate: could not compact the conversation: {e}; {name} stays live")),
+            },
+        };
         let parent = predecessor.forked_from;
         let successor = ContextRow {
             context_id: successor_id,
@@ -2722,8 +2848,8 @@ impl KjDispatcher {
                 db.copy_context_controls(predecessor.context_id, successor_id)?;
                 db.set_context_env(successor_id, "ROTATED_FROM", &predecessor.context_id.to_hex())?;
                 // The env copy carries a predecessor's own mark; only a
-                // migration sets it.
-                if migrated.is_some() {
+                // migration or a compaction sets it.
+                if migrated.is_some() || compacted.is_some() {
                     db.set_context_env(successor_id, "ROTATED_MIGRATED", "1")?;
                 } else {
                     db.delete_context_env(successor_id, "ROTATED_MIGRATED")?;
@@ -2757,6 +2883,15 @@ impl KjDispatcher {
             let successor = self.successor_fate(root_console, successor_id);
             return KjResult::Err(format!(
                 "kj context rotate: could not note the migration in the successor {successor_id}; {successor}{name} stays live: {e}"
+            ));
+        }
+
+        if let Some(carry) = &compacted
+            && let Err(e) = self.note_compaction(predecessor.context_id, successor_id, carry, &name)
+        {
+            let successor = self.successor_fate(root_console, successor_id);
+            return KjResult::Err(format!(
+                "kj context rotate: could not note the compaction in the successor {successor_id}; {successor}{name} stays live: {e}"
             ));
         }
 
@@ -3631,6 +3766,148 @@ fn describe_cost(cost: &crate::pricing::ContextCost) -> String {
         ),
         (_, n) => format!("at least {amount} ({}, {}: `kj price list`)", priced(cost.priced_calls), unpriced(n)),
     }
+}
+
+/// How many recent turns `kj context rotate --compact` carries by default.
+const DEFAULT_ROTATE_KEEP: usize = 6;
+
+/// What `kj context rotate --compact` chose from one version of a
+/// predecessor's blocks.
+struct CompactSelection {
+    /// History-eligible blocks before the carried turns, for the summary.
+    earlier: Vec<kaijutsu_types::BlockSnapshot>,
+    /// The user and model text of the carried turns.
+    carried: std::collections::HashSet<BlockId>,
+    /// How many turns the carried text comes from.
+    turns: usize,
+    /// The blocks of those turns that are not carried.
+    left_out: Vec<kaijutsu_types::BlockSnapshot>,
+}
+
+/// What a compact rotation put in the successor, for its note.
+struct CompactCarry {
+    turns: usize,
+    summarized: bool,
+    /// How many of the oldest earlier turn groups the summary's input bound
+    /// left out.
+    omitted_turns: usize,
+    instruction_path: Option<String>,
+    left_out: Vec<kaijutsu_types::BlockSnapshot>,
+}
+
+/// Pick the last `keep` turns of `blocks`, the text of them to carry and
+/// everything eligible before them to summarize.
+///
+/// A turn is a turn group whose first history-eligible block is user text,
+/// so the carried text always opens on the person's words. A group led by
+/// anything else, such as an earlier summary or a person's shell command,
+/// counts as no turn: before the first kept turn it is summarized, and
+/// after it its text is carried with the turn it follows.
+fn select_compact_tail(blocks: &[kaijutsu_types::BlockSnapshot], keep: usize) -> CompactSelection {
+    use kaijutsu_types::{BlockKind, Role};
+    use crate::llm::hydrate::is_history_eligible;
+    let ranges = crate::drift::closed_eligible_turn_ranges(blocks);
+    let is_turn = |range: &std::ops::Range<usize>| {
+        blocks[range.clone()]
+            .iter()
+            .find(|b| is_history_eligible(b))
+            .is_some_and(|b| b.role == Role::User && b.kind == BlockKind::Text)
+    };
+    let mut turns = 0;
+    let mut cut = blocks.len();
+    for range in ranges.iter().rev() {
+        if turns == keep {
+            break;
+        }
+        if is_turn(range) {
+            turns += 1;
+            cut = range.start;
+        }
+    }
+    let earlier = blocks[..cut].iter().filter(|b| is_history_eligible(b)).cloned().collect();
+    let mut carried = std::collections::HashSet::new();
+    let mut left_out = Vec::new();
+    for block in &blocks[cut..] {
+        if is_history_eligible(block) && block.kind == BlockKind::Text && matches!(block.role, Role::User | Role::Model) {
+            carried.insert(block.id);
+        } else if is_history_eligible(block) || block.kind == BlockKind::File {
+            left_out.push(block.clone());
+        }
+    }
+    CompactSelection { earlier, carried, turns, left_out }
+}
+
+fn count_phrase(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// The note a compact rotation leaves in the successor.
+fn compaction_note(name: &str, predecessor: &str, carry: &CompactCarry) -> String {
+    use kaijutsu_types::BlockKind;
+    let turns = count_phrase(carry.turns, "turn", "turns");
+    let mut note = if carry.summarized {
+        format!("Rotated from '{name}' ({predecessor}) with a summary of the earlier conversation and its last {turns} (text only).")
+    } else {
+        format!("Rotated from '{name}' ({predecessor}) with its last {turns} (text only).")
+    };
+    if let Some(path) = &carry.instruction_path {
+        note.push_str(&format!(" Instruction: {path}."));
+    }
+    if carry.omitted_turns > 0 {
+        note.push_str(&format!(
+            " The summary left out the oldest {}, which did not fit KJ_DISTILL_INPUT_BYTES.",
+            count_phrase(carry.omitted_turns, "turn", "turns"),
+        ));
+    }
+    note.push_str(" The predecessor's system instructions stayed behind; this context's create lifecycle wrote fresh ones.");
+    let mut kinds: Vec<(&str, &str, usize)> = vec![
+        ("tool call", "tool calls", 0),
+        ("tool result", "tool results", 0),
+        ("thinking block", "thinking blocks", 0),
+        ("notification", "notifications", 0),
+        ("drift block", "drift blocks", 0),
+        ("error", "errors", 0),
+        ("file", "files", 0),
+        ("other block", "other blocks", 0),
+    ];
+    for block in &carry.left_out {
+        let slot = match block.kind {
+            BlockKind::ToolCall => 0,
+            BlockKind::ToolResult => 1,
+            BlockKind::Thinking => 2,
+            BlockKind::Notification => 3,
+            BlockKind::Drift => 4,
+            BlockKind::Error => 5,
+            BlockKind::File => 6,
+            _ => 7,
+        };
+        kinds[slot].2 += 1;
+    }
+    let left: Vec<String> = kinds.iter().filter(|k| k.2 > 0).map(|(one, many, n)| count_phrase(*n, one, many)).collect();
+    if !left.is_empty() {
+        note.push_str(&format!(" Left out of those turns: {}.", left.join(", ")));
+    }
+    let mut files: Vec<String> = Vec::new();
+    for block in &carry.left_out {
+        let path = match block.kind {
+            BlockKind::File => block.file_path.clone(),
+            BlockKind::ToolCall => block
+                .tool_input
+                .as_deref()
+                .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+                .and_then(|input| input.get("path").and_then(|p| p.as_str()).map(str::to_string)),
+            _ => None,
+        };
+        if let Some(path) = path
+            && !files.contains(&path)
+        {
+            files.push(path);
+        }
+    }
+    if !files.is_empty() {
+        note.push_str(&format!(" Files those turns named, without their content: {}.", files.join(", ")));
+    }
+    note
 }
 
 #[cfg(test)]
@@ -4703,6 +4980,11 @@ mod tests {
     /// `persist_bindings: false` leaves the broker's bindings in memory, so
     /// every successor reads back with no loadout.
     async fn rotation_fixture_persisting_bindings(persist_bindings: bool) -> RotationFixture {
+        rotation_fixture_slotted(persist_bindings, &["model"]).await
+    }
+
+    /// The rotation fixture whose character `banto` has slots for `roles`.
+    async fn rotation_fixture_slotted(persist_bindings: bool, roles: &[&str]) -> RotationFixture {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         if persist_bindings {
@@ -4721,7 +5003,7 @@ mod tests {
         let seat = register_context(&d, Some("banto"), Some(root), amy);
         let db = d.kernel_db().lock();
         db.update_performer(root, Some(amy)).unwrap();
-        db.seed_test_slots(banto, "mock", "mock-banto", &["model"]).unwrap();
+        db.seed_test_slots(banto, "mock", "mock-banto", roles).unwrap();
         db.update_performer(seat, Some(banto)).unwrap();
         db.update_settings(seat, Some("seat prompt")).unwrap();
         db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
@@ -4993,6 +5275,352 @@ mod tests {
     #[test]
     fn rotate_drop_needs_migrate() {
         crate::on_rc_thread(rotate_drop_needs_migrate_body);
+    }
+
+    /// Seed the seat with `turns` turns: a user line `U<i>`, thinking, a
+    /// `read` tool call naming `f<i>.rs` and its result, then a model line
+    /// `M<i>`, after one system instruction.
+    fn seed_story(f: &RotationFixture, turns: usize) {
+        use kaijutsu_types::{BlockId, BlockSnapshot, BlockKind, Role, ToolKind};
+        let store = f.d.block_store();
+        store.create_document(f.seat, crate::DocumentKind::Conversation, None).unwrap();
+        let put = |snap: BlockSnapshot| {
+            let principal = snap.id.principal_id;
+            let after = store.last_block_id(f.seat);
+            store.insert_from_snapshot_as(f.seat, snap, after.as_ref(), Some(principal)).unwrap()
+        };
+        put(BlockSnapshot::text(BlockId::new(f.seat, PrincipalId::system(), 0), None, Role::System, "OLD STANCE"));
+        for i in 0..turns as u64 {
+            put(BlockSnapshot::text(BlockId::new(f.seat, f.amy, i), None, Role::User, format!("U{i}")));
+            let mut thinking = BlockSnapshot::text(BlockId::new(f.seat, f.banto, i * 10), None, Role::Model, format!("THOUGHT{i}"));
+            thinking.kind = BlockKind::Thinking;
+            thinking.signature = Some(s("sig"));
+            put(thinking);
+            let call = put(BlockSnapshot::tool_call(
+                BlockId::new(f.seat, f.banto, i * 10 + 1), None, ToolKind::Builtin, "read",
+                serde_json::json!({"path": format!("f{i}.rs")}), Role::Model, Some(format!("toolu_{i}")),
+            ));
+            put(BlockSnapshot::tool_result(
+                BlockId::new(f.seat, PrincipalId::system(), i + 1), call, ToolKind::Builtin,
+                &format!("BODY{i}"), false, Some(0), Some(format!("toolu_{i}")),
+            ));
+            put(BlockSnapshot::text(BlockId::new(f.seat, f.banto, i * 10 + 2), None, Role::Model, format!("M{i}")));
+        }
+    }
+
+    /// Register a recording mock provider; the handle reads each prompt sent.
+    async fn recording_mock(f: &RotationFixture) -> std::sync::Arc<parking_lot::Mutex<Vec<Vec<crate::llm::Message>>>> {
+        recording_mock_with_systems(f).await.0
+    }
+
+    /// A recording mock provider; the handles read each prompt and each
+    /// system instruction sent.
+    async fn recording_mock_with_systems(
+        f: &RotationFixture,
+    ) -> (
+        std::sync::Arc<parking_lot::Mutex<Vec<Vec<crate::llm::Message>>>>,
+        std::sync::Arc<parking_lot::Mutex<Vec<Option<String>>>>,
+    ) {
+        use crate::llm::{MockClient, Provider};
+        let (mock, sent) = MockClient::new("THE SUMMARY").recording_sent_messages();
+        let (mock, systems) = mock.recording_sent_systems();
+        f.d.kernel().llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        (sent, systems)
+    }
+
+    fn successor_of(rotated: &KjResult) -> ContextId {
+        let KjResult::Ok { data: Some(data), .. } = rotated else { panic!("rotate returns ids: {rotated:?}") };
+        ContextId::parse(data["context_id"].as_str().unwrap()).unwrap()
+    }
+
+    /// `--compact --keep 2` summarizes everything before the last two turns,
+    /// and carries those turns as user and model text: the summary first, the
+    /// text in order, no tool or thinking blocks, then a note that counts
+    /// what was left out and names the files its tool calls named.
+    async fn rotate_compact_carries_a_summary_and_the_recent_text_body() {
+        use kaijutsu_types::{BlockKind, DriftKind, Role};
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 5);
+        let sent = recording_mock(&f).await;
+
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("2")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let successor = successor_of(&rotated);
+        assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_some());
+
+        let blocks = f.d.block_store().block_snapshots(successor).unwrap();
+        let first = blocks.first().unwrap();
+        assert_eq!((first.kind, first.drift_kind), (BlockKind::Drift, Some(DriftKind::Distill)), "the summary comes first");
+        assert_eq!(first.content, "THE SUMMARY");
+        let text: Vec<&str> = blocks.iter()
+            .filter(|b| b.kind == BlockKind::Text && matches!(b.role, Role::User | Role::Model))
+            .map(|b| b.content.as_str()).collect();
+        assert_eq!(text, ["U3", "M3", "U4", "M4"], "the last two turns, text only, in order");
+        assert!(!blocks.iter().any(|b| matches!(b.kind, BlockKind::ToolCall | BlockKind::ToolResult | BlockKind::Thinking)));
+        assert!(!blocks.iter().any(|b| b.content == "OLD STANCE"));
+        let note = blocks.iter().find(|b| b.kind == BlockKind::Notification && b.content.starts_with("Rotated from")).expect("a carry note");
+        for want in [
+            "with a summary of the earlier conversation and its last 2 turns (text only)",
+            "Instruction: /config/kernel/continuation.md",
+            "2 tool calls, 2 tool results, 2 thinking blocks",
+            "f3.rs, f4.rs",
+        ] {
+            assert!(note.content.contains(want), "{want} in {}", note.content);
+        }
+        let carry_at = blocks.iter().position(|b| b.id == note.id).unwrap();
+        let last_text = blocks.iter().rposition(|b| b.content == "M4").unwrap();
+        assert!(carry_at > last_text, "the note follows the carried turns");
+        let env: std::collections::HashMap<_, _> =
+            f.d.kernel_db().lock().get_context_env(successor).unwrap().into_iter().map(|e| (e.key, e.value)).collect();
+        assert_eq!(env.get("ROTATED_MIGRATED").map(String::as_str), Some("1"));
+
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1, "one summary call");
+        let prompt = serde_json::to_string(&sent[0]).unwrap();
+        assert!(prompt.contains("U2") && prompt.contains("M2") && prompt.contains("BODY0"), "the earlier turns are summarized: {prompt}");
+        assert!(!prompt.contains("U3") && !prompt.contains("M4") && !prompt.contains("BODY4"), "the carried turns are not: {prompt}");
+        assert!(!prompt.contains("OLD STANCE"));
+    }
+
+    #[test]
+    fn rotate_compact_carries_a_summary_and_the_recent_text() {
+        crate::on_rc_thread(rotate_compact_carries_a_summary_and_the_recent_text_body);
+    }
+
+    /// A context with no more turns than `--keep` makes no model call and
+    /// has no summary; its turns come over as text.
+    async fn rotate_compact_of_a_short_context_calls_no_model_body() {
+        use kaijutsu_types::{BlockKind, DriftKind};
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 2);
+        let sent = recording_mock(&f).await;
+        let rotated = f.d.dispatch(&[s("context"), s("rotate"), s("--compact")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let blocks = f.d.block_store().block_snapshots(successor_of(&rotated)).unwrap();
+        assert!(sent.lock().is_empty(), "no summary call");
+        assert!(!blocks.iter().any(|b| b.drift_kind == Some(DriftKind::Distill)), "no summary block");
+        let text: Vec<&str> = blocks.iter().filter(|b| b.kind == BlockKind::Text && b.role != kaijutsu_types::Role::System)
+            .map(|b| b.content.as_str()).collect();
+        assert_eq!(text, ["U0", "M0", "U1", "M1"]);
+        let note = blocks.iter().find(|b| b.content.starts_with("Rotated from")).unwrap();
+        assert!(note.content.contains("with its last 2 turns (text only)") && !note.content.contains("Instruction"), "{}", note.content);
+    }
+
+    #[test]
+    fn rotate_compact_of_a_short_context_calls_no_model() {
+        crate::on_rc_thread(rotate_compact_of_a_short_context_calls_no_model_body);
+    }
+
+    /// `--keep` needs `--compact`, `--keep 0` carries nothing, and
+    /// `--compact` is not `--migrate`; each refuses before anything is made.
+    async fn rotate_compact_flag_misuse_is_refused_body() {
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 3);
+        let before = f.d.kernel_db().lock().list_all_contexts().unwrap().len();
+        for args in [
+            vec!["--keep", "2"],
+            vec!["--compact", "--keep", "0"],
+            vec!["--compact", "--migrate"],
+            vec!["--compact", "--drop", "images"],
+        ] {
+            let mut argv = vec![s("context"), s("rotate")];
+            argv.extend(args.iter().map(|a| s(a)));
+            let rotated = f.d.dispatch(&argv, &rotation_caller(f.seat, f.banto)).await;
+            assert!(!rotated.is_ok(), "{args:?} should refuse");
+        }
+        assert_eq!(f.d.kernel_db().lock().list_all_contexts().unwrap().len(), before, "nothing was created");
+        assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_none());
+    }
+
+    #[test]
+    fn rotate_compact_flag_misuse_is_refused() {
+        crate::on_rc_thread(rotate_compact_flag_misuse_is_refused_body);
+    }
+
+    /// A rotation.md in the character's rc directory is the summary's
+    /// instruction and the note names it; without one, continuation.md is.
+    async fn rotate_compact_reads_the_rc_directorys_rotation_instruction_body() {
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 4);
+        let (_, systems) = recording_mock_with_systems(&f).await;
+        let own = "/config/rc/coder/rotation.md";
+        crate::vfs::VfsOps::write_all(f.d.kernel().vfs().as_ref(), std::path::Path::new(own), b"Keep the plot.").await.unwrap();
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("1")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let blocks = f.d.block_store().block_snapshots(successor_of(&rotated)).unwrap();
+        let note = blocks.iter().find(|b| b.content.starts_with("Rotated from")).unwrap();
+        assert!(note.content.contains(&format!("Instruction: {own}.")), "{}", note.content);
+        assert!(!note.content.contains("continuation.md"), "{}", note.content);
+        assert_eq!(*systems.lock(), [Some(s("Keep the plot."))], "the summary runs under the rc directory's instruction");
+    }
+
+    #[test]
+    fn rotate_compact_reads_the_rc_directorys_rotation_instruction() {
+        crate::on_rc_thread(rotate_compact_reads_the_rc_directorys_rotation_instruction_body);
+    }
+
+    /// A summary that cannot be written refuses the rotation: the predecessor
+    /// stays live, and no context or document is left behind.
+    async fn rotate_compact_refuses_when_the_summary_fails_body() {
+        // The fixture's character has no `distill` slot.
+        let f = rotation_fixture().await;
+        seed_story(&f, 4);
+        let before = f.d.kernel_db().lock().list_all_contexts().unwrap().len();
+        let docs = f.d.block_store().list_ids().len();
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("1")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(!rotated.is_ok(), "{}", rotated.message());
+        assert!(rotated.message().contains("stays live"), "{}", rotated.message());
+        assert_eq!(f.d.kernel_db().lock().list_all_contexts().unwrap().len(), before);
+        assert_eq!(f.d.block_store().list_ids().len(), docs, "no successor document");
+        let seat = f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap();
+        assert!(seat.archived_at.is_none() && seat.label.as_deref() == Some("banto"));
+    }
+
+    #[test]
+    fn rotate_compact_refuses_when_the_summary_fails() {
+        crate::on_rc_thread(rotate_compact_refuses_when_the_summary_fails_body);
+    }
+
+    /// An unusable rotation.md is an error, not a fall back to
+    /// continuation.md.
+    async fn rotate_compact_refuses_an_empty_rotation_instruction_body() {
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 4);
+        recording_mock(&f).await;
+        crate::vfs::VfsOps::write_all(f.d.kernel().vfs().as_ref(), std::path::Path::new("/config/rc/coder/rotation.md"), b"  \n").await.unwrap();
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("1")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(!rotated.is_ok() && rotated.message().contains("rotation.md is empty"), "{}", rotated.message());
+    }
+
+    #[test]
+    fn rotate_compact_refuses_an_empty_rotation_instruction() {
+        crate::on_rc_thread(rotate_compact_refuses_an_empty_rotation_instruction_body);
+    }
+
+    /// A second compact rotation carries the first one's summary forward: the
+    /// summary block is no turn, so it is summarized again, not dropped, even
+    /// when `--keep` covers every turn after it.
+    async fn a_second_compact_rotation_keeps_the_first_summary_body() {
+        use kaijutsu_types::{BlockKind, DriftKind, Role};
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 5);
+        let sent = recording_mock(&f).await;
+        let first = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("2")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(first.is_ok(), "{}", first.message());
+        let middle = successor_of(&first);
+        let second = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("4")],
+            &rotation_caller(middle, f.banto),
+        ).await;
+        assert!(second.is_ok(), "{}", second.message());
+        let blocks = f.d.block_store().block_snapshots(successor_of(&second)).unwrap();
+        let head = blocks.first().unwrap();
+        assert_eq!((head.kind, head.drift_kind), (BlockKind::Drift, Some(DriftKind::Distill)), "a summary still comes first");
+        let text: Vec<&str> = blocks.iter()
+            .filter(|b| b.kind == BlockKind::Text && matches!(b.role, Role::User | Role::Model))
+            .map(|b| b.content.as_str()).collect();
+        assert_eq!(text, ["U3", "M3", "U4", "M4"]);
+        let note = blocks.iter().find(|b| b.content.starts_with("Rotated from")).unwrap();
+        assert!(note.content.contains("its last 2 turns"), "the summary is not counted as a turn: {}", note.content);
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 2, "the second rotation summarizes the first summary");
+        assert!(serde_json::to_string(&sent[1]).unwrap().contains("THE SUMMARY"));
+    }
+
+    #[test]
+    fn a_second_compact_rotation_keeps_the_first_summary() {
+        crate::on_rc_thread(a_second_compact_rotation_keeps_the_first_summary_body);
+    }
+
+    /// A file block in the carried turns stays behind, and the note counts it
+    /// and names its path.
+    async fn rotate_compact_names_a_file_block_it_leaves_behind_body() {
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, Role};
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 3);
+        let store = f.d.block_store();
+        let mut file = BlockSnapshot::text(BlockId::new(f.seat, f.banto, 900), None, Role::Model, "FILE BODY");
+        file.kind = BlockKind::File;
+        file.file_path = Some(s("notes/lane.md"));
+        let after = store.last_block_id(f.seat);
+        store.insert_from_snapshot_as(f.seat, file, after.as_ref(), Some(f.banto)).unwrap();
+        recording_mock(&f).await;
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("1")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let blocks = f.d.block_store().block_snapshots(successor_of(&rotated)).unwrap();
+        assert!(!blocks.iter().any(|b| b.content == "FILE BODY"), "the file's content stays behind");
+        let note = blocks.iter().find(|b| b.content.starts_with("Rotated from")).unwrap();
+        assert!(note.content.contains("1 file"), "{}", note.content);
+        assert!(note.content.contains("notes/lane.md"), "{}", note.content);
+    }
+
+    #[test]
+    fn rotate_compact_names_a_file_block_it_leaves_behind() {
+        crate::on_rc_thread(rotate_compact_names_a_file_block_it_leaves_behind_body);
+    }
+
+    /// The summary is the performer's, as a compact fork's is, even when the
+    /// lineage root rotates the context.
+    async fn a_compact_rotation_summary_carries_the_performer_body() {
+        use kaijutsu_types::DriftKind;
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 4);
+        recording_mock(&f).await;
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("banto"), s("--compact"), s("--keep"), s("1")],
+            &rotation_caller(f.root, f.amy),
+        ).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let blocks = f.d.block_store().block_snapshots(successor_of(&rotated)).unwrap();
+        let summary = blocks.iter().find(|b| b.drift_kind == Some(DriftKind::Distill)).unwrap();
+        assert_eq!(summary.author(), f.banto, "the summary carries the performer, not the requester");
+    }
+
+    #[test]
+    fn a_compact_rotation_summary_carries_the_performer() {
+        crate::on_rc_thread(a_compact_rotation_summary_carries_the_performer_body);
+    }
+
+    /// A summary that could read only the newest of the earlier turns says
+    /// so in the note.
+    async fn rotate_compact_says_when_the_summary_read_only_part_body() {
+        let f = rotation_fixture_slotted(true, &["model", "distill"]).await;
+        seed_story(&f, 6);
+        f.d.kernel_db().lock().set_context_env(f.seat, "KJ_DISTILL_INPUT_BYTES", "1800").unwrap();
+        let sent = recording_mock(&f).await;
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--compact"), s("--keep"), s("1")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let prompt = serde_json::to_string(&sent.lock()[0]).unwrap();
+        assert!(!prompt.contains("\"U0\"") && !prompt.contains("U0\\n"), "the bound left the oldest turn out: {prompt}");
+        let blocks = f.d.block_store().block_snapshots(successor_of(&rotated)).unwrap();
+        let note = blocks.iter().find(|b| b.content.starts_with("Rotated from")).unwrap();
+        assert!(note.content.contains("oldest") && note.content.contains("KJ_DISTILL_INPUT_BYTES"), "{}", note.content);
+    }
+
+    #[test]
+    fn rotate_compact_says_when_the_summary_read_only_part() {
+        crate::on_rc_thread(rotate_compact_says_when_the_summary_read_only_part_body);
     }
 
     /// Only the performer rotating itself or the lineage root may rotate;

@@ -112,6 +112,9 @@ pub struct MockClient {
     /// handed — the only way a test can pin the shape of a request the wire
     /// would have to accept. `None` records nothing.
     sent: Option<Arc<parking_lot::Mutex<Vec<Vec<Message>>>>>,
+    /// The system instruction each `Provider::stream` call received, in call
+    /// order, when a test asked for it with `recording_sent_systems`.
+    sent_systems: Option<Arc<parking_lot::Mutex<Vec<Option<String>>>>>,
     /// The `(step, attempt)` of each `Provider::stream` call's request trace,
     /// in call order, when a test asked for it with `recording_traces`.
     traces: Option<Arc<parking_lot::Mutex<Vec<(u32, u32)>>>>,
@@ -153,6 +156,7 @@ impl MockClient {
             script_dir: None,
             script_by_model: None,
             sent: None,
+            sent_systems: None,
             traces: None,
             hold: None,
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -176,6 +180,14 @@ impl MockClient {
         let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
         self.sent = Some(sent.clone());
         (self, sent)
+    }
+
+    /// Builder: record the system instruction handed to every
+    /// `Provider::stream` call. The returned handle reads them in call order.
+    pub fn recording_sent_systems(mut self) -> (Self, Arc<parking_lot::Mutex<Vec<Option<String>>>>) {
+        let systems = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        self.sent_systems = Some(systems.clone());
+        (self, systems)
     }
 
     /// Builder: record the `(step, attempt)` of the request trace each
@@ -1283,6 +1295,9 @@ impl Provider {
             Self::Mock(mock) => {
                 if let Some(sent) = &mock.sent {
                     sent.lock().push(messages.clone());
+                }
+                if let Some(systems) = &mock.sent_systems {
+                    systems.lock().push(opts.system.clone());
                 }
                 if let Some(traces) = &mock.traces {
                     traces.lock().push(opts.trace.as_ref().map_or((0, 0), |t| (t.step, t.attempt)));

@@ -1520,7 +1520,14 @@ pub const DEFAULT_DISTILL_INPUT_BYTES: usize = 131_072;
 /// tool calls, and tool results stay together even when the tail begins on a
 /// tool block.
 pub(crate) fn most_recent_eligible_turn_group(blocks: &[BlockSnapshot]) -> Vec<BlockSnapshot> {
-    closed_eligible_turn_ranges(blocks)
+    most_recent_eligible_turn_groups(blocks, 1).pop().unwrap_or_default()
+}
+
+/// Select the latest `count` complete, history-eligible turn groups, oldest
+/// first. Each group holds its eligible blocks and no group is empty; fewer
+/// than `count` come back when the log holds fewer.
+pub(crate) fn most_recent_eligible_turn_groups(blocks: &[BlockSnapshot], count: usize) -> Vec<Vec<BlockSnapshot>> {
+    let mut groups: Vec<Vec<BlockSnapshot>> = closed_eligible_turn_ranges(blocks)
         .into_iter()
         .rev()
         .map(|range| {
@@ -1530,8 +1537,11 @@ pub(crate) fn most_recent_eligible_turn_group(blocks: &[BlockSnapshot]) -> Vec<B
                 .cloned()
                 .collect::<Vec<_>>()
         })
-        .find(|group| !group.is_empty())
-        .unwrap_or_default()
+        .filter(|group| !group.is_empty())
+        .take(count)
+        .collect();
+    groups.reverse();
+    groups
 }
 
 /// Extend user-delimited turn groups across eligible tool pairs.
@@ -1541,7 +1551,7 @@ pub(crate) fn most_recent_eligible_turn_group(blocks: &[BlockSnapshot]) -> Vec<B
 /// Pair closure joins every range between the call and result; this may retain
 /// an unrelated intervening turn, but never presents a partial tool exchange.
 /// An excluded or otherwise ineligible partner is deliberately not restored.
-fn closed_eligible_turn_ranges(blocks: &[BlockSnapshot]) -> Vec<Range<usize>> {
+pub(crate) fn closed_eligible_turn_ranges(blocks: &[BlockSnapshot]) -> Vec<Range<usize>> {
     let mut ranges: Vec<Range<usize>> = Vec::new();
     for range in turn_group_ranges(blocks) {
         let begins_eligible_turn = range.start == 0 || is_history_eligible(&blocks[range.start]);
@@ -1735,6 +1745,17 @@ pub(crate) fn build_bounded_distillation_prompt_with_guidance(
     input_bytes: usize,
     length_guidance: Option<&str>,
 ) -> Result<String, String> {
+    bounded_distillation_prompt(blocks, directed_prompt, input_bytes, length_guidance).map(|(prompt, _)| prompt)
+}
+
+/// [`build_bounded_distillation_prompt_with_guidance`], and how many of the
+/// oldest turn groups the bound left out of the transcript.
+pub(crate) fn bounded_distillation_prompt(
+    blocks: &[BlockSnapshot],
+    directed_prompt: Option<&str>,
+    input_bytes: usize,
+    length_guidance: Option<&str>,
+) -> Result<(String, usize), String> {
     if input_bytes == 0 {
         return Err("KJ_DISTILL_INPUT_BYTES must be greater than zero".into());
     }
@@ -1784,7 +1805,7 @@ pub(crate) fn build_bounded_distillation_prompt_with_guidance(
             "KJ_DISTILL_INPUT_BYTES={input_bytes} cannot fit distillation framing and focus"
         ));
     }
-    Ok(prompt)
+    Ok((prompt, selected_start))
 }
 
 /// Build a bounded, source-cited distillation transcript.
@@ -2555,6 +2576,30 @@ mod tests {
         let recent = most_recent_eligible_turn_group(&[request.clone(), excluded, answer.clone()]);
         assert!(recent.iter().any(|block| block.id == request.id));
         assert!(recent.iter().any(|block| block.id == answer.id));
+    }
+
+    #[test]
+    fn most_recent_turn_groups_come_back_oldest_first_and_stop_at_the_log() {
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let blocks: Vec<BlockSnapshot> = (0..4u64)
+            .flat_map(|i| [
+                BlockSnapshot::text(BlockId::new(ctx, author, i * 2), None, Role::User, format!("ask {i}")),
+                BlockSnapshot::text(BlockId::new(ctx, author, i * 2 + 1), None, Role::Model, format!("answer {i}")),
+            ])
+            .collect();
+        let texts = |groups: Vec<Vec<BlockSnapshot>>| -> Vec<Vec<String>> {
+            groups.into_iter().map(|g| g.into_iter().map(|b| b.content).collect()).collect()
+        };
+        assert_eq!(
+            texts(most_recent_eligible_turn_groups(&blocks, 2)),
+            [["ask 2", "answer 2"], ["ask 3", "answer 3"]],
+        );
+        assert_eq!(most_recent_eligible_turn_groups(&blocks, 9).len(), 4, "a short log yields what it has");
+        assert_eq!(
+            most_recent_eligible_turn_group(&blocks).into_iter().map(|b| b.content).collect::<Vec<_>>(),
+            ["ask 3", "answer 3"],
+        );
     }
 
     #[test]

@@ -6,8 +6,9 @@
 #
 # `ROTATED_FROM` is a context env value naming the predecessor by label or
 # id; `kj context rotate` sets the id. Unset, this script does nothing.
-# `kj context rotate --migrate` also sets `ROTATED_MIGRATED=1`: the whole
-# conversation came along, so a tail would repeat it, and none is injected.
+# `kj context rotate --migrate` and `--compact` also set `ROTATED_MIGRATED=1`:
+# the conversation (all of it, or a summary and the recent turns) came along,
+# so a tail would repeat it, and none is injected.
 # The tail is read with `kj wait`, which resolves an idle context from its
 # log without parking: 12 prose blocks, each cut at 400 bytes, so the capture stays under the 8192-byte
 # builtin stdout cap (runtime/embedded_kaish.rs). A stale or archived

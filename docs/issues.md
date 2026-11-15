@@ -651,8 +651,9 @@ conversation"; `blocks/slim.rs`.
   after the first slimmed one.
 - No live run yet: the tests drive the kernel. Untried with a real model
   reading a stub and fetching its original with `kj block read`.
-- `--migrate` copies the conversation before the successor's rows exist, as a
-  fork's copy does; a row insert that then fails leaves an orphan document.
+- `--migrate` and `--compact` copy the conversation before the successor's
+  rows exist, as a fork's copy does; a row insert that then fails leaves an
+  orphan document. For `--compact`, the summary it paid for is lost with it.
 - `assets/defaults/rc/companion/create/` holds full copies of the `lib/create`
   scripts, not path shims as `director` and `storyteller` do. The
   `S17-predecessor.kai` change was made in both; the next edit to a lib
@@ -1779,7 +1780,7 @@ letter queue that no model can read. Where a draft's text goes today:
 | `consume_draft` (`block_store.rs:2583`) | deleted after an accepted shell submit; the text became a command block |
 | `submit_draft` refused (empty) | kept in place |
 | `kj context archive` (`kj/context.rs:2315`, `kernel_db.rs:4484`) | stays in the archived context's blocks; live again on `promote` |
-| `kj context rotate` (`kj/context.rs:2428`) | copies no blocks; stays in the archived predecessor |
+| `kj context rotate` (`kj/context.rs:2428`) | stays in the archived predecessor; `--migrate` and `--compact` leave drafts behind with the rest of the filter |
 | `kj character retire` (`kernel_db.rs:8199`) | contexts archive; same as archive |
 | context switch / client restart | stays in the context's document |
 | kernel restart (`block_store.rs:3086`) | restored from the document snapshot, then the journaled ops replayed over it |

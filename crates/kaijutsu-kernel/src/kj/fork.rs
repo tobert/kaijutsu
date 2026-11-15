@@ -3339,7 +3339,7 @@ mod tests {
             d.block_store().set_excluded(source, &block, true).unwrap();
         });
         assert!(!result.is_ok(), "source mutation must invalidate the summary");
-        assert!(result.message().contains("Source changed"), "{}", result.message());
+        assert!(result.message().contains("changed while it was summarized"), "{}", result.message());
         assert!(d.kernel_db().lock().find_context_by_label("stale-child").unwrap().is_none());
     }
 

@@ -80,10 +80,7 @@ use tokio_util::sync::CancellationToken;
 use kaijutsu_types::{ContentType, ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::block_store::SharedBlockStore;
-use crate::drift::{
-    DEFAULT_DISTILL_INPUT_BYTES, SharedDriftRouter,
-    build_bounded_distillation_prompt_with_guidance,
-};
+use crate::drift::{DEFAULT_DISTILL_INPUT_BYTES, SharedDriftRouter};
 use crate::kernel::Kernel;
 use crate::kernel_db::{ContextEnvRow, KernelDb};
 
@@ -97,6 +94,9 @@ const DEFAULT_CONTINUATION_WORD_TARGET: usize = 1_500;
 enum DistillationPurpose {
     DriftBrief,
     Continuation,
+    /// The earlier conversation of a context being rotated with `--compact`.
+    /// Its instruction is chosen by the rotation, which passes it in.
+    Rotation,
 }
 
 /// A one-shot call's open `turns` row. Dropped before [`Self::finish`] (the
@@ -133,20 +133,21 @@ impl DistillationPurpose {
         match self {
             Self::DriftBrief => crate::model_resolution::DISTILL,
             Self::Continuation => "continuation",
+            Self::Rotation => "rotation",
         }
     }
 
     fn word_target_key(self) -> &'static str {
         match self {
             Self::DriftBrief => DRIFT_WORD_TARGET_ENV,
-            Self::Continuation => CONTINUATION_WORD_TARGET_ENV,
+            Self::Continuation | Self::Rotation => CONTINUATION_WORD_TARGET_ENV,
         }
     }
 
     fn default_word_target(self) -> usize {
         match self {
             Self::DriftBrief => DEFAULT_DRIFT_WORD_TARGET,
-            Self::Continuation => DEFAULT_CONTINUATION_WORD_TARGET,
+            Self::Continuation | Self::Rotation => DEFAULT_CONTINUATION_WORD_TARGET,
         }
     }
 
@@ -158,6 +159,7 @@ impl DistillationPurpose {
             Self::Continuation => crate::config_seed::load_continuation_prompt(kernel.vfs().as_ref())
                 .await
                 .map_err(|e| format!("continuation prompt: {e}")),
+            Self::Rotation => Err("a rotation summary runs under an instruction its caller chose".into()),
         }
     }
 }
@@ -997,6 +999,28 @@ impl KjDispatcher {
         .await
     }
 
+    /// Summarize the earlier conversation of a context being rotated with
+    /// `--compact`: the newest of `blocks` that fit `KJ_DISTILL_INPUT_BYTES`,
+    /// under `instruction`, on the `distill` slot of the rotated context.
+    /// Returns the summary and how many of the oldest turn groups the bound
+    /// left out.
+    pub(crate) async fn summarize_for_rotation(
+        &self,
+        context_id: ContextId,
+        blocks: Vec<kaijutsu_types::BlockSnapshot>,
+        instruction: String,
+    ) -> Result<(String, usize), String> {
+        self.summarize_blocks_for_purpose(
+            context_id,
+            blocks,
+            None,
+            Some(context_id),
+            DistillationPurpose::Rotation,
+            Some(instruction),
+        )
+        .await
+    }
+
     async fn summarize_for_caller_purpose(
         &self,
         context_id: ContextId,
@@ -1008,19 +1032,40 @@ impl KjDispatcher {
             .blocks
             .block_snapshots(context_id)
             .map_err(|e| e.to_string())?;
+        self.summarize_blocks_for_purpose(context_id, blocks, directed_prompt, caller_context_id, purpose, None)
+            .await
+            .map(|(summary, _)| summary)
+    }
+
+    /// Distill `blocks`, which come from `context_id`: its env sets the word
+    /// target and input bound. `instruction` replaces the purpose's own
+    /// system instruction. Returns the summary and how many of the oldest
+    /// turn groups the input bound left out.
+    async fn summarize_blocks_for_purpose(
+        &self,
+        context_id: ContextId,
+        blocks: Vec<kaijutsu_types::BlockSnapshot>,
+        directed_prompt: Option<&str>,
+        caller_context_id: Option<ContextId>,
+        purpose: DistillationPurpose,
+        instruction: Option<String>,
+    ) -> Result<(String, usize), String> {
         if blocks.is_empty() {
             return Err("context has no blocks to summarize".into());
         }
 
         let (word_target, input_bytes) = self.distillation_limits(context_id, purpose)?;
         let length_guidance = format!("about {word_target} words");
-        let user_prompt = build_bounded_distillation_prompt_with_guidance(
+        let (user_prompt, omitted) = crate::drift::bounded_distillation_prompt(
             &blocks,
             directed_prompt,
             input_bytes,
             Some(&length_guidance),
         )?;
-        let system_prompt = purpose.load_system_prompt(self.kernel()).await?;
+        let system_prompt = match instruction {
+            Some(instruction) => instruction,
+            None => purpose.load_system_prompt(self.kernel()).await?,
+        };
 
         // The model comes from the `distill` slot of the caller's context and
         // nowhere else. No registry default or the source's model stands in.
@@ -1116,7 +1161,7 @@ impl KjDispatcher {
         }
         let reply = reply.map_err(|e| format!("LLM summarization failed on {provider_name}/{model}: {e}"))?;
         record?;
-        Ok(reply.text)
+        Ok((reply.text, omitted))
     }
 
     fn distillation_limits(
