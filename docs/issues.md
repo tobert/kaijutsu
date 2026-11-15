@@ -6,6 +6,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## rc bindings: the person-input facades are copied per directory (2026-11-15)
+
+- Every rc directory a person talks to grants `edit_input`, `submit_input`,
+  and `commit_capture` in its own `S10-binding.kai`. When the toolie became
+  an assistant Amy talks to, her tui hit one missing facade, then the next
+  (`submit_input`, then `edit_input`). A shared lib script for the person
+  input set, sourced by each person-facing directory, would keep the set in
+  one place.
+
 ## Context shadows: what the description slice leaves open
 
 - **A resumed ask's error is lost.** 2026-11-15, live: from an MCP seat,

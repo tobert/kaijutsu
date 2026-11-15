@@ -2,8 +2,12 @@
 # `facade:shell` projects it into the model's roster and gives the person's
 # shell box the same read-only shell. Files, `git`, blocks, and kernel search
 # are all reached through it (`cat`, `grep`, `kj block read`, `kj search`).
-# `facade:submit_input` lets a person's typed submit reach the context. The
-# toolie never holds `facade:shell_write`, `exec`, or a write tool.
+# A person talks to the toolie, so it holds the input facades every
+# person-facing context holds: `edit_input` (the compose draft),
+# `submit_input`, and `commit_capture` (captured input). The toolie never
+# holds `facade:shell_write`, `exec`, or a write tool.
 set -e
 kj binding allow "facade:shell"
+kj binding allow "facade:edit_input"
 kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"

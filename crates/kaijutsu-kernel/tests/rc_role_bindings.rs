@@ -252,11 +252,14 @@ async fn toolie_role_seeds_one_read_only_shell_and_refuses_writes_body() {
         ),
         "toolie's RPC shell must be the read-only shell"
     );
-    // A person talks to the toolie, so a typed submit must reach it.
-    assert!(
-        fx_broker_check(&h, &ctx, "submit_input").await.is_ok(),
-        "toolie must hold facade:submit_input, or a person's submit fails"
-    );
+    // A person talks to the toolie, so it holds the input facades every
+    // person-facing context holds: the draft, the submit, and captured input.
+    for facade in ["edit_input", "submit_input", "commit_capture"] {
+        assert!(
+            fx_broker_check(&h, &ctx, facade).await.is_ok(),
+            "toolie must hold facade:{facade}, as every context a person talks to does"
+        );
+    }
 
     // Enforced at the call path: a write is refused, not silently dropped.
     let denied = h
