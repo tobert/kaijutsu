@@ -108,16 +108,17 @@ no rc seeds a separate kaish primer, and `help syntax` holds the language
 reference. The coder stance's working rules adapt DeepSeek Harness's tool
 rules (MIT).
 
-The toolie is a read-only explorer modeled on kaibo's explorer. Its binding
-(`toolie/create/S10-binding.kai`) grants `facade:shell` alone, so its model has
-one tool, the read-only `shell`, and the person's shell box in a toolie context is
-the same read-only shell. Its stance (`toolie/create/S00-stance.md`) adapts
-kaibo's explorer preamble: read files whole with their line numbers, read in
-spans past the 8 KiB result preview, follow each name to its definition, and
-end on a cited report (SummaryOfFindings, RelevantLocations, ExplorationTrace)
-that the asker reads verbatim in the toolie's context.
-The test `the_toolie_stance_examples_run_in_its_read_only_shell` runs every
-command the stance shows, so a stance example cannot drift from the shell.
+The toolie is a helpful assistant with a read-only shell, sized for small
+models such as lfm3. Its binding (`toolie/create/S10-binding.kai`) grants
+`facade:shell` alone, so its model has one tool, the read-only `shell`, and the
+person's shell box in a toolie context is the same read-only shell. Its stance
+(`toolie/create/S00-stance.md`) is a few lines: who it is, the two commands it
+reads with, and that a write is refused. Amy, 2026-11-15: "gut the toolie, very
+short new line, 'You are a helpful assistant.' and maybe some kaish". The
+earlier explorer stance, adapted from kaibo's explorer, pushed a 1.7B model
+into report sections and drafts. The test `the_toolie_reads_run_in_its_read_only_shell`
+runs every command the stance shows, so a stance example cannot drift from the
+shell.
 
 An mcp context ships no stance. Its performer is an outside agent whose own
 system prompt is the only one its model reads; `register_session` returns no

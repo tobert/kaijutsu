@@ -507,8 +507,8 @@ async fn mcp_role_holds_config_governance_body() {
     );
 }
 
-/// The `glob` tool the toolie stance names, and the reads a toolie makes,
-/// run in its read-only shell, and its writes are refused saying so.
+/// The commands the toolie stance shows, and the reads a toolie makes, run
+/// in its read-only shell, and its writes are refused saying so.
 #[test]
 fn the_toolie_reads_run_in_its_read_only_shell() {
     run_on_rc_stack(|| {
@@ -539,20 +539,20 @@ async fn the_toolie_reads_run_in_its_read_only_shell_body() {
             result.structured.expect("the shell returns its envelope")
         }
     };
-    // The stance's tool, then the reads a seat makes with it, bound to files
-    // every toolie seat has.
+    // The commands the stance shows, then the reads a seat makes with the
+    // shell, bound to files every toolie seat has. A stance that shows
+    // another command fails here until this list runs it too.
     let file = "/config/rc/toolie/create/S00-stance.md";
     let dir = "/config/rc/toolie";
-    assert!(stance.contains("`glob`"), "the stance no longer names `glob`");
-    let envelope = run(format!("glob '{dir}/**/*.md'")).await;
-    assert_eq!(envelope["exit_code"], 0, "glob: {envelope}");
-    assert!(envelope["stdout"].as_str().unwrap_or_default().contains("S00-stance.md"), "glob finds the stance: {envelope}");
+    for shown in ["`cat -n FILE`", "`grep -rn PATTERN DIR`"] {
+        assert!(stance.contains(shown), "the stance no longer shows {shown}; run what it shows instead");
+    }
     let reads = [
         format!("cat -n {file}"),
         format!("wc -l {file}"),
         format!("cat -n {file} | sed -n '1,150p'"),
         format!("grep -rn shell {dir}"),
-        format!("grep -rnF 'Ground claims' {dir}"),
+        format!("grep -rnF 'helpful assistant' {dir}"),
         format!("grep -rn -B4 -A8 shell {dir}"),
         format!("file {file}"),
         "pwd".to_string(),
