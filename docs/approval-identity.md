@@ -404,9 +404,24 @@ superseded request need explicit linkage so rotation does not duplicate work.
 
 ## Current implementation
 
-- A model's in-kernel turn holds on an ask its own tool call raised, and
-  continues when the answer lands (`docs/gate-resume.md`, "The turn holds").
-  The MCP and RPC shell paths return `Pending` immediately.
+- **The turn holds on its own asks.** A model's in-kernel turn registers a hold
+  (`runtime/held_asks.rs`) before publishing a `Waiting` tool pair, then waits
+  outside the broker call timeout, stream deadlines, and round cap. Nothing
+  blocks on the wire: MCP and RPC shell paths return `Pending` immediately.
+  - The approval worker is the sole executor. For a held foreground pair, it
+    runs or refuses the command, suppresses the completion notice, writes no
+    seed, starts no turn, and releases the hold so the turn reads the settled
+    result block in place.
+  - A `run_in_background: true` call holds only until the decision: the worker
+    releases the hold when the approved command starts, and the model reads a
+    running receipt (or the denial). Completion later arrives through its
+    notice.
+  - A hard or soft interrupt abandons an unanswered ask and settles the pair
+    `Error`, except `Kernel::interrupt_context_keeping_asks` (used when a
+    council `report` stops an autonomous turn while keeping its ask pending).
+  - Holds are not durable across a kernel restart: boot abandons pending asks
+    and closes `Waiting` pairs. Offline `kj` commands have no approval worker
+    and fail gated holds immediately (`Kernel::refuse_holds`).
 - Shell uses `run_in_background: false` by default and waits for the result.
   Both modes execute kaish and use the same gate. An unknown old `foreground`
   parameter is rejected. `run_in_background: true` returns a stable, non-error

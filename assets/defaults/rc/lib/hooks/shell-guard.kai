@@ -1,5 +1,5 @@
 # Hook body payload, read fresh from this path at every fire
-# (docs/rc-on-disk.md) -- editing this file changes the running hook with
+# (docs/config-namespace.md) -- editing this file changes the running hook with
 # no reinstall. NOT an rc lifecycle script: it sits outside any verb
 # directory, and the lifecycle runner rejects a name that is not
 # SXX-name.{kai,md}, so it cannot be reached as one from either side.

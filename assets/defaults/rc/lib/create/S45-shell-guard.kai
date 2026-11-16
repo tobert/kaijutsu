@@ -52,7 +52,7 @@
 # verb directory so the rc lifecycle never runs it as a script.
 # `HookBody::KaishPath` reads it fresh from the VFS at every pre_call fire,
 # so editing that file reaches the running hook with no reinstall
-# (docs/rc-on-disk.md).
+# (docs/config-namespace.md).
 
 set -e
 

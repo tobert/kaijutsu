@@ -1,5 +1,5 @@
 // Trace Glow Shader — a faint, slowly moving glow for room decoration
-// (`docs/scenes/shell.md`; `shaders::TraceGlowMaterial` has the full uniform
+// (`shaders::TraceGlowMaterial` has the full uniform
 // layout doc). Zero per-frame CPU writes: every element's phase/rate/trough
 // is baked in at spawn time, and all motion here comes from `globals.time`.
 //

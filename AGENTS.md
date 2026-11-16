@@ -159,12 +159,23 @@ area moves.
 
 ## Finding and checking code
 
-We start with `kaijutsu-types` for shared domain types. `kaijutsu-kernel`
-owns state, VFS, model work, embedded kaish, MCP brokerage, and `kj`;
-`kaijutsu-server` owns SSH/RPC hosting and the beat scheduler;
-`kaijutsu-client` owns the RPC client and `ActorHandle`. `kaijutsu-app` is the
-Bevy GUI; `kaijutsu-tui` is the terminal client; `kaijutsu-mcp` is the stdio
-MCP bridge. Wire schema: `kaijutsu.capnp`.
+One shared `Kernel` runs per server process over an SSH session channel bound
+to the `kaijutsu-rpc` Cap'n Proto subsystem (`kaijutsu.capnp`). Isolation is by
+context, not by process.
+
+We start with `kaijutsu-types` for shared domain types and wire envelopes.
+`kaijutsu-kernel` owns durable SQLite state (`KernelDb`), the block store, the
+VFS and mount table, model streaming and hydration, embedded kaish, the MCP
+broker and hooks, the council gate, and `kj`. `kaijutsu-server` owns SSH/SFTP,
+Cap'n Proto RPC hosting, auth (`auth.db`), and the beat scheduler.
+`kaijutsu-client` owns the `Send + Sync` RPC actor bridge (`ActorHandle`),
+outboxes, and subscription streams. `kaijutsu-app` is the Bevy GUI;
+`kaijutsu-tui` is the ratatui terminal client; `kaijutsu-mcp` is the stdio MCP
+bridge and hook listener; `kaijutsu-acp` is the ACP bridge. Supporting crates:
+`kaijutsu-editor` (pure vi core), `kaijutsu-council` (Council v2 / gogi HTTP
+client), `kaijutsu-cas` (BLAKE3 content store), `kaijutsu-index` (semantic
+index), `kaijutsu-abc` and `kaijutsu-hyoushigi` (music notation and cue
+timing), and `approval-ledger` (asks and standing rules).
 
 For GUI work, Amy starts `./contrib/kaijutsu-runner.sh` in her Wayland
 session. We operate that runner with
