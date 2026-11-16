@@ -810,14 +810,14 @@ impl KjDispatcher {
             .map_err(|e| e.to_string())
     }
 
-    /// Refuse a house verb to a seat without the `house` capability. The
-    /// message says the verb is outside this seat's work and does not say
+    /// Refuse a house verb to a context without the `house` capability. The
+    /// message says the verb is outside this context's work and does not say
     /// how to widen the loadout: a worker is not meant to go looking.
     fn require_house(&self, caller: &KjCaller, verb: &str) -> Result<(), KjResult> {
         match self.holds_house(caller) {
             Ok(true) => Ok(()),
             Ok(false) => Err(KjResult::Err(format!(
-                "kj {verb}: not part of this seat's work. `kj help` lists the commands this seat uses."
+                "kj {verb}: not part of this context's work. `kj help` lists the commands this context uses."
             ))),
             Err(e) => Err(KjResult::Err(format!(
                 "kj {verb}: authorization unavailable: {e}. The loadout could not be read, \
@@ -2268,6 +2268,9 @@ mod published_prose {
         if let Some(about) = cmd.get_about() {
             out.push((here.clone(), "about".to_string(), about.to_string()));
         }
+        if let Some(long_about) = cmd.get_long_about() {
+            out.push((here.clone(), "long_about".to_string(), long_about.to_string()));
+        }
         for arg in cmd.get_arguments() {
             if matches!(arg.get_id().as_str(), "help" | "version" | "json") {
                 continue;
@@ -2350,6 +2353,44 @@ mod published_prose {
                 .join("\n")
         );
     }
+
+    #[test]
+    fn published_help_does_not_leak_internal_jargon_or_history() {
+        const FORBIDDEN: &[&str] = &[
+            "for this slice",
+            "standalone slice",
+            "Mirrors MCP",
+            "FSN world plumbing",
+            "Lane K",
+            "stage 0/1",
+            "HookActionWire",
+            "BlockStore",
+            "human root",
+            "time-well",
+            "sqlite-only by decision",
+            "approval_ask_statements",
+            "subscribeVfsActivity",
+        ];
+        let cmd = kj_command();
+        let mut all = Vec::new();
+        published_text(&cmd, "", &mut all);
+
+        let mut leaks = Vec::new();
+        for (path, kind, text) in &all {
+            for &term in FORBIDDEN {
+                if text.contains(term) {
+                    leaks.push(format!("  {path} ({kind}) mentions {term:?}: {text}"));
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "published `kj` help must not leak internal implementation jargon or history \
+             (docs/writing.md). Found {}:\n{}",
+            leaks.len(),
+            leaks.join("\n")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2427,14 +2468,14 @@ mod dispatch_size_tests {
 #[cfg(test)]
 mod house_verb_tests {
     //! House verbs need the `house` capability (`kj/house.rs`). A worker
-    //! seat is refused them before the handler runs and does not see them in
+    //! context is refused them before the handler runs and does not see them in
     //! `kj help`.
 
     use super::test_helpers::*;
     use super::*;
     use crate::mcp::{Capability, ContextToolBinding};
 
-    const REFUSAL: &str = "not part of this seat's work";
+    const REFUSAL: &str = "not part of this context's work";
 
     /// The loadout shape `coder` ships: tools and the worker authorities,
     /// no `house`, no `operator`.

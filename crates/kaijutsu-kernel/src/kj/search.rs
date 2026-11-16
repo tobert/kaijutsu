@@ -34,7 +34,7 @@ pub(crate) struct SearchArgs {
     /// Search all active contexts instead of just one
     #[arg(long, conflicts_with = "context")]
     all: bool,
-    /// Filter by kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace
+    /// Filter by kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace|task
     #[arg(long)]
     kind: Option<String>,
     /// Filter by role: user|model|system|tool|asset

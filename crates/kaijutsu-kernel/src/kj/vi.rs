@@ -18,7 +18,7 @@ use crate::mcp::Capability;
 #[derive(Parser, Debug)]
 #[command(
     name = "vi",
-    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list/recover/registers); the agent and scripting door, not the in-app entry",
+    about = "Drive kernel-owned vi editor sessions",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -53,13 +53,7 @@ enum EditorCommand {
         /// Key sequence in vim notation; a literal `<` is `<lt>`.
         keys: String,
     },
-    /// Splice text at the session's live cursor without touching the vim
-    /// mode — the paste path: this lands arbitrary text without reading it
-    /// as key notation. Insert stays
-    /// insert, normal stays normal. Refused, with the buffer unchanged and
-    /// the reason on the state's message (not an error), while the `:`
-    /// command line is open. No capability is needed: a paste carries no
-    /// write intent, the same as a plain `keys` edit.
+    /// Splice text at the session's live cursor without changing vim mode.
     Insert {
         /// Session handle from `kj vi open`.
         session: u64,

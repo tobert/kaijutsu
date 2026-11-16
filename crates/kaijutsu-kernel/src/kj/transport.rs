@@ -79,8 +79,8 @@ enum TransportCommand {
         #[arg(long)]
         rotate: Option<u64>,
     },
-    /// Detach a context from a track — unbind. Used by rotation's parent-side and
-    /// by archive. The track persists with its remaining attachments.
+    /// Detach a context from a track. The track persists with its remaining
+    /// attachments.
     Detach {
         /// Target context: . (default) | <label> | <hex prefix>
         #[arg(long)]
@@ -108,9 +108,8 @@ enum TransportCommand {
         #[arg(long)]
         track: Option<String>,
     },
-    /// Stop the track's clock (MIDI idiom: stop = stop the clock only). Rotation
-    /// is suspended/remembered, not cleared; per-attachment OODA arm is untouched.
-    /// Use `kj transport ooda off` to disarm OODA separately.
+    /// Stop the track's clock. Rotation is suspended and remembered, not cleared;
+    /// per-attachment OODA arm is untouched (`kj transport ooda off` disarms it).
     Stop {
         /// Target context (used for track lookup when --track is absent).
         #[arg(long)]
@@ -143,9 +142,9 @@ enum TransportCommand {
         track: Option<String>,
     },
     /// Switch the track's beat driver: `system` (local fixed-tempo timer) or
-    /// `modeled` (phase-locked to an observed external MIDI master via the
-    /// edge estimator — docs/midi.md M3). The current period carries over;
-    /// a modeled clock free-runs at it until the first reference arrives.
+    /// `modeled` (phase-locked to an observed external MIDI clock). The current
+    /// period carries over; a modeled clock free-runs at it until the first
+    /// reference arrives.
     Clock {
         /// `system` or `modeled`
         kind: Option<String>,
@@ -157,12 +156,11 @@ enum TransportCommand {
         #[arg(long)]
         track: Option<String>,
     },
-    /// Set (or clear) the rotate cadence — the page turn. At every phrase
-    /// horizon where `phrase % N == 0` the scheduler detaches this context and
-    /// fires the `rotate` rc lifecycle, which replaces it with a successor
-    /// (`kj context rotate`). The detach is synchronous in the scheduler, so it
-    /// can't race the beat. A rotate horizon replaces that phrase's tick, so N
-    /// must be at least 2.
+    /// Set or clear the rotate cadence (the page turn). At every phrase horizon
+    /// where `phrase % N == 0`, the scheduler detaches this context and fires the
+    /// `rotate` rc lifecycle, which replaces it with a successor (`kj context
+    /// rotate`). A rotate horizon replaces that phrase's tick, so N must be at
+    /// least 2.
     Rotate {
         /// Phrases per rotation, at least 2. Omit and pass `off` to disable.
         #[arg(long)]
@@ -177,38 +175,21 @@ enum TransportCommand {
         #[arg(long)]
         track: Option<String>,
     },
-    /// Delete a track — a rename-aside **tombstone**, never a hard delete
-    /// (`docs/tracks.md` Transport). REQUIRES `--track <name>` explicitly: unlike
-    /// every other transport verb, this one never resolves a track from the
-    /// caller's own attachment — deletion must never hit a track you merely
-    /// happen to be attached to. Stops the clock, detaches every attached context
-    /// (their playhead persists, same as `detach`), tears down the track's live
-    /// clock/timeline state, and hides it from `kj transport list` (the persisted
-    /// row is tombstoned, so `list_tracks` skips it).
-    /// The **score context (the durable notation) is left untouched** —
-    /// attaching `--track <name>` again after a delete starts a brand-new track
-    /// with a brand-new score; it never resurrects the old one.
-    ///
-    /// Recovery is **sqlite-only by decision** (no `kj` verb — a deliberately
-    /// cold, deliberate path for an operation that undoes a delete): stop the
-    /// kernel, then run `UPDATE tracks SET track_id = '<name>', deleted_at = NULL
-    /// WHERE track_id = '<name>~tombstone-<epoch-ms>'` against the kernel's
-    /// sqlite DB. This command reports the exact tombstone name on success; if
-    /// it's been lost, find it again with `SELECT track_id FROM tracks WHERE
-    /// deleted_at IS NOT NULL`.
+    // Track deletion is a rename-aside tombstone (`docs/tracks.md`, "Transport").
+    // Recovery is sqlite-only by decision: stop the kernel, then run
+    // `UPDATE tracks SET track_id = '<name>', deleted_at = NULL WHERE track_id = '<name>~tombstone-<epoch-ms>'`.
+    /// Delete a track (`--track <name>` is required). Stops the clock, detaches
+    /// every attached context, and tombstones the track so `kj transport list`
+    /// hides it. Leaves the score context untouched; attaching `--track <name>`
+    /// again starts a new track with a new score.
     Delete {
-        /// Track to delete. REQUIRED — never resolved from the caller's own
-        /// attachment; deletion must never hit a track you merely happen to be
-        /// attached to.
+        /// Track to delete (required; never resolved from the caller's attachment).
         #[arg(long)]
         track: String,
     },
-    /// List every track with its live state — the answer to "are there any
-    /// tracks set up right now?" (also what bare `kj transport` runs). READ-ONLY
-    /// (needs no `transport` capability). Merges the persisted `tracks` rows
-    /// (durable, tombstone-filtered — they survive a restart) with the live
-    /// scheduler snapshot (playhead/beat/attachment truth), so a track shows as
-    /// `dormant` when it's in the DB but nothing has re-attached it this session.
+    /// List every track with its live state (also what bare `kj transport` runs).
+    /// Shows `dormant` for persisted tracks that have no live attachment in this
+    /// session.
     List,
     /// Show pending work and the most recent 256 dispositions: each attempt's
     /// intended tick, estimate in ticks and milliseconds, the queue and compute

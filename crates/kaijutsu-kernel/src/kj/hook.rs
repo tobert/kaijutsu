@@ -94,21 +94,14 @@ enum HookCommand {
         /// Hook id
         hook_id: String,
     },
-    /// Register a new hook entry. Idempotent on `hook_id` (in `match_json`,
-    /// or a generated one if omitted): re-adding the SAME id with an
-    /// otherwise identical phase/match/priority/action is a no-op success —
-    /// safe to run from rc on every context create, including from two
-    /// concurrent context creates racing the same id. Re-adding the same id
-    /// with anything different REPLACES the existing entry via a single
-    /// atomic upsert (no delete step, so a failed write can never lose the
-    /// existing row) rather than erroring on the id collision or leaving a
-    /// stale duplicate behind.
+    // Concurrent context creates and delete-then-insert races are handled by atomic upsert.
+    /// Register a new hook entry.
     Add {
-        /// pre_call | post_call | on_error | on_notification | list_tools
+        /// Hook phase (e.g. pre_call, post_call).
         phase: String,
-        /// JSON object: match_instance/match_tool/match_context/match_principal/priority/hook_id (all optional)
+        /// JSON object with optional match filters.
         match_json: String,
-        /// JSON object: the tagged HookActionWire shape (same as builtin.hooks' hook_add)
+        /// JSON object with action shape: `{"type":"kaish","body":"..."}`, `{"type":"deny","reason":"..."}`, `{"type":"ask"}`, etc.
         action_json: String,
     },
 }

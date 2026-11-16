@@ -30,10 +30,7 @@ pub(crate) struct SwapArgs {
 
 #[derive(Subcommand, Debug)]
 enum SwapCommand {
-    /// List every unflushed file buffer the kernel is holding, and whether
-    /// each one is a recovered swap (unacknowledged — flush refuses on it).
-    /// Source: the durable swap-marker table, not just what happens to be
-    /// loaded right now.
+    /// Lists every unacknowledged swap marker stored in the kernel database.
     List,
     /// Keep the unsaved buffer for `path` and write it to disk. Refuses when
     /// `path` has no recovered swap. Read the buffer first at

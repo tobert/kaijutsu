@@ -279,23 +279,14 @@ enum ContextCommand {
         #[arg(long, value_name = "CHARACTER", requires = "children")]
         performer: Option<String>,
     },
-    /// Conclude a context — mark this work "done" (the time-well's hot→recent
-    /// transition). Reversible via fork; not latched. Needs the operator
-    /// capability, or a person's live root character, which acts as a human
-    /// root from any context. A seat other than the console may not conclude
-    /// its own context; it asks the console. Only a human root concludes the
-    /// console, and nobody concludes a human root.
+    /// Conclude a context: move it from active to recent so it stops warming at startup.
     #[command(alias = "done")]
     Conclude {
         /// Context to conclude. Does not recurse into children. Ids and
         /// labels come from `kj context list`.
         context: String,
     },
-    /// Promote a context into ring 0 ("active"). Not latched. Needs the
-    /// operator capability, or a person, from any context. A context other
-    /// than the console may not promote its own context, a root console, or
-    /// the console; it asks the console. First promote wins the timestamp —
-    /// re-promoting an already-promoted context is a no-op.
+    /// Restore an archived or recent context to active.
     Promote {
         /// Context to promote. An archived context (reachable by full id)
         /// is resurrected, unless its senpai is archived: promote the senpai
@@ -304,28 +295,18 @@ enum ContextCommand {
         /// list`.
         context: String,
     },
-    /// Push a context outward one step on the demote ladder: promoted →
-    /// unpromoted, unpromoted/undemoted → demoted, already demoted →
-    /// archived, after its `archive` rc lifecycle runs. The archiving step
-    /// is latched like `kj context archive`; restore with
-    /// `kj context promote <id>`. Needs the operator capability, or a
-    /// person's live root character, which acts as a human root from any
-    /// context. A seat other than the console may not demote its own context;
-    /// it asks the console. Only a human root demotes a human root or the console.
+    /// Move a context one step down the demote ladder (promoted -> active -> recent -> archived).
     Demote {
         /// Context to push one step down the ladder. Ids and labels come
         /// from `kj context list`.
         context: String,
     },
-    // The flag itself is `ContextRow::paused_at`; see its doc for the
-    // design intent behind a flag that nothing reads yet.
-    /// Set the "suspend activity" flag. Records intent only — nothing gates
-    /// behavior on it yet. Clear it with `kj context resume`.
+    /// Mark a context paused (advisory state).
     Pause {
         /// Context to pause. Ids and labels come from `kj context list`.
         context: String,
     },
-    /// Clear the "suspend activity" flag.
+    /// Clear the paused flag on a context.
     Resume {
         /// Context to resume. Ids and labels come from `kj context list`.
         context: String,
@@ -339,8 +320,7 @@ enum ContextCommand {
         /// `kj context list`.
         context: String,
     },
-    /// Set or clear the conversation hydration window — `[0, marker] ∪ last-N`
-    /// instead of the whole history (the cost guard for endless musician logs).
+    /// Set or clear the sliding-window hydration policy (`[0, marker] + last N` blocks).
     Hydrate {
         /// Context whose hydration window to set or clear. Defaults to the
         /// current context. Ids and labels come from `kj context list`.
@@ -351,7 +331,7 @@ enum ContextCommand {
         /// Pin the prefix end at this block key (default: the current tail).
         #[arg(long)]
         mark: Option<String>,
-        /// Remove the hydration window — hydrate everything again.
+        /// Remove the hydration window so turns hydrate the full history again.
         #[arg(long, conflicts_with_all = ["window", "mark"])]
         clear: bool,
     },
@@ -9721,7 +9701,7 @@ mod tests {
             "the musician receives no coder stance: {musician_prompt}"
         );
         assert!(
-            musician_prompt.contains("You're a musician here"),
+            musician_prompt.contains("We are a cybernetic system making music together."),
             "musician's own role section is still present: {musician_prompt}"
         );
     }

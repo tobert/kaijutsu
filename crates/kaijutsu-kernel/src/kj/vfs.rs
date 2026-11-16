@@ -15,7 +15,7 @@ use crate::vfs::{FileType, SnapshotNode};
 #[derive(Parser, Debug)]
 #[command(
     name = "vfs",
-    about = "VFS landscape queries (FSN world plumbing)",
+    about = "VFS landscape queries",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -26,9 +26,7 @@ pub(crate) struct VfsArgs {
 
 #[derive(Subcommand, Debug)]
 enum VfsCommand {
-    /// Recursive snapshot listing with generation stamps (stage 0/1 kernel
-    /// plumbing). `depth`/`max-entries` are server-clamped regardless of
-    /// what's asked.
+    /// Recursive snapshot listing with generation stamps.
     Snapshot {
         /// VFS path to snapshot (e.g. "/mnt/project")
         path: String,
@@ -39,12 +37,7 @@ enum VfsCommand {
         #[arg(long = "max-entries", default_value_t = 500)]
         max_entries: u32,
     },
-    /// Per-directory activity totals since kernel boot (Lane K digest
-    /// groundwork, `docs/scenes/vfs.md`) — heat, not structure: content
-    /// mutations (write/truncate/setattr) count alongside every structural
-    /// one. Debug/inspection surface for the push digest stream
-    /// (`subscribeVfsActivity`); this command reads the same in-memory
-    /// counters directly, no subscription involved.
+    /// Per-directory activity totals since kernel boot.
     Activity {
         /// Restrict to directories at-or-under this VFS path prefix
         /// (default: every directory ever touched since boot)

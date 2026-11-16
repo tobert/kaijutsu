@@ -30,39 +30,18 @@ pub(crate) struct DbArgs {
 
 #[derive(Subcommand, Debug)]
 enum DbCommand {
-    /// Hot-backup kernel.db to <path> via SQLite's native VACUUM INTO.
+    /// Backup kernel.db to path via SQLite VACUUM INTO.
     #[command(
-        long_about = "Hot-backup kernel.db to <path> via SQLite's native VACUUM INTO — a \
-                      single consistent, already-compacted snapshot, safe to take against a \
-                      live writer with no prior quiesce step. A bare `cp` of kernel.db is NOT \
-                      safe: WAL mode means committed history can live in kernel.db-wal while \
-                      the main file lags, so a raw copy can be torn or stale.\n\
-                      \n\
-                      <path> must be absolute. This verb runs inside the kernel process, whose \
-                      working directory is not your shell's — a relative path would resolve \
-                      somewhere you can't predict, so it's rejected outright rather than \
-                      guessed at.\n\
-                      \n\
-                      The destination must not already exist — VACUUM INTO refuses to \
-                      overwrite, and this verb will not delete an existing file to make room.\n\
-                      \n\
-                      Restore is deliberately NOT a `kj` verb. The kernel holds in-memory state \
-                      (BlockStore documents, registries) that a live file swap would \
-                      desynchronize. To restore a backup: stop the kernel, replace kernel.db \
-                      (removing any -wal/-shm siblings alongside it), then start the kernel."
+        long_about = "Backup kernel.db to path via SQLite VACUUM INTO. \
+                      The path must be absolute and must not already exist."
     )]
     Backup {
-        /// Absolute destination path for the backup file (must not already exist).
+        /// Absolute destination path for the backup file.
         path: String,
     },
-    /// Flush the WAL into kernel.db and report whether it completed cleanly.
+    /// Flush the WAL into kernel.db.
     #[command(
-        long_about = "Run PRAGMA wal_checkpoint(TRUNCATE): flush committed WAL frames into \
-                      kernel.db and shrink kernel.db-wal back to zero. This is the quiesce step \
-                      for people doing their own btrfs/ZFS snapshot or file copy — after a \
-                      clean (non-busy) checkpoint, kernel.db alone reflects all committed \
-                      history. Prefer `kj db backup` for a one-shot backup file; use this when \
-                      you specifically want to snapshot or copy the raw files yourself."
+        long_about = "Flush the WAL into kernel.db by running a checkpoint."
     )]
     Checkpoint,
 }

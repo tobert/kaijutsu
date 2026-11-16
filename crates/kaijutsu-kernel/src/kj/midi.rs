@@ -106,34 +106,33 @@ enum MidiCommand {
     Show {
         /// Device name (e.g. minibrute) or full /config/midi/devices path
         name: String,
-        /// Emit exactly the stored document — no path/length header
+        /// Emit only the stored document without a path or length header
         #[arg(long)]
         raw: bool,
     },
     /// Emit raw MIDI at a named device (the sink resolves the port).
     Send {
-        /// Device name — a profile key under /config/midi/devices
+        /// Device name (a profile key under /config/midi/devices)
         device: String,
         #[command(subcommand)]
         message: SendMessage,
-        /// Target context: . (default) | <label> | <hex prefix>. Mirrors
-        /// `kj play`: every attached sink receives the cue regardless.
+        /// Target context: . (default) | <label> | <hex prefix>.
         #[arg(long, short = 'c', global = true)]
         context: Option<String>,
     },
     /// Ask a device what it is (universal MIDI Identity Request) and record
-    /// the answer as a pulled fact in /run/midi/<device>.
+    /// the answer in /run/midi/<device>.
     Identify {
-        /// Device name — a profile key under /config/midi/devices
+        /// Device name (a profile key under /config/midi/devices)
         device: String,
         /// How long the sink waits for the device's reply, in milliseconds
         #[arg(long, default_value_t = DEFAULT_EXCHANGE_TIMEOUT_MS)]
         timeout_ms: u32,
     },
-    /// All-notes-off + all-sound-off on all 16 channels of <device>, or of
-    /// every device the rig currently reports live when omitted.
+    /// Send all-notes-off and all-sound-off on all 16 channels of `<device>`,
+    /// or of every live device when omitted.
     Panic {
-        /// Device name; omitted = every live device
+        /// Device name; omit to silence every live device
         device: Option<String>,
         /// Target context: . (default) | <label> | <hex prefix>
         #[arg(long, short = 'c')]
@@ -141,9 +140,7 @@ enum MidiCommand {
     },
 }
 
-/// The raw message grammar of `kj midi send <device> …`. Every value is a
-/// literal a human read off a manual or a front panel — profile-resolved
-/// names are slice 2 (`docs/midi-next.md`).
+// The raw message grammar of `kj midi send <device> ...`.
 #[derive(Subcommand, Debug)]
 enum SendMessage {
     /// Note On, optionally gated by a scheduled Note Off.
@@ -154,9 +151,8 @@ enum SendMessage {
         note: u8,
         /// Velocity, 0-127
         velocity: u8,
-        /// Also send the matching Note Off this many ms later. Omitted = a
-        /// bare Note On that sustains until something else stops it (drone,
-        /// or a later `kj midi panic`).
+        /// Send the matching Note Off this many milliseconds later. Omit to
+        /// sustain until stopped (or `kj midi panic`).
         #[arg(long)]
         off_ms: Option<u64>,
     },
@@ -173,18 +169,15 @@ enum SendMessage {
     Pc {
         /// MIDI channel, 1-16
         channel: u8,
-        /// Program number, 0-127 (raw MIDI numbering — gear that prints
-        /// 1-128 on its panel is one higher than this)
+        /// Program number, 0-127 (raw MIDI numbering; gear that prints 1-128 on
+        /// its panel is one higher than this)
         program: u8,
     },
-    /// Fire-and-forget System Exclusive bytes — the day-one escape hatch for
-    /// everything the other verbs don't cover (`docs/midi-next.md` "SysEx:
-    /// the exchange pattern"). No reply is collected; that's `kj midi
-    /// identify`/`pull`, a later slice.
+    /// Send System Exclusive (SysEx) bytes without waiting for a reply.
     Sysex {
-        /// Hex bytes (`f07e7f0601f7`; spaces, commas and 0x prefixes are
-        /// tolerated) or `@<path>` to read a raw `.syx` file. Multiple
-        /// concatenated F0…F7 messages are split and sent in order.
+        /// Hex bytes (`f07e7f0601f7`; spaces, commas, and `0x` prefixes are
+        /// accepted) or `@<path>` to read a raw `.syx` file. Multiple
+        /// concatenated `F0...F7` messages are split and sent in order.
         data: String,
     },
 }

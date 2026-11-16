@@ -287,39 +287,24 @@ fn signal_row_json(s: &approval_ledger::types::SignalRow) -> serde_json::Value {
 
 #[derive(Subcommand, Debug)]
 enum LedgerCommand {
-    /// List asks. By default, shows the live pending queue, oldest first
-    /// (the order you drain a work queue in), capped at `--limit` (default
-    /// 20) — `claimed` asks are deliberately excluded: an answerer is
-    /// already working them, and listing them invites a second answerer to
-    /// step on that claim (see `--status claimed` to see them anyway).
-    /// `--history` shows decided asks instead — `allowed`, `denied`,
-    /// `expired`, or `abandoned` — most recently created first.
-    /// `--since`/`--origin`/`--status` narrow either listing; a decided
-    /// `--status` value (e.g. `allowed`) switches to the history view by
-    /// itself, so `--history` never needs to be passed alongside it.
+    /// List asks. By default, shows pending asks. Excludes claimed asks unless `--status claimed` is passed.
     List {
-        /// Show decided asks instead of the pending/claimed queue.
+        /// Show decided asks instead of pending asks.
         #[arg(long)]
         history: bool,
-        /// Newest N rows (oldest N for the pending queue). Default 20.
+        /// Maximum number of rows to return (default: 20).
         #[arg(long, default_value_t = 20)]
         limit: u32,
-        /// Only asks created within this long of now: an integer plus
-        /// m/h/d, e.g. 30m, 2h, 7d. No absolute timestamps.
+        /// Only include asks created within this duration of now (e.g. 30m, 2h, 7d).
         #[arg(long)]
         since: Option<String>,
-        /// Only asks from this origin.
+        /// Only include asks from this origin.
         #[arg(long)]
         origin: Option<OriginArg>,
-        /// Only asks in this status. A decided value (allowed/denied/
-        /// expired/abandoned) shows history without needing --history too;
-        /// `claimed` shows the in-flight queue the default hides.
+        /// Only include asks in this status.
         #[arg(long)]
         status: Option<StatusArg>,
-        /// Add a SIGNALS column (the advisory-signal count) to the table,
-        /// and switch `.data` from a flat array of request-id strings to
-        /// an array of `{request_id, signals}` objects. Off by default —
-        /// most listings don't want per-row detail.
+        /// Attach each ask's signal rows and nest output under `{ask, signals}`.
         #[arg(long)]
         signals: bool,
     },
@@ -443,12 +428,12 @@ enum LedgerCommand {
         #[arg(long, value_parser = parse_verb_arg)]
         verb: Option<String>,
     },
-    /// List council bumps: for each seat, its streak of bumps in a row,
+    /// List council bumps: for each context, its streak of bumps in a row,
     /// their flavors, and the council's `undo` read of the last one. With
-    /// `--context`, that seat's judged submissions, newest first. A bump has
+    /// `--context`, that context's judged submissions, newest first. A bump has
     /// no ask, so `kj ledger list` does not show it.
     Bumps {
-        /// Show this context's submissions instead of the per-seat summary.
+        /// Show this context's submissions instead of the per-context summary.
         /// Accepts `.` (current), a label, or a hex id prefix.
         #[arg(long)]
         context: Option<String>,
@@ -470,69 +455,41 @@ enum LedgerCommand {
 
 #[derive(Subcommand, Debug)]
 enum SignalCommand {
-    /// Add one advisory signal from a scorer (a hook body calls this after
-    /// scoring a command). With `--auto-allow`, creates a new ask that is
-    /// decided `allowed` in the same transaction — the advisory path: the
-    /// ask records what a scorer read and never blocks on a human itself. With `--request-id <id>`,
-    /// attaches the signal to an existing ask (a second scored command from
-    /// the same statement lands on the ask the first one created). Exactly
-    /// one of the two is required. A signal is advisory: nothing reads it to
-    /// decide an ask.
+    // Hook/classifier design notes and schema references:
+    // scoring pipeline hooks call this after scoring commands.
+    // Maps to approval_ask_statements.stmt_seq, approval_statement_commands.cmd_seq, approval_ledger, kube_ordinal_v8.
+    /// Record an advisory signal on an ask.
     Add {
-        /// The statement text this signal is about. Becomes the new ask's
-        /// description under `--auto-allow`; under `--request-id` it is
-        /// informational only (the row it attaches to already has its own
-        /// description). Unquoted kaish variable expansion carries embedded
-        /// spaces as one argument (kaish does no word splitting), so a
-        /// caller with arbitrarily long or `"`-laden text needs nothing
-        /// beyond passing `$var` here — there is no `--stdin` on this verb.
+        /// Statement text for the signal.
         statement: String,
-        /// Who produced this signal, e.g. `scorer`.
+        /// Source identifier producing this signal.
         #[arg(long = "source-id")]
         source_id: Option<String>,
-        /// Which model scored it, e.g. `kube_ordinal_v8` — read from the
-        /// scorer's own response at call time, never hard-coded by a
-        /// caller (label/model vocabularies change between checkpoints).
+        /// Model identifier that scored the statement.
         #[arg(long = "model-id")]
         model_id: Option<String>,
-        /// The scoring checkpoint's weight hash — the audit pairing a
-        /// verdict to the exact weights that produced it.
+        /// Scoring checkpoint weight hash.
         #[arg(long = "weight-hash")]
         weight_hash: Option<String>,
-        /// The winning label, read from the scorer's response (e.g.
-        /// `situation-normal`) — never a value this verb invents.
+        /// Winning label from the scorer.
         #[arg(long)]
         label: Option<String>,
-        /// The winning label's score, as the scorer reported it. Not
-        /// thresholded here or anywhere in this crate — see `--verdict`.
+        /// Winning label score.
         #[arg(long)]
         score: Option<f64>,
-        /// Which statement of the ask this signal judged (0-based, matching
-        /// `approval_ask_statements.stmt_seq`) — the position that makes
-        /// "which clause of a multi-statement ask was this?" answerable.
-        /// Omit when the signal speaks to the whole ask rather than one
-        /// statement within it.
+        /// Statement sequence index (0-based) judged by this signal.
         #[arg(long = "stmt-seq")]
         stmt_seq: Option<i64>,
-        /// Which command within that statement this signal judged (0-based,
-        /// matching `approval_statement_commands.cmd_seq`). Omit when the
-        /// signal speaks to the whole statement rather than one command
-        /// within it; only meaningful alongside `--stmt-seq`.
+        /// Command sequence index (0-based) judged by this signal.
         #[arg(long = "cmd-seq")]
         cmd_seq: Option<i64>,
-        /// The signal's own recommendation: `escalate` (raise or leave a
-        /// prompt), `deny`, or `allow`. Always advisory — see the module
-        /// doc: nothing in `approval_ledger` ever reads a signal to
-        /// auto-decide an ask, `allow` included.
+        /// Signal recommendation: escalate, deny, or allow (advisory only).
         #[arg(long, value_enum)]
         verdict: SignalVerdictArg,
-        /// Create a NEW ask, already decided `Allowed`, carrying this
-        /// signal — the advisory classifier path. Mutually exclusive with
-        /// `--request-id`.
+        /// Create a new ask already decided allowed, carrying this signal.
         #[arg(long = "auto-allow")]
         auto_allow: bool,
-        /// Attach this signal to an ask that already exists, instead of
-        /// creating one. Required unless `--auto-allow` is given.
+        /// Attach this signal to an existing ask by request identifier.
         #[arg(long = "request-id")]
         request_id: Option<String>,
     },

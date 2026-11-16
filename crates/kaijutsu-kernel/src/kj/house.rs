@@ -1,7 +1,7 @@
 //! The house verbs: the `kj` verbs that run the kaijutsu house itself.
 //!
-//! A worker seat (coder, toolie, musician) does its task and does not need to
-//! administer the kernel. Its loadout leaves out the `house` capability, so
+//! A worker context (coder, toolie, musician) does its task and does not need
+//! to administer the kernel. Its loadout leaves out the `house` capability, so
 //! these verbs are refused and left out of `kj help`. This narrows focus; it
 //! is not a security boundary (`docs/instrument-design.md`, "Many hands, one
 //! trust boundary"). The verb's own capability (`operator`, `drive`, ...)
@@ -17,7 +17,7 @@ pub(crate) const HOUSE_VERBS: &[&str] = &[
     "preset", "price", "rc", "roster", "swap", "system", "transport",
 ];
 
-/// Top-level verbs a worker seat keeps. Read by the classification test,
+/// Top-level verbs a worker context keeps. Read by the classification test,
 /// which is what makes a new verb choose a table.
 #[cfg(test)]
 pub(crate) const WORKER_VERBS: &[&str] = &[

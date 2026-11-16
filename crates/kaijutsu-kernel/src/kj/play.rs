@@ -37,49 +37,33 @@ use crate::hyoushigi::schedule_clip_cell;
 #[derive(Parser, Debug)]
 #[command(
     name = "play",
-    about = "Play an audio sample now, or commit it as a clip cell onto a track with --track (docs/pcm.md)",
+    about = "Play an audio sample now, or schedule it as a clip on a track with --track",
     long_about = "Bare `kj play <path|--cas>` plays now over every attached client's render \
-                  target (unchanged). With `--track <t>`, the same media is committed as a \
-                  Shape A clip record onto track <t>'s score instead of playing immediately — \
-                  the producer side of a placed sample (docs/pcm.md R2). `--at <tick>` places \
-                  it at an absolute tick (default: ASAP, playhead + 1); `--label` names the clip \
-                  in the score (defaults to the file stem for a <path>; REQUIRED for --cas, which \
-                  has no derivable name).",
+                  sink. With `--track <t>`, the audio is stored in CAS and scheduled as a clip \
+                  cell on track `<t>`'s score instead of playing immediately. `--at <tick>` \
+                  places it at an absolute tick (default: `playhead + 1`); `--label` names the \
+                  clip in the score (defaults to the file stem for `<path>`; required for `--cas`).",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
 pub(crate) struct PlayArgs {
-    /// Path to the audio file to play (OS path, not a VFS path — mirrors `kj cas
-    /// put`). Mutually exclusive with `--cas`; exactly one is required.
+    /// Host path to the audio or `.abc` file to play (mutually exclusive with `--cas`).
     path: Option<String>,
-    /// Play an object already in the CAS by its content hash. The MIME is resolved
-    /// from the object's CAS metadata, and the cue carries a `Cas` payload — so the
-    /// sink resolves the bytes from its XDG cache / SFTP `/v/cas` (the
-    /// clip-prefetch path, docs/pcm.md 5c / docs/slash-v.md track B).
+    /// Play an object already in CAS by its content hash.
     #[arg(long, conflicts_with = "path")]
     cas: Option<String>,
-    /// Target context: . (default) | <label> | <hex prefix>. Reserved for
-    /// future per-listener routing; the standalone slice forwards to every
-    /// attached client regardless of which context is named.
+    /// Target context: . (default) | <label> | <hex prefix>.
     #[arg(long, short = 'c')]
     context: Option<String>,
-    /// Commit a clip cell onto this track's score instead of playing now
-    /// (docs/pcm.md R2). The track must already be armed (`kj transport
-    /// attach --track <t>` first) — an un-armed track is a loud error naming
-    /// how to arm it.
+    /// Schedule a clip cell on this track's score instead of playing now. The
+    /// track must already be armed (`kj transport attach --track <t>`).
     #[arg(long)]
     track: Option<String>,
-    /// With `--track`: the absolute tick to place the clip at (must be ≥ 0).
-    /// Omitted = ASAP (`playhead + 1` at schedule time). Meaningless without
-    /// `--track`, so clap rejects that combination outright (kaibo review
-    /// 2026-07-16: silent-ignore was a UX footgun).
+    /// With `--track`: absolute tick to place the clip at (`>= 0`; default: `playhead + 1`).
     #[arg(long, requires = "track")]
     at: Option<i64>,
-    /// With `--track`: the clip's human label — hashes are opaque, the label
-    /// is how the score reads. Defaults to the file stem for the `<path>`
-    /// form (`kick-808.wav` → `kick-808`); REQUIRED for the `--cas` form
-    /// (a hash has no derivable name). Meaningless without `--track`, so
-    /// clap rejects that combination outright.
+    /// With `--track`: human label for the clip in the score (defaults to the
+    /// file stem for `<path>`; required with `--cas`).
     #[arg(long, requires = "track")]
     label: Option<String>,
 }

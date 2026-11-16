@@ -102,8 +102,7 @@ enum BlockCommand {
         #[arg(long)]
         role: Option<String>,
     },
-    /// Read a block's full content. Mirrors MCP `block_read` — line numbers
-    /// by default; `--range start:end` for half-open slices (0-indexed).
+    /// Read a block's full content. Line numbers by default; `--range start:end` for half-open slices (0-indexed).
     Read {
         /// Block id
         block_id: String,
@@ -142,12 +141,7 @@ enum BlockCommand {
         #[arg(long, default_value_t = 20.0)]
         margin: f64,
     },
-    /// One-step blob readback: resolve a block's payload and print or save
-    /// it, following the CAS reference when the block is a derived/asset
-    /// sibling (e.g. an ABC→MIDI render) instead of a hand-assembled
-    /// `inspect` → `cas get` chain. Textual payloads print to stdout;
-    /// binary payloads require `--out` (refused otherwise — a terminal
-    /// should never eat raw binary).
+    /// Read back the blob payload of a block, following CAS references when derived. Textual payloads print to stdout; binary payloads require `--out`.
     Cat {
         /// Block id to read (mutually exclusive with `--latest`)
         block_id: Option<String>,
@@ -165,10 +159,7 @@ enum BlockCommand {
         #[arg(long)]
         out: Option<String>,
     },
-    /// Read back the byte-exact original an ingest transform consumed for
-    /// this block (docs/ansi-and-beyond.md). The stored bytes are escape
-    /// sequences by definition, so the terminal path renders ESC visibly and
-    /// only `--out <file>` writes the exact bytes.
+    /// Read back the byte-exact original an ingest transform consumed for this block.
     Original {
         /// Block id
         block_id: String,
@@ -179,18 +170,12 @@ enum BlockCommand {
         #[arg(long)]
         out: Option<String>,
     },
-    /// Re-run the CURRENT ingest parser over this block's stored original and
-    /// re-emit its style spans (docs/ansi-and-beyond.md). Only `ansi-strip`
-    /// is implemented — `kj block original --transform` names any transform
-    /// with a stored row, but this verb always re-runs the one parser this
-    /// kernel has. Updates *styling* only: refuses rather than overwriting
-    /// the block if content has moved since ingest, either because it was
-    /// edited or because a background block's output was capped.
+    /// Re-run the current ingest parser over this block's stored original and re-emit style spans.
     Reproject {
         /// Block id
         block_id: String,
     },
-    /// Append text to a block (streaming-friendly). Mirrors MCP `block_append`.
+    /// Append text to a block.
     Append {
         /// Block id to append to
         block_id: String,
@@ -203,7 +188,7 @@ enum BlockCommand {
         #[arg(long)]
         text: String,
     },
-    /// Show creation + version info for a block. Mirrors MCP `block_history`.
+    /// Show creation and version info for a block.
     History {
         /// Block id
         block_id: String,
@@ -213,8 +198,7 @@ enum BlockCommand {
         #[arg(long, short = 'c')]
         context: Option<String>,
     },
-    /// Unified line-by-line diff of block content against original text.
-    /// Mirrors MCP `block_diff`. Without --original, prints current content.
+    /// Show a line-by-line diff of block content against original text.
     Diff {
         /// Block id
         block_id: String,
@@ -222,18 +206,14 @@ enum BlockCommand {
         #[arg(long)]
         original: Option<String>,
     },
-    /// Set the status field on a block. Mirrors MCP `block_status`.
+    /// Set the status field on a block.
     Status {
         /// Block id
         block_id: String,
         /// New status: pending|running|waiting|done|error
         new_status: String,
     },
-    /// Edit a block via line-based operations. Single op per invocation —
-    /// the kj surface trades MCP's batch-of-ops for a clean CLI shape.
-    /// Mirrors MCP `block_edit` minus the multi-op atomicity (which the
-    /// caller can recover with `kaish` script + `kj block read` between
-    /// edits to confirm intermediate state).
+    /// Edit a block via line-based operations.
     Edit {
         /// Block id
         block_id: String,

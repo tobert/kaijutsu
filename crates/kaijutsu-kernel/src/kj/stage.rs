@@ -26,8 +26,7 @@ pub(crate) struct StageArgs {
 
 #[derive(Subcommand, Debug)]
 enum StageCommand {
-    /// Transition from Staging to Live. Merges the staged child live (a
-    /// cross-context write) — same authority as `drift merge`.
+    /// Transition from Staging to Live (requires drift authority).
     #[command(alias = "go")]
     Commit,
     /// Show staging state and block counts.

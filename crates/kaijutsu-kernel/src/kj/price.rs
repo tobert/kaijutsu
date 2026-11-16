@@ -688,7 +688,7 @@ mod tests {
         let list = argv(&["price", "list"]);
 
         let worker = seat("worker", &[Capability::Drift]);
-        assert!(d.dispatch(&list, &worker).await.message().contains("not part of this seat's work"));
+        assert!(d.dispatch(&list, &worker).await.message().contains("not part of this context's work"));
 
         let house = seat("house", &[Capability::House]);
         assert!(d.dispatch(&list, &house).await.is_ok());

@@ -30,8 +30,7 @@ pub(crate) struct CpArgs {
     /// Destination VFS path — or an existing directory, cp(1)-style
     /// (copies to `<dst>/<basename of src>`)
     dst: String,
-    /// Recursive copy — NOT implemented yet; directories are out of scope
-    /// for this slice.
+    /// Reserved for recursive copy (not yet implemented; directory copy is refused).
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
 }
