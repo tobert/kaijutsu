@@ -124,33 +124,33 @@ fn peer_nick_for_label(label: &str) -> String {
 // Prompt Argument Types
 // ============================================================================
 
-/// Arguments for the document analysis prompt
+/// Arguments for the `analyze_document` prompt.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Document analysis parameters")]
+#[schemars(description = "Parameters for analyzing a context document.")]
 pub struct AnalyzeDocumentArgs {
-    #[schemars(description = "Document ID to analyze")]
+    #[schemars(description = "Context ID to analyze.")]
     pub document_id: String,
-    #[schemars(description = "Focus area: 'structure', 'content', 'activity', or 'all'")]
+    #[schemars(description = "Focus area: 'structure', 'content', 'activity', or 'all' (default).")]
     pub focus: Option<String>,
 }
 
-/// Arguments for the search context prompt
+/// Arguments for the `search_context` prompt.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Search context parameters")]
+#[schemars(description = "Parameters for searching blocks by regex.")]
 pub struct SearchContextArgs {
-    #[schemars(description = "Search query (regex pattern)")]
+    #[schemars(description = "Regex pattern to match against block lines.")]
     pub query: String,
-    #[schemars(description = "Optional document ID to limit search")]
+    #[schemars(description = "Optional context ID to limit the search.")]
     pub document_id: Option<String>,
 }
 
-/// Arguments for the editing assistant prompt
+/// Arguments for the `editing_assistant` prompt.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Editing assistant parameters")]
+#[schemars(description = "Parameters for preparing a block edit.")]
 pub struct EditingAssistantArgs {
-    #[schemars(description = "Block ID to edit")]
+    #[schemars(description = "Block ID to edit.")]
     pub block_id: String,
-    #[schemars(description = "Edit type: 'refine', 'expand', 'summarize', or 'fix'")]
+    #[schemars(description = "Edit goal: 'refine' (default), 'expand', 'summarize', or 'fix'.")]
     pub edit_type: Option<String>,
 }
 
@@ -2567,13 +2567,10 @@ impl KaijutsuMcp {
 
 #[prompt_router]
 impl KaijutsuMcp {
-    /// Analyze a document's structure, content, and activity.
-    ///
-    /// Provides comprehensive context about a document for LLM consumption,
-    /// including block relationships, content summaries, and metadata.
+    /// Summarize a context document's block tree, content, and authorship.
     #[prompt(
         name = "analyze_document",
-        description = "Analyze a document's structure, content, and activity for comprehensive understanding"
+        description = "Summarize a context document's block tree, content previews, and authorship."
     )]
     pub async fn analyze_document(
         &self,
@@ -2670,13 +2667,10 @@ impl KaijutsuMcp {
         .with_description(format!("Analysis of document '{}'", args.document_id)))
     }
 
-    /// Search across documents and provide context around matches.
-    ///
-    /// Finds matching content using regex and returns results with surrounding
-    /// context, ideal for understanding code or conversation patterns.
+    /// Search blocks by regex and return matching lines with surrounding lines.
     #[prompt(
         name = "search_context",
-        description = "Search documents and return matches with surrounding context"
+        description = "Search blocks by regex and return up to 20 matches with surrounding lines."
     )]
     pub async fn search_context(
         &self,
@@ -2774,13 +2768,10 @@ impl KaijutsuMcp {
         .with_description(format!("Search results for '{}'", args.query)))
     }
 
-    /// Assist with editing a block by providing context and suggestions.
-    ///
-    /// Reads a block's content and metadata, then provides editing context
-    /// based on the requested edit type (refine, expand, summarize, fix).
+    /// Prepare an edit for a block with its content, parent block, and goal.
     #[prompt(
         name = "editing_assistant",
-        description = "Get editing context and suggestions for a specific block"
+        description = "Read a block and its parent to prepare a refine, expand, summarize, or fix edit."
     )]
     pub async fn editing_assistant(
         &self,
@@ -2843,36 +2834,37 @@ impl KaijutsuMcp {
         content.push_str("## Instructions\n\n");
         match edit_type {
             "refine" => {
-                content.push_str("Please refine this content by:\n");
-                content.push_str("- Improving clarity and conciseness\n");
-                content.push_str("- Fixing any grammatical or spelling errors\n");
-                content.push_str("- Maintaining the original meaning and intent\n");
+                content.push_str("Refine this block:\n");
+                content.push_str("- Tighten the prose and remove filler.\n");
+                content.push_str("- Fix grammar and spelling.\n");
+                content.push_str("- Preserve the original meaning.\n");
             }
             "expand" => {
-                content.push_str("Please expand this content by:\n");
-                content.push_str("- Adding more detail and explanation\n");
-                content.push_str("- Including relevant examples\n");
-                content.push_str("- Elaborating on key points\n");
+                content.push_str("Expand this block:\n");
+                content.push_str("- Add missing detail and concrete examples.\n");
+                content.push_str("- State each rule before its reason.\n");
             }
             "summarize" => {
-                content.push_str("Please summarize this content by:\n");
-                content.push_str("- Extracting the key points\n");
-                content.push_str("- Reducing length while preserving meaning\n");
-                content.push_str("- Creating a concise overview\n");
+                content.push_str("Summarize this block:\n");
+                content.push_str("- Keep the key facts and decisions.\n");
+                content.push_str("- Cut repetition while preserving meaning.\n");
             }
             "fix" => {
-                content.push_str("Please fix any issues in this content:\n");
-                content.push_str("- Correct errors or bugs (if code)\n");
-                content.push_str("- Fix logical inconsistencies\n");
-                content.push_str("- Address any incomplete sections\n");
+                content.push_str("Fix the defects in this block:\n");
+                content.push_str("- Correct code bugs or broken commands.\n");
+                content.push_str("- Resolve contradictions and incomplete sections.\n");
             }
             _ => {
                 content.push_str(&format!(
-                    "Edit type '{}' not recognized. Please describe what changes you'd like.\n",
+                    "Unrecognized edit_type '{}'. State the changes to make.\n",
                     edit_type
                 ));
             }
         }
+        content.push_str(&format!(
+            "\nApply the change with `kj block edit '{}' --old ... --new ...` via the `shell` tool.\n",
+            args.block_id
+        ));
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             Role::User,
