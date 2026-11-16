@@ -2921,7 +2921,7 @@ impl ServerHandler for KaijutsuMcp {
         // a client two steps, past a version we fully support. Bump deliberately
         // when rmcp learns a newer version.
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
-        .with_instructions("Kaijutsu kernel MCP server. Provides tools for collaborative document and block editing with kernel-owned consistency.")
+        .with_instructions("Kaijutsu kernel MCP server. Call `register_session` first to bind your context, then use `shell` to run kaish and `kj` commands (`kj help` lists them).")
     }
 
     // ========================================================================

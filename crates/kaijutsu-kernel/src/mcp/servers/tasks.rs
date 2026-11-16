@@ -39,57 +39,51 @@ use super::adapter::{from_exec_result, to_exec_context};
 
 // ── Typed Params (schemars-derived) ────────────────────────────────────────
 
+// Subtask nesting reuses the ordinary DAG `parent_id` edge — no separate
+// hierarchy field. A freshly created task defaults to `open`; other statuses
+// are accepted so callers can import an existing task list in one pass.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskCreateParams {
-    /// Title/description of the task.
+    /// Title or description of the task.
     pub content: String,
-    /// Parent task's block ID, for a subtask. Omit for a root task. Subtask
-    /// nesting reuses the ordinary DAG `parent_id` edge — no separate
-    /// hierarchy field.
+    /// Parent task block ID for a subtask. Omit for a root task.
     #[serde(default)]
     pub parent_id: Option<String>,
-    /// Initial status. Defaults to "open" — a freshly created task starting
-    /// anywhere else would be an odd thing to represent, but it's accepted
-    /// for completeness (e.g. importing an already-in-progress task list).
+    /// Initial status: "open" (default), "in_progress", "done", or "cancelled".
     #[serde(default)]
     pub status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskUpdateParams {
-    /// Task's block ID.
+    /// Task block ID.
     pub block_id: String,
-    /// Replace the task's title/description. At least one of `content`/
-    /// `status` must be given.
+    /// Replace the task's title or description. Pass at least one of `content` or `status`.
     #[serde(default)]
     pub content: Option<String>,
-    /// New status ("open" | "in_progress" | "done" | "cancelled").
+    /// New status: "open", "in_progress", "done", or "cancelled".
     #[serde(default)]
     pub status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskCompleteParams {
-    /// Task's block ID.
+    /// Task block ID.
     pub block_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskCancelParams {
-    /// Task's block ID.
+    /// Task block ID.
     pub block_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskListParams {
-    /// Only list subtasks of this task's block ID. Omit to list root tasks
-    /// AND subtasks together (the common "show me everything" case);
-    /// combine with `filter` to narrow.
+    /// Only list direct subtasks of this task block ID. Omit to list all tasks in the context.
     #[serde(default)]
     pub parent_id: Option<String>,
-    /// "open" (Open ∪ InProgress — not yet finished), "done" (Done ∪
-    /// Cancelled — finished, either way), or an exact status name ("open",
-    /// "in_progress", "done", "cancelled"). Omit for no filter.
+    /// Status filter: "open" (open and in_progress), "done" (done and cancelled), or an exact status ("open", "in_progress", "done", "cancelled"). Omit for all tasks.
     #[serde(default)]
     pub filter: Option<String>,
 }
@@ -187,7 +181,7 @@ impl McpServerLike for BuiltinTasksServer {
             tool_def::<TaskCreateParams>(
                 &self.instance_id,
                 "task_create",
-                "Create a task (or subtask, via parent_id) for grooming — household-agent task/plan state.",
+                "Create a task block in the current context (or a subtask via `parent_id`).",
             )?,
             tool_def::<TaskUpdateParams>(
                 &self.instance_id,
@@ -197,17 +191,17 @@ impl McpServerLike for BuiltinTasksServer {
             tool_def::<TaskCompleteParams>(
                 &self.instance_id,
                 "task_complete",
-                "Mark a task done. Shorthand for task_update with status=done.",
+                "Mark a task done (shorthand for `task_update` with `status: \"done\"`).",
             )?,
             tool_def::<TaskCancelParams>(
                 &self.instance_id,
                 "task_cancel",
-                "Mark a task cancelled (deliberately abandoned, distinct from done). Shorthand for task_update with status=cancelled.",
+                "Mark a task cancelled (shorthand for `task_update` with `status: \"cancelled\"`).",
             )?,
             tool_def::<TaskListParams>(
                 &self.instance_id,
                 "task_list",
-                "List tasks in the current context, optionally filtered by parent (subtasks) and/or status bucket (open/done).",
+                "List tasks in the current context, optionally filtered by `parent_id` or status (`open`, `done`, `in_progress`, `cancelled`).",
             )?,
         ])
     }

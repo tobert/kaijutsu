@@ -35,9 +35,9 @@ use super::adapter::{from_exec_result, to_exec_context};
 pub struct BlockCreateParams {
     /// Parent block ID for DAG relationship (omit for root).
     pub parent_id: Option<String>,
-    /// Role of the block author.
+    /// Block role: user, model, system, tool, or asset.
     pub role: String,
-    /// Content type.
+    /// Block kind: text, thinking, tool_call, tool_result, drift, file, error, notification, resource, trace, or task.
     pub kind: String,
     /// Initial content.
     #[serde(default)]
@@ -82,18 +82,17 @@ pub enum EditOp {
     },
 }
 
+// `offset` and `delete_count` are character-indexed (`String::chars()`), not
+// UTF-8 byte offsets.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockSpliceParams {
     /// Block ID to edit.
     pub block_id: String,
-    /// CHARACTER offset (not bytes — block text is char-indexed;
-    /// the tool description has always said "character-based" but this
-    /// schema doc used to say "byte", steering callers into computing byte
-    /// offsets that corrupt multibyte content).
+    /// Zero-based character offset (Unicode scalar values, not UTF-8 bytes) where the edit begins.
     pub offset: usize,
-    /// Number of CHARACTERS to delete.
+    /// Number of characters to delete starting at `offset`.
     pub delete_count: usize,
-    /// Text to insert.
+    /// Text to insert at `offset`.
     pub insert: Option<String>,
 }
 

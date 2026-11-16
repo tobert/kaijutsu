@@ -72,9 +72,10 @@ pub struct EditParams {
     #[serde(default)]
     pub replace_all: bool,
     /// Hashline mode: address a line or range by the `N:hash` anchors that
-    /// `read` prints — `42:a3f1` for one line, `42:a3f1..45:0e9c` for an
-    /// inclusive range. The hash is reverified before writing, so a stale edit
-    /// fails loud instead of corrupting. Mutually exclusive with `old_string`.
+    /// `read` prints (`42:a3f1` for one line, `42:a3f1..45:0e9c` for an
+    /// inclusive range). The hash is verified before writing, so a stale edit
+    /// fails cleanly instead of corrupting the file. Mutually exclusive with
+    /// `old_string`.
     #[serde(default)]
     pub anchor: Option<String>,
 }
@@ -161,19 +162,19 @@ impl McpServerLike for FileToolsServer {
     async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
         Ok(vec![
             tool_def::<ReadParams>(&self.instance_id, "read", 
-                "Read file content. Each line is shown as `LINE:hash→ content`; the `LINE:hash` prefix is metadata (not file bytes) — pass it to `edit` as an `anchor` to replace that line without retyping it. Supports windowing via offset/limit."
+                "Read file content. Each line is shown as `LINE:hash→ content`; the `LINE:hash` prefix is metadata (not file bytes) that you can pass to `edit` as `anchor` to replace that line. Supports windowing via `offset` and `limit`."
             )?,
             tool_def::<ViewImageParams>(&self.instance_id, "view_image",
-                "Look at an image file (png, jpg, webp, gif; up to 5 MB). The result confirms the attachment, and the image itself follows the result as a user message. Needs a model that accepts images."
+                "Attach an image file (png, jpg, webp, gif; up to 5 MB) to this turn. The result confirms the attachment, and the image follows as a user message. Requires a model that accepts images."
             )?,
             tool_def::<EditParams>(&self.instance_id, "edit",
-                "Edit a file. String mode: exact `old_string`→`new_string` substring replacement (whitespace-exact; set replace_all for many). Hashline mode: pass `anchor` (`N:hash` or `N:hash..M:hash`, the anchors `read` prints) to replace a line/range by reference — the hash is reverified before writing, so a stale edit fails loud instead of corrupting. In hashline mode `new_string` is the full new line content (empty deletes)."
+                "Edit a file. String mode: exact `old_string` to `new_string` substring replacement (whitespace-exact; set `replace_all` to replace every match). Hashline mode: pass `anchor` (`N:hash` or `N:hash..M:hash` from `read`) to replace a line or range by reference; `new_string` is the full new line content (empty deletes). The hash is verified before writing."
             )?,
             tool_def::<WriteParams>(&self.instance_id, "write",
-                "Write or create a file with the given content"
+                "Create or replace a file with the given content."
             )?,
             tool_def::<GlobParams>(&self.instance_id, "glob",
-                "Find files matching a glob pattern (supports **, gitignore)"
+                "Find files matching a glob pattern (supports `**` and `.gitignore`)."
             )?,
         ])
     }
