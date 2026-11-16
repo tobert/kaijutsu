@@ -1353,8 +1353,8 @@ impl KjDispatcher {
         };
         // The senpai this context answers to, the same fact the turn path
         // reads (llm_stream.rs).
-        let (character, senpai) = match crate::llm::system_prompt::character_facts(&self.kernel_db().lock(), target_id) {
-            Ok(facts) => facts,
+        let senpai = match crate::llm::system_prompt::senpai_fact(&self.kernel_db().lock(), target_id) {
+            Ok(fact) => fact,
             Err(error) => return KjResult::Err(format!("kj context prompt: performer: {error}")),
         };
 
@@ -1408,7 +1408,6 @@ impl KjDispatcher {
             provider: resolved_backend.clone(),
             model: resolved_model.clone(),
             performer,
-            character,
             senpai,
         };
         let prompt = crate::llm::build_system_prompt(&situational, &rc_sections);
@@ -9828,7 +9827,8 @@ mod tests {
             }
         };
         let lane_situation = situation(lane).await;
-        assert!(lane_situation.contains("<character name=\"coder\"/>"), "{lane_situation}");
+        assert!(lane_situation.contains(&format!("<performer id=\"{coder}\" name=\"coder\"/>")), "{lane_situation}");
+        assert!(!lane_situation.contains("<character "), "{lane_situation}");
         assert!(
             lane_situation.contains(&format!("<senpai id=\"{}\" context=\"banto-seat\" character=\"banto\"/>", seat.short())),
             "{lane_situation}"
@@ -9842,7 +9842,7 @@ mod tests {
         );
         let root_situation = situation(root).await;
         assert!(!root_situation.contains("<senpai"), "a root console has no senpai: {root_situation}");
-        assert!(root_situation.contains("<character name=\"amy\"/>"), "{root_situation}");
+        assert!(root_situation.contains(&format!("<performer id=\"{amy}\" name=\"amy\"/>")), "{root_situation}");
 
         // The edge is the context character's: moving it changes the fact.
         d.kernel_db().lock().set_context_senpai(lane, Some(root)).unwrap();

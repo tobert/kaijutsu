@@ -74,12 +74,13 @@ own prompts may use any language. No stance branches on the model name;
 per-model specializations wait for comparative evidence.
 
 The kernel adds runtime facts in a `<situation>` block, including the performer
-and the senpai: `<performer id="<principal id>" name="<name>"/>`,
-`<character name="<name>"/>` and `<senpai id="<short id>" context="<label>"
-character="<name>"/>`, where `context` is the senpai's label and is left out
-when it has none; a root console has no `<senpai>`. The reviewer of the context's own asks is the senpai's
-character, or the climb past it; `kj context info` prints it. rc supplies the instruction
-sections. Provider/model selection remains a separate fact.
+and the senpai: `<performer id="<principal id>" name="<name>"/>` and
+`<senpai id="<short id>" context="<label>" character="<name>"/>`, where
+`context` is the senpai's label and is left out when it has none; a root
+console has no `<senpai>`. The reviewer of the context's own asks is the
+senpai's character, or the climb past it; `kj context info` prints it. rc
+supplies the instruction sections. Provider/model selection remains a separate
+fact.
 
 banto is the operator, and it performs the console by default. `banto/create/S00-stance.kai`
 writes one line naming the system, the character that performs it and the
@@ -149,8 +150,9 @@ elsewhere reminders accumulate until rotation or a filtered fork sheds them
 "Storyteller: what the prototype leaves open".
 
 The executable filename controls order. The coder handles general work;
-assistant remains fleet coordination, with a helper branch that observes and a
-spine branch that interprets.
+assistant handles fleet coordination (`assistant/create/S00-stance.md`) with a
+`companion`-shaped binding (`assistant/create/S10-binding.kai`) and an hourly
+tick (`assistant/tick/S10-checkin.kai`).
 
 `kj context create <character>` refuses before committing a row when the
 character's `create` bucket (`/config/rc/<rc_dir>/create`) is missing or holds no

@@ -311,7 +311,7 @@ senpai that no `root_ctx` names. At the commit the archived console takes the su
 
 ## What a context sees
 
-- The `<situation>` block names the context's performer and its senpai: `<character name="<name>"/>` and
+- The `<situation>` block names the context's performer and its senpai: `<performer id="<principal id>" name="<name>"/>` and
   `<senpai id="<short id>" context="<label>" character="<name>"/>`. `character` is named even when retired,
   `context` is left out when the senpai has no label, and a root console has no `<senpai>`.
 - The rc persona text (banto's S00-stance) says "our senpai" and reads the name from the kernel fact.

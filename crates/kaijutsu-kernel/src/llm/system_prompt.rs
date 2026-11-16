@@ -14,14 +14,6 @@ pub struct CharacterIdentity {
     pub name: String,
 }
 
-/// The context character a context has, as its `<situation>` names it
-/// (`docs/senpai-kohai.md`, "What a context sees").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CharacterFact {
-    /// The character's name.
-    pub name: String,
-}
-
 /// The senpai of a context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenpaiFact {
@@ -33,16 +25,15 @@ pub struct SenpaiFact {
     pub character: String,
 }
 
-/// The character fact and the senpai fact for `context_id`, read from its
-/// row. A context with no performer has neither; a
-/// context with no senpai (a root console) has no senpai fact. A missing row
+/// The senpai fact for `context_id`, read from its row. A context with no
+/// performer or no senpai (a root console) has no senpai fact. A missing row
 /// is an error, never an absent fact.
-pub(crate) fn character_facts(
+pub(crate) fn senpai_fact(
     db: &crate::kernel_db::KernelDb,
     context_id: ContextId,
-) -> Result<(Option<CharacterFact>, Option<SenpaiFact>), String> {
+) -> Result<Option<SenpaiFact>, String> {
     let Some(row) = db.context_character(context_id).map_err(|e| e.to_string())? else {
-        return Ok((None, None));
+        return Ok(None);
     };
     let senpai = match row.senpai_ctx {
         Some(senpai) => {
@@ -62,7 +53,7 @@ pub(crate) fn character_facts(
         }
         None => None,
     };
-    Ok((Some(CharacterFact { name: db.name_for(row.principal_id) }), senpai))
+    Ok(senpai)
 }
 
 /// Read the instruction sections currently stored in a context.
@@ -88,8 +79,6 @@ pub struct SituationalContext {
     pub model: Option<String>,
     /// The character performing this turn.
     pub performer: Option<CharacterIdentity>,
-    /// The context character this context has.
-    pub character: Option<CharacterFact>,
     /// The context this one answers to. Who reviews the performer's asks
     /// follows from it (`kj context info` prints the climb).
     pub senpai: Option<SenpaiFact>,
@@ -104,7 +93,6 @@ impl SituationalContext {
             && self.provider.is_none()
             && self.model.is_none()
             && self.performer.is_none()
-            && self.character.is_none()
             && self.senpai.is_none()
     }
 }
@@ -121,7 +109,6 @@ impl SituationalContext {
 ///   <context id="…" label="…" state="live"/>
 ///   <model provider="anthropic" name="claude-haiku-4-5"/>
 ///   <performer id="…" name="coder"/>
-///   <character name="coder"/>
 ///   <senpai id="01a2b3c4" context="lead" character="lead"/>
 /// </situation>
 /// ```
@@ -197,10 +184,6 @@ pub fn build_system_prompt(situational: &SituationalContext, rc_sections: &[Stri
             performer.principal_id,
             xml_escape(&performer.name)
         ));
-    }
-
-    if let Some(character) = &situational.character {
-        out.push_str(&format!("  <character name=\"{}\"/>\n", xml_escape(&character.name)));
     }
 
     if let Some(senpai) = &situational.senpai {
@@ -311,7 +294,6 @@ mod tests {
             provider: Some("anthropic".to_string()),
             model: Some("claude-haiku-4-5".to_string()),
             performer: None,
-            character: None,
             senpai: None,
         };
         let out = build_system_prompt(&situational, &[]);
@@ -324,21 +306,20 @@ mod tests {
     }
 
     #[test]
-    fn performer_character_and_senpai_are_distinct_runtime_facts() {
+    fn performer_and_senpai_are_distinct_runtime_facts() {
         let performer = CharacterIdentity { principal_id: PrincipalId::new(), name: "coder <one>".into() };
         let senpai = SenpaiFact { id: "ab12".into(), context: Some("lead \"seat\"".into()), character: "lead & two".into() };
         let prompt = build_system_prompt(
             &SituationalContext {
                 model: Some("test-model".into()),
                 performer: Some(performer.clone()),
-                character: Some(CharacterFact { name: "coder <one>".into() }),
                 senpai: Some(senpai),
                 ..Default::default()
             },
             &[],
         );
         assert!(prompt.contains(&format!("<performer id=\"{}\" name=\"coder &lt;one&gt;\"/>", performer.principal_id)));
-        assert!(prompt.contains("<character name=\"coder &lt;one&gt;\"/>"), "{prompt}");
+        assert!(!prompt.contains("<character "), "performer is named once: {prompt}");
         assert!(
             prompt.contains("<senpai id=\"ab12\" context=\"lead &quot;seat&quot;\" character=\"lead &amp; two\"/>"),
             "{prompt}"
@@ -353,12 +334,12 @@ mod tests {
         assert!(unlabeled.contains("<senpai id=\"cd34\" character=\"lead\"/>"), "{unlabeled}");
         let top = build_system_prompt(
             &SituationalContext {
-                character: Some(CharacterFact { name: "amy".into() }),
+                performer: Some(CharacterIdentity { principal_id: PrincipalId::new(), name: "amy".into() }),
                 ..Default::default()
             },
             &[],
         );
-        assert!(top.contains("<character name=\"amy\"/>") && !top.contains("<senpai"), "{top}");
+        assert!(top.contains("name=\"amy\"/>") && !top.contains("<senpai"), "{top}");
     }
 
     #[test]

@@ -123,7 +123,7 @@ refused from inside; use the tailnet name in `mcp.toml`.
 ## Agent development container
 
 Built on zorak on 2026-10-18 for nagaya; "As built" below lists where it differs from the plan. One container holds one
-project's kernel and workspace. A DeepSeek coder seat works there with no
+project's kernel and workspace. A DeepSeek coder context works there with no
 asks. A Claude session outside supervises it over MCP. Each instance takes
 the project's name, written `<project>` below.
 
@@ -138,14 +138,14 @@ overlay.
   run in it unchanged, and the build needs no network. The image label names the kaijutsu commit; `build.sh`
   refuses a tree with uncommitted changes under `crates/` or `assets/`.
 - **Mounts.** `~/src` is read-only at its host path and `~/src/<project>` is read-write over it, so the project
-  repository is the seat's working tree and other projects are there to read. `/workspace` is a scratch
+  repository is the context's working tree and other projects are there to read. `/workspace` is a scratch
   repository for small tasks. Two private keys under `~/src` are masked with `/dev/null`.
 - **Build cache.** `~/kj-dev/<project>/cargo-target` mounts at `~/.cache/kaijutsu/cargo-target`, the
   `CARGO_TARGET_DIR` that the default rc gives each context. The root file system is read-only, so without the
-  volume cargo cannot write there. `check.sh <project>` probes each path that a seat writes.
+  volume cargo cannot write there. `check.sh <project>` probes each path that a context writes.
 - **Models.** `/tank/ml/models` mounts read-only at the same path, so GPU tests read weights where the
   engine's own docs name them. `check.sh` probes it.
-- **Seats.** banto plays a context on `anthropic/claude-haiku-5-5` in the project. Its senpai is the
+- **Contexts.** banto plays a context on `anthropic/claude-haiku-5-5` in the project. Its senpai is the
   supervising Claude session's context, whose holder connects over MCP with its own key (`~/.ssh/kaijutsu-senpai`).
   That context does not exist when `bootstrap.sh` runs, so banto starts under Amy's root console, and Amy moves
   it with `kj context set <project>-banto --senpai <senpai's context>` (bootstrap prints the command).
@@ -170,7 +170,7 @@ overlay.
 - **The kernel runs inside the container.** A context's shell runs host
   programs where the kernel runs (`ExternalExec::Allow`, see
   `docs/kaish-integration.md`), so the container is the boundary for
-  everything the seat runs. A host kernel that executes inside a container
+  everything the context runs. A host kernel that executes inside a container
   would need a new execution path.
 - **A separate `agent-dev` image stage.** The runtime image stays minimal.
   The agent image starts from Arch, which matches the host's glibc and ROCm
@@ -189,8 +189,8 @@ overlay.
 - **SSH** publishes on `127.0.0.1:2224`. The Quadlet above uses 2223 and
   the host kernel uses 2222.
 - **Network.** Default rootless networking (pasta) with open egress, so
-  the seat can fetch crates, clone repositories, and read docs. No SSH key
-  or forge token enters the container: the seat commits in `/workspace`
+  the context can fetch crates, clone repositories, and read docs. No SSH key
+  or forge token enters the container: the context commits in `/workspace`
   and a person pushes from the host.
 - **Resources on zorak** (32 threads, 125 GiB, Strix Halo):
   `--cpuset-cpus=4-31`, `--memory=64g`, a lower CPU weight, and a high
@@ -202,27 +202,27 @@ overlay.
   in a per-host drop-in so the base unit carries no vendor flags. An NVIDIA
   host uses CDI (`--device nvidia.com/gpu=all`) in its own drop-in.
 
-### Seat, gate, and supervision
+### Contexts, gate, and supervision
 
 - Characters: a `<project>-coder` performer on the `deepseek-flash` model,
-  and `banto`. Each coder context answers to banto's seat, so its asks reach
-  banto, which is driving the loop; banto's seat answers to the supervising
+  and `banto`. Each coder context answers to banto's context, so its asks reach
+  banto, which is driving the loop; banto's context answers to the supervising
   Claude session's context. The bootstrap creates both with `kj context create`.
   In the first runs the supervising Claude session outside the container can
-  hold the banto seat itself and drive the coder seats over MCP. Later a model
+  play the banto context itself and drive the coder contexts over MCP. Later a model
   performing banto in the kernel drives them the same way.
 - `gate.toml` sets `[rc.coder] uncovered = "allow"` and
   `allow = ["shell_write"]`. Explicit `ask` keys in `[global]` still fire,
   so the file needs an audit for this kernel. The council stays off:
   Jev bumps need a council port to a chat backend
   (`docs/issues.md`, "Council presets per context").
-- Recovery is Git. The seat commits often and never pushes.
+- Recovery is Git. The context commits often and never pushes.
 - kaibo runs inside as an `mcp.toml` stdio server with the `crusoe` cast
   (GLM-5.3), with `/workspace` as its allowed tree.
 - The supervisor (banto in the first runs, senpai once a model performs banto in the kernel): a dedicated Claude Code session with its own
   `kaijutsu-dev` MCP entry. Its `kaijutsu-mcp` comes from the same commit
   as the container, because the wire version must match. It drives the
-  seat with `kj drive` and `kj wait`, rotates the seat's context with a
+  coder context with `kj drive` and `kj wait`, rotates that context with a
   handoff when it fills, and writes a daily digest into
   `~/kj-dev/<project>/`: spend, cache hit ratio, commits, and open
   problems.
@@ -230,10 +230,10 @@ overlay.
 - The coder and banto each get an environment
   instruction from `contrib/agent-dev/rc/<rc dir>/create/S12-environment.md`,
   installed into this kernel's host rc next to the shipped defaults. It
-  names `/workspace`, `/exchange`, and the kernel's own state, so a seat
+  names `/workspace`, `/exchange`, and the kernel's own state, so a context
   does not spend calls finding them. The text names no project and does not say who the
-  senpai is: the seat reads that from the `<senpai>` fact in its `<situation>` block.
-- A drift that arrives at a coder seat starts its turn, through a coder
+  senpai is: the performer reads that from the `<senpai>` fact in its `<situation>` block.
+- A drift that arrives at a coder context starts its turn, through a coder
   `drift` rc script on this kernel only (`docs/drift-ux.md`, gap 2, shape
   B). The identity problem that section names is checked against current
   code before the script ships.
@@ -269,7 +269,7 @@ project per kernel where a parameter costs nothing.
    backend; the script adds `add-key` for the supervisor, the characters,
    `gate.toml`, and `rc reseed`.
 7. A standalone test task: a one-page spec for a small Rust crate,
-   acceptance tests the seat cannot see, a kaibo review step, and a step
+   acceptance tests the coder context cannot see, a kaibo review step, and a step
    that writes `rocminfo` output to `GPU.md`. The supervisor runs the
    acceptance tests in a fresh container. The task stays as a regression
    check for the environment itself.

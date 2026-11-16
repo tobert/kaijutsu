@@ -641,7 +641,7 @@ mod tests {
         assert!(seed_body("/config/rc/mcp/create/S00-stance.md").is_none());
         assert!(seed_body("/config/rc/mcp/create/S00-stance.kai").is_none());
 
-        for dir in ["coder", "banto", "council", "judge", "storyteller", "companion", "musician"] {
+        for dir in ["coder", "banto", "council", "judge", "storyteller", "companion", "musician", "assistant"] {
             let path = format!("/config/rc/{dir}/create/S00-stance.md");
             let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
             let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -650,6 +650,21 @@ mod tests {
                 "{dir} names who is accountable for the work in its own stance"
             );
         }
+    }
+
+    /// Every shipped character directory except `judge` (which runs a shadow
+    /// with no model turn of its own) ships `create/S10-binding.kai` so
+    /// contexts created for it have a loadout.
+    #[test]
+    fn every_shipped_character_directory_binds_a_loadout_except_judge() {
+        for dir in ["banto", "coder", "companion", "musician", "storyteller", "toolie", "assistant", "council", "person", "mcp"] {
+            let path = format!("/config/rc/{dir}/create/S10-binding.kai");
+            assert!(
+                seed_body(&path).is_some(),
+                "{dir} is missing {path}"
+            );
+        }
+        assert!(seed_body("/config/rc/judge/create/S10-binding.kai").is_none());
     }
 
     /// Instruction text is read by models that are mostly not English-first.
@@ -677,6 +692,7 @@ mod tests {
             "/config/rc/musician/chairs/drums.md",
             "/config/rc/musician/tick/S10-drive.kai",
             "/config/rc/toolie/create/S00-stance.md",
+            "/config/rc/assistant/create/S00-stance.md",
             "/config/rc/banto/create/S00-stance.kai",
             "/config/rc/assistant/create/S00-stance.kai",
             "/config/rc/banto/create/S06-kj-help.md",

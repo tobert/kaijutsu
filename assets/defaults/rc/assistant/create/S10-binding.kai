@@ -1,0 +1,7 @@
+# assistant: the fleet-coordination context's loadout, matching companion.
+set -e
+kj binding allow "facade:shell_write"
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"
+kj binding allow "editor"

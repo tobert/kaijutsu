@@ -710,10 +710,10 @@ pub(super) async fn spawn_admitted_turn(
     // rc sections come from `(Role::System, BlockKind::Text)` blocks in the
     // conversation — typically dropped in by rc-on-create/-on-fork. They
     // land before the `<situation>` addendum.
-    let (character, senpai) = match crate::llm::system_prompt::character_facts(&kernel_db.lock(), context_id) {
-        Ok(facts) => facts,
+    let senpai = match crate::llm::system_prompt::senpai_fact(&kernel_db.lock(), context_id) {
+        Ok(fact) => fact,
         Err(e) => {
-            tracing::error!("character fact read failed for context {context_id}: {e}");
+            tracing::error!("senpai fact read failed for context {context_id}: {e}");
             return Err(format!("Could not read this context's performer: {e}. The turn was stopped."));
         }
     };
@@ -724,7 +724,6 @@ pub(super) async fn spawn_admitted_turn(
         provider: Some(backend_name.clone()),
         model: Some(model_name.clone()),
         performer: Some(performer.clone()),
-        character,
         senpai,
     };
     let rc_sections = match crate::read_system_prompt_sections(&documents, context_id) {

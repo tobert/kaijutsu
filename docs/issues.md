@@ -567,17 +567,11 @@ shows only reports). A generic server inspector can live in gogi later.
 - `kaijutsu-server bootstrap` on an existing kernel ran `kj character model set banto …` (banto had no model) and
   then said "banto, coder already exist; bootstrap leaves an existing character as it is, its rc directory and
   model included". It fills a missing model; the note should say so.
-- `assistant/` ships a stance and a tick check-in but no `create/S10-binding.kai`, so every assistant context is
-  created inert (no loadout; `kj context create assistant` warns). It never had one; decide its loadout (the
-  companion's shape is the nearest) and add a test that each shipped character's `create` binds a loadout
-  (`judge/` excepted: a judge is a shadow).
 - After the deploy, `coder` (an existing character, which bootstrap leaves alone) has no model, so a coder context
   says so at create and cannot run a turn until `kj character model set coder <backend>/<model>`.
 
 ## Type melt M7: what the docs pass leaves open (2026-11-05)
 
-- `"seat"` still names a context or a character in `docs/container.md`;
-  `docs/writing.md` Terms keep `"seat"` for the council.
 - A rotation moves no context that answered to the predecessor; the character takes them by hand
   (docs/senpai-kohai.md, "Rotation hands off its contexts"). A `rotate` lifecycle that takes them after the commit
   was described and never built; `rotate` today is the beat scheduler's page-turn verb (rc/mod.rs ~136-142).
@@ -606,8 +600,6 @@ the character"). Open, outside M2:
   for one), and whether the backfill left any character unset
   (`context_character_migration_report`, kinds `rc_dir_unset` and
   `console_ambiguous`).
-- The Terms table's `context_type` row in `docs/writing.md` still says it is
-  the rc bundle a context runs (M6 rewrites it).
 
 ## Type melt M3: what one-model and the judge character leave open (2026-11-04)
 
