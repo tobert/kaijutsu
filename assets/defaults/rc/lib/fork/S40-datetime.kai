@@ -8,4 +8,4 @@
 # when it's inserted.
 set -e
 now="$(date '+%Y-%m-%d %A %H:%M %z')"
-kj block create --role system --kind notification --content "Current date/time: $now (contexts have no other clock — use this when dating anything you write)"
+kj block create --role system --kind notification --content "Current date/time: $now (contexts have no other clock; use this when dating anything you write)"

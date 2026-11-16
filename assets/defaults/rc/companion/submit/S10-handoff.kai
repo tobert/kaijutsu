@@ -1,4 +1,4 @@
-# companion: when the person writes, show the seat what the check-ins left.
+# companion: when the person writes, show the context what the check-ins left.
 # The recent notes ride behind the person's message as a notification that
 # serves only this turn, so each turn pays for one copy.
 #

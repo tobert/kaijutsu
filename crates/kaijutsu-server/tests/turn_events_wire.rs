@@ -884,7 +884,7 @@ fn the_page_turn_replaces_a_musician_with_a_fully_set_successor_on_the_same_trac
             assert!(blocks.iter().any(|block| block.content.contains(first_line)),
                 "the successor carries the {name} block ({first_line:?})");
         }
-        assert!(blocks.iter().any(|block| block.content.starts_with("You're a musician here")),
+        assert!(blocks.iter().any(|block| block.content.starts_with("We are a cybernetic system making music together.")),
             "the successor carries the stance");
 
         let attached: Vec<String> = server.kernel_db.lock().list_attachments_for_context(successor).unwrap()

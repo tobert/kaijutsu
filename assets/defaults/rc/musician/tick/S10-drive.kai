@@ -35,7 +35,7 @@ fi
 bars=$(( KJ_PHRASE_BEATS / 4 ))
 phrases=$(( KJ_LEAD_BEATS / KJ_PHRASE_BEATS + 1 ))
 target=$(( KJ_TICK + phrases * KJ_PHRASE_BEATS ))
-kj drive --track "$KJ_TRACK" --score-at "$target" --fallback last-good --prompt "Commit at tick $target. Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM, 4/4. Recently played (oldest→newest JSON): $KJ_HEARD. Play the NEXT phrase, continuing seamlessly from what you just played. Write exactly $KJ_PHRASE_BEATS beats with L:1/4 — one beat per bare note or chord, a barline | every 4 beats, $bars bars total — so the line is continuous with no gap. CRITICAL: do NOT add duration numbers (no C2, no C/2) and do NOT pack multiple notes into a beat. Your header and register come from your chair. Output ONE complete ABC tune: that header, then the body. Raw ABC only — no prose, no code fences."
+kj drive --track "$KJ_TRACK" --score-at "$target" --fallback last-good --prompt "Commit at tick $target. Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM, 4/4. Recently played (oldest to newest JSON): $KJ_HEARD. Play the next phrase, continuing seamlessly from what we just played. Write $KJ_PHRASE_BEATS beats with L:1/4: one beat per bare note or chord, a barline | every 4 beats, $bars bars total, so the line is continuous with no gap. Do not add duration numbers (no C2, no C/2) and do not pack multiple notes into a beat. Your header and register come from your chair. Emit one complete ABC tune: that header, then the body. Raw ABC only, with no prose and no code fences."
 if [[ "$uncovered" = "repeat" ]] && [[ "$phrases" -gt 1 ]]; then
   for i in $(seq 1 $(( phrases - 1 ))); do
     kj transport repeat --track "$KJ_TRACK" --at "$(( KJ_TICK + i * KJ_PHRASE_BEATS ))"

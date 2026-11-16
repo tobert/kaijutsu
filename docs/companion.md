@@ -3,9 +3,9 @@
 A `companion` is a character, with its own rc directory, for a long-lived personal agent. One person
 talks to it. While the person is away, a clock wakes a short-lived copy of it
 once an hour. That copy looks at the world, decides whether anything matters,
-and stops. The rc lives in `assets/defaults/rc/companion/`. The directory is
-standalone: each script is a copy of what it uses, so copying the directory to
-`rc/<other-name>/` makes an experiment you can change freely.
+and stops. The rc lives in `assets/defaults/rc/companion/`. Shared scripts link to
+`/config/rc/lib/`, while companion-specific stances, bindings, and tick scripts
+live in `companion/`.
 
 ## The pieces
 

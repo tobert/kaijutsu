@@ -576,9 +576,8 @@ shows only reports). A generic server inspector can live in gogi later.
 
 ## Type melt M7: what the docs pass leaves open (2026-11-05)
 
-- "seat" still names a context or a character in docs/container.md, the companion, storyteller,
-  toolie and assistant stances, and the assistant `S00` comment; docs/writing.md Terms keep "seat" for the
-  council. The stances are published prose: rewrite them together, read the composed prompt after.
+- `"seat"` still names a context or a character in `docs/container.md`;
+  `docs/writing.md` Terms keep `"seat"` for the council.
 - A rotation moves no context that answered to the predecessor; the character takes them by hand
   (docs/senpai-kohai.md, "Rotation hands off its contexts"). A `rotate` lifecycle that takes them after the commit
   was described and never built; `rotate` today is the beat scheduler's page-turn verb (rc/mod.rs ~136-142).
@@ -654,10 +653,6 @@ conversation"; `blocks/slim.rs`.
 - `--migrate` and `--compact` copy the conversation before the successor's
   rows exist, as a fork's copy does; a row insert that then fails leaves an
   orphan document. For `--compact`, the summary it paid for is lost with it.
-- `assets/defaults/rc/companion/create/` holds full copies of the `lib/create`
-  scripts, not path shims as `director` and `storyteller` do. The
-  `S17-predecessor.kai` change was made in both; the next edit to a lib
-  create script can miss the companion copy.
 
 ## Companion: what the first build leaves open (2026-11-02)
 

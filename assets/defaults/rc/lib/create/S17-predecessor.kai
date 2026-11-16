@@ -1,5 +1,5 @@
-# S17-predecessor.kai — when this context replaces another (a seat
-# rotation), inject the predecessor's recent prose so the new seat starts
+# S17-predecessor.kai — when this context replaces another (a context
+# rotation), inject the predecessor's recent prose so the new context starts
 # where the old one stopped (docs/prompts.md, "Rotating a context").
 #
 #   kj context rotate banto
@@ -37,7 +37,7 @@ fi
 tail="$(kj wait $prev --timeout 1 --max-blocks 12 --max-bytes 400 --include text || true)"
 
 if test -z "$tail"; then
-  tail="(no tail readable from '$prev' — it may be archived or mislabeled)"
+  tail="(no tail readable from '$prev'; it may be archived or mislabeled)"
 fi
 
 stamp="$(date -u --iso-8601=seconds)"

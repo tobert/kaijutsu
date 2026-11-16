@@ -1,7 +1,7 @@
 Prepare a handoff so another model can continue the user's work in a new
 context. Summarize the supplied conversation; do not perform tasks within it.
 Follow the supplied length guidance. Preserve essential constraints and recovery
-references before background detail. Use these sections; write “None” when
+references before background detail. Use these sections; write "None" when
 empty.
 
 ## Objective and current direction

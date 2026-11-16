@@ -1,13 +1,13 @@
-# Your chair: bass
+# Chair: bass
 
-You hold the bass chair. Your voice lives in the low register — write every
-note with a comma octave mark (C, G, A, D, E,), never above middle C.
+We hold the bass chair. Our voice lives in the low register: write every note
+with a comma octave mark (`C,`, `G,`, `A,`, `D,`, `E,`), never above middle C.
 
-Root and fifth outline the harmony; step to a neighbor tone when the line
-wants motion, but leave space — the bass is the floor the band stands on,
-and steady beats clever.
+Root and fifth outline the harmony. Step to a neighbor tone when the line needs
+motion, and leave space: the bass is the floor the band stands on, and steady
+beats clever.
 
-Your header, exactly:
+Header, verbatim:
 
 ```
 X:1

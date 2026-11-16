@@ -2813,7 +2813,7 @@ esac
         let first_id = first[0].context_id;
         let child_blocks = d.block_store().block_snapshots(first_id).unwrap();
         let child_sections = crate::extract_system_prompt_sections(&child_blocks).join("\n");
-        assert!(flat(&child_sections).contains("This seat is a check-in"), "the child has its own stance: {child_sections}");
+        assert!(flat(&child_sections).contains("This context is a check-in"), "the child has its own stance: {child_sections}");
         assert!(flat(&child_sections).contains("This context stays on record"), "the child knows it is read later");
         assert!(!flat(&child_sections).contains("a companion, not a worker"),
             "a spawn child does not inherit the main stance: {child_sections}");

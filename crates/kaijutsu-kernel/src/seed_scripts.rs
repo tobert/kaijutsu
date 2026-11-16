@@ -641,7 +641,7 @@ mod tests {
         assert!(seed_body("/config/rc/mcp/create/S00-stance.md").is_none());
         assert!(seed_body("/config/rc/mcp/create/S00-stance.kai").is_none());
 
-        for dir in ["coder", "banto", "council", "judge", "storyteller", "companion"] {
+        for dir in ["coder", "banto", "council", "judge", "storyteller", "companion", "musician"] {
             let path = format!("/config/rc/{dir}/create/S00-stance.md");
             let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
             let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -671,6 +671,12 @@ mod tests {
             "/config/rc/companion/fork/S20-stance.md",
             "/config/rc/companion/tick/S10-checkin.md",
             "/config/rc/companion/tick/S10-wrapup.md",
+            "/config/rc/musician/create/S00-stance.md",
+            "/config/rc/musician/create/S15-abc-primer.md",
+            "/config/rc/musician/chairs/bass.md",
+            "/config/rc/musician/chairs/drums.md",
+            "/config/rc/musician/tick/S10-drive.kai",
+            "/config/rc/toolie/create/S00-stance.md",
             "/config/rc/banto/create/S00-stance.kai",
             "/config/rc/assistant/create/S00-stance.kai",
             "/config/rc/banto/create/S06-kj-help.md",

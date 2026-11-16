@@ -5,7 +5,7 @@
 # First, on every tick, close out the previous check-in. A check-in has a
 # read-only shell, so it cannot write anything: its last message is its report
 # and begins with QUIET: or FINDING:. This script reads that report and puts a
-# FINDING into this context's log as a notification, where the seat reads it on
+# FINDING into this context's log as a notification, where the context reads it on
 # its next turn and folds what matters into its own handoff notes. (A handoff
 # note is authored by a character, and this script runs as the clock, so it
 # leaves none.) A check-in that left neither word, or no message, is reported
@@ -16,10 +16,10 @@
 # Then one of three things happens:
 #
 #  1. A wrap-up was asked for on an earlier tick (WRAPUP_AT is set): rotate this
-#     context now. The seat has had a whole tick to write its handoff notes.
+#     context now. The context has had a whole tick to write its handoff notes.
 #  2. This context is large (the last call filled ROTATE_AT_TOKENS or more):
-#     drive a wrap-up turn asking the seat to write its handoff, and mark it.
-#     No check-in this tick; the seat is busy.
+#     drive a wrap-up turn asking the context to write its handoff, and mark it.
+#     No check-in this tick; the context is busy.
 #  3. Otherwise fork a fresh empty check-in (`spawn` keeps nothing); its own fork
 #     rc builds its stance and loadout, and the seed text below drives its turn.
 #

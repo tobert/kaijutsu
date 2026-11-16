@@ -737,7 +737,7 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
         let has_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("the fleet's assistant seat")
+                && b.content.contains("the fleet's assistant context")
         });
         assert!(
             has_stance,

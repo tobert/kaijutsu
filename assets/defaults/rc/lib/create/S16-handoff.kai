@@ -61,7 +61,7 @@ case "$who" in
     ;;
 esac
 
-# Nothing to hand over is nothing to say: no block, so the seat does not carry
+# Nothing to hand over is nothing to say: no block, so the context does not carry
 # an empty section on every request. The phrase is `kj handoff tail`'s own.
 case "$notes" in
   ""|*"has no handoff notes yet"*)
@@ -72,13 +72,13 @@ esac
 
 stamp="$(date -u --iso-8601=seconds)"
 
-content="=== Handoff — the last $window notes on the log of $who (auto-injected at create) ===
+content="=== Handoff: the last $window notes on the log of $who (auto-injected at create) ===
 Read $stamp. Notes are append-only and carry their own author, so a note
-signed by someone else was left FOR this seat by another character.
+signed by someone else was left for this character by another character.
 
 $notes
 
-Leave one before this seat goes cold or rotates:
+Leave one before this context goes cold or rotates:
     $note_cmd
 A note you write for someone else still lands under your own name."
 
