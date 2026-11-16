@@ -7,7 +7,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "cas",
-    about = "Content-addressed storage for binary blobs (images, etc.)",
+    about = "Content-addressed storage for binary blobs",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -18,32 +18,31 @@ pub(crate) struct CasArgs {
 
 #[derive(Subcommand, Debug)]
 enum CasCommand {
-    /// Ingest a file, print its hash.
+    /// Ingest a file and print its hash.
     Put {
-        /// Path to the file to ingest
+        /// Path to the file to ingest.
         path: String,
     },
-    /// Retrieve by hash. With `--out`, write the bytes to a file; otherwise
-    /// report the size (binary data can't go to stdout as text).
+    /// Retrieve content by hash. With --out, write bytes to a file; otherwise report size.
     Get {
-        /// Content hash to retrieve
+        /// Content hash to retrieve.
         hash: String,
-        /// Write the retrieved bytes to this path instead of reporting size
+        /// Write the retrieved bytes to this path instead of reporting size.
         #[arg(long)]
         out: Option<String>,
     },
     /// List all stored objects.
     #[command(alias = "list")]
     Ls,
-    /// Show metadata (mime, size, path) for a hash.
+    /// Show metadata for a hash.
     Info {
-        /// Content hash to inspect
+        /// Content hash to inspect.
         hash: String,
     },
-    /// Remove an object (unconditional, no ref-checking).
+    /// Remove an object.
     #[command(alias = "remove")]
     Rm {
-        /// Content hash to remove
+        /// Content hash to remove.
         hash: String,
     },
 }

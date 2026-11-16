@@ -21,11 +21,6 @@ use crate::kernel_db::WatchRow;
 #[command(
     name = "watch",
     about = "Watch files; changes go with the next prompt as a notice",
-    long_about = "Watch files for this context. A watch never starts a turn: changes \
-                  accrue while the context is idle, and the next prompt carries one notice \
-                  block before it naming each changed path, how many times it changed, and \
-                  whether it still exists. The notice holds no file content. Rotation gives \
-                  the successor fresh copies of the watches; a fork copies none.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -37,27 +32,20 @@ pub(crate) struct WatchArgs {
 #[derive(Subcommand, Debug)]
 enum WatchCommand {
     /// Watch a file.
-    ///
-    /// The path is absolute or relative to this context's working
-    /// directory, and must name an existing file on a host directory mount;
-    /// a path with no host file behind it is refused. Adding a stopped
-    /// watch's path starts it again with no changes.
     Add {
         /// The file to watch.
         path: String,
     },
     /// List this context's watches and the changes each holds.
-    ///
-    /// A watch stopped by `kj context promote` says so.
     List,
     /// Show one watch.
     Show {
-        /// The watch id from `kj watch list`.
+        /// The watch id.
         id: i64,
     },
     /// Remove a watch and the changes it holds.
     Rm {
-        /// The watch id from `kj watch list`.
+        /// The watch id.
         id: i64,
     },
 }

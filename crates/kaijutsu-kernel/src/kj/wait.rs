@@ -74,31 +74,24 @@ impl TailFilter {
 #[derive(Parser, Debug)]
 #[command(
     name = "wait",
-    about = "Wait for a context to finish its accepted turns, a shell operation, an ask decision, or a kaish job. \
-             A context wait also returns, with status `ask`, when that context holds a pending ask you review.",
+    about = "Wait for a context to finish its accepted turns, a shell operation, an ask decision, or a kaish job.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
 pub(crate) struct WaitArgs {
     /// Wait for this shell operation to finish, including any approval wait.
-    /// Reports completion-notification status and any pending outcome-retention error.
     #[arg(long, conflicts_with_all = ["ask", "job", "since"])]
     operation: Option<String>,
-    /// Wait for this ask's decision. Approval may start work that is still running.
+    /// Wait for this ask's decision.
     #[arg(long, conflicts_with_all = ["operation", "job", "since"])]
     ask: Option<String>,
-    /// Wait for this process-local kaish job in the target context. Reports status and exit code;
-    /// use --operation to inspect durable publication and notification status.
+    /// Wait for this process-local kaish job in the target context.
     #[arg(long, conflicts_with_all = ["operation", "ask", "since"])]
     job: Option<u64>,
-    /// Report only blocks after this one. Pass the `cursor` from a previous
-    /// `kj wait` to read newly added blocks.
+    /// Report only blocks after this one.
     #[arg(long)]
     since: Option<String>,
-    /// Stop waiting after this long and report status `running` with the
-    /// current observations, without canceling the work. Bare seconds
-    /// (`120`), an explicit `s` (`90s`), or `kj ledger list --since`'s
-    /// integer+unit grammar (`20m`, `2h`, `7d`).
+    /// Stop waiting after this long and report status `running` with current observations (`120`, `90s`, `20m`, `2h`, `7d`).
     #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds)]
     timeout: u64,
     /// Keep at most this many blocks in the tail, newest kept.
@@ -107,7 +100,7 @@ pub(crate) struct WaitArgs {
     /// Truncate each block's text at this many bytes.
     #[arg(long, default_value_t = 2048)]
     max_bytes: usize,
-    /// What the tail carries: prose and errors, plus tool traffic, or everything.
+    /// What the tail carries.
     #[arg(long, value_enum, default_value_t = TailFilter::Text)]
     include: TailFilter,
     /// Target context (label or id); defaults to the current context.

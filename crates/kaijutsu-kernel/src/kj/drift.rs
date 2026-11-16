@@ -133,35 +133,33 @@ enum DriftCommand {
     /// never starts or extends a turn. A drift into the console waits
     /// for its human instead: it reaches the console's model only after
     /// `kj ledger allow <id>`. With --summarize, distill the caller's whole
-    /// context (on its `distill` slot) instead of sending literal content. With --stage, queue it for a later
-    /// `flush` instead of delivering now. Refuses an archived or concluded
-    /// target, at both push and flush time — fork it to continue.
+    /// context instead of sending literal content. With --stage, queue it for a later
+    /// flush instead of delivering now. Refuses an archived or concluded
+    /// target.
     Push {
-        /// Destination context reference. `.senpai` names the context this one answers to
+        /// Destination context reference (`.senpai` names the context this one answers to).
         dst: String,
-        /// LLM-distill the caller's context instead of using literal content
+        /// Distill the caller's context instead of using literal content.
         #[arg(long, short = 's')]
         summarize: bool,
-        /// Queue for a later `kj drift flush` instead of delivering now
+        /// Queue for a later kj drift flush instead of delivering now.
         #[arg(long)]
         stage: bool,
         /// Content to send (joined with spaces). Omit when using --summarize.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         content: Vec<String>,
     },
-    /// Distill a source context into the caller's context. It runs on the
-    /// caller's `distill` slot and refuses when the caller has none.
+    /// Distill a source context into the caller's context.
     Pull {
-        /// Source context reference
+        /// Source context reference.
         src: String,
-        /// Optional directed prompt (joined with spaces)
+        /// Optional directed prompt (joined with spaces).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
-    /// Distill this fork back into the parent context (or a given ctx). It
-    /// runs on this context's `distill` slot and refuses when it has none.
+    /// Distill this fork back into the parent context (or a given context).
     Merge {
-        /// Target context (default: the context this one was forked from)
+        /// Target context (default: the context this one was forked from).
         ctx: Option<String>,
     },
     /// Deliver all staged drifts.
@@ -171,12 +169,12 @@ enum DriftCommand {
     Queue,
     /// Remove a staged drift before it is flushed.
     Cancel {
-        /// Queue id of the staged drift, from `kj drift queue`
+        /// Queue id of the staged drift, from kj drift queue.
         queue_id: String,
     },
     /// Show drift edges for a context, each with its edge UUID.
     History {
-        /// Target context (default: the current context)
+        /// Target context (default: the current context).
         ctx: Option<String>,
     },
     /// Manage post-flush drift edges.
@@ -188,10 +186,10 @@ enum DriftCommand {
 
 #[derive(Subcommand, Debug)]
 enum EdgeCommand {
-    /// Remove a post-flush drift edge by its UUID (see `kj drift history`).
+    /// Remove a post-flush drift edge by its UUID.
     #[command(alias = "remove")]
     Rm {
-        /// Drift edge UUID
+        /// Drift edge UUID.
         uuid: String,
     },
 }

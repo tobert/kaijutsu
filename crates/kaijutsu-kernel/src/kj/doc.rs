@@ -26,7 +26,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "doc",
-    about = "Manage kernel documents (storage layer)",
+    about = "Manage kernel documents",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -37,45 +37,39 @@ pub(crate) struct DocArgs {
 
 #[derive(Subcommand, Debug)]
 enum DocCommand {
-    /// List all documents. Includes the File and Symlink kinds that
-    /// `kj context list` hides. Filter with `--kind`.
+    /// List all documents. Includes file and symlink kinds. Filter with --kind.
     #[command(alias = "ls")]
     List {
-        /// Filter by kind: conversation|file|symlink
+        /// Filter by kind: conversation|file|symlink.
         #[arg(long)]
         kind: Option<String>,
     },
-    /// Render a document's block DAG as ASCII tree. Most useful for
-    /// conversation docs — non-conversation kinds typically have a
-    /// single linear chain.
+    /// Render a document's block DAG as an ASCII tree.
     Tree {
-        /// Document id (hex UUID, with or without dashes)
+        /// Document id (hex UUID).
         doc_id: String,
-        /// Maximum depth to render (omit for full tree)
+        /// Maximum depth to render (omit for full tree).
         #[arg(long = "max-depth")]
         max_depth: Option<u32>,
-        /// Show ToolCall + ToolResult as separate nodes (default: collapsed)
+        /// Show ToolCall and ToolResult as separate nodes.
         #[arg(long = "expand-tools")]
         expand_tools: bool,
     },
-    /// Create a new document. For Conversation kind, prefer
-    /// `kj context create` (which also registers contexts metadata).
-    /// Use this verb for File docs that aren't conversations.
+    /// Create a new document. For conversation kind, prefer kj context create.
     Create {
-        /// Kind: conversation|file|symlink (default: conversation)
+        /// Kind: conversation|file|symlink (default: conversation).
         #[arg(long, default_value = "conversation")]
         kind: String,
-        /// Programming language (for code documents)
+        /// Programming language (for code documents).
         #[arg(long)]
         language: Option<String>,
-        /// Explicit hex UUID to use (omit to generate)
+        /// Explicit hex UUID to use (omit to generate).
         #[arg(long)]
         id: Option<String>,
     },
-    /// Delete a document that has no context, including its blocks and history.
-    /// Requires --confirm. Contexts must be archived with `kj context archive`.
+    /// Delete a document that has no context. Requires --confirm.
     Delete {
-        /// Document id (hex UUID)
+        /// Document id (hex UUID).
         doc_id: String,
     },
 }

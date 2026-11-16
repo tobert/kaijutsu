@@ -27,50 +27,34 @@ use super::{KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug, Default)]
 #[command(name = "fork", about = "Fork the current context into a child", disable_help_subcommand = true, no_binary_name = true)]
 pub(crate) struct ForkArgs {
-    /// Label for the child
+    /// Label for the child.
     #[arg(long, short = 'n')]
     name: Option<String>,
-    /// Seed prompt; drives the child's turn
+    /// Seed prompt; drives the child's turn.
     #[arg(long)]
     prompt: Option<String>,
-    /// Preset whose fork filters select what the child copies
+    /// Preset whose fork filters select what the child copies.
     #[arg(long)]
     preset: Option<String>,
-    /// Working directory for the forked context's shell: an existing
-    /// absolute directory. Defaults to the source context's cwd, which must
-    /// still exist
+    /// Working directory for the forked context's shell. Defaults to the source context's working directory.
     #[arg(long)]
     pwd: Option<String>,
-    /// Start the child in staging state
+    /// Start the child in staging state.
     #[arg(long, visible_alias = "staging")]
     stage: bool,
-    /// Move the session to the child after forking
+    /// Move the session to the child after forking.
     #[arg(long)]
     switch: bool,
-    /// Summarize earlier work on the forking context's `distill` slot (refuses
-    /// when it has none); retain chosen instructions and the latest
-    /// complete turn.
-    /// Word guidance and input limit come from the source context's environment.
+    /// Summarize earlier work on the forking context's distill slot; retain chosen instructions and the latest complete turn.
     #[arg(long, conflicts_with_all = ["preset", "include", "exclude"])]
     compact: bool,
-    /// Include only these ranges (repeatable). A range is `[lo]:[hi]`,
-    /// half-open `[lo, hi)`, with integer, `end`, or `end-N` endpoints
-    /// (e.g. `0:5`, `end-10:`, `:`). Fails if an explicit include is excluded
-    /// by another range or the preset.
+    /// Include only these ranges (repeatable). A range is [lo]:[hi], half-open [lo, hi).
     #[arg(long)]
     include: Vec<String>,
-    /// Exclude from the fork (repeatable): a range (`10:20`, `end-3:`) or
-    /// an exact block key (`context_principal_seq`). The block must exist
-    /// in the source. Ranges use the same grammar as --include.
+    /// Exclude from the fork (repeatable): a range or an exact block key.
     #[arg(long)]
     exclude: Vec<String>,
-    /// Drop bulk from the child, comma-separated or repeated: `images`,
-    /// `thinking` (the last turn keeps its own), `tool_results`, or
-    /// `mcp:<server>` for that server's results; `none` drops nothing. Tool calls stay paired with
-    /// their results. A result over 1024 bytes keeps its shell fact lines
-    /// (`[exit 1]`, `[cwd now ...]`) or its smallest JSON fields, and one
-    /// line or a `dropped` field names the source block for `kj block read`.
-    /// The source context keeps everything.
+    /// Drop bulk from the child: images, thinking, tool_results, or mcp:<server>.
     #[arg(long, value_delimiter = ',', conflicts_with = "compact")]
     drop: Vec<String>,
 }

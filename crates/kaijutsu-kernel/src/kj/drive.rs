@@ -26,10 +26,10 @@ pub(crate) struct DriveArgs {
     /// Commit this turn's complete ABC output at this absolute track tick.
     #[arg(long, requires = "track")]
     score_at: Option<i64>,
-    /// Track for the intended score commitment; must already be armed.
+    /// Track for the intended score commitment.
     #[arg(long, requires = "score_at")]
     track: Option<String>,
-    /// Missed or invalid score output uses last-good (default) or skip.
+    /// Missed or invalid score output fallback.
     #[arg(long, requires = "score_at", value_parser = ["last-good", "skip"])]
     fallback: Option<String>,
     /// Target context to drive (label or id); defaults to the current context.
