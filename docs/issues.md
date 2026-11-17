@@ -104,7 +104,7 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 ## Council backend: what retiring mk leaves open (2026-11-08)
 
 - **Liveness during a long `call` phase.** A slow served model writing a long call can reach the runtime's 120 s idle timeout.
-- **Media.** `lfm3-omni` reads images, audio and video and writes audio; the provider sends images as objects, and nothing carries audio or video in or audio out.
+- **Media.** `lfm3-omni` reads images, audio and video and writes audio. The provider sends each media part the served model reads as an object: on 2026-11-17 an `audio/wav` asset block (`kj cas put`, then `kj block create --role asset --kind text --content-type audio/wav --content <hash>`) reached `lfm3-omni` on a generation turn, which described a 16-note clip and a 2-note clip differently. Video in is untested. Nothing carries audio out: the request sends no `output` and the reply reads none.
 - **lfm3 on tool loops.** A 1.7B model is weaker than Gemma 4 on long tool loops.
 
 ## `kj watch`: what the first build leaves open (2026-11-08)
@@ -168,6 +168,15 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
   - A leader's chat message moves the answer only when each option has a description in words, and the performer's own earlier phrases outweigh it.
   - Audio in a decision works as an audio part of a context message (0.99 "sparse", 1.00 "busy" on test clips). The same clip as `case_media` is read but changes nothing; this is the nagaya's to examine. In a generation, omni called an 82 Hz tone "high-pitched".
   - The lfm engines left zorak's served list for about a minute and came back; a player must survive that.
+- **Listening players: what is open.** `kj audio render` turns CAS notation or MIDI, or a track's last phrases, into a WAV in the CAS, and a musician with `KJ_LISTEN=<track>` gets that clip in its context before each turn (`rc/musician/tick/S10-drive.kai`). From the first live run and a kaibo review:
+  - Every tick stores a new clip and a new block, and nothing prunes them: about 250 KB a phrase at 16 kHz, so a player left running fills the CAS. Wanted: one replaced block, or a kept window.
+  - A decision turn with a clip in its context took 18 to 25 s on `lfm3-omni`, against 4 s without. Each of the 16 decisions reads the audio again. The lead adapts and phrases commit, with repeats between them.
+  - A dormant or misspelled track is one failure: the tick drives, then ends with status 1 and an error block every phrase. After a restart every track is dormant until attached.
+  - The render reads the whole score context and loads the soundfont file on every call, on the dispatch task; only synthesis runs on the blocking pool.
+  - Cells are placed with the track's current beat period, so a tempo change misplaces earlier phrases in a clip.
+  - A rate under 16 kHz is made by averaging sample pairs with no filter. `--phrases` has no upper bound before the offset arithmetic.
+  - The render uses its own soundfont (`~/.local/share/kaijutsu/models/soundfont/default.sf2`); the speakers use the audio node's synth. They can differ.
+  - The second source is not built: a clip taken from an audio node's buffer (microphone, eurorack) should feed the same step.
 - **Decision turns: what is open.** A character model with `--decide <program>` on a council backend builds its reply from `choice` decisions (`llm/council/decide.rs`; the shipped program is `rc/musician/programs/bass-bars.json`). From the kaibo review of the first build:
   - The whole turn runs inside `provider.stream`, before the runtime's request and idle deadlines start, so only the council client's per-call timeout bounds it, and a transient failure runs every decision again. The request sends no `timeout_ms`.
   - A slot that fails loses the usage of the decisions before it; the done event reports the largest prompt and not the spend of all decisions.

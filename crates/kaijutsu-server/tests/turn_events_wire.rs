@@ -1216,6 +1216,124 @@ fn a_slow_performer_gets_a_later_target_and_no_second_open_phrase() {
     });
 }
 
+/// `KJ_LISTEN` names a track whose last phrase the tick renders and places in
+/// the context before it drives. A track with nothing committed in that phrase
+/// is skipped quietly and the drive still runs; an unknown track is reported
+/// as a failed script after the drive is admitted; unset changes nothing. The rendering branch needs a
+/// SoundFont: set KAIJUTSU_TEST_SOUNDFONT and run with XDG_DATA_HOME pointing
+/// at a scratch directory, which receives a `default.sf2` link to it.
+#[test]
+fn kj_listen_renders_the_last_phrase_skips_a_silent_track_and_reports_an_unknown_one() {
+    run_local(async {
+        use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider}};
+        use kaijutsu_server::beat::BeatScheduler;
+        use kaijutsu_types::TrackId;
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "listening-player").await.unwrap();
+        let performer = PrincipalId::new();
+        assign_turn_identity(&server, context, performer);
+        kj.join_context(context, "listening-player").await.unwrap();
+        let (callback, mut events) = turn_events_channel(64);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n"))));
+        let track = TrackId::new("listen-score").unwrap();
+        let mut scheduler = BeatScheduler::new(server.kernel.clone(), server.documents.clone());
+        let mut attachment = Attachment::musician_default();
+        attachment.ooda_armed = false;
+        scheduler.attach(track.clone(), context, attachment, BeatPolicy {
+            period: Duration::from_secs(1), beats_per_phrase: 4,
+        }).unwrap();
+        let timeline = server.kernel.track_timeline(&track).unwrap();
+        let base = tokio::time::Instant::now();
+        scheduler.play(&track, base);
+        common::perform_with_rc_dir(&server, context, "musician");
+        // The track to listen to lives in the server's own scheduler, where the
+        // kernel reaches live track state; the driven track above is this
+        // test's private scheduler.
+        let heard = create_context(&kj, "heard-player").await.unwrap();
+        let attached = kj.execute_kj_quiet(heard, &["transport".into(), "attach".into(), "--track".into(), "heard-band".into()]).await.unwrap();
+        assert_eq!(attached.exit_code, 0, "{}", attached.stderr);
+        let heard_score = server.kernel_db.lock().get_track("heard-band").unwrap().unwrap().score_context_id.unwrap();
+        let mut beat = 0u64;
+        let assets = |server: &kaijutsu_server::SharedKernel| server.documents.block_snapshots(context).unwrap()
+            .into_iter().filter(|b| b.role == Role::Asset).collect::<Vec<_>>();
+        let errors = |server: &kaijutsu_server::SharedKernel| server.documents.block_snapshots(context).unwrap()
+            .into_iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content).collect::<Vec<_>>();
+
+        // Nothing committed on the listened track: skip quietly, still drive.
+        server.kernel_db.lock().set_context_env(context, "KJ_LISTEN", "heard-band").unwrap();
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        run_shipped_tick(&server, &scheduler, context, performer).await;
+        assert_eq!(timeline.lock().future_len(), 1, "the drive still runs: {:?}", errors(&server));
+        assert!(assets(&server).is_empty(), "no clip when nothing was committed");
+        assert!(errors(&server).is_empty(), "a silent track is not an error: {:?}", errors(&server));
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        drop(held);
+        recv_turn_event(&mut events, context).await;
+
+        // Unset: the same drive, no listening.
+        server.kernel_db.lock().set_context_env(context, "KJ_LISTEN", "").unwrap();
+        let held = session.lock().await;
+        run_shipped_tick(&server, &scheduler, context, performer).await;
+        assert!(timeline.lock().future_len() >= 1, "the drive runs (plus any repeats): {:?}", errors(&server));
+        assert!(assets(&server).is_empty(), "unset KJ_LISTEN places no clip");
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        drop(held);
+        recv_turn_event(&mut events, context).await;
+
+        // An unknown track does not stop the phrase: the drive is admitted,
+        // and the script then fails with the cause.
+        server.kernel_db.lock().set_context_env(context, "KJ_LISTEN", "ghost").unwrap();
+        let held = session.lock().await;
+        run_shipped_tick(&server, &scheduler, context, performer).await;
+        assert!(errors(&server).iter().any(|e| e.contains("ghost")), "{:?}", errors(&server));
+        assert!(timeline.lock().future_len() >= 1, "the drive still runs: {:?}", errors(&server));
+        assert!(assets(&server).is_empty());
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        drop(held);
+        recv_turn_event(&mut events, context).await;
+
+        // A committed phrase in the window is rendered and placed as audio. The
+        // heard track's playhead is 0, so tick -2 lies in its last phrase.
+        let (Ok(font), Ok(xdg)) = (std::env::var("KAIJUTSU_TEST_SOUNDFONT"), std::env::var("XDG_DATA_HOME")) else {
+            eprintln!("skipped rendering branch: set KAIJUTSU_TEST_SOUNDFONT and XDG_DATA_HOME");
+            return;
+        };
+        let font_dir = std::path::Path::new(&xdg).join("kaijutsu/models/soundfont");
+        std::fs::create_dir_all(&font_dir).unwrap();
+        let link = font_dir.join("default.sf2");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&font, &link).unwrap();
+        server.kernel_db.lock().set_context_env(context, "KJ_LISTEN", "heard-band").unwrap();
+        let mut cell = kaijutsu_types::BlockSnapshotBuilder::new(
+            kaijutsu_types::BlockId::new(heard_score, PrincipalId::new(), 1), BlockKind::Text,
+        ).role(Role::Model).content("X:1\nQ:1/4=120\nK:C\nCDEF|\n").content_type(kaijutsu_types::ContentType::Abc)
+            .tick(kaijutsu_types::Tick::new(-2)).track(TrackId::new("heard-band").unwrap()).build();
+        cell.id = kaijutsu_types::BlockId::new(heard_score, PrincipalId::new(), 1);
+        server.documents.insert_from_snapshot(heard_score, cell, None).unwrap();
+        let held = session.lock().await;
+        run_shipped_tick(&server, &scheduler, context, performer).await;
+        let clips = assets(&server);
+        assert_eq!(clips.len(), 1, "one clip placed: {:?}", errors(&server));
+        let hash: kaijutsu_cas::ContentHash = clips[0].content.parse().expect("the block holds the clip hash");
+        let reference = kaijutsu_cas::ContentStore::inspect(server.kernel.cas().as_ref(), &hash).unwrap().expect("clip in CAS");
+        assert_eq!(reference.mime_type, "audio/wav");
+        drop(held);
+    });
+}
+
 /// `KJ_UNCOVERED=silence` leaves the phrases before a slow performer's target
 /// silent: no repeat is placed. A value other than `repeat` or `silence` fails
 /// the tick script loudly, naming both, even while work is open.

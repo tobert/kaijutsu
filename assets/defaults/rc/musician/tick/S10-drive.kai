@@ -10,6 +10,14 @@
 # performer's last phrase there; `silence` places nothing. Any other value
 # fails this script, even while work is open.
 #
+# KJ_LISTEN, from the context env, names a track to listen to. When set, the
+# tick renders that track's last phrase with `kj audio render` and appends the
+# clip to this context as an audio block before it drives, so a model that
+# reads audio hears what the track just played. A track that committed nothing
+# in that phrase is skipped quietly. Any other render failure does not stop the
+# phrase: the tick still drives, then ends with status 1 and the cause, so the
+# player keeps playing and the failure is on record. Unset, nothing changes.
+#
 # One phrase is open at a time. While this performer still has unsettled work
 # on the track (KJ_OPEN_WORK above 0), the tick admits nothing and ends with
 # status 0. A repeat is not open work.
@@ -32,6 +40,22 @@ if [[ "$KJ_OPEN_WORK" -gt 0 ]]; then
   echo "tick: $KJ_OPEN_WORK phrase(s) still open on $KJ_TRACK; no new turn"
   exit 0
 fi
+listen_failed=""
+if [[ -n "$KJ_LISTEN" ]]; then
+  heard="$(kj audio render --track "$KJ_LISTEN" --phrases 1 --json 2>&1 || true)"
+  case "$heard" in
+    *"committed nothing"*)
+      echo "tick: nothing committed on $KJ_LISTEN in the last phrase; not listening"
+      ;;
+    *'"hash"'*)
+      clip="$(echo "$heard" | jq -r '.hash')"
+      kj block create --role asset --kind text --content-type audio/wav --content "$clip"
+      ;;
+    *)
+      listen_failed="$heard"
+      ;;
+  esac
+fi
 bars=$(( KJ_PHRASE_BEATS / 4 ))
 phrases=$(( KJ_LEAD_BEATS / KJ_PHRASE_BEATS + 1 ))
 target=$(( KJ_TICK + phrases * KJ_PHRASE_BEATS ))
@@ -40,4 +64,8 @@ if [[ "$uncovered" = "repeat" ]] && [[ "$phrases" -gt 1 ]]; then
   for i in $(seq 1 $(( phrases - 1 ))); do
     kj transport repeat --track "$KJ_TRACK" --at "$(( KJ_TICK + i * KJ_PHRASE_BEATS ))"
   done
+fi
+if [[ -n "$listen_failed" ]]; then
+  echo "tick: drove without listening; kj audio render --track $KJ_LISTEN failed: $listen_failed"
+  exit 1
 fi
