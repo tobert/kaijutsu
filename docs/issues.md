@@ -170,7 +170,7 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
   - The lfm engines left zorak's served list for about a minute and came back; a player must survive that.
 - **Listening players: what is open.** `kj audio render` turns CAS notation or MIDI, or a track's last phrases, into a WAV in the CAS, and a musician with `KJ_LISTEN=<track>` gets that clip in its context before each turn (`rc/musician/tick/S10-drive.kai`). From the first live run and a kaibo review:
   - Every tick stores a new clip and a new block, and nothing prunes them: about 250 KB a phrase at 16 kHz, so a player left running fills the CAS. Wanted: one replaced block, or a kept window.
-  - A decision turn with a clip in its context took 18 to 25 s on `lfm3-omni`, against 4 s without. Each of the 16 decisions reads the audio again. The lead adapts and phrases commit, with repeats between them.
+  - A decision turn with clips in its context took 18 to 32 s on `lfm3-omni`, against 4 s without, and it grows as the kept history holds more clips. Each of the 16 decisions reads the audio again. The lead adapts and phrases commit, with repeats between them; one committed with no margin left.
   - A dormant or misspelled track is one failure: the tick drives, then ends with status 1 and an error block every phrase. After a restart every track is dormant until attached.
   - The render reads the whole score context and loads the soundfont file on every call, on the dispatch task; only synthesis runs on the blocking pool.
   - Cells are placed with the track's current beat period, so a tempo change misplaces earlier phrases in a clip.
