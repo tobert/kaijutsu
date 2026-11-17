@@ -369,6 +369,7 @@ pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<Con
                     effort: slot.effort.clone(),
                     thinking_budget: non_negative(slot.thinking_budget),
                     thinking_style: slot.thinking_style.clone(),
+                    decide: slot.decide.clone(),
                 },
             }))
         }

@@ -81,6 +81,10 @@ pub struct CharacterModelRow {
     pub effort: Option<String>,
     pub thinking_budget: Option<i64>,
     pub thinking_style: Option<String>,
+    /// A VFS path to a decision program. A turn on a council backend then
+    /// assembles its reply from council decisions. Only a character's model
+    /// has one; a backend's model row and the character's other slots do not.
+    pub decide: Option<String>,
 }
 
 pub(super) const CHARACTER_SLOT_COLS: &str = "principal_id, role, backend_id, model, max_tokens, temperature, \
@@ -102,7 +106,7 @@ pub(super) fn row_to_character_slot(row: &rusqlite::Row<'_>) -> SqliteResult<Cha
 }
 
 pub(super) const CHARACTER_MODEL_COLS: &str = "principal_id, backend_id, model, max_tokens, temperature, \
-                                    top_p, effort, thinking_budget, thinking_style";
+                                    top_p, effort, thinking_budget, thinking_style, decide";
 
 pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterModelRow> {
     Ok(CharacterModelRow {
@@ -115,7 +119,19 @@ pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<Ch
         effort: row.get(6)?,
         thinking_budget: row.get(7)?,
         thinking_style: row.get(8)?,
+        decide: row.get(9)?,
     })
+}
+
+/// A decision program is named by an absolute VFS path.
+fn validate_decide(decide: Option<&str>) -> KernelDbResult<()> {
+    match decide {
+        Some(path) if !path.starts_with('/') => Err(KernelDbError::Validation(format!(
+            "decide must be an absolute VFS path to a decision program, such as \
+             /config/rc/musician/programs/bass-bars.json (got {path:?})"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 impl KernelDb {
@@ -228,10 +244,11 @@ impl KernelDb {
             row.thinking_budget,
             row.thinking_style.as_deref(),
         )?;
+        validate_decide(row.decide.as_deref())?;
         self.conn.execute(
             &format!(
                 "INSERT INTO character_models ({CHARACTER_MODEL_COLS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(principal_id) DO UPDATE SET
                      backend_id = excluded.backend_id,
                      model = excluded.model,
@@ -240,7 +257,8 @@ impl KernelDb {
                      top_p = excluded.top_p,
                      effort = excluded.effort,
                      thinking_budget = excluded.thinking_budget,
-                     thinking_style = excluded.thinking_style"
+                     thinking_style = excluded.thinking_style,
+                     decide = excluded.decide"
             ),
             params![
                 blob_param(row.principal_id.as_bytes()),
@@ -252,6 +270,7 @@ impl KernelDb {
                 row.effort,
                 row.thinking_budget,
                 row.thinking_style,
+                row.decide,
             ],
         )?;
         Ok(())

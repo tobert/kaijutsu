@@ -40,6 +40,25 @@ impl Client {
     /// model that is not ready. The flag says whether the server holds
     /// objects.
     pub(super) async fn served_model(&self, turn: &Turn, model: &str) -> LlmResult<(ServedModel, bool)> {
+        let identity = self.read_identity(turn).await?;
+        let served = served(&self.name, &identity, model, Capability::Generate)?;
+        if !served.has(Capability::Generate) {
+            return Err(LlmError::InvalidRequest(format!(
+                "council backend '{}': served model {} does not list generate, so it cannot take turns; \
+                 the server serves {}. Name a model that lists generate",
+                self.name,
+                served.model,
+                served_list(&identity, Capability::Generate)
+            )));
+        }
+        Ok((served.clone(), identity.has(Capability::Objects)))
+    }
+
+    /// The server's council v2 identity: the cached one, or one read when
+    /// none is cached or the cached one is older than `identity_max_age`. A
+    /// server without council v2 answers the identity with 404, 405, or 501,
+    /// and is refused as one.
+    pub(super) async fn read_identity(&self, turn: &Turn) -> LlmResult<ServerIdentity> {
         let cell = {
             let mut cached = self.identity.lock();
             if cached.get().is_some_and(|(_, read)| read.elapsed() >= self.identity_max_age) {
@@ -63,17 +82,7 @@ impl Client {
                 Ok::<_, LlmError>((identity, tokio::time::Instant::now()))
             })
             .await?;
-        let served = served(&self.name, identity, model)?;
-        if !served.has(Capability::Generate) {
-            return Err(LlmError::InvalidRequest(format!(
-                "council backend '{}': served model {} does not list generate, so it cannot take turns; \
-                 the server serves {}. Name a model that lists generate",
-                self.name,
-                served.model,
-                served_list(identity)
-            )));
-        }
-        Ok((served.clone(), identity.has(Capability::Objects)))
+        Ok(identity.clone())
     }
 
     /// Drops the cached council v2 identity, so the next turn reads it
@@ -161,7 +170,7 @@ impl Client {
     /// media type; the server is asked whether it holds the object, and it is
     /// put when it does not. Any other part gets the reason it is left out.
     /// A failed put fails the turn.
-    async fn place_media(&self, turn: &Turn, history: &[Message], model: &ServedModel, holds_objects: bool) -> LlmResult<build::Objects> {
+    pub(super) async fn place_media(&self, turn: &Turn, history: &[Message], model: &ServedModel, holds_objects: bool) -> LlmResult<build::Objects> {
         use base64::Engine as _;
         let mut placed = build::Objects::new();
         for (hash, mime, data) in media(history) {
@@ -228,7 +237,7 @@ fn media(history: &[Message]) -> impl Iterator<Item = (&str, &str, Option<&str>)
 
 /// A control list needs a served model that declares `control_vectors`; one
 /// that does not is refused the list, not sent the turn without it.
-fn check_controls(name: &str, controls: &[Control], model: &ServedModel) -> LlmResult<()> {
+pub(super) fn check_controls(name: &str, controls: &[Control], model: &ServedModel) -> LlmResult<()> {
     if controls.is_empty() || model.has(Capability::ControlVectors) {
         return Ok(());
     }
@@ -265,22 +274,23 @@ fn wants_thinking(name: &str, effort: Option<&str>, model: &ServedModel) -> LlmR
 }
 
 /// The served model `model` names, by its `model` or an alias.
-fn served<'a>(name: &str, identity: &'a ServerIdentity, model: &str) -> LlmResult<&'a ServedModel> {
+pub(super) fn served<'a>(name: &str, identity: &'a ServerIdentity, model: &str, capability: Capability) -> LlmResult<&'a ServedModel> {
     identity.models.iter().find(|m| m.is_named(model)).ok_or_else(|| {
         LlmError::InvalidRequest(format!(
             "council backend '{name}': the council server serves no model named {model:?}; it serves {}. \
              Name one of them, or an alias, as the model",
-            served_list(identity)
+            served_list(identity, capability)
         ))
     })
 }
 
-/// The served models, each marked with whether it lists `generate`.
-fn served_list(identity: &ServerIdentity) -> String {
+/// The served models, each marked with whether it lists `capability`.
+pub(super) fn served_list(identity: &ServerIdentity, capability: Capability) -> String {
+    let word = serde_json::to_value(capability).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| format!("{capability:?}"));
     identity
         .models
         .iter()
-        .map(|m| format!("{} {} generate", m.model, if m.has(Capability::Generate) { "with" } else { "without" }))
+        .map(|m| format!("{} {} {word}", m.model, if m.has(capability) { "with" } else { "without" }))
         .collect::<Vec<_>>()
         .join(", ")
 }

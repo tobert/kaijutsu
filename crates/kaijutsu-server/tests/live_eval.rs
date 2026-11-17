@@ -380,6 +380,7 @@ fn write_haiku_defaults(state_dir: &std::path::Path) {
         effort: None,
         thinking_budget: None,
         thinking_style: None,
+        decide: None,
     })
     .expect("give the performer the haiku model");
 }

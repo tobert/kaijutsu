@@ -162,6 +162,22 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Endpoint cooldown & stop behavior.** Unloaded models trigger endpoint-wide cooldowns; stopped tracks leave admitted turns retrying until interrupted.
 - **Model pacing & thinking.** Thinking models struggle with tight phrase deadlines (`--effort none` vs `--thinking-style off`); output bounds need strict enforcement.
 - **Audio sink and track management.** Sinks share context tags and flush states; transport deletion and track naming need CLI refinements.
+- **lfm3 players: decisions, not free ABC (2026-11-17).** Measured against zorak's nagaya, outside the kernel. A free ABC turn on `lfm3` or `lfm3-omni` ends cleanly in about 1 s when thinking is off and earlier phrases are assistant messages, but only about 10% of the phrases have 4 bars of the right length; an open last message (the contract's continuation) fixes the header and nothing else. A per-bar `choice` decision on `lfm3-omni` over a 12-bar menu takes 0.12 s a read and is valid by construction. Open:
+  - Option order sways the answer (`lfm3` mostly picks the first option listed), so each question is read under several orderings and pooled. A server-side option for this would cut the round trips.
+  - The chooser repeats itself: one bar everywhere without constraints, one phrase over and over with them. The menu needs more than 12 bars, or separate rhythm and contour questions.
+  - A leader's chat message moves the answer only when each option has a description in words, and the performer's own earlier phrases outweigh it.
+  - Audio in a decision works as an audio part of a context message (0.99 "sparse", 1.00 "busy" on test clips). The same clip as `case_media` is read but changes nothing; this is the nagaya's to examine. In a generation, omni called an 82 Hz tone "high-pitched".
+  - The lfm engines left zorak's served list for about a minute and came back; a player must survive that.
+- **Decision turns: what is open.** A character model with `--decide <program>` on a council backend builds its reply from `choice` decisions (`llm/council/decide.rs`; the shipped program is `rc/musician/programs/bass-bars.json`). From the kaibo review of the first build:
+  - The whole turn runs inside `provider.stream`, before the runtime's request and idle deadlines start, so only the council client's per-call timeout bounds it, and a transient failure runs every decision again. The request sends no `timeout_ms`.
+  - A slot that fails loses the usage of the decisions before it; the done event reports the largest prompt and not the spend of all decisions.
+  - A council `model` slot with no `max_tokens` is refused at turn time, though a decision turn samples no tokens. Set `--max-tokens` on the character for now.
+  - Any 404 from a decision is read as a spec the server lost; a server with no decisions route gets a spec post per decision before the turn fails.
+  - A decision turn writes no `llm request` line and no request dump.
+  - `Provider::one_shot_opts` returns early for a slot with an effort or thinking style, before the council client clears `decide`. No one-shot carries a program today.
+  - `Reply::whole` trims white space at the edges of the program's reply, and a cancelled decision stream yields no cancel-confirm `Done`.
+  - With fewer distinct orderings than `shuffle`, orderings repeat and the pool is uneven (a 2-option slot with `shuffle` above 2).
+  - The turn refuses a served model without `reads`; the gate decides without that check. The contract should settle which is right.
 
 ---
 

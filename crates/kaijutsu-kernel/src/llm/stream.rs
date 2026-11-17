@@ -357,6 +357,14 @@ pub struct BuildOpts {
     /// `claude::build::resolve_thinking`). Validated on Claude and Alibaba,
     /// where `"off"` turns thinking off; ignored elsewhere.
     pub thinking_style: Option<String>,
+    /// VFS path of a decision program. Only a `council` backend takes it: its
+    /// turn is then assembled from council decisions, with no tokens sampled
+    /// by the server. Every other provider refuses a turn that has one rather
+    /// than ignore it.
+    pub decide: Option<String>,
+    /// The mount table a `decide` path is read through. A turn with `decide`
+    /// and no mount table is refused.
+    pub vfs: Option<std::sync::Arc<crate::vfs::MountTable>>,
     pub tools: Vec<ToolDefinition>,
     /// Cache breakpoint policy for Claude and Alibaba prompt caching.
     /// Empty = no `cache_control` applied. See [`CacheTarget`].
@@ -386,6 +394,8 @@ impl BuildOpts {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
+            decide: None,
+            vfs: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
             controls: Vec::new(),
@@ -433,6 +443,16 @@ impl BuildOpts {
         self
     }
 
+    pub fn with_decide(mut self, decide: impl Into<String>) -> Self {
+        self.decide = Some(decide.into());
+        self
+    }
+
+    pub fn with_vfs(mut self, vfs: std::sync::Arc<crate::vfs::MountTable>) -> Self {
+        self.vfs = Some(vfs);
+        self
+    }
+
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = tools;
         self
@@ -458,6 +478,7 @@ pub fn apply_tunables(mut opts: BuildOpts, tunables: &SlotTunables) -> BuildOpts
     opts.effort = tunables.effort.clone();
     opts.thinking_budget = tunables.thinking_budget;
     opts.thinking_style = tunables.thinking_style.clone();
+    opts.decide = tunables.decide.clone();
     opts
 }
 
@@ -797,6 +818,7 @@ mod tests {
                 effort: Some("low".into()),
                 thinking_budget: Some(1000),
                 thinking_style: Some("auto".into()),
+                decide: None,
             }
         }
 

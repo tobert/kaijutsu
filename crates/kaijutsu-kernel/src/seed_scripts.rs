@@ -54,8 +54,8 @@
 use include_dir::{include_dir, Dir, DirEntry};
 
 /// The embedded `/config/rc` seed tree — a 1:1 mirror of `assets/defaults/rc/`,
-/// embedded at build time. This is the manifest: every `.kai`/`.md` file
-/// under it is a seed, keyed by its path.
+/// embedded at build time. This is the manifest: every `.kai`, `.md`, or
+/// `.json` file under it is a seed, keyed by its path.
 static RC_SEED_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../assets/defaults/rc");
 
 /// The VFS root every rc canonical path lives under. Re-exported from
@@ -73,7 +73,7 @@ fn rc_relpath(canonical: &str) -> Option<&str> {
     canonical.strip_prefix(RC_VFS_ROOT)?.strip_prefix('/')
 }
 
-/// Recursively collect every embedded `.kai`/`.md` seed file as
+/// Recursively collect every embedded `.kai`, `.md`, or `.json` seed file as
 /// `(canonical /config/rc path, body)`.
 fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str)>) {
     for entry in dir.entries() {
@@ -84,7 +84,7 @@ fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str
                     Some(r) => r,
                     None => continue, // non-UTF-8 path: not a canonical rc file
                 };
-                if !(rel.ends_with(".kai") || rel.ends_with(".md")) {
+                if !(rel.ends_with(".kai") || rel.ends_with(".md") || rel.ends_with(".json")) {
                     continue;
                 }
                 let body = file
@@ -1063,9 +1063,9 @@ mod tests {
         ] {
             assert!(paths.contains(&expected.to_string()), "missing seed: {expected}");
         }
-        // Only .kai/.md are seeds — no stray extensions leak in.
+        // Only .kai/.md/.json are seeds — no stray extensions leak in.
         assert!(
-            paths.iter().all(|p| p.ends_with(".kai") || p.ends_with(".md")),
+            paths.iter().all(|p| p.ends_with(".kai") || p.ends_with(".md") || p.ends_with(".json")),
             "non-script file embedded as a seed: {paths:?}"
         );
     }

@@ -70,6 +70,7 @@ pub fn load_backends(db: &KernelDb) -> LlmResult<Vec<BackendConfig>> {
                         effort: m.tunables.effort,
                         thinking_budget: m.tunables.thinking_budget.and_then(|v| u64::try_from(v).ok()),
                         thinking_style: m.tunables.thinking_style,
+                        decide: None,
                     },
                 },
             );

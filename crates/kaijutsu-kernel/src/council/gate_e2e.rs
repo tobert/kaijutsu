@@ -632,6 +632,7 @@ fn bind_seat(
             effort: None,
             thinking_budget: None,
             thinking_style: None,
+            decide: None,
         })
         .unwrap();
     }
@@ -657,6 +658,7 @@ fn bind_judge(db: &crate::kernel_db::KernelDb, gate_server: &str, spec: &SlotSpe
         effort: None,
         thinking_budget: None,
         thinking_style: None,
+        decide: None,
     })
     .unwrap();
     judge

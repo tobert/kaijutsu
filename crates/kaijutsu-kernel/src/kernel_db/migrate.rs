@@ -121,6 +121,8 @@ impl KernelDb {
             "ALTER TABLE backend_models ADD COLUMN thinking_budget INTEGER \
                  CHECK (thinking_budget IS NULL OR thinking_budget > 0)",
             "ALTER TABLE backend_models ADD COLUMN thinking_style TEXT",
+            "ALTER TABLE character_models ADD COLUMN decide TEXT CHECK (decide IS NULL OR decide != '')",
+            "ALTER TABLE context_slots ADD COLUMN decide TEXT CHECK (decide IS NULL OR decide != '')",
         ];
         for sql in alters {
             match conn.execute(sql, []) {

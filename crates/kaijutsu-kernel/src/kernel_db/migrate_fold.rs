@@ -18,16 +18,27 @@ CREATE TABLE context_slots_fold (
     effort          TEXT,
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
+    decide          TEXT CHECK (decide IS NULL OR decide != ''),
     PRIMARY KEY (context_id, role)
 );
+";
+
+/// Copies the rows of the old `context_slots` into [`CONTEXT_SLOTS_FOLDED`]
+/// and swaps it in. `decide` is copied when the old table has it.
+fn fold_context_slots_sql(old_has_decide: bool) -> String {
+    let decide = if old_has_decide { "decide" } else { "NULL" };
+    format!(
+        "{CONTEXT_SLOTS_FOLDED}
 INSERT INTO context_slots_fold
     (context_id, role, backend_id, model, max_tokens, context_window, temperature, top_p, effort,
-     thinking_budget, thinking_style)
+     thinking_budget, thinking_style, decide)
 SELECT context_id, role, backend_id, model, max_tokens, context_window, temperature, top_p, effort,
-       thinking_budget, thinking_style FROM context_slots;
+       thinking_budget, thinking_style, {decide} FROM context_slots;
 DROP TABLE context_slots;
 ALTER TABLE context_slots_fold RENAME TO context_slots;
-";
+"
+    )
+}
 
 /// A context as the fold reads it.
 struct FoldCtx {
@@ -237,7 +248,8 @@ impl KernelDb {
             |r| r.get(0),
         )?;
         if slots_reference_old_table {
-            tx.execute_batch(CONTEXT_SLOTS_FOLDED)?;
+            let old_has_decide = Self::has_column(&tx, "context_slots", "decide")?;
+            tx.execute_batch(&fold_context_slots_sql(old_has_decide))?;
         }
         tx.execute("DROP TABLE context_characters", [])?;
         {

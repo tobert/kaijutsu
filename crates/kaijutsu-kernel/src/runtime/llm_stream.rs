@@ -3088,7 +3088,8 @@ async fn run_llm_stream(
                 .with_system(&system_prompt)
                 .with_tools(tools.clone())
                 .with_cache_breakpoints(cache_breakpoints)
-                .with_controls(controls),
+                .with_controls(controls)
+                .with_vfs(kernel.vfs().clone()),
             &tunables,
         );
 

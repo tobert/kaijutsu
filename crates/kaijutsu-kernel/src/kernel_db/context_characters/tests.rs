@@ -215,6 +215,7 @@ impl World {
                     effort: slot.effort.clone(),
                     thinking_budget: slot.thinking_budget,
                     thinking_style: slot.thinking_style.clone(),
+                    decide: None,
                 })
                 .unwrap();
         }
@@ -436,6 +437,7 @@ impl World {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
+            decide: None,
         };
         self.db.set_character_model(&row).unwrap();
         row
@@ -472,6 +474,48 @@ fn a_character_model_fills_model_and_distill() {
         assert_eq!(slot.temperature, Some(0.3), "{role}: the character's own value wins");
         assert_eq!(slot.context_window, Some(64_000), "{role}");
     }
+}
+
+/// A character model's decision program reaches its context's `model` slot,
+/// and from there the request options of the turn. The `distill` copy runs
+/// one-shot prompts and has none.
+///
+/// Falsified by a copy that drops the program, or one that gives it to `distill`.
+#[test]
+fn a_character_models_decision_program_reaches_the_model_slot_and_the_turn() {
+    let w = world();
+    w.house();
+    let who = w.character("decider");
+    let mut row = w.give_model(who, w.nagaya, "gemma", Some(1024));
+    row.decide = Some("/config/rc/musician/programs/bass-bars.json".into());
+    w.db.set_character_model(&row).unwrap();
+    let conv = w.ctx("conv", "coder", None, None);
+
+    w.db.write_context_character(conv.context_id, who, None, None).unwrap();
+
+    let model = w.db.context_slot(conv.context_id, "model").unwrap().unwrap();
+    assert_eq!(model.decide.as_deref(), Some("/config/rc/musician/programs/bass-bars.json"));
+    let distill = w.db.context_slot(conv.context_id, "distill").unwrap().unwrap();
+    assert_eq!(distill.decide, None, "a one-shot takes no decision program");
+    let crate::model_resolution::ContextModelLookup::Model(bound) =
+        crate::model_resolution::context_model(&w.db, conv.context_id).unwrap()
+    else {
+        panic!("the context has a model");
+    };
+    let opts = crate::llm::apply_tunables(crate::llm::BuildOpts::new(&bound.model, bound.max_tokens), &bound.tunables);
+    assert_eq!(opts.decide.as_deref(), Some("/config/rc/musician/programs/bass-bars.json"));
+}
+
+/// A decision program is an absolute VFS path.
+#[test]
+fn a_character_model_refuses_a_relative_decision_program() {
+    let w = world();
+    w.house();
+    let who = w.character("relative");
+    let mut row = w.give_model(who, w.nagaya, "gemma", Some(1024));
+    row.decide = Some("programs/bass-bars.json".into());
+    let error = w.db.set_character_model(&row).unwrap_err().to_string();
+    assert!(error.contains("absolute VFS path") && error.contains("programs/bass-bars.json"), "{error}");
 }
 
 /// A `distill` slot wins over the model for distillation; the model still
@@ -621,6 +665,7 @@ fn a_root_character_refuses_a_model() {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
+            decide: None,
         })
         .unwrap_err()
         .to_string();

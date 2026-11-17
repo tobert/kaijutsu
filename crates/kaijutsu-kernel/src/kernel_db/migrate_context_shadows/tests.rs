@@ -99,6 +99,7 @@ fn the_older_migration_still_runs_on_an_old_database() {
         db.set_character_model(&CharacterModelRow {
             principal_id: judge, backend_id: backend, model: "m".into(), max_tokens: Some(512), temperature: None,
             top_p: None, effort: None, thinking_budget: None, thinking_style: None,
+            decide: None,
         })
         .unwrap();
         let mut told = make_context_row(Some("judge-told"));

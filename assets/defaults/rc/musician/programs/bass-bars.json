@@ -1,0 +1,31 @@
+{
+  "instructions": "You are the bass player in a tune in E minor, 4/4. Choose the next bar of the bass line. The bar should follow what has been played, leave room for the other players, and the last bar should close the phrase.",
+  "input_label": "The phrase so far",
+  "question": "The bar to play next.",
+  "prefix": "X:1\nM:4/4\nL:1/8\nK:Em\n",
+  "join": " | ",
+  "suffix": " |]",
+  "shuffle": 4,
+  "history_messages": 8,
+  "no_repeat": true,
+  "options": {
+    "p0": {"means": "root pulse, walk up to A", "text": "E,,2 E,,E,, G,,2 A,,2"},
+    "p1": {"means": "fifth pulse, walk down", "text": "B,,2 B,,B,, A,,2 G,,2"},
+    "p2": {"means": "climb root to seventh", "text": "E,,2 G,,A,, B,,2 D,2"},
+    "p3": {"means": "descend from the octave", "text": "E,2 D,B,, A,,2 G,,2"},
+    "p4": {"means": "held root, then rest", "text": "E,,4 z4"},
+    "p5": {"means": "held octave, then rest", "text": "E,4 z4"},
+    "p6": {"means": "driving eighths on the root", "text": "E,,E,,E,,E,, E,,E,,E,,E,,"},
+    "p7": {"means": "syncopated root, push to third", "text": "E,,3 E,, z2 G,,2"},
+    "p8": {"means": "fourth to fifth, building", "text": "A,,2 A,,A,, B,,2 B,,2"},
+    "p9": {"means": "quarter-note walk up", "text": "G,,2 A,,2 B,,2 D,2"},
+    "p10": {"means": "offbeat root, lots of space", "text": "z2 E,,2 z2 E,,2"},
+    "p11": {"means": "fall to a held root", "text": "B,,2 A,,G,, E,,4"}
+  },
+  "slots": [
+    {"case": "Bar 1 of 4.", "options": ["p0", "p2", "p6", "p7", "p10"]},
+    {"case": "Bar 2 of 4.", "options": ["p0", "p1", "p2", "p3", "p6", "p7", "p8", "p9", "p10"]},
+    {"case": "Bar 3 of 4.", "options": ["p0", "p1", "p2", "p3", "p6", "p7", "p8", "p9", "p10"]},
+    {"case": "Bar 4 of 4, the last bar.", "options": ["p4", "p5", "p11"]}
+  ]
+}

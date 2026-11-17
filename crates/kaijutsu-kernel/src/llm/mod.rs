@@ -1269,6 +1269,15 @@ impl Provider {
                 opts.controls.len()
             )));
         }
+        if let Some(program) = &opts.decide
+            && !matches!(self, Self::Council(_))
+        {
+            return Err(LlmError::InvalidRequest(format!(
+                "provider '{}' cannot take a decision turn, and this model names the decision program {program}; \
+                 `kj character model set` without --decide takes ordinary turns, or give the context a council backend",
+                self.name()
+            )));
+        }
         match self {
             Self::Claude(client) => {
                 let stream = client.stream(opts, messages).await?;
@@ -1847,6 +1856,41 @@ mod tests {
 
         #[tokio::test]
         async fn an_empty_control_list_is_not_refused() {
+            let provider = Provider::Mock(MockClient::new("CANNED"));
+            provider.stream(BuildOpts::new("m", 64), vec![Message::user("hi")]).await.unwrap();
+        }
+    }
+
+    /// A decision program rides to a council backend only. Every other
+    /// provider refuses the turn before any request leaves.
+    mod decide {
+        use super::*;
+
+        /// Falsified by dropping the provider check, which lets the mock turn
+        /// run and sends the OpenAI and Claude requests to a closed port, a
+        /// connection error rather than this refusal.
+        #[tokio::test]
+        async fn a_provider_that_is_not_council_refuses_a_decision_program_before_sending() {
+            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+            let base = format!("http://{closed}");
+            let providers = [
+                Provider::OpenAi(openai::Client::new("t").with_base_url(&base)),
+                Provider::Claude(claude::Client::new("k").unwrap().with_base_url(&base)),
+                Provider::Mock(MockClient::new("CANNED")),
+            ];
+            for provider in providers {
+                let opts = BuildOpts::new("m", 64).with_decide("/config/rc/musician/programs/bass-bars.json");
+                let Err(error) = provider.stream(opts, vec![Message::user("hi")]).await else {
+                    panic!("{}: a decision program was accepted", provider.name());
+                };
+                let LlmError::InvalidRequest(text) = &error else { panic!("{error:?}") };
+                assert!(text.contains(provider.name()) && text.contains("bass-bars.json"), "{text}");
+                assert!(text.contains("council backend"), "{text}");
+            }
+        }
+
+        #[tokio::test]
+        async fn no_decision_program_is_not_refused() {
             let provider = Provider::Mock(MockClient::new("CANNED"));
             provider.stream(BuildOpts::new("m", 64), vec![Message::user("hi")]).await.unwrap();
         }

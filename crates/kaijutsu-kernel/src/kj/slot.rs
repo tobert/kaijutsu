@@ -121,6 +121,13 @@ pub(super) enum CharacterModelCommand {
         /// Extended-thinking style: budget needs --thinking-budget below max tokens
         #[arg(long = "thinking-style", value_parser = ["off", "auto", "adaptive", "budget"])]
         thinking_style: Option<String>,
+        /// Decision program: the VFS path of a JSON file, such as
+        /// `/config/rc/musician/programs/bass-bars.json`. A turn then builds
+        /// its reply from council decisions, and the server samples no
+        /// tokens. Needs a council backend. Setting the model without
+        /// `--decide` clears the program
+        #[arg(long)]
+        decide: Option<String>,
     },
     /// Remove the character's model. Role slots stay. Contexts keep the
     /// slots they copied until they are rotated.
@@ -166,6 +173,7 @@ pub(super) fn model_data(
         "effort": m.effort,
         "thinking_budget": m.thinking_budget,
         "thinking_style": m.thinking_style,
+        "decide": m.decide,
     })
 }
 
@@ -175,7 +183,10 @@ pub(super) fn model_summary(
     backends: &std::collections::HashMap<kaijutsu_types::BackendId, String>,
 ) -> String {
     let backend = backends.get(&m.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
-    let knobs = knob_list(m.max_tokens, m.temperature, m.top_p, m.effort.as_deref(), m.thinking_budget, m.thinking_style.as_deref());
+    let mut knobs = knob_list(m.max_tokens, m.temperature, m.top_p, m.effort.as_deref(), m.thinking_budget, m.thinking_style.as_deref());
+    if let Some(path) = &m.decide {
+        knobs.push(format!("decide={path}"));
+    }
     if knobs.is_empty() {
         format!("{backend}/{} (no parameters set)", m.model)
     } else {
@@ -226,6 +237,7 @@ impl KjDispatcher {
                 effort,
                 thinking_budget,
                 thinking_style,
+                decide,
             } => {
                 let (backend, model) = match split_backend_model(&model) {
                     Ok(pair) => pair,
@@ -250,6 +262,13 @@ impl KjDispatcher {
                     }
                     Err(e) => return KjResult::Err(format!("kj character model set: {e}")),
                 };
+                if decide.is_some() && !crate::model_resolution::is_council_kind(&b.kind) {
+                    return KjResult::Err(format!(
+                        "kj character model set: --decide needs a council backend, and backend '{backend}' is kind {}; \
+                         `kj backend list` names the council backends",
+                        b.kind
+                    ));
+                }
                 if let Err(e) = db.set_character_model(&CharacterModelRow {
                     principal_id: sheet.principal_id,
                     backend_id: b.backend_id,
@@ -260,6 +279,7 @@ impl KjDispatcher {
                     effort,
                     thinking_budget: thinking_budget.map(|v| v as i64),
                     thinking_style,
+                    decide,
                 }) {
                     return KjResult::Err(format!("kj character model set: {e}"));
                 }
@@ -715,6 +735,42 @@ mod tests {
         assert!(d.dispatch(&argv(&["character", "model", "unset", "house"]), &c).await.is_ok());
         let again = d.dispatch(&argv(&["character", "model", "unset", "house"]), &c).await;
         assert!(matches!(&again, KjResult::Err(m) if m.contains("has no model")), "{again:?}");
+    }
+
+    /// `model set --decide` stores the program path beside the other settings,
+    /// `show` and its summary report it, and a `model set` without `--decide`
+    /// clears it. A program needs a council backend and an absolute path.
+    ///
+    /// Falsified by a set that drops the flag, a show that omits it, or a
+    /// second set that keeps the old program.
+    #[tokio::test]
+    async fn model_set_takes_and_clears_a_decision_program() {
+        let d = seeded().await;
+        let c = test_caller();
+        let path = "/config/rc/musician/programs/bass-bars.json";
+        let set = d.dispatch(&argv(&["character", "model", "set", "house", "nagaya/gemma", "--decide", path]), &c).await;
+        assert!(set.is_ok(), "{}", set.message());
+        let shown = d.dispatch(&argv(&["character", "model", "show", "house"]), &c).await;
+        let KjResult::Ok { data: Some(v), message, .. } = &shown else { panic!("{shown:?}") };
+        assert_eq!(v["decide"], path);
+        assert!(message.contains(&format!("decide={path}")), "{message}");
+        {
+            let db = d.kernel_db().lock();
+            let house = db.get_character_by_name("house").unwrap().unwrap();
+            assert_eq!(db.get_character_model(house.principal_id).unwrap().unwrap().decide.as_deref(), Some(path));
+        }
+
+        let cleared = d.dispatch(&argv(&["character", "model", "set", "house", "nagaya/gemma"]), &c).await;
+        assert!(cleared.is_ok(), "{}", cleared.message());
+        let shown = d.dispatch(&argv(&["character", "model", "show", "house"]), &c).await;
+        let KjResult::Ok { data: Some(v), message, .. } = &shown else { panic!("{shown:?}") };
+        assert!(v["decide"].is_null(), "{v}");
+        assert!(!message.contains("decide="), "{message}");
+
+        let chat = d.dispatch(&argv(&["character", "model", "set", "house", "anthropic/claude-opus-5", "--decide", path]), &c).await;
+        assert!(matches!(&chat, KjResult::Err(m) if m.contains("--decide needs a council backend") && m.contains("anthropic")), "{chat:?}");
+        let relative = d.dispatch(&argv(&["character", "model", "set", "house", "nagaya/gemma", "--decide", "bass-bars.json"]), &c).await;
+        assert!(matches!(&relative, KjResult::Err(m) if m.contains("absolute VFS path")), "{relative:?}");
     }
 
     /// `model set` shares `slot set`'s range checks and refuses an unknown

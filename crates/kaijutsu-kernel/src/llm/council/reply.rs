@@ -122,6 +122,17 @@ impl Reply {
         self.end(&done.reasoning, &done.content, stop_reason, calls, usage)
     }
 
+    /// The events of a reply that is already whole: `text` as the answer, a
+    /// normal end of turn, and `usage` as `(prompt, completion, extra)`. The
+    /// answer is trimmed as a streamed one is.
+    pub(super) fn whole(text: &str, usage: (u64, u64, CouncilUsageExtra)) -> Result<Vec<StreamEvent>, String> {
+        let mut reply = Reply::new(false);
+        let mut out = reply.phased(CouncilPhase::Content, text);
+        let content = reply.answer.text.clone();
+        out.extend(reply.end("", &content, "end_turn", Vec::new(), usage)?);
+        Ok(out)
+    }
+
     /// Closes the open block, checks the streamed text against the reply's,
     /// then emits the calls and `Done` with `(prompt, completion, extra)`.
     fn end(

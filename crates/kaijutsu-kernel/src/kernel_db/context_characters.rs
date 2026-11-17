@@ -88,6 +88,8 @@ pub struct ContextSlotRow {
     pub effort: Option<String>,
     pub thinking_budget: Option<i64>,
     pub thinking_style: Option<String>,
+    /// The VFS path of the decision program the slot's turns follow.
+    pub decide: Option<String>,
 }
 
 /// One line of `context_character_migration_report`.
@@ -136,10 +138,18 @@ pub(super) struct SlotValues {
     pub(super) effort: Option<String>,
     pub(super) thinking_budget: Option<i64>,
     pub(super) thinking_style: Option<String>,
+    pub(super) decide: Option<String>,
 }
 
 impl SlotValues {
-    pub(super) fn new(backend_id: BackendId, model: &str, tunables: ModelTunablesRow, max_tokens: Option<i64>, context_window: Option<i64>) -> Self {
+    pub(super) fn new(
+        backend_id: BackendId,
+        model: &str,
+        tunables: ModelTunablesRow,
+        decide: Option<String>,
+        max_tokens: Option<i64>,
+        context_window: Option<i64>,
+    ) -> Self {
         Self {
             backend_id,
             model: model.to_string(),
@@ -150,6 +160,7 @@ impl SlotValues {
             effort: tunables.effort,
             thinking_budget: tunables.thinking_budget,
             thinking_style: tunables.thinking_style,
+            decide,
         }
     }
 }
@@ -157,8 +168,8 @@ impl SlotValues {
 pub(super) fn insert_slot(conn: &Connection, context_id: ContextId, role: &str, slot: &SlotValues) -> KernelDbResult<()> {
     conn.execute(
         "INSERT INTO context_slots (context_id, role, backend_id, model, max_tokens, context_window,
-                                    temperature, top_p, effort, thinking_budget, thinking_style)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                    temperature, top_p, effort, thinking_budget, thinking_style, decide)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             blob_param(context_id.as_bytes()),
             role,
@@ -171,6 +182,7 @@ pub(super) fn insert_slot(conn: &Connection, context_id: ContextId, role: &str, 
             slot.effort,
             slot.thinking_budget,
             slot.thinking_style,
+            slot.decide,
         ],
     )?;
     Ok(())
@@ -204,11 +216,12 @@ fn row_to_slot(row: &rusqlite::Row<'_>) -> SqliteResult<ContextSlotRow> {
         effort: row.get(8)?,
         thinking_budget: row.get(9)?,
         thinking_style: row.get(10)?,
+        decide: row.get(11)?,
     })
 }
 
 const SLOT_COLS: &str = "context_id, role, backend_id, model, max_tokens, context_window, \
-                         temperature, top_p, effort, thinking_budget, thinking_style";
+                         temperature, top_p, effort, thinking_budget, thinking_style, decide";
 
 /// Give `child` a copy of `source`'s performance: the same performer and
 /// persona and every slot verbatim, with `source` as its senpai. A source with
@@ -258,9 +271,9 @@ pub(super) fn copy_character_into(conn: &Connection, source: ContextId, child: C
     }
     conn.execute(
         "INSERT INTO context_slots (context_id, role, backend_id, model, max_tokens, context_window,
-                                    temperature, top_p, effort, thinking_budget, thinking_style)
+                                    temperature, top_p, effort, thinking_budget, thinking_style, decide)
          SELECT ?2, role, backend_id, model, max_tokens, context_window,
-                temperature, top_p, effort, thinking_budget, thinking_style
+                temperature, top_p, effort, thinking_budget, thinking_style, decide
          FROM context_slots WHERE context_id = ?1",
         params![blob_param(source.as_bytes()), blob_param(child.as_bytes())],
     )?;
@@ -379,9 +392,9 @@ impl KernelDb {
                 )));
             };
             let subject = format!("slot {role} of character {who}");
-            self.copy_one_slot(context_id, MODEL, &subject, slot.backend_id, &slot.model, slot_tunables(slot))?;
+            self.copy_one_slot(context_id, MODEL, &subject, slot.backend_id, &slot.model, slot_tunables(slot), None)?;
             if !slots.iter().any(|slot| slot.role == DISTILL) {
-                self.copy_one_slot(context_id, DISTILL, &subject, slot.backend_id, &slot.model, slot_tunables(slot))?;
+                self.copy_one_slot(context_id, DISTILL, &subject, slot.backend_id, &slot.model, slot_tunables(slot), None)?;
             }
         } else if let Some(model) = self.get_character_model(principal_id)? {
             let subject = format!("the model of character {who}");
@@ -393,14 +406,15 @@ impl KernelDb {
                 thinking_budget: model.thinking_budget,
                 thinking_style: model.thinking_style.clone(),
             };
-            self.copy_one_slot(context_id, MODEL, &subject, model.backend_id, &model.model, tunables.clone())?;
+            // The decision program steers the chat turns; the `distill` copy is a one-shot and has none.
+            self.copy_one_slot(context_id, MODEL, &subject, model.backend_id, &model.model, tunables.clone(), model.decide.clone())?;
             if !slots.iter().any(|slot| slot.role == DISTILL) {
-                self.copy_one_slot(context_id, DISTILL, &subject, model.backend_id, &model.model, tunables)?;
+                self.copy_one_slot(context_id, DISTILL, &subject, model.backend_id, &model.model, tunables, None)?;
             }
         }
         for slot in &slots {
             let subject = format!("slot {} of character {who}", slot.role);
-            self.copy_one_slot(context_id, &slot.role, &subject, slot.backend_id, &slot.model, slot_tunables(slot))?;
+            self.copy_one_slot(context_id, &slot.role, &subject, slot.backend_id, &slot.model, slot_tunables(slot), None)?;
         }
         Ok(())
     }
@@ -416,6 +430,7 @@ impl KernelDb {
         backend_id: BackendId,
         model: &str,
         own: ModelTunablesRow,
+        decide: Option<String>,
     ) -> KernelDbResult<()> {
         let model_row = self.list_backend_models(backend_id)?.into_iter().find(|m| m.model_id == model);
         let tunables = over(&own, &model_row.as_ref().map(|m| m.tunables.clone()).unwrap_or_default());
@@ -444,7 +459,7 @@ impl KernelDb {
                 )));
             }
         }
-        let values = SlotValues::new(backend_id, model, tunables, max_tokens, model_row.and_then(|m| m.context_window));
+        let values = SlotValues::new(backend_id, model, tunables, decide, max_tokens, model_row.and_then(|m| m.context_window));
         insert_slot(&self.conn, context_id, role, &values)
     }
 

@@ -240,7 +240,7 @@ impl Catalog {
                 Some(UNSET_MAX_TOKENS)
             }
         };
-        SlotValues::new(backend_id, model, tunables, max_tokens, row.and_then(|m| m.context_window))
+        SlotValues::new(backend_id, model, tunables, None, max_tokens, row.and_then(|m| m.context_window))
     }
 }
 

@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS context_slots (
     effort          TEXT,
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
+    decide          TEXT CHECK (decide IS NULL OR decide != ''),
     PRIMARY KEY (context_id, role)
 );
 
@@ -846,7 +847,8 @@ CREATE TABLE IF NOT EXISTS character_models (
     top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
     effort          TEXT,
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
-    thinking_style  TEXT
+    thinking_style  TEXT,
+    decide          TEXT CHECK (decide IS NULL OR decide != '')
 );
 CREATE INDEX IF NOT EXISTS idx_character_models_backend ON character_models(backend_id);
 

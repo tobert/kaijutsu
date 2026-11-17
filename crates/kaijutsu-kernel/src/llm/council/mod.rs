@@ -12,6 +12,7 @@
 //! model that does not declare `control_vectors` is refused a non-empty list.
 
 mod build;
+mod decide;
 mod reply;
 mod generation;
 
@@ -53,6 +54,8 @@ pub struct Client {
     /// `identity_max_age`, and after a generation refused for its `thinking`.
     identity: Arc<parking_lot::Mutex<IdentityCell>>,
     identity_max_age: Duration,
+    /// The decision specs this client has posted to the server.
+    specs: decide::PostedSpecs,
 }
 
 /// One read of the council v2 identity, which concurrent turns share.
@@ -76,6 +79,7 @@ impl Client {
             endpoint: None,
             identity: Arc::default(),
             identity_max_age: IDENTITY_MAX_AGE,
+            specs: Arc::default(),
         })
     }
 
@@ -143,7 +147,7 @@ impl Client {
     /// one-shot wants the answer text and thinking tokens count against
     /// `max_tokens`.
     pub fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
-        opts.with_effort("none")
+        BuildOpts { decide: None, ..opts.with_effort("none") }
     }
 
     /// A streamed turn: a council v2 generation after the whole
@@ -153,6 +157,9 @@ impl Client {
     pub async fn stream(&self, opts: BuildOpts, history: Vec<Message>) -> LlmResult<Stream> {
         build::effort(opts.effort.as_deref())?;
         let turn = self.turn();
+        if let Some(path) = opts.decide.clone() {
+            return self.stream_decisions(&path, opts, history, turn).await;
+        }
         let served = self.served_model(&turn, &opts.model).await?;
         self.stream_generation(opts, history, served, turn).await
     }
@@ -333,6 +340,8 @@ mod tests {
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
             controls: Vec::new(),
+            decide: None,
+            vfs: None,
             trace: None,
         }
     }
