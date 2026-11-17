@@ -178,6 +178,7 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
   - `Reply::whole` trims white space at the edges of the program's reply, and a cancelled decision stream yields no cancel-confirm `Done`.
   - With fewer distinct orderings than `shuffle`, orderings repeat and the pool is uneven (a 2-option slot with `shuffle` above 2).
   - The turn refuses a served model without `reads`; the gate decides without that check. The contract should settle which is right.
+  - A context past the server's decision limit (3,072 tokens on the nagaya) drops its oldest messages and the slot is sent again. The size that fit is not remembered, so each turn pays for the refused sends again: about 1 s of a 4 s turn on the live `omnijam` run, where the musician stance and ABC primer fill most of the limit. A decision player wants a shorter create rc, or a measured size before the first send.
 
 ---
 

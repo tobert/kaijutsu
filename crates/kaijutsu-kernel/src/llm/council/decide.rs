@@ -426,14 +426,20 @@ impl Client {
             }
         }
         let objects = self.place_media(&turn, &history, &served, holds_objects).await?;
-        let messages = trim(build::messages(opts.system.as_deref(), &history, &objects)?, opts.system.is_some(), program.history_messages);
+        let whole = build::messages(opts.system.as_deref(), &history, &objects)?;
+        let has_system = opts.system.is_some();
+        // The kept history shrinks while the server answers that the context is
+        // too large for a decision, so `keep` is what the first slot found to fit.
+        let mut keep = program.history_messages;
+        let messages = trim(whole.clone(), has_system, keep);
+        keep = keep.min(messages.len().saturating_sub(usize::from(has_system)));
         if messages.is_empty() {
             return Err(LlmError::InvalidRequest(format!(
                 "council backend '{}': decision program {}: the conversation is empty, so there is nothing to decide after",
                 self.name, program.path
             )));
         }
-        let context = Context { thinking: false, tools: Vec::new(), queue: None, control: opts.controls.clone(), messages };
+        let mut context = Context { thinking: false, tools: Vec::new(), queue: None, control: opts.controls.clone(), messages };
         let mut rng = Rng::new(seed);
         let mut picks: Vec<usize> = Vec::new();
         // The prompt count is the largest single decision's: the runtime reads it
@@ -443,19 +449,29 @@ impl Client {
             let allowed = self.program_allowed(&program, at, &picks);
             let so_far = if picks.is_empty() { "(nothing yet)".to_string() } else { program.picked(&picks) };
             let case = format!("{} So far: {so_far}", program.slots[at].case);
-            let mut asks = Vec::new();
-            for ordering in orderings(&allowed, program.shuffle, &mut rng) {
-                let spec = spec_for(&program, &ordering, choice_options as usize)?;
-                let request = DecisionRequest {
-                    model: served.model.clone(),
-                    case: Value::String(case.clone()),
-                    spec_id: spec.id(),
-                    contexts: vec![context.clone()],
-                    ..Default::default()
-                };
-                asks.push((spec, request));
-            }
-            let answers = futures::future::try_join_all(asks.iter().map(|(spec, request)| self.decide(&turn, spec, request))).await?;
+            let answers = loop {
+                let mut asks = Vec::new();
+                for ordering in orderings(&allowed, program.shuffle, &mut rng) {
+                    let spec = spec_for(&program, &ordering, choice_options as usize)?;
+                    let request = DecisionRequest {
+                        model: served.model.clone(),
+                        case: Value::String(case.clone()),
+                        spec_id: spec.id(),
+                        contexts: vec![context.clone()],
+                        ..Default::default()
+                    };
+                    asks.push((spec, request));
+                }
+                let too_large = AtomicBool::new(false);
+                match futures::future::try_join_all(asks.iter().map(|(spec, request)| self.decide(&turn, spec, request, &too_large))).await {
+                    Ok(answers) => break answers,
+                    Err(_) if too_large.load(Ordering::Relaxed) && keep > 1 => {
+                        keep -= 1;
+                        context.messages = trim(whole.clone(), has_system, keep);
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             let mut each = Vec::with_capacity(answers.len());
             for response in &answers {
                 usage.0 = usage.0.max(response.usage.prompt);
@@ -527,22 +543,30 @@ impl Client {
     /// One decision. The spec is posted first when this client has not posted
     /// it to the server; a `404` for the spec posts it and sends the decision
     /// once more.
-    async fn decide(&self, turn: &Turn, spec: &Spec, request: &DecisionRequest) -> LlmResult<DecisionResponse> {
+    async fn decide(&self, turn: &Turn, spec: &Spec, request: &DecisionRequest, too_large: &AtomicBool) -> LlmResult<DecisionResponse> {
         self.ensure_spec(turn, spec).await?;
         let missing = AtomicBool::new(false);
-        match self.decide_once(turn, request, &missing).await {
+        match self.decide_once(turn, request, &missing, too_large).await {
             Err(_) if missing.load(Ordering::Relaxed) => {
                 self.specs.lock().remove(&request.spec_id);
                 self.ensure_spec(turn, spec).await?;
-                self.decide_once(turn, request, &AtomicBool::new(false)).await
+                self.decide_once(turn, request, &AtomicBool::new(false), too_large).await
             }
             answered => answered,
         }
     }
 
     /// One `POST /council/v2/decisions` through the endpoint. `missing` is set
-    /// when the server answers 404, which says it does not hold the spec.
-    async fn decide_once(&self, turn: &Turn, request: &DecisionRequest, missing: &AtomicBool) -> LlmResult<DecisionResponse> {
+    /// when the server answers 404, which says it does not hold the spec, and
+    /// `too_large` when it answers 413, which says a context is past the
+    /// decision limit.
+    async fn decide_once(
+        &self,
+        turn: &Turn,
+        request: &DecisionRequest,
+        missing: &AtomicBool,
+        too_large: &AtomicBool,
+    ) -> LlmResult<DecisionResponse> {
         let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
         let traceparent = (!traceparent.is_empty()).then_some(traceparent);
         let (_, response) = self
@@ -552,6 +576,9 @@ impl Client {
                     let answered = self.client.decide_traced(request, left, traceparent).await;
                     if answered.as_ref().is_err_and(|e| e.status() == Some(404)) {
                         missing.store(true, Ordering::Relaxed);
+                    }
+                    if answered.as_ref().is_err_and(|e| e.status() == Some(413)) {
+                        too_large.store(true, Ordering::Relaxed);
                     }
                     answered
                 }
@@ -619,6 +646,8 @@ mod tests {
         decisions_404: bool,
         /// Every decision fails with this status.
         decision_failure: Option<u16>,
+        /// A decision whose context has more messages than this is a 413.
+        too_large_over: Option<usize>,
     }
 
     impl Behavior {
@@ -635,6 +664,7 @@ mod tests {
                 lose_spec_once: false,
                 decisions_404: false,
                 decision_failure: None,
+                too_large_over: None,
             }
         }
     }
@@ -690,6 +720,9 @@ mod tests {
                     let id = body()["spec_id"].as_str().unwrap().to_string();
                     if let Some(status) = b.decision_failure {
                         return reply(status, json!({"error": {"type": "internal", "message": "the council is down"}}).to_string());
+                    }
+                    if b.too_large_over.is_some_and(|most| body()["contexts"][0]["messages"].as_array().unwrap().len() > most) {
+                        return reply(413, json!({"error": {"type": "too_large", "message": "context 0 has 3255 tokens, and a decision reads at most 3072"}}).to_string());
                     }
                     let lost = b.lose_spec_once && decided == 1;
                     if lost {
@@ -762,6 +795,31 @@ mod tests {
     /// Falsified by a turn that sends the whole history, drops the system
     /// message, leaves the picks out of the next case, or builds the reply
     /// without the prefix, join, or suffix.
+    #[tokio::test]
+    async fn a_context_too_large_for_a_decision_drops_its_oldest_messages() {
+        let slots = json!([{"case": "Bar 1.", "options": ["a", "b"]}, {"case": "Bar 2.", "options": ["c", "d"]}]);
+        let mut program = program(1, slots);
+        program["history_messages"] = json!(4);
+        let vfs = vfs_holding(&program.to_string()).await;
+        // The system message and 2 more fit; the program keeps 4.
+        let (base, seen) = council(Behavior { too_large_over: Some(3), ..Behavior::weighted(&[("b", 9.0), ("d", 9.0)]) }).await;
+        let (text, _) = drain(client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap()).await;
+        assert_eq!(text, "P:B1|D1]");
+        let sizes: Vec<usize> =
+            bodies(&seen, "/council/v2/decisions").iter().map(|d| d["contexts"][0]["messages"].as_array().unwrap().len()).collect();
+        assert_eq!(sizes, [5, 4, 3, 3], "slot 1 is sent with 4, 3, then 2 kept messages; slot 2 keeps what fit");
+    }
+
+    #[tokio::test]
+    async fn a_context_too_large_with_one_message_left_fails_the_turn() {
+        let slots = json!([{"case": "Bar 1.", "options": ["a", "b"]}]);
+        let vfs = vfs_holding(&program(1, slots).to_string()).await;
+        let (base, seen) = council(Behavior { too_large_over: Some(1), ..Behavior::weighted(&[]) }).await;
+        let error = client(&base).stream(opts(vfs, Some(0.0)), history()).await.err().expect("refused");
+        assert!(error.to_string().contains("3072"), "{error}");
+        assert_eq!(bodies(&seen, "/council/v2/decisions").len(), 2, "sent with 2 kept messages, then 1, and no more");
+    }
+
     #[tokio::test]
     async fn a_decision_turn_assembles_its_reply_from_decisions() {
         let slots = json!([{"case": "Bar 1.", "options": ["a", "b", "c"]}, {"case": "Bar 2.", "options": ["b", "c", "d", "a"]}]);

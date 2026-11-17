@@ -6,7 +6,7 @@
   "join": " | ",
   "suffix": " |]",
   "shuffle": 4,
-  "history_messages": 8,
+  "history_messages": 4,
   "no_repeat": true,
   "options": {
     "p0": {"means": "root pulse, walk up to A", "text": "E,,2 E,,E,, G,,2 A,,2"},
