@@ -171,7 +171,7 @@ armed traps awaiting migration.
 ## The day the wire stopped being a storage engine (August 15–16)
 
 Client-side sync protocols and text CRDTs were removed in favor of an ordered
-per-context change feed (`docs/change-feed.md`). Document content became plain
+per-context change feed (`docs/contexts.md`). Document content became plain
 `String` with amortized `push_str` appends.
 
 ## Two doorbells, one ledger (August 18)

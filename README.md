@@ -12,10 +12,9 @@ media can travel over SFTP while the performance continues. The shared pulse
 gives that work a place in time. Whether a result is ready and still valid
 determines how it can join the performance.
 
-This is the direction we judge the implementation against. The timing design
-is in [Hyoushigi](docs/hyoushigi.md), the shared clock in
-[MIDI and the timebase](docs/midi.md), and the current model-placement
-assessment in [Audio inference](docs/audio-inference.md). The
+This is the direction we judge the implementation against. The timing and
+shared-clock design is in [Time and the pulse](docs/time.md), and the hardware
+and model-placement rules are in [Audio I/O](docs/audio-io.md). The
 [iteration plan](docs/issues.md#anticipation-and-commitment--iteration-order)
 tracks the gaps between that direction and the code.
 
@@ -195,18 +194,18 @@ that renders as both standard staff notation and audio.
 ### kaijutsu-audio
 
 FFI-free audio/render types: the mime-keyed `RenderCue` wire cue, the clip
-record (`docs/pcm.md`), and the beat phasor/timebase used by the metronome.
+record (`docs/audio-io.md`), and the beat phasor/timebase used by the metronome.
 Sinks in `kaijutsu-audio-runtime` own the actual hardware. The timing
 doctrine — emission-stamped wire artifacts, receiver back-dating, staleness
 ladder, the deadband-locked phasor ("the local clock is the truth between
-references") — lives in `docs/midi.md`, "The one timebase".
+references") — lives in `docs/time.md`.
 
 ### kaijutsu-audio-runtime
 
 Bevy-free MIDI and PCM runtime, hosted by the `kaijutsu-audiod` SSH client —
 the sole hardware owner; the app has no hardware I/O. The kernel drives
-playback; the runtime owns local hardware. See [Audio daemon](docs/audio-daemon.md)
-for device selection, capture and systemd setup.
+playback; the runtime owns local hardware. See [Audio I/O](docs/audio-io.md)
+for device selection, capture, and systemd setup.
 
 ### kaijutsu-hyoushigi
 
@@ -216,7 +215,7 @@ commit. The shared score that musicians (model contexts) play onto.
 ### kaijutsu-editor
 
 Kernel-owned vi editing sessions (`EditorCore`, pure modalkit vim). The app is
-one renderer among many possible drivers; see `docs/vi.md`.
+one renderer among many possible drivers; see `docs/input.md`.
 
 ### kaijutsu-viz
 
@@ -229,11 +228,8 @@ HNSW nearest-neighbor search, density-based clustering, and persistent
 keyword/gist synthesis. Kaijutsu owns content selection and caching; the
 service owns model loading and inference. Query/document purpose, model
 identity, and normalization are explicit in the embedding interface.
-
-See [Synthesis](docs/synthesis.md) for service configuration, startup failure
-behavior, cache identity, and the remaining incremental work. Automatic
-synthesis is disabled; `kj synth <context>` runs it on demand and reuses
-unchanged results. Add `--force` to recompute synthesis.
+Automatic synthesis is disabled; `kj synth <context>` runs it on demand and
+reuses unchanged results. Add `--force` to recompute synthesis.
 
 ### kaijutsu-mcp
 
@@ -271,9 +267,15 @@ text rendering, theming, and the UI architecture.
 | Doc | Purpose |
 |-----|---------|
 | [AGENTS.md](AGENTS.md) | System architecture, crate map, and working rules |
-| [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance — principles for system-message design |
-| [docs/devlog.md](docs/devlog.md) | The story of how kaijutsu took shape — arcs, decisions, lessons |
-| [docs/orchestration.md](docs/orchestration.md) | Playing multi-model, multi-context work — at the `kj` prompt or through MCP |
-| [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
-| [docs/abc-reference.md](docs/abc-reference.md) | ABC music notation reference |
-| [docs/issues.md](docs/issues.md) | Live work items not yet in code |
+| [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance, shared trust, and capabilities/loadouts |
+| [docs/character.md](docs/character.md) | Characters, performers, and senpai–kohai |
+| [docs/contexts.md](docs/contexts.md) | Contexts, conversations, forks, drift, rotations, and shadows |
+| [docs/rc.md](docs/rc.md) | `/config`, rc lifecycles, system prompts, and kaish execution |
+| [docs/approval-identity.md](docs/approval-identity.md) | Turn identity, review routing, `gate.toml`, and the council |
+| [docs/input.md](docs/input.md) | Input routing, vi editor sessions, and file buffers |
+| [docs/time.md](docs/time.md) | The one timebase, pulse, tracks, and *hyoushigi* |
+| [docs/audio-io.md](docs/audio-io.md) | `audiod`, PCM rendering, MIDI profiles, and audio inference |
+| [docs/operating.md](docs/operating.md) | Operating the service and containers |
+| [docs/writing.md](docs/writing.md) | STE prose style and the canonical Terms table |
+| [docs/devlog.md](docs/devlog.md) | Decisions and lessons, oldest to newest |
+| [docs/issues.md](docs/issues.md) | Open work items |

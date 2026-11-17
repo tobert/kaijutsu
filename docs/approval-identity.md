@@ -1,466 +1,59 @@
-# Approval identity
+# Approval identity and gate policy
 
-Every context that does work answers to one other context: its **senpai**. The senpai's
-character reviews the work. The character performing an operation cannot approve it, from any context, except the
-self-confirmation at a root console, which nobody else may answer. The design and its decisions are in
-`docs/senpai-kohai.md`; this file is the approval contract that follows from it. There is no configured default
-reviewer, no per-context override, and no grant that moves review from one character to another.
+Every context that does work answers to one other context: its **senpai**. The senpai character reviews the work. The character performing an operation cannot approve it, from any context, except self-confirmation at a root console.
 
-```sh
-kj character create fixer --rc coder --model deepseek/deepseek-flash
-kj context create fixer --name repair
-kj context info repair
-```
+## The senpai edge and routing
 
-`kj context create` starts a context that fixer performs, labeled `repair`, answering to the caller's context; it
-runs `coder/`. Run from Amy's root console, her root console is its senpai and Amy reviews fixer. Run from the
-console, which banto performs, the console is its senpai and banto reviews fixer. Creating a context does not grant review authority to
-anyone beyond what the senpai edge gives.
+`contexts.senpai_ctx` names the senpai context. It is null only for a root console. Asks climb `senpai_ctx` to the first live character reviewer:
+1. Let S be K's `senpai_ctx`. If S is null (root console): when actor A is K's live root character, it is a self-confirmation; when A is not root and K's performer is live root, that root reviews it; otherwise resolution refuses.
+2. A senpai with no performer is passed over.
+3. The reviewer is S's character when live, not A, and not K's performer.
+4. When S's character is A or K's performer, climb: K becomes S and repeat.
 
-## The senpai edge
+**Self-confirmation:** At a root console the actor is the context's own character. The ask is recorded as a self-confirmation. A model turn refuses when its performer would review itself.
 
-`contexts.senpai_ctx` names the senpai context. It is null only for a root console. A context with no
-performer (scratch, the handoff log, the drift queue, lost+found, the beat score) runs no turns and has a senpai
-like any other; a climb passes over a senpai with no performer. A rotation writes the successor with the predecessor's character and senpai, so the successor keeps the edge.
-
-- The **character** of a context is fixed when the context is made, and never changes.
-- The **kohai** of a context are the live contexts whose `senpai_ctx` is that context.
-- The chain never has a cycle. Setting an edge that would close one is refused.
-
-`kj context info [<ctx>]` prints the context's performer, its senpai (label and character), the lineage root, and
-who would review an ask by its character. `kj context list --senpai <ctx>` lists the live contexts that answer to a
-context.
-
-## Routing
-
-The reviewer of an ask raised in context K by actor A:
-
-1. Let S be K's `senpai_ctx`. If S is null (K is a root console): when A is K's live root character, the ask is a
-   self-confirmation; when A is not a root and K's performer is a live root, that root reviews it; otherwise
-   resolution refuses and names A and K.
-2. A senpai with no performer is passed over: the climb continues to its senpai.
-3. The reviewer is S's character when it is live, is not A, and is not K's performer.
-4. When S's character is A or K's performer, climb: K becomes S, and repeat from 1. A fork's performer is its
-   source's character, so an ask in a fork, by anyone, climbs past that character.
-5. A retired character refuses by name. It never substitutes another character.
-
-One resolver does this. Every ask, the model-turn check, `kj context info` and `kj ledger escalate` use it.
-
-```
-coder lane ──senpai──► banto context ──senpai──► amy (root console)
-  ask by coder          character: banto         character: amy
-  reviewer: banto       ask by banto             ask by amy
-                        reviewer: amy            self-confirmation
-```
-
-**Self-confirmation.** At a root console the actor is the context's own character. The ask is raised with the actor as its
-reviewer, the actor alone may answer it, and the ledger records the answer as a self-confirmation. A root character
-runs no model, so self-confirmation is a human's act. A model turn refuses to start when its performer would
-review itself.
-
-**Escalation** runs the same climb past the context that yielded the current reviewer, and refuses at a
-context with no senpai, naming it.
-
-**Lineage root.** The character at the top of the senpai chain. It must be a live root character, or the lookup
-refuses with the reason.
-
-## Authority
-
-One rule: **the performer of a context's senpai (climbing past senpais with no performer), or its lineage root**, may
-
-- move it to another senpai (`kj context set <ctx> --senpai <senpai-ctx>`);
-- escalate its asks;
-- rotate it (its own performer may also rotate it, with no ask);
-- archive it.
-
-An rc lifecycle may also act on the contexts that answer to the context whose lifecycle runs
-(`docs/senpai-kohai.md`, "Authority").
-
-A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root (<root>) may <act>". Also true:
-
-- A person (a root character) may perform any context; every context a person performs runs no model turns,
-  and its draft runs as shell.
-- A live person may archive a context whose lineage has no live root, such as the former console of a retired
-  person: nobody above it is left to archive it. A broken lineage, such as a senpai cycle, refuses, naming it.
-- Only a live person retires a person (`kj character retire`). A character that performs a live person's console
-  is retired only by that person; anyone else is refused, naming the console, `kj character set <person> --console
-  <ctx>` or `--no-console`, and archiving the console first. Retirement archives every context the character
-  performs in one transaction, and a person's own root console with them.
-- `kj context create <character>` needs the Operator capability and a live character caller, and raises no ask. The new
-  context's senpai is the caller's context, or the `--senpai <ctx>` context the caller has authority over.
-- A model-played context holds no authority over itself, so it cannot widen its own egress list or move its own
-  senpai (`docs/egress.md`).
-- A senpai move refuses while a pending ask in the moved context, or below it, would change reviewer. Performer
-  and reviewer must resolve to live, distinct characters.
-
-Create sets the edge, and nothing else moves it but `kj context set --senpai`: `kj fork` takes the forking context as
-the child's senpai, and `kj context rotate` gives the successor the predecessor's senpai, so neither moves a kohai.
-Every client creation names its performer as the positional character.
-
-Ring placement and conclusion do not follow the lineage. `kj context
-promote`, `demote`, and `conclude` need the operator capability, except
-for a person (a live root character): they act as a human root from any context,
-and a context grants nothing because of what it is or its label. The console (the
-context a person's `console_ctx` names) and a person may act on any context.
-Another caller with Operator, such as banto in a context other than the console, may act on any context except a
-root console, the console, or its own; for its own, it asks the console. Only a person demotes
-or concludes a root console, only the person whose console it is concludes,
-demotes or archives the console while that person is a live root (after that,
-any person may), and nobody concludes or archives a root console. See
-`docs/character.md`, "The console places contexts".
+**Escalation and Authority:** The performer of a context's senpai or its lineage root may move it, escalate its asks, rotate it, or archive it.
 
 ## Three identities
 
 | Field | Meaning |
 |---|---|
 | `principal_id` | Authenticated requester; retained for capability and redemption scope |
-| `actor_id` | Character performing this invocation; the context's performer for kernel model work |
-| `reviewer_id` | Effective reviewer snapshotted on the invocation or ask (a field of the ask, not a column of the context) |
+| `actor_id` | Character performing this invocation |
+| `reviewer_id` | Effective reviewer snapshotted on the ask |
 
-The context row carries its `performer` and the senpai edge (`senpai_ctx`) the
-reviewer is resolved from. It records no reviewer of its own, so nothing is
-copied from `created_by`.
+## Gate policy layers (gate.toml)
 
-The kernel resolves a model turn's identity before it starts. Tools,
-read-only and writable shells, nested `kj` commands, and hook bodies preserve
-its requester and performer. When a new ask is recorded, the gate resolves
-the current reviewer from the context's senpai edge. Moving the edge
-therefore affects new asks even from an already running turn.
-Provider text, reasoning, and tool calls are authored
-by the performer. User prompts keep their requester; kernel-produced tool
-results keep kernel authorship.
+`gate_policy::evaluate(planned_statements, ctx)` returns per-statement verdicts: Allow, Deny, or Uncovered.
 
-`kj drive` runs the driven turn with the caller's performer as its
-requester, and writes the `--prompt` seed as that performer. When banto,
-performing a turn Amy requested, drives a lane, the lane's turn, its tool
-calls, and its asks carry banto as `principal_id`. The lane's own performer
-and reviewer still play and review that turn. The self-approval check
-compares the reviewer with the performer, not the requester, so a driver
-that is also the lane's reviewer still answers the lane's asks. As the
-asks' requester, the driver may also cancel them, and a `session` rule
-learned on one covers the lane and the driver as its requester.
+### Layers, bottom to top
+1. **Builtin**: Verb's declared `Effect` (`Read`, `Write`, `Destroy`).
+2. **Global config**: `/config/kernel/gate.toml`, `[global]`.
+3. **Performer config**: `[rc.<dir>]`, `[root]`, `[character.<name>]`. Narrowest decides.
+4. **User explicit**: Learned rules (`approval_rules` and `approval_rule_families`) via `kj ledger allow --remember`.
 
-An app, TUI, ACP client, or MCP bridge acts as the character bound to its
-credential. Navigating into a coder context does not turn Amy into coder.
-External lead models need their own character-bound credential; two processes
-using the same credential are the same character. The `user_initiated` flag
-controls presentation, never approval authority.
+Top wins. A learned human allow overrides config deny. Structural conditions (redirects, background flags, heredocs) drop family-keyed allows to Uncovered, whereas exact digest-keyed rules override them. Verbs decided by their target check literal arguments against the database (e.g., `kj drift push`, `kj context archive`, `kj context demote`, `kj character set --no-root`, and character retirement).
 
-The Bevy app, the TUI, `kaijutsu-mcp`, and `kaijutsu-acp` all accept the same
-`--key-fingerprint <fingerprint>` (select one SSH-agent key) and `--key-file
-<path>` (select a private-key file) pair, resolved by the one shared
-`kaijutsu_client::key_select::resolve_key_source` (`docs/character.md`, "The
-bridge identity: a key per model character"). The selectors are mutually
-exclusive and do not fall back to another key. The app's displayed identity
-and draft ownership come from the authenticated connection's `whoami` result.
-The app has dedicated ledger controls: an ask sheet
-(`crates/kaijutsu-app/src/ui/ask_sheet.rs`) and a ledger ribbon
-(`crates/kaijutsu-app/src/ui/ledger_ribbon.rs`), alongside shell `kj ledger`
-commands.
+## The council gate and Council v2 backend
 
-New ACP sessions select a kernel model performer at launch:
+When enabled in `gate.toml`, the gate consults the council for statements left Uncovered by static rules.
 
-```sh
-kaijutsu-acp --character coder
-```
+### The flow
+- **Allow**: Pooled probability $p(\text{allow}) \ge \text{allow\_at}$, mass floor met, agreement met, no control-text hit. Uncovered statements become council allows; submission runs with a durable auto-decision row naming the council.
+- **Ask**: Opens ledger ask with the council's answer attached.
+- **Report**: Opens ledger ask plus a council report event; stops autonomous turns with `Kernel::interrupt_context_keeping_asks`.
+- **Miss**: Leaves submission where it is if council is down, slow, or low mass.
 
-`--parent <label>` names the context new sessions are created under; without
-it, the kernel's only live root console is used. The named character
-becomes the performer, the new context answers to the context that creates
-it, and the reviewer follows the senpai edge.
-`kaijutsu-tui` and `kaijutsu-mcp` take the same `--character` (MCP also reads
-`KAIJUTSU_CHARACTER`); a root's connection needs it, since a context a root
-performs runs no model turns. Without `--character`, use ACP session loading
-to attach to an already configured context. The flag selects a character,
-and the character's rc directory runs.
-
-## Answering and withdrawing asks
-
-```sh
-kj ledger show <request-id>
-kj ledger allow <request-id>
-kj ledger deny <request-id>
-kj ledger escalate <request-id> --to amy
-kj ledger cancel <request-id>
-```
-
-An ask snapshots its requester, performer, and reviewer. `show` reports all
-three plus the deciding character. The assigned reviewer may allow or deny.
-The assigned reviewer, the character of the ask context's senpai, or its lineage
-root may pass a pending ask up the senpai chain with `escalate`. Naming the
-next reviewer with `--to`, or taking the ask over, is the lineage root's
-alone; this lets Amy reclaim an ask in her lineage when its reviewer is
-unavailable. Escalation records both reviewer identities
-and the actual caller, and refuses to assign the performer. The requester or
-performer may cancel a pending ask. Cancellation runs nothing; it does not
-undo an executed action.
-
-Clients read and answer the ledger with typed RPCs that take no context:
-`listAsks`, `getAsk`, `decideAsk`, and `escalateAsk`, with
-`subscribeLedgerEvents` pushing every ask that changed after a generation.
-The caller is the connection's principal. The ledger row is the record of an
-answer: `decideAsk` authors no block in any transcript, and the asking
-context learns the outcome through its own completion notice or held turn.
-Amy, 2026-10-08: "the ledger is more about accounting than enforcement";
-reviewer assignment is the boundary, and the ledger enforces it.
-
-Only the assigned reviewer answers. To answer an ask assigned to someone
-else, the lineage root first reassigns it to herself (`kj ledger escalate
-<id> --to amy`, or `escalateAsk`), then answers. The ledger records each
-reassignment with the reviewer before and after and the caller who moved it,
-and `kj ledger show` lists them as `reassigned:` lines; a caller who names
-itself took the ask over.
-
-The TUI displays the authenticated character and offers approval controls only
-to the assigned reviewer. Each card carries the ask's tool call, the lineage
-root, and whether the ask has a program, and `AskSummary` supplies the rules
-clients gate on: `can_escalate` (the pending ask's reviewer),
-`can_take_over` (the lineage root, when it is neither reviewer nor performer),
-and `can_remember_for_character` (a reviewer of an ask with a program).
-In a client the root's way to reassign is a takeover, an escalation to itself;
-the kernel also lets the root reassign to a third character through `kj ledger
-escalate --to`. The card does not carry whether the context is archived, so
-the kernel's refusal stands for that case. `kj ledger show` prints the lineage
-root. A second context is unnecessary. The global ledger
-also exposes asks raised in other contexts. ACP permission prompts follow the
-same eligibility rule; the kernel remains authoritative if the assignment
-changes while a prompt is open. Timeouts, cancelled ACP prompts, and transport
-errors leave the ask pending; only an explicit decision records a verdict.
-
-A senpai model reads the kohai's response and `kj ledger list|show` to
-evaluate its asks. Reviewer assignment does not automatically schedule a
-turn in one of that character's contexts.
-
-Direct commands retain their connected actor. If that actor is also the
-assigned reviewer, the ask is a self-confirmation: that actor answers it,
-cancels it, or reassigns it to a different character. Human status is not
-inferred from a client type.
+### Council contexts and backend
+- **Council contexts**: `council-<character>` and `council-system` along the reviewer chain. Root and system contexts vote; character contexts observe.
+- **Council v2 backend (`kaijutsu-council`)**: Speaks Council v2 (`gogi-proto`). The kernel pins council seats under `kernel-<kernel_id>`, reads `/council/v2/identity`, streams `/council/v2/generations` for chat turns, and sends control vectors and CAS media objects.
+- **House rules**: Enabled via `[council] house_rules = true`, reading the first `AGENTS.md` up from working directory.
+- **Judge shadows & Bumper mode**: Judge shadows give opinions; bump shadows answer proceed or bump in **bumper mode** (`[council] mode = "bumper"` or `"bump-only"`).
 
 ## Standing rules for a character
 
-```sh
-kj ledger allow <request-id> --remember character --family
-kj ledger rules
-kj ledger forget <rule-id>
-```
-
-A `character` rule applies to the character that performed the ask, in
-every context it performs in, and to no other character. Scope `session`
-covers the asking context and requester; scope `always` covers everyone.
-
-A character allow covers a `kj` call that acts on a context only when the
-character holds the target's senpai. It covers these verbs:
-
-| Verb | Target | Not covered |
-|---|---|---|
-| `kj drive [<target>]` | the target, default the current context | |
-| `kj interrupt <target>` | the target | |
-| `kj context archive [<context>]` | the context, default the current context | `--children` |
-| `kj context create [--senpai <c>]` | `--senpai`; without it, the new context is the caller's own kohai | |
-
-The gate resolves the target the way the verb does (label, id, `.`,
-`.parent`, `.senpai`). Every argument must be a literal word, because an expanded
-argument could name another context or a flag, and a call with `--` is
-not covered. A `kj` call that the builtin layer allows (a read, `kj
-ledger`, `--help`) passes. Any other `kj` call is not covered, and
-neither is a host command spelled `kj` or `kjc` (`./kj`, `kjc -c ...`),
-which can reach a verb whose target the gate does not read. Nor is a
-wrapper whose arguments name `kj` or `kjc` (`env kj ...`, `xargs kj`,
-`bash -c 'kj drive x'`): its family key would cover the wrapper with any
-target. A character allow is not learned from a program that contains
-any of these; the answer names the command, and the decision on that ask
-still stands. A family rule on a path (`source <path>`, `bash <path>`)
-covers that path in later calls whatever the file then holds, so prefer
-an exact rule for scripts. A
-character deny applies without the target condition.
-
-The gate checks the target when it decides, and the verbs do not check
-it again. A senpai change that lands between the decision and the run
-is not seen by that call.
-
-For example, Amy answers banto's ask for `kj drive lane-1 --prompt ...`
-with `--remember character --family`. Banto then drives any lane whose senpai it holds with no ask. It still
-asks to drive a context whose senpai Amy holds, including its own conversation, and
-the rule does not reach another character. An exact rule (`--remember
-character` without `--family`) checks the target too, so the same statement
-asks again after its target gets another senpai.
-
-Commands other than `kj` carry no target that the gate reads. A
-character family rule for them applies wherever the character performs,
-by family key: `cd /tmp/x && git log` teaches `cd /tmp/x` and `git log`,
-and `python3 -m unittest` teaches bare `python3`, because its first
-argument is a flag. The answer names the keys it learned. Prefer an exact
-rule when a family key is wider than intended.
-
-The rule binds the character, not its rc directory: another character's
-context that runs the same directory is not covered. The reviewer who answers the ask makes the rule
-and alone can forget it, and the rule applies even where another
-character reviews this character's work. `kj ledger rules` shows the
-scope as `character <name>`. A `[character.<name>]` section of
-`gate.toml` allows a key for one character with no first ask, and without
-the target condition (`docs/gate-policy-tuning.md`, "Performer layers").
-
-## Persistence and replay
-
-A caller's retry redeems an answer only when the requester, performer,
-context, statements, and label match. The approval worker redeems an ask
-with a stored command by its id.
-Changing performers revokes that context's learned session rules. Broader
-rules remain governed by their explicit scope. A linked model approval whose
-performer changed is consumed without execution; restoring the old performer
-does not revive it. Malformed or partial output-pair linkage refuses replay.
-Linking an executable ask also retains the original pair's execution receipt;
-model Waiting publication commits both together. Context and performer must
-match, and an established pair or owner cannot be replaced. Receipt lookup
-through the original ask survives later result-review asks.
-
-Old asks with no recorded performer/reviewer remain audit history and cannot
-be approved through a guessed identity. The senpai migration
-(`docs/senpai-kohai.md`, "Migration") maps each live context to a senpai from how it
-was routed, reports every mapping that was not the nearest-ancestor case, and
-refuses to run rather than guess. It never derives a senpai from requester
-identity. A missing performer still requires assignment before kernel model work.
+`kj ledger allow <request-id> --remember character [--family]` binds a rule to the character performing the ask. Scope `session` covers the context and requester; scope `always` covers everyone.
 
 ## Continuation windows and async work
 
-An ask has no default expiry. Its captured operation can await an explicit
-decision without a human-time deadline. Cleanup may later cancel
-obsolete requests with a recorded reason; elapsed waiting alone does not
-invalidate the approval request.
-
-A **continuation window** governs automatic model resumption after yielding.
-It expresses expectations about retained KV state and the cost of continuing,
-not a known provider-cache expiry. Ending the window does not expire the ask,
-cancel its command, or erase its result. An explicit signoff can end a
-continuation before the window would otherwise close. `/config/kernel/
-continuation.toml` owns the policy: its shipped `[gate_resume] window_secs =
-1800` keeps the window open for 30 minutes after the last actual provider
-inference request. Each inference request, including a tool-loop iteration,
-refreshes that time. Yielding, polling, and tool activity do not. `kj handoff
-signoff <note>` closes the window immediately. `kj interrupt <target>` (and
-the RPC `interruptContext`) records a separate, independent fact —
-`interrupted_at`/`interrupted_by` on the epoch — that also closes the
-window; unlike signoff, this is a senpai or reviewer stopping the loop
-from outside, not the performer's own handoff close, and it does not set
-`signed_off_at`. Stopping the running turn alone is not enough: every turn
-end records a yield even when cancelled, so without this fact a later async
-shell completion would still restart the chain.
-
-Changing a context's performer closes its continuation and invalidates all
-previous epochs in the same transaction as the assignment. Queued automatic
-startup and each later inference attempt reject those epochs, including after
-assigning the original performer again. An inference admitted before reassignment
-may finish under its original performer; the next request is refused. Explicit
-turn preparation rechecks the performer before opening an epoch.
-
-Signoff, interrupt, and a newer explicit drive only close automatic
-resumption. Already accepted turns can finish, but their requests do not
-refresh a closed window or a newer epoch. Senpai changes preserve the
-performer's continuation. Opening a new epoch (`kj drive`) clears a prior
-interrupt along with the rest of the epoch's state.
-
-Async shell submission returns a stable receipt naming the operation and any
-approval dependency. Completion is a separate durable fact,
-not a replacement for an acknowledgement already sent to the model. This
-keeps earlier conversation content stable while the coder does independent
-work, checkpoints, or signs off. The result must remain discoverable even
-when no model is automatically resumed.
-
-`kj wait` waits for its target context to have no accepted turns left in flight
-and evidence that a turn ran. A terminal event cannot finish the wait while
-another turn remains. Events supply the latest observed terminal detail;
-quiet polling uses the block log and live turn registry if events are lost.
-A terminated subscription switches to paced state polling. A pending ask in
-the target context whose stored reviewer is the waiter ends the wait first,
-with status `ask`, the ask's id and description, and the `kj ledger` commands
-that answer it: the lane is blocked on the waiter.
-
-Select a shell operation with `--operation <id>`, an ask with `--ask <id>`,
-or a native kaish job with `--job <integer>` (optionally selecting a context).
-Job IDs belong to the current process and context; durable operation IDs remain
-readable after restart or job cleanup. A wait timeout ends that wait only;
-it neither cancels work nor expires an ask. Waiting on an ask's decision and
-waiting on the approved command's completion are distinct conditions. A kaish
-job wait reports status and the captured command exit code. If durable
-publication fails, the job can finish while its
-operation remains pending; use `--operation` to inspect durable completion and
-notification status. Publication failure does not change the command's exit.
-A terminal-result write failure reports `state.retention_error` while the kernel
-keeps the first result in memory and retries persistence. Result-review ledger
-reads report `result_review.retention_error`. Recovery never reruns the command
-or its result hooks. Shutdown reports results that remain non-durable.
-Waiting must not hold a context
-execution lock that prevents another invocation from writing a handoff or
-observing completion. Preserve the rule that no RPC waits indefinitely.
-
-The coder maintains a handoff while active and updates it before an
-explicit wait or signoff. Record outstanding operation and ask IDs with the
-objective, progress, evidence, and next actions. Beyond the continuation
-window, default to leaving results for explicit drive or rotation instead of
-starting a turn solely to recover a signoff from a cold conversation. A
-successor inspects outstanding asks and completed results. It does not inherit
-an old context's redemption authority. Re-asking and cancellation of a
-superseded request need explicit linkage so rotation does not duplicate work.
-
-## Current implementation
-
-- **The turn holds on its own asks.** A model's in-kernel turn registers a hold
-  (`runtime/held_asks.rs`) before publishing a `Waiting` tool pair, then waits
-  outside the broker call timeout, stream deadlines, and round cap. Nothing
-  blocks on the wire: MCP and RPC shell paths return `Pending` immediately.
-  - The approval worker is the sole executor. For a held foreground pair, it
-    runs or refuses the command, suppresses the completion notice, writes no
-    seed, starts no turn, and releases the hold so the turn reads the settled
-    result block in place.
-  - A `run_in_background: true` call holds only until the decision: the worker
-    releases the hold when the approved command starts, and the model reads a
-    running receipt (or the denial). Completion later arrives through its
-    notice.
-  - A hard or soft interrupt abandons an unanswered ask and settles the pair
-    `Error`, except `Kernel::interrupt_context_keeping_asks` (used when a
-    council `report` stops an autonomous turn while keeping its ask pending).
-  - Holds are not durable across a kernel restart: boot abandons pending asks
-    and closes `Waiting` pairs. Offline `kj` commands have no approval worker
-    and fail gated holds immediately (`Kernel::refuse_holds`).
-- Shell uses `run_in_background: false` by default and waits for the result.
-  Both modes execute kaish and use the same gate. An unknown old `foreground`
-  parameter is rejected. `run_in_background: true` returns a stable, non-error
-  receipt with `operation_id` instead of waiting; a gate receipt may also
-  carry `ask_id` and status `waiting`.
-- The original model receipt stays `done`. The operation has a separate,
-  excluded command/output pair, followed by a completion notification.
-- A denied or cancelled model pair settles before notification. Its notification
-  and answer redemption commit together; a failed write leaves the answer
-  available. A session reads its pair directly and consumes the answer after
-  successful settlement. Repeating a delivered refusal creates no second
-  notification. Restart recovery for old answers remains limited as described
-  in `docs/issues.md`.
-- Native kaish jobs use a manager per context, so jobs survive materialized
-  shell instances. The RPC shell path runs kaish in a detached task to preserve cwd, env,
-  and session switching, while its job registration supplies the same waiting
-  and cancellation handles.
-- The continuation window is 30 minutes after the last actual provider
-  request, including each tool-loop iteration. `kj handoff signoff <note>`
-  closes it immediately. An approval still executes and records its result
-  outside the window; automatic model resume requires the matching yielded,
-  unsigned continuation epoch.
-- Restart abandons unresolved asks and unfinished operations, and archive
-  abandons that context's asks.
-  Having no default expiry does not change those policies. Restart survival and
-  rotation recovery need an explicit execution/recovery design before removal
-  of those cleanup paths.
-- Reviewer resolution is one function over `contexts.senpai_ctx` (the climb above,
-  `KernelDb::route_review`). A retired senpai character refuses by name. `kj ledger escalate` without
-  `--to` runs the same climb past the current reviewer and refuses at a context with no senpai.
-- Self-confirmation: an ask whose reviewer is its own actor is answerable only by that actor, and the
-  decision is recorded as a self-confirmation. A context with no senpai (a root console) self-confirms only for
-  the live root character whose root console it is (`CharacterRow::root`); a model acting there is reviewed by
-  that root, and anyone else is refused (Routing, step 1). The performer-cannot-approve rule
-  holds for every other ask.
-- Character rules: `approval_rules` and `approval_rule_families` record the ask's `actor_id`, and scope
-  `character` matches it. The kernel decides the target condition per command
-  (`kj::gate_policy::serves_character`) and passes it to the ledger's match
-  (`approval_ledger::rules::RuleMatch`); `kj ledger allow` refuses a character allow over a `kj` call
-  the condition does not read (`gate_policy::character_rule_refusal`).
-- Authority: the one rule above, checked at each act it governs. The lineage root is the character at the top
-  of the senpai chain.
+A **continuation window** governs automatic model resumption after yielding (default 30 minutes after the last provider inference request). `kj handoff signoff <note>` closes it immediately. `kj interrupt <target>` stops the loop from outside. Async shell operations return a stable receipt naming the operation and approval dependency.

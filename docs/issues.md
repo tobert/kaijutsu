@@ -13,9 +13,9 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 ## Context shadows: what the description slice leaves open
 
 - **A resumed ask's error is lost.** 2026-11-15, live: from an MCP seat, `kj context create --as shadow-probe --label shadow-probe` raised an ask; Amy allowed it; gate-resume logged "running approved ask" and nothing more. The ask's output block is empty (0 bytes) and no error was logged, so a command that fails to parse after approval says nothing to anyone.
-- **No RPC and no asynchronous delivery.** `kj shadow describe` waits up to `DESCRIBE_TIMEOUT` (120 seconds) and prints the description. The app and tui need a request that returns at once, and a rendition that arrives through the change feed when it is ready (`docs/shadows.md`, "Open questions").
-- **Turns do not follow the media slots yet.** A turn sends an image whenever its provider can; the rule in `docs/shadows.md`, "Slots per media kind", says the character's `image` slot decides: native when it names the character's model, a description in place when it names another, a marker when absent.
-- **A shadow keeps the `image` slot it was made with.** A character's later `kj character slot set <name> image ...` reaches a new shadow only after the old one is archived. The maker in the index is the shadow's own slot, so the key stays truthful. A rotation of the source does not yet carry its description shadow to the successor (`docs/shadows.md`, "Lifecycle").
+- **No RPC and no asynchronous delivery.** `kj shadow describe` waits up to `DESCRIBE_TIMEOUT` (120 seconds) and prints the description. The app and tui need a request that returns at once, and a rendition that arrives through the change feed when it is ready (`docs/contexts.md`).
+- **Turns do not follow the media slots yet.** A turn sends an image whenever its provider can; the character's `image` slot (`docs/contexts.md`) should decide: native when it names the character's model, a description in place when it names another, a marker when absent.
+- **A shadow keeps the `image` slot it was made with.** A character's later `kj character slot set <name> image ...` reaches a new shadow only after the old one is archived. The maker in the index is the shadow's own slot, so the key stays truthful. A rotation of the source does not yet carry its description shadow to the successor (`docs/contexts.md`).
 - **A refused marker leaves an empty shadow.** The shadow is made before the provider says it cannot read the type, because the maker comes from the shadow's slot. The request writes no rendition and calls no model.
 - **Simultaneous misses both call the model.** Two requests for one key that both miss the index each pay for a description. The second one is linked and not indexed, so its shadow holds a rendition the key does not name.
 - **A failed commit stops the shadow's document.** A rendition whose link or index row cannot be written fails the request and leaves no block, and the shadow's document refuses writes until the kernel restarts (the rule of `BlockStore::append_block_recorded`).
@@ -48,13 +48,13 @@ From kaibo (deepseek) on `kaijutsu-council`:
 - **Audio costs tokens by the second.** `estimate_tokens` charges every audio or video block the flat `ESTIMATED_TOKENS_PER_AUDIO_VIDEO`, and it sees the type only once the resolver has run; an unresolved block counts as an image. `prefix::edit_cost`, behind the cost notes of `kj stage exclude` and `kj fork`, estimates unresolved hydration, so it charges audio and video as images.
 - **The request dump keeps Gemini's media.** `request_dump::elide_images` knows Anthropic's base64 source and `data:` URLs, not Gemini's `inlineData`, so a Gemini dump holds the whole base64 body under a header that says images are elided.
 - **Gemini sends images only.** Its API reads audio and video inline; the builder writes a marker for them. Gemini omni models will want them.
-- **The `images` fork filter drops audio and video too.** `kj fork --drop images` matches every Asset `Media` block; the filter name and `docs/fork-filters.md` still say image.
+- **The `images` fork filter drops audio and video too.** `kj fork --drop images` matches every Asset `Media` block; the filter name still says image.
 - **Kaijutsu's CAS ids are 128 bits.** `ContentHash` keeps half of BLAKE3, so every council object id is computed again from the bytes.
 - **Continuations replay a cut reply as closed.** The contract marks a reply cut by `max_tokens` open, and a reply to an open message takes its place. The kernel sets `open: false` in its projection and ignores `GenerationDone.context`, so the server appends a new message instead.
 
 ## vi registers: what sharing leaves open (2026-11-10)
 
-A player's text registers are shared through the kernel's register store: compose in the tui and the app and the kernel's vi sessions replay one another's writes (`docs/vi.md`, "A kernel-owned register store"). Amy's bar: "the register works for my common workflow of yy/dd/p". Open:
+A player's text registers are shared through the kernel's register store: compose in the tui and the app and the kernel's vi sessions replay one another's writes (`docs/input.md`). Amy's bar: "the register works for my common workflow of yy/dd/p". Open:
 
 - **A client without `onRegisterWrite` can lose its editor pushes.** It answers the new callback method with an unimplemented error, which the server's editor bridge counts as a callback failure; 15 s of continuous failures reap the bridge. State pushes that succeed reset the streak, so the risk is a mixed-version deploy, not a steady state.
 - **`registers_put` holds the editor sessions lock across one synchronous SQLite write.**
@@ -92,7 +92,7 @@ A player's text registers are shared through the kernel's register store: compos
 
 ## App and tui tune-up: what the first pass leaves open (2026-11-10)
 
-Folds and the reader's block landed in both clients (`docs/tui.md`, "Folds" and "The reader's block"; `docs/input.md`). Left from the survey:
+Folds and the reader's block landed in both clients (`docs/input.md`). Left from the survey:
 - **`render.rs`, `app.rs` and `present.rs` have smaller splits.**
 - **Four tui tests read the `run` module's source as text.**
 - **Logic both clients carry.** Ask-to-tool join, short age/count formatting, picker head/tail lines.
@@ -109,7 +109,7 @@ Folds and the reader's block landed in both clients (`docs/tui.md`, "Folds" and 
 
 ## `kj watch`: what the first build leaves open (2026-11-08)
 
-`kj watch` watches host files and delivers waiting changes before the next prompt (`docs/watch.md`). Open:
+`kj watch` watches host files and delivers waiting changes before the next prompt. Open:
 - **Only path watches.** Next sources named: a ledger event for a context, a council report.
 - **No way to wake a turn.**
 - **A fork copies no watches.**
@@ -167,19 +167,19 @@ Folds and the reader's block landed in both clients (`docs/tui.md`, "Folds" and 
 
 ## Anticipation and commitment — iteration order
 
-The kernel coordinates anticipation and commitment on the shared pulse. Iterate through one observable performance with producers at different speeds; each change should improve that flow, remove a competing mechanism, or establish a testable contract. Keep model placement independent of this work. `docs/audio-inference.md` records the workload and measured costs.
+The kernel coordinates anticipation and commitment on the shared pulse. Iterate through one observable performance with producers at different speeds; each change should improve that flow, remove a competing mechanism, or establish a testable contract. Keep model placement independent of this work. `docs/audio-io.md` and `docs/time.md` record the timing and placement rules.
 
-1. **Keep interaction dependable.** Continue the complete kaish/rc caller migration alongside the following steps, using `docs/kaish-integration.md`'s inventory. Each migrated caller must retain identity, cancellation, complete output, and terminal settlement, with the old path removed. These are the means of playing the instrument, so verify them through the actual client as well as unit tests.
+1. **Keep interaction dependable.** Continue the kaish/rc caller migration alongside the following steps (`docs/rc.md`). Each migrated caller must retain identity, cancellation, complete output, and terminal settlement, with the old path removed. These are the means of playing the instrument, so verify them through the actual client as well as unit tests.
 2. **Prove different producer speeds on one pulse.** Done: `crates/kaijutsu-server/tests/timeline_commitment_wire.rs` drives controlled producers against manual beats through the SSH client. Fast, slow, obsolete, and failed producers share one pulse; stale output never commits; a failed producer plays its declared fallback once.
-3. **Align execution with that proof.** Audit admission through completion and commitment against exact work ownership and intended musical time. Keep slow preparation outside timeline locks; give attempts bounded resource admission (`docs/resource-admission.md`) and explicit cancellation/shutdown behavior. Preserve a small synchronous commit step. Use existing runtime and resolver seams; delete superseded paths as the scenario starts passing.
-4. **Expose the feedback needed to play.** `kj transport work --track` reports each attempt's intended tick, admission, start, readiness, basis validity, and disposition (committed, fallback with its reason, cancelled, superseded), with the estimate and planned preparation tick beside them, as a table and as JSON. Producers report measured queue and compute time on results and errors, and each timeline keeps the newest 32 samples per resolver (`docs/hyoushigi.md`). The model output resolver's estimate is the performer's largest recent sample, and the musician tick script targets by it ("Lead time from measured cost: what is open"). Open: CAS preparation's estimate is a fixed guess; transfer durations wait for media delivery in the scenario; no client shows work yet. Measure under overlap before choosing lead-time targets; avoid turning unmeasured percentiles into guarantees.
+3. **Align execution with that proof.** Audit admission through completion and commitment against exact work ownership and intended musical time. Keep slow preparation outside timeline locks; give attempts bounded resource admission and explicit cancellation/shutdown behavior. Preserve a small synchronous commit step. Use existing runtime and resolver seams; delete superseded paths as the scenario starts passing.
+4. **Expose the feedback needed to play.** `kj transport work --track` reports each attempt's intended tick, admission, start, readiness, basis validity, and disposition (committed, fallback with its reason, cancelled, superseded), with the estimate and planned preparation tick beside them, as a table and as JSON. Producers report measured queue and compute time on results and errors, and each timeline keeps the newest 32 samples per resolver (`docs/time.md`). The model output resolver's estimate is the performer's largest recent sample, and the musician tick script targets by it ("Lead time from measured cost: what is open"). Open: CAS preparation's estimate is a fixed guess; transfer durations wait for media delivery in the scenario; no client shows work yet. Measure under overlap before choosing lead-time targets; avoid turning unmeasured percentiles into guarantees.
 5. **Exercise replacement, then extract.** Run the same scenario with one real producer and CAS/SFTP media delivery, observing it through a client and audiod when hardware is available. Use the evidence to choose which model-specific behavior becomes an optional tool or resolver adapter. `kj audio beats` is a candidate; its new home remains undecided. Remove the kernel dependency and obsolete verb only with a verified replacement or an explicit decision to drop the feature.
 
 The first day's useful checkpoint is a repaired interaction path and a repeatable scenario that exposes the next scheduling gap. A controlled failure is useful evidence; a new model integration is not required to prove the coordination contract. Update the checklist as each step lands, and correct adjacent docs/comments in the same change.
 
 ### Measure and recover admitted timeline work
 
-Live model score work now binds an absolute target and a seed/score basis at admission, with turn-owned delivery and timeline-owned cancellation. The old completion listener is deleted. Controlled SSH tests exercise both the generic producer scenario and timed `kj drive`, including the shipped musician tick script. See `docs/hyoushigi.md`, "Model turns with an intended score tick". The basis deliberately excludes the changing conversation, tool inputs and cross-track heard view. Broader dependencies need an explicit projection; current model handoffs do not automatically replay their producer on invalidity.
+Live model score work now binds an absolute target and a seed/score basis at admission, with turn-owned delivery and timeline-owned cancellation. The old completion listener is deleted. Controlled SSH tests exercise both the generic producer scenario and timed `kj drive`, including the shipped musician tick script (`docs/time.md`). The basis deliberately excludes the changing conversation, tool inputs and cross-track heard view. Broader dependencies need an explicit projection; current model handoffs do not automatically replay their producer on invalidity.
 
 CAS preparation has a process-wide limit of four operations. An uninterruptible host read retains its slot even after its owner is cancelled; four stuck reads would stop further CAS preparation until a read returns or the process restarts. Timeline deadlines still settle waiting work and the pulse keeps advancing. The 20 ms cost estimate remains an initial guess, not a measured size/queue model. The open-work bound counts operations, not bytes; ready-source and committed CAS residency still need measurement before admitting large rendered artifacts through this adapter (placed clips carry small records referring to media in CAS).
 

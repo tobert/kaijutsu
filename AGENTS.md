@@ -18,8 +18,8 @@ execution, and hardware timing separate. A useful model or tool does not
 automatically belong in the kernel or earn a core `kj` verb.
 
 We use the existing timeline, resolver, runtime, and CAS contracts before
-adding another mechanism. We read `docs/hyoushigi.md`, `docs/tracks.md`, and
-`docs/audio-inference.md` before changing their boundaries. We check
+adding another mechanism. We read `docs/time.md` and `docs/audio-io.md` before
+changing their boundaries. We check
 implementation against design claims: a resolver's start and each poll run on
 the beat path and must return without blocking, so slow work belongs behind
 the resolver's own admission. Realignment is tracked in `docs/issues.md`,
@@ -83,10 +83,10 @@ We read the doc that owns an area before changing it:
 
 | Area | Read |
 |---|---|
-| Character sheets, persons, rc directories, shipped characters | `docs/character.md` |
-| Senpai, kohai, and who asks, reports, moves, and archives | `docs/senpai-kohai.md` |
-| Turn identity and review | `docs/approval-identity.md` |
-| Prompt composition, rc instructions, rotation, and the stance register | `docs/prompts.md` |
+| Character sheets, persons, senpai–kohai, and shipped characters | `docs/character.md` |
+| Contexts, conversations, forks, drift, rotations, and shadows | `docs/contexts.md` |
+| Turn identity, review routing, `gate.toml`, and the council | `docs/approval-identity.md` |
+| Prompt composition, rc lifecycles, `/config`, and kaish execution | `docs/rc.md` |
 
 ## State and interfaces
 
@@ -99,7 +99,7 @@ Clients read over RPC and edit through kaish (`kj block append|edit`, block
 tools, scripts). Whole-block submission (`authorBlock`) and interaction-rate
 paths such as compose input, block queries, and the change feed remain RPC.
 Administration belongs in `kj`: config, rc, reset, and reload do not earn wire
-methods. Bootstrap config reads remain RPC. See `docs/change-feed.md`.
+methods. Bootstrap config reads remain RPC. See `docs/contexts.md`.
 
 Block text is a plain `String`; streaming appends with `push_str`. The kernel
 sequences every write, so nothing merges concurrent text into a document.
@@ -118,17 +118,16 @@ opt-out; that policy remains open in `docs/issues.md`.
 `kj stage exclude <id> && kj fork` removes unwanted history from the child's
 conversation. History edits wait for hydration; stored system instruction
 edits and exclusions affect the next turn. Editing an rc source file affects
-future lifecycle runs, not already stored instructions. See `docs/prompts.md`.
+future lifecycle runs, not already stored instructions. See `docs/rc.md`.
 
 Async writers reach the next turn through a mailbox cursor over the durable
 log. There is no insert-time tool-pair gate; snapshot repair fixes the live
 conversation shape while durable blocks may remain interleaved. See
-`docs/conversation-session.md`.
+`docs/contexts.md`.
 
 Every player is inside one trust boundary; the kernel runs as one Unix user.
 Capabilities and loadouts narrow focus and prevent mistakes. They are not
-security boundaries between players. See `docs/instrument-design.md`, "Many
-hands, one trust boundary" and `docs/chameleon.md`.
+security boundaries between players. See `docs/instrument-design.md`.
 
 ## Config and execution
 
@@ -136,7 +135,7 @@ Config is ordinary host files reached through `LocalBackend`. `/config/rc`,
 `/config/kernel`, `/config/client`, and `/config/midi` have no capabilities of
 their own; kernel file writes use `file:write`. `/config` is a mount-table
 name, with no backend of its own. Locations are declared through
-`--config-root`, `mounts.toml`, or `--mount`; see `docs/config-namespace.md`.
+`--config-root`, `mounts.toml`, or `--mount`; see `docs/rc.md`.
 
 We edit shipped defaults in `assets/defaults/`, then materialize rc with
 `kaijutsu-server rc reseed [--force]` when deploying. Reseed reports differing
@@ -151,8 +150,8 @@ Host execution policy belongs to kaish's `EmbeddedKaish` and its
 stdio server launch through `rmcp` is the sanctioned config-driven exception.
 A new `Command::new` or `/bin/sh -c` execution path needs a design
 conversation; asynchronous shell work uses kaish jobs and durable Kaijutsu
-receipts. We read `docs/kaish-integration.md` before changing construction,
-execution, or rc orchestration. It owns the complete caller migration plan.
+receipts. We read `docs/rc.md` before changing construction,
+execution, or rc orchestration.
 We keep rc lifecycle policy distinct from the shared interpreter integration,
 migrate callers, delete superseded APIs, and correct adjacent comments as each
 area moves.
@@ -186,10 +185,10 @@ We read the relevant contract before changing these areas:
 
 | Area | Rules to preserve | Read |
 |---|---|---|
-| Beat, clock, cue | Model the clock; stamp emissions and back-date sinks; reject stale data; never replay missed beats; scheduled-periodic kernel grid; local phasor free-runs inside its deadband | `docs/midi.md`, "The one timebase" |
-| App input | Central action table → `ActionFired` → handlers; add `InputContext` and bindings. Only the vi editor grabs raw keyboard input. Vi owns Esc where live; elsewhere one `PopLevel` | `docs/input.md` |
-| Tui | The tui owns the alternate screen; the transcript is its buffer and scrolling is copy mode. Reasoning and long tool results fold in place. Every act on a block uses the reader's block | `docs/tui.md`, "The owned screen", "Folds" and "The reader's block" |
-| Navigation and editing | Preserve screen/tmux `Ctrl+A` and vi muscle memory; document differences | `docs/input.md` and `docs/tui.md` |
+| Beat, clock, cue | Model the clock; stamp emissions and back-date sinks; reject stale data; never replay missed beats; scheduled-periodic kernel grid; local phasor free-runs inside its deadband | `docs/time.md` |
+| App input and vi | Central action table → `ActionFired` → handlers; add `InputContext` and bindings. Only the vi editor grabs raw keyboard input. Vi owns Esc where live; elsewhere one `PopLevel` | `docs/input.md` |
+| Tui | The tui owns the alternate screen; the transcript is its buffer and scrolling is copy mode. Reasoning and long tool results fold in place. Every act on a block uses the reader's block (`kaijutsu_present::reader::target`) | `docs/input.md` |
+| Navigation and editing | Preserve screen/tmux `Ctrl+A` and vi muscle memory; document differences | `docs/input.md` |
 
 For Bevy APIs, we read `Cargo.lock` and the matching cargo cache source. A
 related crate's version does not identify its Bevy dependency. We check

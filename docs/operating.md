@@ -1,203 +1,46 @@
-# Operating the live kernel
+# Operating the live kernel and container runtime
 
-The facts a session needs to touch the running kernel on zorak without
-breaking it. Measured values (sizes, counts) are examples from the day
-they were written; re-run the command rather than trusting the number.
-`docs/audio-daemon.md` covers the audio nodes; `docs/cc-peer.md` the hook
-adapter; `docs/character.md` the bridge identity.
+## The systemd service
 
-## The service
+ zorak runs the kernel as a systemd **user** unit from `target/debug/kaijutsu-server`:
 
-zorak runs the kernel as a systemd **user** unit from
-`target/debug/kaijutsu-server`:
-
-```
+```bash
 systemctl --user restart kaijutsu-server.service   # ~30 s to accepting
 systemctl --user status kaijutsu-server.service
 ```
 
-Its environment is the service's, not your shell's: an API key set in an
-environment variable needs a restart, while `kj backend set` and the
-config trees hot-reload.
+Environment variables need a service restart, while `kj backend set` and config trees hot-reload. Before bouncing, check `kj system status` for pending asks and in-flight turns.
 
-## Before a bounce
+## Deploy workflow
 
-```
-kj system status        # turns in flight, asks pending
-```
+1. Build: `cargo build -p kaijutsu-server`
+2. Stop: `systemctl --user stop kaijutsu-server.service`
+3. Back up database (`kernel.db`, `-wal`, `-shm`) and `auth.db` (`../auth.db*`) to `~/.local/share/kaijutsu/kernel/backups/`.
+4. Start: `systemctl --user start kaijutsu-server.service`
 
-A bounce abandons every pending ask and cuts every turn in flight. A turn
-that shows in flight with no `llm_stream` log lines for an hour is stale
-and safe to cut. Amy's own client sessions are attached; when she has said
-"you may bounce whenever today", bounce, otherwise ask.
+Reseed rc trees with `kaijutsu-server rc reseed` while stopped (`--force` overwrites defaults or moves retired trees aside).
 
-## Deploy = build, back up, restart
+## Rootless Podman and container setup
 
-```
-cargo build -p kaijutsu-server
-systemctl --user stop kaijutsu-server.service
-cd ~/.local/share/kaijutsu/kernel
-stamp="$(date +%Y%m%d-%H%M%S)"
-for f in kernel.db kernel.db-wal kernel.db-shm; do
-  cp -p "$f" "backups/$f.$stamp"
-done
-for f in auth.db auth.db-wal auth.db-shm; do
-  cp -p "../$f" "backups/$f.$stamp"
-done
-systemctl --user start kaijutsu-server.service
-```
+The Kaijutsu container image (`localhost/kaijutsu:dev`) runs as the non-root `kaijutsu` user (UID/GID 10001).
 
-Copy while stopped. Stopping does **not** checkpoint the WAL, so the
-`-wal` file is part of the backup, not an optional extra. `auth.db` lives
-one directory up, in `~/.local/share/kaijutsu/`, with its own `-wal` and
-`-shm`; it is in the set since the keyring melt rewrites it. Chain the
-copies so a missing file stops the script before the start, and start the
-service by hand if it does. `backups/` is gitignored.
-Snapshot retention is decided: the db grows, because `doc_snapshots.state`
-is the conversation and a sweep there deletes sessions.
+Run rootless Podman on zorak:
 
-Schema changes in `kaijutsu.capnp` are additive by convention (interface
-ordinals stay sequential, a retired method leaves a stub), so an old MCP
-process keeps working across a kernel deploy.
+```bash
+mkdir -p /tank/kaijutsu/kernel-data /tank/kaijutsu/workspace
 
-Restart the kernel promptly after committing a change to a serialized struct
-(`SyncPayload`, `BlockSnapshot`, `StoreSnapshot`, `BlockHeader`, `TextEdit`,
-or anything reachable from them). A running process keeps writing the old
-shape, and the rows it writes before the restart are the ones that fail to
-decode. `SCHEMA` and `apply_additive_migrations` stay the mechanism; there is
-no migration framework.
-
-A deploy does not touch the host rc tree or `/config/kernel`, and a start
-does not add a new shipped file to an existing `/config/kernel`: after a
-deploy that ships one (`description.md` on 2026-11-15), write it with
-`kj config reset <file>`, which installs the embedded default. The council's
-specs live under `/config/kernel/council/`; copy any missing ones from
-`assets/defaults/council/` before enabling the council (no seed step
-installs them on an existing host yet). Run
-`kaijutsu-server rc reseed` with the service stopped: it installs new seeds,
-names files that differ from theirs, and names retired defaults still
-installed. `--force` overwrites the first, removes retired files, and moves a retired
-directory aside to `<dir>.retired-<UTC timestamp>`; to keep your own edits, create a
-`<path>.keep` beside them (`docs/config-namespace.md`). Scripts of your own in a
-retired directory (`director/`, `console/`, `default/`, `root/`, `shell/`) do not
-run again until you copy them into the directory that absorbed it: `banto/`,
-`coder/` or `person/`. A
-`gate.toml` section the kernel no longer reads fails the load and refuses
-every gated shell submission, naming the section; delete it from
-`~/.config/kaijutsu/config/kernel/gate.toml` before the restart. The
-`[context_type.<type>]` sections are among them: write the same policy under
-`[rc.<dir>]` or `[character.<name>]` (`docs/gate-policy-tuning.md`).
-
-Two boot migrations change `kernel.db` on the first start of a binary that has
-them, and each copies the database aside first when it would change a row. An
-existing copy stays as it is, and a copy that cannot be made fails the start.
-
-| Migration | What it changes | Copy |
-|---|---|---|
-| `rc-dir-rename-v1` | `characters.rc_dir` moves to the directory that absorbed the retired one: `director` and `console` to `banto`, `root` and `shell` to `person` for a root, `default` to `coder`. A character that is not a root and ran `root` or `shell` gets no directory; its create refuses until `kj character set <name> --rc <dir>` sets one | `kernel.db.pre-rc-dir-rename` |
-| `type-melt-v1` | Drops `contexts.context_type` and `characters.context_type`, and renames the approval ledger's `rc_runs.context_type` to `rc_dir` | `kernel.db.pre-type-melt` |
-
-The copies sit beside `kernel.db`; prune them by hand once the new kernel has run
-well.
-
-## The MCP binary
-
-`~/bin/kaijutsu-mcp` is a symlink into `target/debug`. Never copy over it.
-
-```
-cargo build -p kaijutsu-mcp     # this is the deploy
+podman run --detach --name kaijutsu \
+  --userns=keep-id:uid=10001,gid=10001 --user kaijutsu \
+  --init \
+  --cap-drop=all --security-opt=no-new-privileges \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1g \
+  --publish 2222:2222 \
+  --mount type=bind,src=/tank/kaijutsu/kernel-data,dst=/var/lib/kaijutsu \
+  --mount type=bind,src=/tank/kaijutsu/workspace,dst=/workspace \
+  localhost/kaijutsu:dev
 ```
 
-Every Claude Code session picks the new binary up on its next `/mcp`
-reconnect. Rebuild it after any kaish or wire change. Hook events reach
-the listener in the same process tree through the PPID-derived socket.
-
-After a reboot the ssh-agent is empty and Claude Code reports the kaijutsu
-server as "Connection closed" at startup:
-
-```
-ssh-add ~/.ssh/kaijutsu-lead    # no passphrase
-```
-
-then `/mcp`.
-
-## Driving the kernel from Bash
-
-There is no standalone `kj` binary. Drive `kaijutsu-mcp --connect` over
-stdio: `initialize`, `initialized`, `register_session`, then `tools/call`.
-A `register_session` with a label another live session holds conflicts;
-pick a fresh label. Registration raises no ask: the gate allows a `kj
-context create` whose `--parent` is the MCP hub of the caller's root
-(`mcp/<root name>`), and the session lands there, with the root console as
-its senpai. `kj context list
---tree` shows every session of a root under its hub. A session archives
-itself at its end (`kj context archive`, from the session); `kj context
-promote` restores it.
-
-The gate asks before a `kj` write from an MCP seat that no `gate.toml` key
-covers (rename, retag, resume, rebind). An approval executes: `kj ledger allow <id>` runs the stored command in the
-ask's context. Chain with `&&` inside one command; `;` trips the
-shell-escape guard. The performing character cannot approve its own ask. Its assigned reviewer
-can answer from the same context; external model leads need a credential bound
-to their own character. See `docs/approval-identity.md`.
-
-`kj context create <character>` is how to probe a character's rc directory. A reseed seeds
-from the **binary**, so build first.
-
-## Builds beside a live kernel
-
-Run a build in its own low-weight scope under the user manager, where it
-is a sibling of `kaijutsu-server.service` and the weights compare:
-
-```sh
-systemd-run --user --scope -q -p CPUWeight=20 --nice=19 cargo test -p kaijutsu-kernel --lib
-```
-
-The kernel service carries `CPUWeight=1000` (drop-in
-`~/.config/systemd/user/kaijutsu-server.service.d/priority.conf`), so a
-build scope at 20 yields to it under CPU pressure. A plain `cargo` from a
-Claude Code terminal lands in `session-N.scope` instead, a sibling of the
-whole `user@1000.service` tree at equal weight, and its nice value (Claude
-Code runs at -15, inherited by every child) never compares against the
-kernel at all.
-
-Two limits, both measured 2026-09-10 on zorak: the IO controller is not
-delegated to the user slice and both NVMe queues run the `none` scheduler,
-so `IOWeight` is accepted and ignored — `/proc/pressure/io` was the only
-pressure that registered while the kernel felt slow, and fixing that is a
-root decision (`bfq` on the queues plus io delegation). And a command a
-context runs through kaish is spawned inside the kernel's own cgroup at the
-kernel's nice; see `docs/issues.md`, "kaish children inherit the kernel's
-priority".
-
-## Parallel lanes in one working tree
-
-Subagents make no git mutations. Each lane gets a disjoint file territory,
-and the lead commits path-scoped:
-
-```
-git commit -F <msg-file> -- <paths>
-```
-
-`git add <paths> && git commit` commits the whole index, including a
-sibling's staged work. Verify a lane's citations by re-reading each
-file:line, and re-run its red-test mutations by hand.
-
-A lane whose crate a sibling can transiently break may loop "waiting for a
-notification" that does not exist. Tell it there is nothing to wait for,
-and stop it if it loops again.
-
-## Test runs
-
-Never pipe a test run through `tail`; capture to a file and read that.
-Foreground `sleep` is blocked in the Bash tool; `top -b -n 2 -d N` is the
-wait. Bevy startup panics (B0001) do not surface in the unit suite because
-tests never initialize schedules; launch the app to catch them.
-
-## Machines
-
-`hostname` says where you are. moltar's wallclock runs about 100 s behind
-zorak's and NTP is off on both; the kernel's clock is the timebase and
-nodes model their offset from the ping, so do not "fix" the hosts for our
-sake. rc-driving threads need `KAISH_RC_THREAD_STACK` or the kernel
-SIGABRTs.
+- **State directory:** `/var/lib/kaijutsu` holds auth, config, and kernel data.
+- **Workspace:** `/workspace` is the project working mount.
+- **Bootstrap:** Run `bootstrap` with `--backend` and `--api-key-file` when initializing a fresh kernel instance with read-only secret mounts.
+- **Quadlet integration:** Systemd user unit configurations in `contrib/kaijutsu.container` manage container lifecycle under `~/.config/containers/systemd/`.

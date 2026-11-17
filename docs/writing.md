@@ -119,7 +119,7 @@ by itself, so the explanation is confirmation rather than the only source.
 
 `kj stage exclude <id> && kj fork` — exclude unwanted conversation history,
 then hydrate a child without it. Stored system instruction exclusions affect
-the next turn directly; see `docs/prompts.md`.
+the next turn directly; see `docs/rc.md`.
 
 Avoid incorrect examples. When one is necessary, put the correct form first and
 mark the error next to it:
@@ -140,18 +140,18 @@ a collision appears in real prose, not in advance.
 | player | noun | Anyone acting on the instrument — human, model, connected app, sibling context. All players are inside one trust boundary. |
 | capability | noun | An ergonomic nudge that narrows focus and removes a footgun. Never a security control, and never a statement that a player is less trusted. |
 | loadout | noun | The set of capabilities a context is given. Where mistake-prevention is routed. |
-| council context | noun | The context labeled `council-<character>` that holds a character's guidance for the council (`docs/council.md`). The set read along the reviewer chain is "the reviewer contexts". Not "voice", which names a musical voice (ABC `V:`, MIDI). |
-| performer | noun | The character that plays a context (`contexts.performer`), fixed when the context is made (`docs/senpai-kohai.md`). Not "context character" or "character instance", and not "seat", which is the council's word for the context whose calls it gates. |
+| council context | noun | The context labeled `council-<character>` that holds a character's guidance for the council (`docs/approval-identity.md`). The set read along the reviewer chain is "the reviewer contexts". Not "voice", which names a musical voice (ABC `V:`, MIDI). |
+| performer | noun | The character that plays a context (`contexts.performer`), fixed when the context is made (`docs/character.md`). Not "context character" or "character instance", and not "seat", which is the council's word for the context whose calls it gates. |
 | root console | noun | A root character's own context, the one `characters.root_ctx` names: it has no senpai and runs no model turns. Not "the console". |
 | console | noun | The model console a person talks to, the context `characters.console_ctx` names (bootstrap labels it `console`), performed by a non-root character and answering to the person's root console. Not "ROOT" and not "root console". |
-| seat | noun | Only the council's: the context whose calls the council gates (`docs/council.md`). For a context a character plays, say "context"; for the character in operation, say "performer". |
+| seat | noun | Only the council's: the context whose calls the council gates (`docs/approval-identity.md`). For a context a character plays, say "context"; for the character in operation, say "performer". |
 | gate | noun, verb | The check that stops a statement to ask its assigned reviewer. The one place that authority lives. |
-| reader's block | noun | The block an act on "the block I am looking at" applies to: the last block that fits the act, at or above the reader's line, or the newest that fits on the live tail (`kaijutsu_present::reader::target`, `docs/tui.md`, "The reader's block"). Not the edge, which is where the player's submit says the context ended. |
+| reader's block | noun | The block an act on "the block I am looking at" applies to: the last block that fits the act, at or above the reader's line, or the newest that fits on the live tail (`kaijutsu_present::reader::target`). Not the edge, which is where the player's submit says the context ended. |
 | ask | noun | A durable row a gate leaves behind, waiting for a decision. Answered through `kj ledger`. |
 | continuation window | noun | Policy window for automatically resuming a model conversation after it yields. It lasts 30 minutes from the last actual provider inference request, not a yield. It expresses KV-cache and cost expectations, not a guaranteed cache lifetime or an ask expiry; see `docs/approval-identity.md`, "Continuation windows and async work". |
 | fork | noun, verb | Making a child context. Its parent is `forked_from`; the context graph is a forest. |
 | drift | noun, verb | An overlay edge between contexts, deliberately cyclic. Never unify it with fork. |
-| shadow | noun | Two kinds, named in full where either could be meant. A *context shadow* follows a source context and holds renditions of its blocks (`docs/shadows.md`). A *command shadow* is a builtin that hides a host command of the same name, as `ps` does (`docs/system-verbs.md`). |
+| shadow | noun | Two kinds, named in full where either could be meant. A *context shadow* follows a source context and holds renditions of its blocks (`docs/contexts.md`). A *command shadow* is a builtin that hides a host command of the same name, as `ps` does. |
 | rendition | noun | A block in a shadow made from a source block: speech, a description, an image, a swarm trace. Not "derivative" and not "projection", which is the council's word for a seat's context value. |
 | speech | noun | Audio a model or TTS engine makes from text. Not "voice", which names a musical voice. |
 | hydrate | verb | To build a conversation from a context. Happens only at a boundary event. |
@@ -160,4 +160,4 @@ a collision appears in real prose, not in advance.
 | character | noun | The persistent someone a name resolves to; human or model. A principal with a sheet (`docs/character.md`). For a text unit say code point, glyph, or `char`, never character. |
 | headless kernel | noun | A kernel started with `--headless` (`KernelMode::Headless`): it runs with little input from people, as under a harness, and turns on behavior an interactive kernel leaves off, such as asking for `done` after a text-only reply. Not a turn property; for a turn the kernel drove, say autonomous turn. |
 | autonomous turn | noun | A turn no person prompted (`TurnOrigin::Autonomous`): `kj drive`, `kj fork --prompt`, drift delivery. Not "headless turn" or "driven turn". |
-| rc directory | noun | The directory under `/config/rc/` whose lifecycle scripts a character's contexts run, `/config/rc/<rc_dir>/<verb>/`, named by `characters.rc_dir`. Several characters may share one. A context has no type; say "rc directory" or "performer", never "context type". See `docs/character.md`, "What a context and a character carry". |
+| rc directory | noun | The directory under `/config/rc/` whose lifecycle scripts a character's contexts run, `/config/rc/<rc_dir>/<verb>/`, named by `characters.rc_dir`. Several characters may share one. A context has no type; say "rc directory" or "performer", never "context type". See `docs/rc.md`. |
