@@ -11,6 +11,9 @@
 //! - [`build`] — kaijutsu `Message` / `ContentBlock` → wire shapes.
 //! - [`sse`] — Server-Sent Events parser (`data:` chunks + `[DONE]`).
 //! - [`stream`] — SSE → kaijutsu `StreamEvent` state machine.
+//! - [`responses`] — the `/v1/responses` wire under the ChatGPT plan
+//!   contract, which the `chatgpt` backend speaks through
+//!   [`Client::stream_responses`].
 //!
 //! [`Client`] owns a `reqwest::Client` and attaches `Authorization: Bearer`
 //! per request *when a key is configured* — local servers need none.
@@ -18,6 +21,7 @@
 //! prompt streams too (`Provider::prompt_with_system`).
 
 pub mod build;
+pub mod responses;
 pub mod sse;
 pub mod stream;
 pub mod types;
@@ -234,6 +238,46 @@ impl Client {
         let response = self.error_for_status(response).await?;
 
         Ok(Stream::from_response(response, slot))
+    }
+
+    /// Start a streaming `/v1/responses` request under the ChatGPT plan
+    /// contract, authorized by `bearer` rather than this client's key.
+    pub async fn stream_responses(
+        &self,
+        opts: BuildOpts,
+        messages: Vec<Message>,
+        bearer: &str,
+    ) -> Result<responses::Stream, responses::OpenError> {
+        use responses::OpenError;
+        let body = responses::build::build_request(&opts, &messages, &self.provider_name);
+        let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait())
+            .await
+            .map_err(OpenError::Other)?;
+        let mut request = self
+            .http
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(bearer)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body);
+        for (name, value) in &self.headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(timeout) = self.request_timeout {
+            request = request.timeout(timeout);
+        }
+        crate::llm::request_dump::record(
+            opts.trace.as_deref(), &self.provider_name, &opts.model, &self.base_url,
+            opts.system.as_deref(), &messages, &body,
+        );
+        let response = request.send().await.map_err(|e| OpenError::Other(http_error(e)))?;
+        crate::llm::endpoint::observe_open(slot.as_ref(), &response);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_else(|e| format!("(failed to read body: {e})"));
+            return Err(responses::open_error(status, &body));
+        }
+        Ok(responses::Stream::from_response(response, slot))
     }
 
     /// Map an OpenAI-compatible 4xx/5xx response body into [`LlmError`].
