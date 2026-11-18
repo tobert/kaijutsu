@@ -3683,7 +3683,7 @@ esac
         }
     }
 
-    // ── Working-directory orientation (coder/create/S35-orient.kai) ───────
+    // ── Working-directory orientation (lib/create/S35-orient.kai) ─────────
 
     /// First words of the orientation notification.
     const ORIENT_MARKER: &str = "Orientation of the working directory";
