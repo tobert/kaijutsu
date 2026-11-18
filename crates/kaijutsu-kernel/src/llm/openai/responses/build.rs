@@ -18,6 +18,12 @@
 //! therefore have no sink here; an explicitly set sampling knob or budget is
 //! warned once per backend, model and value.
 //!
+//! Cache affinity: the plan route keeps prompt caches per machine and
+//! routes by the `session-id` header. A request inside a turn names its
+//! context id as [`cache_session`], sent as that header and as
+//! `prompt_cache_key`, so a context's requests reach a machine holding its
+//! prefix. Without it the requests scatter and rarely hit.
+//!
 //! Reasoning continues across requests through `encrypted_content`: the
 //! request asks for `reasoning.encrypted_content`, the stream puts it in the
 //! [`crate::llm::StreamEvent::ThinkingEnd`] signature behind
@@ -37,6 +43,12 @@ use crate::llm::{ContentBlock, Message, MessageContent, Role};
 /// The prefix on a [`crate::llm::StreamEvent::ThinkingEnd`] signature that
 /// holds a Responses reasoning item's `encrypted_content`.
 pub const REASONING_SIGNATURE_PREFIX: &str = "openai-responses:";
+
+/// The cache session a request belongs to: its context id, when it runs
+/// inside a turn.
+pub fn cache_session(opts: &BuildOpts) -> Option<String> {
+    opts.trace.as_ref().map(|t| t.context.to_string())
+}
 
 /// Build a plan-contract `/v1/responses` body. `backend_label` names the
 /// backend in the warnings for knobs this route drops.
@@ -64,6 +76,9 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
         "include": ["reasoning.encrypted_content"],
         "reasoning": { "summary": "auto" },
     });
+    if let Some(session) = cache_session(opts) {
+        body["prompt_cache_key"] = Value::String(session);
+    }
     if let Some(effort) = &opts.effort {
         body["reasoning"]["effort"] = Value::String(effort.clone());
     }

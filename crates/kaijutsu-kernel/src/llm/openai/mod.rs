@@ -263,6 +263,9 @@ impl Client {
         for (name, value) in &self.headers {
             request = request.header(*name, *value);
         }
+        if let Some(session) = responses::build::cache_session(&opts) {
+            request = request.header("session-id", session);
+        }
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }

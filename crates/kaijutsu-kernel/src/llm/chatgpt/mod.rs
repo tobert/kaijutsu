@@ -144,6 +144,28 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         assert_eq!(body["input"][0]["content"][0]["text"], "s");
     }
 
+    /// A turn's request carries the context id as both the `session-id`
+    /// header and `prompt_cache_key`: the plan route takes cache affinity
+    /// from that header, and without it requests scatter across machines
+    /// and rarely hit the cache.
+    ///
+    /// Falsified by a request with no `session-id`, or one whose key differs.
+    #[tokio::test]
+    async fn a_request_names_its_context_for_cache_affinity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, seen) = serve_with(|_| sse(COMPLETED)).await;
+        let creds = signed_in(tmp.path(), format!("{base}/token"), "tok");
+        let client = Client::new("gpt", creds).with_base_url(format!("{base}/v1"));
+        let context = kaijutsu_types::ContextId::new();
+        let trace = crate::llm::request_dump::RequestTrace::new(context, kaijutsu_types::TurnId::new(), 1, None);
+        let mut stream = client.stream(BuildOpts::new("m", 1).with_trace(trace), vec![Message::user("hi")]).await.unwrap();
+        while stream.next_event().await.is_some() {}
+        let seen = seen.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+        assert_eq!(seen[0].header("session-id"), Some(context.to_string().as_str()));
+        assert_eq!(body["prompt_cache_key"], context.to_string());
+    }
+
     /// The endpoint slot is free once `Done` is read: the runtime stops
     /// reading there and runs tools with the stream still in scope.
     ///
