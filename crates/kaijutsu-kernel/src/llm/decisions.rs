@@ -61,6 +61,63 @@ pub const OPENROUTER_DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/deci
 /// Google's Gemini Decisions endpoint.
 pub const GEMINI_DECISIONS_URL: &str = "https://generativelanguage.googleapis.com/v1beta/decisions";
 
+/// The largest reply body read; a longer one is unreadable.
+pub const MAX_REPLY_BYTES: usize = 1 << 20;
+
+/// How far a choice's probabilities may sum from 1.
+pub const PROBABILITY_SUM_TOLERANCE: f64 = 1e-3;
+
+/// Read a decisions endpoint: its wire, from the end of its path
+/// (`/api/alpha/decisions` is OpenRouter, `/v1beta/decisions` is Gemini),
+/// and the URL as it is stored and sent, trimmed and without a trailing
+/// slash. The endpoint is https, or http on a loopback host, and carries no
+/// user info, query, or fragment, where a key would sit in config; that
+/// refusal does not echo the URL. Any other URL is refused, naming both
+/// APIs' endpoints.
+pub fn endpoint(url: &str) -> Result<(Wire, String), String> {
+    let refuse = |why: String| {
+        format!(
+            "{why}; a decisions backend's --base-url is the full endpoint, {OPENROUTER_DECISIONS_URL} \
+             or {GEMINI_DECISIONS_URL} (another https host with the same path works too)"
+        )
+    };
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(refuse("it has no --base-url".into()));
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| refuse(format!("{url} is not a URL ({e})")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("a decisions --base-url must not carry user info, a query, or a fragment, which would keep a key \
+                    in config; name the key with --api-key-file or --api-key-env"
+            .into());
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    let host = match (parsed.scheme(), parsed.host_str()) {
+        ("https", Some(host)) => host,
+        ("http", Some(host)) if loopback => host,
+        (scheme, _) => {
+            return Err(refuse(format!(
+                "{url} uses {scheme}; a decisions endpoint is https, or http on a loopback host"
+            )));
+        }
+    };
+    let path = parsed.path().trim_end_matches('/');
+    let wire = if path.ends_with("/api/alpha/decisions") {
+        Wire::OpenRouter
+    } else if path.ends_with("/v1beta/decisions") {
+        Wire::Gemini
+    } else {
+        return Err(refuse(format!("{url} is not a Decisions endpoint")));
+    };
+    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Ok((wire, format!("{}://{host}{port}{path}", parsed.scheme())))
+}
+
 /// A `choice` may name at most this many options.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 
@@ -75,28 +132,9 @@ pub enum Wire {
 }
 
 impl Wire {
-    /// The wire a decisions endpoint speaks, from the end of its path:
-    /// `/api/alpha/decisions` is OpenRouter and `/v1beta/decisions` is
-    /// Gemini, on any host. Any other URL is refused, naming both.
+    /// The wire a decisions endpoint speaks ([`endpoint`]).
     pub fn for_url(url: &str) -> Result<Self, String> {
-        let refuse = |why: String| {
-            format!(
-                "{why}; a decisions backend's --base-url is the full endpoint, {OPENROUTER_DECISIONS_URL} \
-                 or {GEMINI_DECISIONS_URL} (another host with the same path works too)"
-            )
-        };
-        if url.trim().is_empty() {
-            return Err(refuse("it has no --base-url".into()));
-        }
-        let parsed = reqwest::Url::parse(url.trim()).map_err(|e| refuse(format!("{url} is not a URL ({e})")))?;
-        let path = parsed.path().trim_end_matches('/');
-        if path.ends_with("/api/alpha/decisions") {
-            Ok(Self::OpenRouter)
-        } else if path.ends_with("/v1beta/decisions") {
-            Ok(Self::Gemini)
-        } else {
-            Err(refuse(format!("{url} is not a Decisions endpoint")))
-        }
+        endpoint(url).map(|(wire, _)| wire)
     }
 
     /// The API's name, for `kj backend show`.
@@ -116,6 +154,18 @@ impl Wire {
         }
     }
 
+    /// The standard key variable for `url`, read only when it is the API's
+    /// own endpoint, [`OPENROUTER_DECISIONS_URL`] or [`GEMINI_DECISIONS_URL`].
+    /// Any other host, a proxy included, names its own key source, so one
+    /// provider's key never goes to another host.
+    pub fn hosted_key_env(url: &str) -> Option<&'static str> {
+        match endpoint(url).ok()?.1.as_str() {
+            OPENROUTER_DECISIONS_URL => Some(Self::OpenRouter.standard_env_var()),
+            GEMINI_DECISIONS_URL => Some(Self::Gemini.standard_env_var()),
+            _ => None,
+        }
+    }
+
     /// The models this wire is known to serve.
     pub fn models(self) -> Vec<&'static str> {
         match self {
@@ -132,6 +182,9 @@ pub struct Choice {
     pub instructions: String,
     /// Each option's label and what it means; 2 to 255 of them.
     pub options: BTreeMap<String, String>,
+    /// The first label [`Choice::new`] was given twice, which
+    /// [`Self::validate`] refuses.
+    repeated: Option<String>,
 }
 
 impl Choice {
@@ -140,16 +193,25 @@ impl Choice {
         instructions: impl Into<String>,
         options: impl IntoIterator<Item = (K, V)>,
     ) -> Self {
-        Self {
-            instructions: instructions.into(),
-            options: options.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+        let mut map = BTreeMap::new();
+        let mut repeated = None;
+        for (label, meaning) in options {
+            let label = label.into();
+            if map.insert(label.clone(), meaning.into()).is_some() && repeated.is_none() {
+                repeated = Some(label);
+            }
         }
+        Self { instructions: instructions.into(), options: map, repeated }
     }
 
     /// Refuses what the providers accept but answer wrongly: no instructions,
-    /// fewer than 2 or more than [`MAX_CHOICE_OPTIONS`] options, an empty label.
+    /// fewer than 2 or more than [`MAX_CHOICE_OPTIONS`] options, an empty
+    /// label, a label given twice.
     fn validate(&self, id: &str) -> Result<(), DecideError> {
         let bad = |why: String| DecideError::InvalidQuestion { id: id.to_string(), why };
+        if let Some(label) = &self.repeated {
+            return Err(bad(format!("option label {label:?} is given twice")));
+        }
         if self.instructions.trim().is_empty() {
             return Err(bad("its instructions are empty; say what to decide".into()));
         }
@@ -242,8 +304,11 @@ pub struct ChoiceAnswer {
 }
 
 impl ChoiceAnswer {
-    /// Checks the answer against its question: the label is an option, and
-    /// every option, and only an option, has a probability from 0 to 1.
+    /// Checks the answer against its question: the label is an option;
+    /// every option, and only an option, has a probability from 0 to 1;
+    /// they sum to 1 within [`PROBABILITY_SUM_TOLERANCE`]; the label is the
+    /// most likely option (a tie may pick either); and a confidence, when
+    /// given, is from 0 to 1.
     fn check(&self, id: &str, question: &Choice) -> Result<(), DecideError> {
         let mismatch = |why: String| DecideError::Mismatch { id: id.to_string(), why };
         if !question.options.contains_key(&self.choice) {
@@ -257,6 +322,25 @@ impl ChoiceAnswer {
         }
         if let Some((label, p)) = self.probabilities.iter().find(|(_, p)| !(0.0..=1.0).contains(*p)) {
             return Err(mismatch(format!("option {label:?} has probability {p}, outside 0 to 1")));
+        }
+        let sum: f64 = self.probabilities.values().sum();
+        if (sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
+            return Err(mismatch(format!("the probabilities sum to {sum}, not 1")));
+        }
+        let (best, top) = self
+            .probabilities
+            .iter()
+            .fold(("", f64::MIN), |best, (label, p)| if *p > best.1 { (label.as_str(), *p) } else { best });
+        if self.probabilities[&self.choice] < top {
+            return Err(mismatch(format!(
+                "the chosen label {:?} is not the most likely option ({best:?} at {top})",
+                self.choice
+            )));
+        }
+        if let Some(c) = self.confidence
+            && !(0.0..=1.0).contains(&c)
+        {
+            return Err(mismatch(format!("the confidence {c} is outside 0 to 1")));
         }
         Ok(())
     }
@@ -379,12 +463,12 @@ pub enum DecideError {
 }
 
 impl DecideError {
-    /// Whether the same request may pass when sent again: a 429, a 5xx, a
-    /// timeout, or a transport failure. Any other failure needs a different
+    /// Whether the same request may pass when sent again: a 408, 425, 429,
+    /// or 5xx, a timeout, or a transport failure. Any other failure needs a different
     /// request.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::Provider { status, .. } => *status == 429 || *status >= 500,
+            Self::Provider { status, .. } => matches!(*status, 408 | 425 | 429) || *status >= 500,
             Self::Timeout(_) | Self::Transport(_) => true,
             _ => false,
         }
@@ -428,7 +512,7 @@ impl Client {
     /// `request_timeout`.
     pub fn new(name: impl Into<String>, url: &str, key: impl Into<String>, request_timeout: Duration) -> LlmResult<Self> {
         let name = name.into();
-        let wire = Wire::for_url(url).map_err(|e| LlmError::InvalidRequest(format!("backend '{name}': {e}")))?;
+        let (wire, url) = endpoint(url).map_err(|e| LlmError::InvalidRequest(format!("backend '{name}': {e}")))?;
         let key = key.into();
         if reqwest::header::HeaderValue::from_str(&key).is_err() {
             return Err(LlmError::AuthError(format!(
@@ -436,11 +520,14 @@ impl Client {
                  such as a newline)"
             )));
         }
+        // A redirect is never followed: reqwest keeps `x-goog-api-key` on a
+        // redirect to another host.
         let http = reqwest::Client::builder()
             .user_agent(http_user_agent())
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| LlmError::NetworkError(format!("backend '{name}': could not build an HTTP client: {e}")))?;
-        Ok(Self { name, wire, url: url.trim().to_string(), key, http, request_timeout, endpoint: None })
+        Ok(Self { name, wire, url, key, http, request_timeout, endpoint: None })
     }
 
     /// Take a slot from `endpoint` before each call.
@@ -457,6 +544,11 @@ impl Client {
     /// The backend name.
     pub fn provider_name(&self) -> &str {
         &self.name
+    }
+
+    /// The endpoint, normalized ([`endpoint`]).
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     pub fn wire(&self) -> Wire {
@@ -486,11 +578,17 @@ impl Client {
             Wire::Gemini => post.header("x-goog-api-key", &self.key),
         };
         let call = async {
-            let resp = post.json(&req.body()).send().await.map_err(|e| DecideError::Transport(e.to_string()))?;
+            let mut resp = post.json(&req.body()).send().await.map_err(|e| DecideError::Transport(e.to_string()))?;
             crate::llm::endpoint::observe(slot.as_ref(), &resp);
             let status = resp.status();
-            let body = resp.text().await.map_err(|e| DecideError::Transport(e.to_string()))?;
-            Ok::<_, DecideError>((status, body))
+            let mut body = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| DecideError::Transport(e.to_string()))? {
+                if body.len() + chunk.len() > MAX_REPLY_BYTES {
+                    return Err(DecideError::Unreadable(format!("the reply is larger than {MAX_REPLY_BYTES} bytes")));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok::<_, DecideError>((status, String::from_utf8_lossy(&body).into_owned()))
         };
         let (status, body) = tokio::time::timeout_at(deadline, call).await.map_err(|_| timed_out())??;
         if !status.is_success() {
@@ -541,6 +639,71 @@ mod tests {
             assert!(err.contains(bad), "{err}");
         }
         assert!(Wire::for_url("https://openrouter.ai").unwrap_err().contains(OPENROUTER_DECISIONS_URL));
+    }
+
+    /// An endpoint is https, or http on a loopback host; it has a host, and
+    /// no user info or query, which would put a secret in config. A refusal
+    /// of either never echoes the URL.
+    ///
+    /// Falsified by a plain-http remote endpoint that validates, or a
+    /// refusal that prints the key it found.
+    #[test]
+    fn an_endpoint_is_https_or_loopback_and_carries_no_secret() {
+        assert_eq!(Wire::for_url("http://localhost:9/api/alpha/decisions"), Ok(Wire::OpenRouter));
+        assert_eq!(Wire::for_url("http://[::1]:9/v1beta/decisions"), Ok(Wire::Gemini));
+        let err = Wire::for_url("http://proxy.test/api/alpha/decisions").unwrap_err();
+        assert!(err.contains("https"), "{err}");
+        let err = Wire::for_url("file:///api/alpha/decisions").unwrap_err();
+        assert!(err.contains("https"), "{err}");
+        for (secret, url) in [
+            ("hunter2", "https://me:hunter2@openrouter.ai/api/alpha/decisions"),
+            ("AIzaSECRET", "https://generativelanguage.googleapis.com/v1beta/decisions?key=AIzaSECRET"),
+        ] {
+            let err = Wire::for_url(url).unwrap_err();
+            assert!(!err.contains(secret), "the refusal echoes the secret: {err}");
+            assert!(err.contains("--api-key-file") || err.contains("--api-key-env"), "{err}");
+        }
+    }
+
+    /// The stored and sent endpoint is the one the wire was read from:
+    /// trimmed, with no trailing slash.
+    #[test]
+    fn an_endpoint_is_normalized() {
+        assert_eq!(
+            endpoint(" https://openrouter.ai/api/alpha/decisions/ "),
+            Ok((Wire::OpenRouter, OPENROUTER_DECISIONS_URL.to_string()))
+        );
+        let client = Client::new("jev", "https://openrouter.ai/api/alpha/decisions//", "k", Duration::from_secs(5)).unwrap();
+        assert_eq!(client.url(), OPENROUTER_DECISIONS_URL);
+    }
+
+    /// The standard key variable is read only at the API's own host and
+    /// path; a proxy, or one API's path on the other's host, names its own.
+    ///
+    /// Falsified by an OpenRouter key sent to a host that is not
+    /// openrouter.ai, or a Gemini key sent to openrouter.ai.
+    #[test]
+    fn the_standard_key_is_read_only_at_its_own_host() {
+        assert_eq!(Wire::hosted_key_env(OPENROUTER_DECISIONS_URL), Some("OPENROUTER_API_KEY"));
+        assert_eq!(Wire::hosted_key_env("https://openrouter.ai/api/alpha/decisions/"), Some("OPENROUTER_API_KEY"));
+        assert_eq!(Wire::hosted_key_env(GEMINI_DECISIONS_URL), Some("GEMINI_API_KEY"));
+        for other in [
+            "https://proxy.test/api/alpha/decisions",
+            "https://openrouter.ai.evil.test/api/alpha/decisions",
+            "https://openrouter.ai/v1beta/decisions",
+            "https://generativelanguage.googleapis.com/api/alpha/decisions",
+            "https://openrouter.ai/proxy/api/alpha/decisions",
+            "http://127.0.0.1:9/v1beta/decisions",
+        ] {
+            assert_eq!(Wire::hosted_key_env(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_choice_with_a_repeated_label_is_refused() {
+        let twice = Choice::new("which", [("a", "x"), ("b", "y"), ("a", "z")]);
+        let err = DecisionRequest::new(Wire::OpenRouter, "m", "s".into(), one("q", twice)).unwrap_err();
+        assert!(matches!(&err, DecideError::InvalidQuestion { .. }) && err.to_string().contains("\"a\""), "{err}");
     }
 
     #[test]
@@ -658,6 +821,34 @@ mod tests {
         assert!(matches!(err, DecideError::Unreadable(_)), "{err}");
     }
 
+    /// Probabilities that do not sum to 1, a chosen label that is not the
+    /// most likely, and a confidence outside 0 to 1 are each a mismatch.
+    #[test]
+    fn an_answer_must_be_a_distribution_whose_choice_is_its_argmax() {
+        let req = request(Wire::OpenRouter);
+        let with = |answer: serde_json::Value| json!({"answers": {"verdict": answer}}).to_string();
+        let ok = with(json!({"type": "choice", "choice": "risky", "probabilities": {"safe": 0.2, "other": 0.2, "risky": 0.6}}));
+        assert!(DecisionResponse::parse(&ok, &req).is_ok());
+        let tie = with(json!({"type": "choice", "choice": "safe", "probabilities": {"safe": 0.4, "other": 0.2, "risky": 0.4}}));
+        assert!(DecisionResponse::parse(&tie, &req).is_ok(), "a tied top label may be chosen");
+        for (bad, want) in [
+            (json!({"type": "choice", "choice": "risky", "probabilities": {"safe": 0.5, "other": 0.5, "risky": 0.5}}), "sum"),
+            (json!({"type": "choice", "choice": "safe", "probabilities": {"safe": 0.1, "other": 0.1, "risky": 0.8}}), "most likely"),
+            (json!({"type": "choice", "choice": "risky", "probabilities": {"safe": 0.0, "other": 0.0, "risky": 1.0},
+                    "confidence": 1.5}), "confidence"),
+        ] {
+            let err = DecisionResponse::parse(&with(bad), &req).unwrap_err();
+            assert!(matches!(&err, DecideError::Mismatch { .. }) && err.to_string().contains(want), "{want}: {err}");
+        }
+    }
+
+    #[test]
+    fn retryable_includes_request_timeout_and_too_early() {
+        for status in [408, 425] {
+            assert!(DecideError::Provider { status, message: String::new() }.retryable(), "{status}");
+        }
+    }
+
     #[test]
     fn the_provider_message_is_extracted_or_kept_raw() {
         assert_eq!(
@@ -738,6 +929,33 @@ mod tests {
         let err = client.choose("m", json!("s"), "v", &one_option, Duration::from_secs(5)).await.unwrap_err();
         assert!(matches!(err, DecideError::InvalidQuestion { .. }), "{err}");
         assert_eq!(seen.lock().unwrap().len(), 1, "the invalid question sent nothing");
+    }
+
+    /// A redirect is not followed, so the key header never reaches the
+    /// host it points at.
+    ///
+    /// Falsified by reqwest's default policy, which follows it and keeps
+    /// `x-goog-api-key`.
+    #[tokio::test]
+    async fn a_redirect_is_refused_and_the_key_stays_home() {
+        let (elsewhere, followed) = serve(vec![reply(200, GEMINI_REPLY)]).await;
+        let moved = kaijutsu_council::test_server::Reply {
+            headers: vec![("location", format!("{elsewhere}/v1beta/decisions"))],
+            ..reply(307, "")
+        };
+        let (base, _) = serve(vec![moved]).await;
+        let client = Client::new("gem", &format!("{base}/v1beta/decisions"), "AIza", Duration::from_secs(5)).unwrap();
+        let err = client.choose("gemini-decision-1", json!("s"), "verdict", &verdict(), Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(err, DecideError::Provider { status: 307, .. }), "{err}");
+        assert!(followed.lock().unwrap().is_empty(), "the redirect was followed");
+    }
+
+    #[tokio::test]
+    async fn a_reply_past_the_body_cap_is_unreadable() {
+        let (base, _) = serve(vec![reply(200, "x".repeat(MAX_REPLY_BYTES + 1))]).await;
+        let client = Client::new("jev", &format!("{base}/api/alpha/decisions"), "k", Duration::from_secs(5)).unwrap();
+        let err = client.choose("m", json!("s"), "verdict", &verdict(), Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(&err, DecideError::Unreadable(why) if why.contains("larger than")), "{err}");
     }
 
     #[tokio::test]

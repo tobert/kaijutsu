@@ -767,6 +767,12 @@ impl KjDispatcher {
         if let Err(msg) = probe.validate() {
             return KjResult::Err(format!("kj backend set: {msg}"));
         }
+        // A decisions endpoint is stored as the wire was read from it.
+        let base_url = match parsed_kind {
+            BackendKind::Decisions => base_url
+                .map(|url| crate::llm::decisions::endpoint(&url).map(|(_, normalized)| normalized).unwrap_or(url)),
+            _ => base_url,
+        };
 
         let db = self.kernel_db().lock();
         let stored = db.upsert_backend(&BackendRow {
@@ -1200,11 +1206,14 @@ mod tests {
         );
         assert!(d.kernel().llm().read().await.get("gem").is_none());
 
+        let with_slash = format!("{}/", crate::llm::decisions::GEMINI_DECISIONS_URL);
         let set = d
-            .dispatch(&argv(&["backend", "set", "gem", "--kind", "decisions", "--base-url",
-                crate::llm::decisions::GEMINI_DECISIONS_URL, "--api-key-file", key]), &c)
+            .dispatch(&argv(&["backend", "set", "gem", "--kind", "decisions", "--base-url", &with_slash,
+                "--api-key-file", key]), &c)
             .await;
         assert!(matches!(&set, KjResult::Ok { .. }), "{set:?}");
+        let stored = d.kernel_db().lock().get_backend_by_name("gem").unwrap().unwrap().base_url;
+        assert_eq!(stored.as_deref(), Some(crate::llm::decisions::GEMINI_DECISIONS_URL), "the stored URL is normalized");
         let provider = d.kernel().llm().read().await.get("gem").expect("the decisions backend registered");
         assert_eq!(provider.decisions().map(|c| c.wire()), Some(crate::llm::decisions::Wire::Gemini));
 

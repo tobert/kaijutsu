@@ -139,7 +139,9 @@ impl BackendKind {
     /// names neither an `api_key_env` nor an `api_key_file`. An `openai`
     /// backend reads `OPENAI_API_KEY` only at api.openai.com: any other
     /// OpenAI-compatible server names its own key source, so an OpenAI key
-    /// never goes to a host that is not OpenAI.
+    /// never goes to a host that is not OpenAI. A `decisions` backend
+    /// likewise reads `OPENROUTER_API_KEY` or `GEMINI_API_KEY` only at that
+    /// API's own endpoint.
     pub fn standard_env_var(&self, base_url: Option<&str>) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
@@ -149,9 +151,7 @@ impl BackendKind {
             Self::OpenAi => base_url
                 .is_some_and(crate::llm::openai::is_hosted_openai)
                 .then_some("OPENAI_API_KEY"),
-            Self::Decisions => base_url
-                .and_then(|url| crate::llm::decisions::Wire::for_url(url).ok())
-                .map(crate::llm::decisions::Wire::standard_env_var),
+            Self::Decisions => base_url.and_then(crate::llm::decisions::Wire::hosted_key_env),
             Self::ChatGpt | Self::Council => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
@@ -608,6 +608,8 @@ mod tests {
         assert_eq!(kind.standard_env_var(Some(OPENROUTER_DECISIONS_URL)), Some("OPENROUTER_API_KEY"));
         assert_eq!(kind.standard_env_var(Some(GEMINI_DECISIONS_URL)), Some("GEMINI_API_KEY"));
         assert_eq!(kind.standard_env_var(Some("https://openrouter.ai/api/v1")), None);
+        assert_eq!(kind.standard_env_var(Some("https://proxy.test/api/alpha/decisions")), None, "a proxy names its own key");
+        assert_eq!(kind.standard_env_var(Some("https://openrouter.ai/v1beta/decisions")), None, "no Gemini key to openrouter.ai");
         assert!(!kind.sends_output_limit());
         assert!(!kind.requires_slot_output_limit());
         assert!(!kind.runs_chat_turns());
