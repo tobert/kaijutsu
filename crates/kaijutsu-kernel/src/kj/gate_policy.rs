@@ -411,6 +411,9 @@ struct TierTable {
     uncovered: Option<UncoveredTier>,
     /// This section's council block, when it has one. `[global]` has none.
     council: Option<CouncilBlock>,
+    /// This section's guardian switch, `[<section>.guardian] enabled`, when
+    /// it has one. `[global]` has none.
+    guardian: Option<bool>,
 }
 
 /// One section's council block, `[<section>.council]`: the keys it states.
@@ -451,6 +454,8 @@ pub(crate) struct GateConfig {
     character: BTreeMap<String, TierTable>,
     root: Option<TierTable>,
     council: Option<CouncilConfig>,
+    /// `[guardian]`, or its defaults when the file has none.
+    guardian: GuardianConfig,
     /// The `[rc.<dir>]` and `[character.<name>]` sections that name no rc
     /// directory or character, found by [`load_config`].
     nobody: Vec<Section>,
@@ -566,6 +571,27 @@ pub(crate) struct CouncilConfig {
     /// (`docs/council.md`, "Shadow context"). `None` runs the council with
     /// no judge.
     pub(crate) judge: Option<String>,
+}
+
+/// `[guardian]`: how a chat model on a context's `gate` slot judges the
+/// submissions the static rules escalate (`docs/approval-identity.md`,
+/// "The guardian"). Every key has a default, so a file may enable the
+/// guardian with a section switch alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GuardianConfig {
+    /// Bounds the guardian's one model call.
+    pub(crate) deadline_ms: u64,
+    /// The budget for the context's transcript tail, estimated at four
+    /// bytes a token.
+    pub(crate) transcript_tokens: u64,
+    /// The budget for the workspace's `AGENTS.md`, estimated the same way.
+    pub(crate) house_rules_tokens: u64,
+}
+
+impl Default for GuardianConfig {
+    fn default() -> Self {
+        GuardianConfig { deadline_ms: 30_000, transcript_tokens: 8_000, house_rules_tokens: DEFAULT_HOUSE_RULES_TOKENS }
+    }
 }
 
 /// `[council] escalate = { bumps = N, minutes = M }`.
@@ -698,6 +724,22 @@ struct CouncilSwitchToml {
     judge: Option<String>,
 }
 
+/// `[guardian]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuardianToml {
+    deadline_ms: Option<i64>,
+    transcript_tokens: Option<i64>,
+    house_rules_tokens: Option<i64>,
+}
+
+/// `[rc.<dir>.guardian]`, `[character.<name>.guardian]` or `[root.guardian]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuardianSwitchToml {
+    enabled: bool,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct GateToml {
@@ -714,6 +756,7 @@ struct GateToml {
     #[serde(default)]
     context_type: Option<toml::Value>,
     council: Option<CouncilToml>,
+    guardian: Option<GuardianToml>,
 }
 
 #[derive(Deserialize, Default)]
@@ -729,6 +772,8 @@ struct TierToml {
     uncovered: Option<String>,
     /// Accepted under every section but `[global]`, which is refused.
     council: Option<CouncilSwitchToml>,
+    /// Accepted under every section but `[global]`, which is refused.
+    guardian: Option<GuardianSwitchToml>,
 }
 
 /// Why `gate.toml` could not be used. Every variant refuses the
@@ -808,6 +853,14 @@ impl GateConfig {
                     .into(),
             ));
         }
+        if raw.global.guardian.is_some() {
+            return Err(GateConfigError::Parse(
+                "[global.guardian]: the guardian has no global switch; enable it per rc directory \
+                 with [rc.<dir>.guardian] or per character with [character.<name>.guardian]"
+                    .into(),
+            ));
+        }
+        let guardian = raw.guardian.as_ref().map(Self::guardian_from).transpose()?.unwrap_or_default();
         let council = raw.council.as_ref().map(Self::council_from).transpose()?;
         let table = |tier: &TierToml, section: Section| Self::table_from(tier, &section, council.as_ref());
         let mut config = GateConfig {
@@ -816,6 +869,7 @@ impl GateConfig {
             character: BTreeMap::new(),
             root: raw.root.as_ref().map(|tier| table(tier, Section::Root)).transpose()?,
             council: None,
+            guardian,
             nobody: Vec::new(),
         };
         for (dir, tier) in &raw.rc {
@@ -879,6 +933,20 @@ impl GateConfig {
             }
         }
         Ok(CouncilBlock { enabled: switch.enabled, contexts: switch.contexts.clone(), judge: switch.judge.clone() })
+    }
+
+    fn guardian_from(raw: &GuardianToml) -> Result<GuardianConfig, GateConfigError> {
+        let defaults = GuardianConfig::default();
+        let positive = |key: &str, value: Option<i64>, default: u64| match value {
+            None => Ok(default),
+            Some(v) if v > 0 => Ok(v as u64),
+            Some(v) => Err(GateConfigError::Parse(format!("[guardian] {key}: {v} must be an integer greater than 0"))),
+        };
+        Ok(GuardianConfig {
+            deadline_ms: positive("deadline_ms", raw.deadline_ms, defaults.deadline_ms)?,
+            transcript_tokens: positive("transcript_tokens", raw.transcript_tokens, defaults.transcript_tokens)?,
+            house_rules_tokens: positive("house_rules_tokens", raw.house_rules_tokens, defaults.house_rules_tokens)?,
+        })
     }
 
     fn council_from(raw: &CouncilToml) -> Result<CouncilConfig, GateConfigError> {
@@ -1151,6 +1219,19 @@ impl GateConfig {
         enabled.then_some(council)
     }
 
+    /// The guardian settings for a context `performer` plays, when its
+    /// sections enable the guardian: the last section with a guardian
+    /// switch decides. A caller with no performer has none.
+    pub(crate) fn guardian_for(&self, performer: Option<&GatePerformer>) -> Option<GuardianConfig> {
+        let mut enabled = false;
+        for section in performer?.sections() {
+            if let Some(switch) = self.table(&section).and_then(|t| t.guardian) {
+                enabled = switch;
+            }
+        }
+        enabled.then_some(self.guardian)
+    }
+
     fn table_from(tier: &TierToml, section: &Section, council: Option<&CouncilConfig>) -> Result<TierTable, GateConfigError> {
         let header = section.header();
         let mut entries = Vec::new();
@@ -1176,7 +1257,7 @@ impl GateConfig {
             Some(switch) => Some(Self::council_block(switch, section, council)?),
             None => None,
         };
-        Ok(TierTable { entries, uncovered, council })
+        Ok(TierTable { entries, uncovered, council, guardian: tier.guardian.as_ref().map(|g| g.enabled) })
     }
 
     /// The uncovered tier in force for a context `performer` plays, and the
@@ -1456,6 +1537,23 @@ pub(crate) fn council_for_context(
         return Ok(None);
     }
     Ok(config.council_for(performer))
+}
+
+/// [`council_for_context`] for the guardian: a console or root console has
+/// none, whatever its performer's sections say.
+pub(crate) fn guardian_for_context(
+    db: &KernelDb,
+    config: &GateConfig,
+    context: ContextId,
+    performer: Option<&GatePerformer>,
+) -> Result<Option<GuardianConfig>, String> {
+    let unread = |what: &str, e: crate::kernel_db::KernelDbError| {
+        format!("the gate could not read whether context {} is {what}: {e} (fail-closed)", context.short())
+    };
+    if db.is_console(context).map_err(|e| unread("a console", e))? || db.is_root_console(context).map_err(|e| unread("a root console", e))? {
+        return Ok(None);
+    }
+    Ok(config.guardian_for(performer))
 }
 
 /// The performer of a context, as the gate's layers key on it: its name,
@@ -3983,6 +4081,53 @@ enabled = false
     fn require_agree_can_be_turned_off() {
         let cfg = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nrequire_agree = false"));
         assert!(!cfg.council().unwrap().require_agree);
+    }
+
+    /// The guardian is off unless a performer's sections enable it, and
+    /// needs no `[guardian]` section: its settings have defaults.
+    #[test]
+    fn the_guardian_is_enabled_per_rc_directory_with_defaults() {
+        let cfg = config("[rc.sol.guardian]\nenabled = true\n\n[rc.toolie.guardian]\nenabled = false\n");
+        let guardian = cfg.guardian_for(Some(&dir("sol"))).expect("enabled for sol");
+        assert_eq!(guardian, GuardianConfig::default());
+        assert_eq!(guardian.deadline_ms, 30_000);
+        assert!(cfg.guardian_for(Some(&dir("toolie"))).is_none(), "enabled = false");
+        assert!(cfg.guardian_for(Some(&dir("coder"))).is_none(), "unmentioned directory");
+        assert!(cfg.guardian_for(None).is_none(), "no performer");
+        let shipped = config(crate::config_seed::DEFAULT_GATE_CONFIG);
+        assert!(shipped.guardian_for(Some(&dir("sol"))).is_none(), "the shipped default is guardian-off");
+    }
+
+    /// A later section's switch reads over an earlier one: a character can
+    /// turn off what its rc directory turned on.
+    #[test]
+    fn a_character_section_reads_over_its_directory_s_guardian_switch() {
+        let cfg = config("[rc.sol.guardian]\nenabled = true\n\n[character.sol.guardian]\nenabled = false\n");
+        assert!(cfg.guardian_for(Some(&dir("sol"))).is_none());
+    }
+
+    #[test]
+    fn the_guardian_section_sets_its_deadline_and_budgets() {
+        let cfg = config(
+            "[guardian]\ndeadline_ms = 45000\ntranscript_tokens = 2000\nhouse_rules_tokens = 500\n\n[rc.sol.guardian]\nenabled = true\n",
+        );
+        let guardian = cfg.guardian_for(Some(&dir("sol"))).unwrap();
+        assert_eq!((guardian.deadline_ms, guardian.transcript_tokens, guardian.house_rules_tokens), (45_000, 2000, 500));
+    }
+
+    #[test]
+    fn guardian_settings_are_checked() {
+        for bad in ["deadline_ms = 0", "transcript_tokens = -1", "house_rules_tokens = 0"] {
+            let m = council_err(&format!("[guardian]\n{bad}\n"));
+            let key = bad.split(' ').next().unwrap();
+            assert!(m.contains(&format!("[guardian] {key}")) && m.contains("greater than 0"), "{m}");
+        }
+        let m = council_err("[guardian]\nretries = 2\n");
+        assert!(m.contains("retries"), "{m}");
+        let m = council_err("[rc.sol.guardian]\nenabled = true\nextra = 1\n");
+        assert!(m.contains("extra"), "{m}");
+        let m = council_err("[global.guardian]\nenabled = true\n");
+        assert!(m.contains("[global.guardian]"), "{m}");
     }
 
     #[test]
