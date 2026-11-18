@@ -276,7 +276,7 @@ impl Default for CouncilSync {
 /// kernel VFS, up to one byte past the budget so the projection can mark a
 /// cut. A file that cannot be read, or is not UTF-8, is skipped with a
 /// warning; the decision reads no house-rules context rather than missing.
-async fn house_rules(kernel: &crate::Kernel, seat: ContextId, house_rules_tokens: u64) -> Option<HouseRules> {
+pub(crate) async fn house_rules(kernel: &crate::Kernel, seat: ContextId, house_rules_tokens: u64) -> Option<HouseRules> {
     use crate::vfs::VfsOps;
     let cwd = match kernel.kernel_db().lock().get_context_shell(seat) {
         Ok(row) => row.and_then(|row| row.cwd),

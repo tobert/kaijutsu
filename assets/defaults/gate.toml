@@ -87,6 +87,23 @@
 #   enabled = true
 #   contexts = ["council-amy", "council-banto"]  # replaces the shared contexts for this directory; spec contexts still join
 
+# Guardian: a chat model that judges what the tiers above escalate, by the
+# policy in /config/kernel/council/guardian.md. It is off. A context is judged
+# by the guardian when its `gate` slot names a chat backend (`kj character
+# slot set <character> gate chatgpt/<model>`, then `kj context rotate`) and a
+# section below enables it; the last section with a switch decides. An allow
+# runs, a deny asks with the guardian's rationale, a deny at critical risk
+# reports, and a failure asks as if there were no guardian. See
+# docs/approval-identity.md, "The guardian".
+#
+#   [guardian]                              # optional; these are the defaults
+#   deadline_ms = 30000                     # integer > 0; bounds the model call
+#   transcript_tokens = 8000                # the transcript tail it reads, at four bytes a token
+#   house_rules_tokens = 2000               # the workspace's AGENTS.md it reads
+#
+#   [rc.sol.guardian]
+#   enabled = true
+
 [global]
 allow = [
   "kj handoff note",     # recoverable by construction; the friction that started this

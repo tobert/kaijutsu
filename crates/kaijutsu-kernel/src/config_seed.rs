@@ -51,6 +51,11 @@ pub const DEFAULT_COUNCIL_BUMP_MESSAGE: &str =
 pub const DEFAULT_COUNCIL_PROGRAM_GATE: &str =
     include_str!("../../../assets/defaults/council/program-gate.json");
 
+/// Embedded guardian policy, seeded to `/config/kernel/council/guardian.md`
+/// (`docs/approval-identity.md`, "The guardian"). The host file is the live
+/// body, read at each guardian decision.
+pub const DEFAULT_GUARDIAN_POLICY: &str = include_str!("../../../assets/defaults/council/guardian.md");
+
 /// Embedded council spec a director's seat is read under, seeded to
 /// `/config/kernel/council/direction-check.json` (`docs/council.md`,
 /// "Council contexts are kaijutsu contexts").
@@ -116,6 +121,7 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("council/bump.md"), DEFAULT_COUNCIL_BUMP_MESSAGE),
         (config_path("council/program-gate.json"), DEFAULT_COUNCIL_PROGRAM_GATE),
         (config_path("council/direction-check.json"), DEFAULT_COUNCIL_DIRECTION_CHECK),
+        (config_path("council/guardian.md"), DEFAULT_GUARDIAN_POLICY),
         (config_path("continuation.toml"), DEFAULT_CONTINUATION_CONFIG),
         (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
         (config_path("continuation.md"), DEFAULT_CONTINUATION_PROMPT),

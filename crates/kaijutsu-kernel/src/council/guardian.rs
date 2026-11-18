@@ -220,6 +220,186 @@ impl Breakers {
     }
 }
 
+/// What the guardian made of one submission, for
+/// [`super::gate::guardian_verdict`].
+#[derive(Clone, Debug)]
+pub(crate) struct Judged {
+    pub(crate) outcome: Outcome,
+    /// The answer, when one parsed.
+    pub(crate) assessment: Option<Assessment>,
+    /// The slot's backend name.
+    pub(crate) backend: String,
+    pub(crate) model: String,
+    /// The digest of the system text the guardian read: the policy and the
+    /// answer format. Empty when the policy could not be read.
+    pub(crate) policy_digest: String,
+    pub(crate) deadline_ms: u64,
+    pub(crate) elapsed: std::time::Duration,
+    /// The breaker's cause, when this answer tripped it.
+    pub(crate) tripped: Option<String>,
+}
+
+impl Judged {
+    /// The guardian as the ask and the record name it: `<backend>/<model>`.
+    pub(crate) fn name(&self) -> String {
+        format!("{}/{}", self.backend, self.model)
+    }
+}
+
+/// A program the submission runs, as the prompt shows it: its file or the
+/// command that runs it, and its text.
+pub(crate) struct ShownProgram {
+    pub(crate) name: String,
+    pub(crate) text: String,
+}
+
+/// The policy text without a leading `<!-- ... -->` comment, which holds the
+/// file's attribution.
+pub(crate) fn without_leading_comment(policy: &str) -> &str {
+    let trimmed = policy.trim_start();
+    match trimmed.strip_prefix("<!--").and_then(|rest| rest.split_once("-->")) {
+        Some((_, rest)) => rest.trim_start(),
+        None => trimmed,
+    }
+}
+
+/// The user message: the house rules, the transcript tail, the planned
+/// action, and the text of each program it runs.
+pub(crate) fn prompt(
+    house: Option<&super::projection::HouseRules>,
+    transcript: &str,
+    action: &serde_json::Value,
+    programs: &[ShownProgram],
+) -> String {
+    let mut text = String::new();
+    match house {
+        Some(house) => text.push_str(&format!("# The workspace's AGENTS.md ({}), trusted\n\n{}\n\n", house.path, house.text.trim())),
+        None => text.push_str("# The workspace's AGENTS.md\n\nNone was found.\n\n"),
+    }
+    let transcript = if transcript.is_empty() { "(empty)" } else { transcript };
+    text.push_str(&format!("# The transcript of this context, oldest first\n\n{transcript}\n\n"));
+    let action = serde_json::to_string_pretty(action).expect("the action is plain data");
+    text.push_str(&format!("# The planned action\n\n{action}\n"));
+    for program in programs {
+        text.push_str(&format!("\n# Program text it runs: {}\n\n{}\n", program.name, program.text));
+    }
+    text.push_str("\nJudge the planned action.");
+    text
+}
+
+/// Ask the guardian on `bound` (the context's `gate` slot) about the
+/// planned `action`. Every failure is a miss with its cause: a tripped
+/// breaker, a policy that cannot be read, no provider for the slot, a call
+/// that fails or passes `config.deadline_ms`, or an answer that does not
+/// parse. Runs with no database lock held.
+pub(crate) async fn judge(
+    kernel: &crate::Kernel,
+    bound: &crate::model_resolution::BoundSlot,
+    config: &crate::kj::gate_policy::GuardianConfig,
+    context: ContextId,
+    action: &serde_json::Value,
+    programs: &[ShownProgram],
+) -> Judged {
+    use crate::vfs::VfsOps;
+    let started = std::time::Instant::now();
+    let mut judged = Judged {
+        outcome: Outcome::Miss(String::new()),
+        assessment: None,
+        backend: bound.backend.clone(),
+        model: bound.slot.model.clone(),
+        policy_digest: String::new(),
+        deadline_ms: config.deadline_ms,
+        elapsed: std::time::Duration::ZERO,
+        tripped: None,
+    };
+    let missed = |mut judged: Judged, cause: String| {
+        judged.outcome = Outcome::Miss(cause);
+        judged.elapsed = started.elapsed();
+        judged
+    };
+    if let Some(cause) = kernel.guardian_breakers().tripped(context) {
+        return missed(
+            judged,
+            format!("the guardian stopped judging this context because {cause}; its submissions ask until the kernel restarts"),
+        );
+    }
+    let path = kaijutsu_types::paths::config_path(POLICY_PATH);
+    let policy = kernel
+        .vfs()
+        .read_all(std::path::Path::new(&path))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}")));
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(why) => {
+            return missed(judged, format!("the guardian policy {path} could not be read ({why}); `kj config reset {POLICY_PATH}` restores the shipped one"));
+        }
+    };
+    let system = format!("{}\n\n{ANSWER_FORMAT}", without_leading_comment(&policy).trim_end());
+    judged.policy_digest = super::gate::text_digest(&system);
+    let house = super::sync::house_rules(kernel, context, config.house_rules_tokens).await;
+    let budget = usize::try_from(config.transcript_tokens.saturating_mul(super::projection::HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
+    let tail = match kernel.blocks().block_snapshots(context) {
+        Ok(blocks) => transcript(&blocks, budget),
+        Err(e) => return missed(judged, format!("the guardian could not read the context's transcript: {e}")),
+    };
+    let text = prompt(house.as_ref(), &tail, action, programs);
+    let Some(provider) = kernel.llm().read().await.get(&bound.backend) else {
+        return missed(judged, format!("backend {} has no provider in the kernel's registry", bound.backend));
+    };
+    let max_tokens = match bound.request_max_tokens(super::gate::GATE) {
+        Ok(max_tokens) => max_tokens,
+        Err(e) => return missed(judged, e.to_string()),
+    };
+    let slot = &bound.slot;
+    let tunables = crate::llm::SlotTunables {
+        max_tokens: None,
+        temperature: slot.temperature,
+        top_p: slot.top_p,
+        effort: slot.effort.clone(),
+        thinking_budget: slot.thinking_budget.and_then(|v| u64::try_from(v).ok()),
+        thinking_style: slot.thinking_style.clone(),
+        decide: None,
+    };
+    let opts = crate::llm::apply_tunables(
+        crate::llm::BuildOpts::with_output_limit(&slot.model, max_tokens).with_system(system),
+        &tunables,
+    );
+    let deadline = std::time::Duration::from_millis(config.deadline_ms);
+    let reply = match tokio::time::timeout(deadline, provider.prompt_with_system(opts, &text)).await {
+        Ok(reply) => reply,
+        Err(_) => return missed(judged, format!("no answer within the {} ms deadline", config.deadline_ms)),
+    };
+    let usage = match &reply {
+        Ok(reply) => Some(&reply.usage),
+        Err(failed) => failed.usage.as_ref(),
+    };
+    if let Some(usage) = usage
+        && let Err(e) = crate::runtime::llm_stream::record_turn_spend(
+            kernel.kernel_db(), None, provider.name(), &slot.model, usage.input_tokens, usage.output_tokens, &usage.extra,
+        )
+    {
+        tracing::error!(target: "kaijutsu::council", error = %e, "the guardian's spend could not be recorded");
+    }
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(e) => {
+            let cause = format!("{} failed: {e}", judged.name());
+            return missed(judged, cause);
+        }
+    };
+    let assessment = match parse_assessment(&reply.text) {
+        Ok(assessment) => assessment,
+        Err(cause) => return missed(judged, cause),
+    };
+    judged.tripped = kernel.guardian_breakers().record(context, assessment.outcome);
+    judged.outcome = assessment.outcome();
+    judged.assessment = Some(assessment);
+    judged.elapsed = started.elapsed();
+    judged
+}
+
 /// Bytes one block shows in the transcript.
 const BLOCK_BYTES: usize = 2048;
 
