@@ -36,7 +36,7 @@ Top wins. A learned human allow overrides config deny. Structural conditions (re
 
 ## The council gate and Council v2 backend
 
-When enabled in `gate.toml`, the gate consults the council for statements left Uncovered by static rules.
+When enabled in `gate.toml`, the gate consults the council for statements left Uncovered by static rules. A context whose `gate` slot names a chat model is judged by the guardian instead (below).
 
 ### The flow
 - **Allow**: Pooled probability $p(\text{allow}) \ge \text{allow\_at}$, mass floor met, agreement met, no control-text hit. Uncovered statements become council allows; submission runs with a durable auto-decision row naming the council.
@@ -49,6 +49,18 @@ When enabled in `gate.toml`, the gate consults the council for statements left U
 - **Council v2 backend (`kaijutsu-council`)**: Speaks Council v2 (`gogi-proto`). The kernel pins council seats under `kernel-<kernel_id>`, reads `/council/v2/identity`, streams `/council/v2/generations` for chat turns, and sends control vectors and CAS media objects.
 - **House rules**: Enabled via `[council] house_rules = true`, reading the first `AGENTS.md` up from working directory.
 - **Judge shadows & Bumper mode**: Judge shadows give opinions; bump shadows answer proceed or bump in **bumper mode** (`[council] mode = "bumper"` or `"bump-only"`).
+
+### The guardian
+
+`kj character slot set sol gate chatgpt/gpt-6.2-sol`, `[rc.sol.guardian] enabled = true` in `gate.toml`, then `kj context rotate`: a chat model judges what the rules escalate.
+
+The kind of backend a context's `gate` slot names picks who judges. A `council` backend runs the council above. A chat backend (`anthropic`, `deepseek`, `openai`, `chatgpt`, `alibaba`, `gemini`) runs the guardian when the performer's sections enable it (`[rc.<dir>.guardian]`, `[root.guardian]`, `[character.<name>.guardian]`; the last switch decides). The guardian is modeled on OpenAI Codex's auto-review.
+
+- **The call.** One model call on the slot, bounded by `[guardian] deadline_ms` (default 30000). The system text is `/config/kernel/council/guardian.md` and the answer format. The user message holds the workspace's `AGENTS.md`, the tail of the context's transcript (user and model text, tool calls and results; `transcript_tokens`, default 8000), and the planned action as the council's shell case reads it, with the text of each program it runs.
+- **The answer.** One JSON object, `{outcome, risk_level, user_authorization, rationale}`, parsed strictly. Anything else is a miss. No provider client sends a JSON schema yet, so the format is asked for in the prompt.
+- **Outcomes.** `allow` runs the submission with an auto-decision row naming the guardian's model. `deny` asks, with the rationale in the ask. `deny` at `critical` risk reports. An `allow` at `critical` risk asks. A timeout, a transport error, or an unparseable answer is a miss.
+- **Circuit breaker.** After 3 denials in a row, or 10 of the last 50, the guardian stops judging that context until the kernel restarts; each later submission is a miss naming why, so it asks the senpai.
+- **Record.** Each decision is a `council_decisions` row with spec name `guardian`; the model's own answer is a `council_assessments` row beside it.
 
 ## Standing rules for a character
 

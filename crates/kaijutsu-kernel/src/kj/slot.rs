@@ -8,8 +8,9 @@
 //!
 //! A character also holds up to three **slots**: `distill`, a cheaper model
 //! that summarizes for `kj fork --compact` and `kj drift pull|merge`,
-//! `gate`, the council server (a backend of kind `council`) that judges the gate
-//! (`docs/council.md`, "Configuration"), and `image`, the model that reads
+//! `gate`, the model that judges the gate: a council server (a backend of kind
+//! `council`, `docs/council.md`, "Configuration") or a chat model, the guardian
+//! (`docs/approval-identity.md`, "The guardian"), and `image`, the model that reads
 //! images for the character (`docs/shadows.md`). No other role exists: the judge is
 //! a character of its own, whose model is its council server.
 //!
@@ -36,8 +37,9 @@ pub(super) enum CharacterSlotCommand {
         /// The character's name
         character: String,
         /// Role: `distill` for the model that summarizes for `kj fork
-        /// --compact` and `kj drift pull|merge`, `gate` for the council
-        /// server (a council backend) that judges the gate, or `image` for the
+        /// --compact` and `kj drift pull|merge`, `gate` for the model that
+        /// judges the gate (a council backend, or a chat model when
+        /// `gate.toml` enables the guardian), or `image` for the
         /// model that reads images for the character, which `kj shadow
         /// describe` asks for a description. The character's chat model is
         /// `kj character model set`
@@ -953,11 +955,11 @@ mod tests {
     /// A character's slots are `distill`, `gate`, and `describe`. `slot set` and `slot
     /// unset` refuse any other role and name the verb that holds it: `kj
     /// character model set` for `model`, the judge character for
-    /// `judge`. A `gate` slot names a council server, so a backend of
-    /// another kind refuses. Nothing is written.
+    /// `judge`. Nothing is written for a refused role. A `gate` slot on a
+    /// chat backend is accepted: it names the guardian.
     ///
-    /// Falsified by accepting a role as a forward declaration, or a gate on
-    /// a chat backend.
+    /// Falsified by accepting a role as a forward declaration, or by
+    /// refusing a gate on a chat backend.
     #[tokio::test]
     async fn slot_set_takes_distill_and_gate_only() {
         let d = seeded().await;
@@ -985,11 +987,12 @@ mod tests {
                 "{verb} judge: {r:?}"
             );
         }
-        let gate = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/claude-opus-5"]), &c).await;
-        assert!(matches!(&gate, KjResult::Err(m) if m.contains("council server") && m.contains("not council")), "{gate:?}");
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
         assert!(db.list_character_slots(house.principal_id).unwrap().is_empty(), "nothing was written");
+        drop(db);
+        let gate = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/claude-opus-5"]), &c).await;
+        assert!(gate.is_ok(), "a gate slot on a chat backend names the guardian: {}", gate.message());
     }
 
     /// An `image` slot names the model that reads images for the character.

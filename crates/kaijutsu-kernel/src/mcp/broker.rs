@@ -3059,10 +3059,9 @@ impl Broker {
         Ok(policy.describe_asks_planned(&statements, !root).map(|description| AskTier { description, council }))
     }
 
-    /// Whether the council reads `ctx`'s decisions: the rule `consult`,
-    /// seat planning and the judge shadow read
-    /// ([`crate::kj::gate_policy::council_for_context`]), so a console and a
-    /// root console are not under it. With no dispatcher wired there is no
+    /// Whether the council or the guardian reads `ctx`'s decisions: the rule
+    /// `consult` reads ([`crate::council::gate::judged`]), so a console and a
+    /// root console are not under either. With no dispatcher wired there is no
     /// council. `Err` when the pointers do not read.
     async fn council_applies(
         &self,
@@ -3072,7 +3071,7 @@ impl Broker {
     ) -> Result<bool, String> {
         let Some(dispatcher) = self.kj_dispatcher().await else { return Ok(false) };
         let db = dispatcher.kernel_db().lock();
-        Ok(crate::kj::gate_policy::council_for_context(&db, config, ctx.context_id, performer)?.is_some())
+        crate::council::gate::judged(&db, config, ctx.context_id, performer)
     }
 
     /// Whether `ctx`'s actor is a live root character: a person's hands, so

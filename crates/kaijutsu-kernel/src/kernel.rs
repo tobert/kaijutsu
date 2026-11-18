@@ -124,6 +124,9 @@ pub struct Kernel {
     /// (`docs/acp.md`, "Client-declared MCP servers"). Ephemeral: they live
     /// only as long as a declaring connection.
     context_mcp: crate::mcp::ContextMcpServers,
+    /// Each context's guardian circuit breaker (`council::guardian`).
+    /// In memory: a restart resets them.
+    guardian_breakers: crate::council::guardian::Breakers,
     /// Kernel-wide timeout policy: kaish-script bounds, LLM streaming,
     /// MCP connect/handshake. Per-instance MCP `call_timeout` overrides live
     /// on `InstancePolicy`.
@@ -484,6 +487,7 @@ impl Kernel {
                 b
             }),
             context_mcp: crate::mcp::ContextMcpServers::new(),
+            guardian_breakers: Default::default(),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             mode: KernelMode::default(),
             blocks,
@@ -658,6 +662,10 @@ impl Kernel {
     /// MCP servers connected clients declared for one context each.
     pub fn context_mcp(&self) -> &crate::mcp::ContextMcpServers {
         &self.context_mcp
+    }
+
+    pub(crate) fn guardian_breakers(&self) -> &crate::council::guardian::Breakers {
+        &self.guardian_breakers
     }
 
     /// The host `PATH` this kernel process started with — the `$PATH` seed for

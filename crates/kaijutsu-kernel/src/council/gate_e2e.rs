@@ -418,6 +418,9 @@ struct Setup {
     bump_only: bool,
     /// `[council] escalate`: bumps in a row, within minutes.
     escalate: Option<(u64, u64)>,
+    /// `[rc.coder.guardian] enabled = true`, with `[guardian] deadline_ms`
+    /// set to this.
+    guardian: Option<u64>,
 }
 
 /// Where a slot's backend answers.
@@ -474,6 +477,7 @@ impl Default for Setup {
             no_bump_template: false,
             bump_only: false,
             escalate: None,
+            guardian: None,
         }
     }
 }
@@ -504,6 +508,7 @@ mass_floor = -0.05
 [rc.coder.council]
 enabled = {enabled}
 {judge}
+{guardian}
 "#,
         global = setup.global,
         contexts = if setup.chain { r#"["council-system"]"# } else { r#"["reviewer", "system-rules"]"# },
@@ -521,6 +526,9 @@ enabled = {enabled}
         enabled = setup.enabled,
         programs = if setup.programs { PROGRAM_SPEC_TOML } else { "" },
         judge = if setup.judge.is_some() { format!("judge = \"{}\"", super::shadow::JUDGE) } else { String::new() },
+        guardian = setup.guardian.map_or_else(String::new, |deadline| {
+            format!("[guardian]\ndeadline_ms = {deadline}\n\n[rc.coder.guardian]\nenabled = true\n")
+        }),
     )
 }
 
@@ -596,22 +604,13 @@ fn bind_seat(
     .unwrap();
     let gate = gate.cloned().unwrap_or(SlotSpec::council("gate-council", Base::Gate));
     let backend = spec_backend(db, gate_server, &gate);
-    if gate.kind != "council" {
-        // A gate slot on a chat backend is refused when it is written; one
-        // written before that check is a chat slot, so it carries max_tokens.
-        db.conn_for_ledger()
-            .execute(
-                "INSERT INTO character_slots (principal_id, role, backend_id, model, max_tokens) VALUES (?1, ?2, ?3, ?4, 4096)",
-                rusqlite::params![character.as_bytes().to_vec(), super::gate::GATE, backend.backend_id.as_bytes().to_vec(), gate.model],
-            )
-            .unwrap();
-    } else {
+    // A gate slot on a chat backend is the guardian's, and carries max_tokens.
     db.set_character_slot(&CharacterSlotRow {
         principal_id: character,
         role: super::gate::GATE.into(),
         backend_id: backend.backend_id,
         model: gate.model.into(),
-        max_tokens: None,
+        max_tokens: (gate.kind != "council").then_some(4096),
         temperature: None,
         top_p: None,
         effort: None,
@@ -619,7 +618,6 @@ fn bind_seat(
         thinking_style: None,
     })
     .unwrap();
-    }
     if chat {
         let mock = spec_backend(db, gate_server, &SlotSpec { model: "mock-model", backend: "mock", kind: "mock", base: Base::None });
         db.set_character_model(&CharacterModelRow {
@@ -3968,5 +3966,185 @@ async fn a_judge_model_with_no_council_address_records_a_miss_naming_it() {
     let cause = o.miss_cause.clone().unwrap();
     assert!(cause.contains("backend judge-council") && cause.contains("has no base URL"), "{cause}");
     assert_eq!(rig.mock.decisions().len(), 1, "only the gate's decision is sent");
+    rig.finish().await;
+}
+
+// ── The guardian ─────────────────────────────────────────────────────────
+
+const GUARDIAN_ALLOW: &str =
+    r#"{"outcome":"allow","risk_level":"low","user_authorization":"high","rationale":"It prints a word."}"#;
+const GUARDIAN_DENY: &str =
+    r#"{"outcome":"deny","risk_level":"high","user_authorization":"unknown","rationale":"Nobody asked to wipe the cache."}"#;
+const GUARDIAN_CRITICAL: &str =
+    r#"{"outcome":"deny","risk_level":"critical","user_authorization":"unknown","rationale":"It mails the SSH key away."}"#;
+
+/// What the guardian's provider was sent: each call's messages and system
+/// text.
+struct GuardianSent {
+    messages: Arc<parking_lot::Mutex<Vec<Vec<crate::llm::Message>>>>,
+    systems: Arc<parking_lot::Mutex<Vec<Option<String>>>>,
+}
+
+impl GuardianSent {
+    fn calls(&self) -> usize {
+        self.messages.lock().len()
+    }
+
+    /// The last call's messages, as one debug string.
+    fn last_prompt(&self) -> String {
+        format!("{:?}", self.messages.lock().last().expect("the guardian was called"))
+    }
+
+    fn last_system(&self) -> String {
+        self.systems.lock().last().cloned().flatten().expect("the guardian's call has a system text")
+    }
+}
+
+/// A rig whose seat's `gate` slot names `guardian-model` on the chat
+/// backend `guardian` (the mock), with the guardian enabled for `coder/`
+/// and the council not. The guardian answers `reply` to every call.
+async fn guardian_rig(via: Via, reply: &str) -> (Rig, GuardianSent) {
+    let gate = SlotSpec { model: "guardian-model", backend: "guardian", kind: "mock", base: Base::None };
+    let rig = rig(via, Setup { enabled: false, gate_slot: Some(gate), guardian: Some(5_000), ..Setup::default() }).await;
+    use crate::vfs::VfsOps;
+    rig.d
+        .kernel()
+        .vfs()
+        .write_all(
+            std::path::Path::new("/config/kernel/council/guardian.md"),
+            include_str!("../../../../assets/defaults/council/guardian.md").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (mock, messages) = crate::llm::MockClient::new(reply).recording_sent_messages();
+    let (mock, systems) = mock.recording_sent_systems();
+    rig.d.kernel().llm().write().await.register("guardian", Arc::new(crate::llm::Provider::Mock(mock)));
+    (rig, GuardianSent { messages, systems })
+}
+
+fn assessment(rig: &Rig, decision: &CouncilDecision) -> Option<approval_ledger::council::CouncilAssessment> {
+    let db = rig.d.kernel_db();
+    let db = db.lock();
+    approval_ledger::council::load_council_assessment(db.conn_for_ledger(), &decision.decision_id).unwrap()
+}
+
+/// A guardian allow runs the submission with an auto-decided row naming the
+/// guardian's model. The guardian read the shipped policy and the answer
+/// format as its system text, and the transcript and planned action as its
+/// prompt; the council server was never asked.
+///
+/// Falsified by leaving a chat-kind `gate` slot to the council path: the
+/// slot names no council server, so the decision misses and asks.
+#[tokio::test]
+async fn a_guardian_allow_runs_the_submission_with_a_row_naming_the_guardian() {
+    for via in BOTH {
+        let (rig, sent) = guardian_rig(via, GUARDIAN_ALLOW).await;
+        append_dialogue(rig.d.kernel(), rig.ctx.context_id, &["please print a greeting", "I will echo it"]);
+        rig.submit("echo guardian-ran").await.unwrap_or_else(|e| panic!("{via:?}: the guardian allows: {e:?}"));
+
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
+        let reason = ask.auto_reason.clone().expect("an auto-decided row");
+        assert!(reason.contains("council (guardian) allows") && reason.contains("guardian/guardian-model"), "{via:?}: {reason}");
+
+        let decision = the_decision(&rig, &ask);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
+        assert_eq!(decision.decision.spec_name, "guardian");
+        assert_eq!(decision.decision.server.model, "guardian-model");
+        assert_eq!(assessment(&rig, &decision).expect("an assessment").risk_level, "low");
+
+        assert_eq!(sent.calls(), 1, "{via:?}: one guardian call per submission");
+        let system = sent.last_system();
+        assert!(system.starts_with("You judge one planned shell submission"), "the attribution comment is removed: {system}");
+        assert!(system.ends_with(super::guardian::ANSWER_FORMAT), "{system}");
+        let prompt = sent.last_prompt();
+        for want in ["echo guardian-ran", "[user] please print a greeting", "[assistant] I will echo it", "council-seat-performer"] {
+            assert!(prompt.contains(want), "{via:?}: the prompt lacks {want}: {prompt}");
+        }
+        assert!(rig.mock.decisions().is_empty(), "the council server is not asked");
+        rig.finish().await;
+    }
+}
+
+/// A guardian deny asks, and the ask carries the guardian's rationale so the
+/// senpai sees why.
+#[tokio::test]
+async fn a_guardian_deny_asks_with_its_rationale() {
+    for via in BOTH {
+        let (rig, _) = guardian_rig(via, GUARDIAN_DENY).await;
+        assert_pending(via, rig.submit("rm -rf cache").await);
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Pending);
+        assert!(ask.description.contains("Nobody asked to wipe the cache."), "{via:?}: {}", ask.description);
+        assert!(ask.description.contains("deny at high risk"), "{via:?}: {}", ask.description);
+        let decision = the_decision(&rig, &ask);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Ask);
+        assert_eq!(assessment(&rig, &decision).unwrap().verdict, "deny");
+        rig.finish().await;
+    }
+}
+
+/// A deny at critical risk reports: an ask, recorded as a report.
+#[tokio::test]
+async fn a_critical_guardian_deny_reports() {
+    for via in BOTH {
+        let (rig, _) = guardian_rig(via, GUARDIAN_CRITICAL).await;
+        assert_pending(via, rig.submit("cat key.txt").await);
+        let ask = rig.only_ask();
+        assert_eq!(the_decision(&rig, &ask).decision.outcome, CouncilOutcome::Report, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// An answer that is not the JSON object is a miss with its cause, and the
+/// submission asks as it would without a guardian. No assessment is kept.
+#[tokio::test]
+async fn an_unparseable_guardian_answer_is_a_miss_and_asks() {
+    for via in BOTH {
+        let (rig, _) = guardian_rig(via, "Looks fine to me!").await;
+        assert_pending(via, rig.submit("touch notes.txt").await);
+        let ask = rig.only_ask();
+        let decision = the_decision(&rig, &ask);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Miss, "{via:?}");
+        let cause = decision.decision.miss_cause.clone().unwrap();
+        assert!(cause.contains("not the JSON object") && cause.contains("Looks fine to me!"), "{cause}");
+        assert!(assessment(&rig, &decision).is_none());
+        rig.finish().await;
+    }
+}
+
+/// After three denials in a row the guardian stops judging the context: the
+/// next submission is a miss naming the breaker, and the model is not
+/// called again.
+///
+/// Falsified by never consulting the breaker: the fourth submission calls
+/// the model and is recorded as an ask.
+#[tokio::test]
+async fn three_guardian_denials_stop_it_judging_the_context() {
+    let (rig, sent) = guardian_rig(Via::Tool, GUARDIAN_DENY).await;
+    for i in 0..3 {
+        assert_pending(Via::Tool, rig.submit(&format!("touch denied-{i}")).await);
+    }
+    assert_eq!(sent.calls(), 3);
+    assert_pending(Via::Tool, rig.submit("touch after-the-breaker").await);
+    assert_eq!(sent.calls(), 3, "a tripped breaker calls no model");
+    let latest = latest_decision(&rig);
+    assert_eq!(latest.decision.outcome, CouncilOutcome::Miss);
+    let cause = latest.decision.miss_cause.unwrap();
+    assert!(cause.contains("stopped judging") && cause.contains("3 submissions in a row"), "{cause}");
+    rig.finish().await;
+}
+
+/// A chat-kind `gate` slot with the guardian off is the council's as
+/// before: with the council on, the decision misses because the slot names
+/// no council server.
+#[tokio::test]
+async fn a_chat_gate_slot_without_the_guardian_stays_a_council_miss() {
+    let gate = SlotSpec { model: "guardian-model", backend: "guardian", kind: "mock", base: Base::None };
+    let rig = rig(Via::Tool, Setup { gate_slot: Some(gate), ..Setup::default() }).await;
+    assert_pending(Via::Tool, rig.submit("touch notes.txt").await);
+    let decision = the_decision(&rig, &rig.only_ask());
+    assert_eq!(decision.decision.spec_name, "shell-gate");
+    assert!(decision.decision.miss_cause.unwrap().contains("not council"));
     rig.finish().await;
 }

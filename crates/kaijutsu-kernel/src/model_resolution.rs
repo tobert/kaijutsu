@@ -326,6 +326,11 @@ pub struct BoundSlot {
 }
 
 impl BoundSlot {
+    /// The kind of the slot's backend.
+    pub(crate) fn kind(&self) -> BackendKind {
+        self.kind
+    }
+
     pub(crate) fn is_gate_only(&self) -> bool {
         self.kind == BackendKind::Council && self.slot.max_tokens.is_none()
     }

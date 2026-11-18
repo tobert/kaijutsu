@@ -757,6 +757,10 @@ pub(crate) struct CouncilVerdict {
     /// The seat's judge, read after the decision commits
     /// (`super::shadow`).
     judge: Option<super::shadow::JudgeRead>,
+    /// A guardian decision's parsed answer, recorded beside the decision.
+    assessment: Option<super::guardian::Assessment>,
+    /// A guardian allow's key: the guardian and the risk it named.
+    allow_by: Option<String>,
 }
 
 /// A decision's bump: what it is called and what it tells the seat.
@@ -944,6 +948,9 @@ impl CouncilVerdict {
         request_id: Option<&str>,
     ) -> approval_ledger::error::Result<Vec<u8>> {
         let id = approval_ledger::council::insert_council_decision_within(conn, &self.record_for(request_id))?;
+        if let Some(assessment) = &self.assessment {
+            approval_ledger::council::insert_council_assessment_within(conn, &id, &assessment.recorded())?;
+        }
         approval_ledger::council_observation::insert_council_reviewer_skips_within(conn, &id, &self.skips())?;
         let mut rows = Vec::new();
         for program in &self.programs {
@@ -1040,6 +1047,9 @@ impl CouncilVerdict {
 
     /// The key an allowed statement's decision names.
     pub(crate) fn allow_key(&self) -> String {
+        if let Some(by) = &self.allow_by {
+            return by.clone();
+        }
         let mut key = format!("at p={:.3}", self.p_allow.unwrap_or(f64::NAN));
         for program in &self.programs {
             if let Ok(decision) = &program.decision {
@@ -1134,7 +1144,12 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The record's submission digest: the submitted command, hashed.
 fn submission_digest(command: &str) -> String {
-    format!("sha256:{}", hex(&Sha256::digest(command.as_bytes())))
+    text_digest(command)
+}
+
+/// `sha256:<hex>` of `text`.
+pub(crate) fn text_digest(text: &str) -> String {
+    format!("sha256:{}", hex(&Sha256::digest(text.as_bytes())))
 }
 
 fn pool_words(council: &CouncilConfig) -> (&'static str, &'static str) {
@@ -1396,6 +1411,8 @@ fn build_verdict(
         escalation: None,
         undo: None,
         judge: None,
+        assessment: None,
+        allow_by: None,
     }
 }
 
@@ -1838,6 +1855,230 @@ pub(crate) fn decided_without_council(
     Ok(None)
 }
 
+/// The verdict a guardian decision leaves, shaped as a council decision's
+/// so the gate acts on it and records it the same way: spec name
+/// [`super::guardian::SPEC`], the slot's model as the server model, its
+/// backend as the engine, and the digest of the policy as the spec id.
+pub(crate) fn guardian_verdict(caller: &KjCaller, case: CaseInput, judged: super::guardian::Judged) -> CouncilVerdict {
+    use super::guardian::SPEC;
+    let name = judged.name();
+    let (outcome, miss_cause) = judged.outcome.recorded();
+    let record = NewCouncilDecision {
+        request_id: None,
+        context_id: caller.context_id.map(|c| c.as_bytes().to_vec()).unwrap_or_default(),
+        principal_id: caller.principal_id.as_bytes().to_vec(),
+        submission_digest: submission_digest(&case.text),
+        spec_id: judged.policy_digest.clone(),
+        spec_name: SPEC.to_string(),
+        server: CouncilServer {
+            model: judged.model.clone(),
+            weight_hash: String::new(),
+            tokenizer_hash: String::new(),
+            template: String::new(),
+            engine: judged.backend.clone(),
+        },
+        pool_method: "none".into(),
+        pool_weights: "none".into(),
+        threshold: None,
+        deadline_ms: judged.deadline_ms as i64,
+        outcome,
+        miss_cause,
+        agreement: None,
+        queue_ms: 0,
+        ms: judged.elapsed.as_millis() as i64,
+        house_rules_head: None,
+        bump_flavor: None,
+        seat_bump: None,
+        reads: Vec::new(),
+        pooled: Vec::new(),
+        control_text: Vec::new(),
+    };
+    let word = other_word(&judged.outcome);
+    let mut note = match (&judged.outcome, &judged.assessment) {
+        (Outcome::Miss(cause), _) => format!("guardian ({name}) gave no answer: {cause}"),
+        (_, Some(a)) => format!("guardian ({name}) answered {word}: {}", a.summary()),
+        (_, None) => format!("guardian ({name}) answered {word}"),
+    };
+    if let Some(cause) = &judged.tripped {
+        note.push_str(&format!("\nThe guardian stops judging this context because {cause}; its later submissions ask."));
+    }
+    let label = match (&judged.outcome, &judged.assessment) {
+        (Outcome::Miss(cause), _) => format!("miss: {cause}"),
+        (_, Some(a)) => format!("{word}: {} risk, authorization {}", a.risk_level.as_str(), a.user_authorization.as_str()),
+        (_, None) => word.to_string(),
+    };
+    let signal = NewSignal {
+        source_kind: SignalSourceKind::Council,
+        source_id: Some(SPEC.to_string()),
+        model_id: Some(name.clone()),
+        weight_hash: None,
+        stmt_seq: None,
+        cmd_seq: None,
+        label: Some(label),
+        score: None,
+        verdict: if judged.outcome == Outcome::Allow { SignalVerdict::Allow } else { SignalVerdict::Escalate },
+    };
+    let report = (judged.outcome == Outcome::Report).then(|| ReportedAnswers {
+        submission: case.text.clone(),
+        answers: judged.assessment.as_ref().map_or(serde_json::Value::Null, |a| {
+            serde_json::json!({"guardian": name, "risk_level": a.risk_level.as_str(), "rationale": a.rationale})
+        }),
+    });
+    let allow_by = judged.assessment.as_ref().map(|a| format!("by {name} at {} risk", a.risk_level.as_str()));
+    CouncilVerdict {
+        spec: SPEC.to_string(),
+        outcome: judged.outcome,
+        p_allow: None,
+        reads: String::new(),
+        record,
+        signal,
+        note,
+        skipped: Vec::new(),
+        observing: Vec::new(),
+        council: guardian_council(judged.deadline_ms),
+        state: case.state,
+        report,
+        decide_span: None,
+        programs: Vec::new(),
+        rubric: Vec::new(),
+        bump: None,
+        bump_history: Vec::new(),
+        undo: None,
+        escalation: None,
+        judge: None,
+        assessment: judged.assessment,
+        allow_by,
+    }
+}
+
+/// The council settings a guardian verdict carries: gatekeeper mode, with
+/// no server, contexts, specs, bumps, escalation, or judge.
+fn guardian_council(deadline_ms: u64) -> CouncilConfig {
+    CouncilConfig {
+        server: String::new(),
+        model: None,
+        contexts: Vec::new(),
+        pool_method: CouncilPoolMethod::Linear,
+        pool_weights: CouncilPoolWeights::Uniform,
+        deadline_ms,
+        require_agree: false,
+        reviewer_contexts: false,
+        house_rules: false,
+        house_rules_tokens: 0,
+        mode: CouncilMode::Gatekeeper,
+        bump_limit: None,
+        escalate: None,
+        specs: Vec::new(),
+        thresholds: Vec::new(),
+        judge: None,
+    }
+}
+
+/// Who judges a context's gate asks.
+enum GateJudge {
+    /// The council, on the server the `gate` slot names.
+    Council(CouncilConfig),
+    /// The guardian: the chat model on the `gate` slot.
+    Guardian(crate::kj::gate_policy::GuardianConfig, crate::model_resolution::BoundSlot),
+}
+
+/// Whether a `gate` slot on a backend of `kind` is judged by the guardian.
+/// A council server answers pooled decisions, which the council path
+/// classifies; every chat backend is a guardian. A backend that answers
+/// choice probabilities belongs with the council, which classifies them by
+/// threshold.
+fn judged_by_guardian(kind: crate::llm::BackendKind) -> bool {
+    use crate::llm::BackendKind;
+    match kind {
+        BackendKind::Council => false,
+        BackendKind::Anthropic
+        | BackendKind::DeepSeek
+        | BackendKind::Alibaba
+        | BackendKind::OpenAi
+        | BackendKind::ChatGpt
+        | BackendKind::Gemini => true,
+        #[cfg(any(test, feature = "test-mock"))]
+        BackendKind::Mock => true,
+    }
+}
+
+/// Who judges `context`'s gate asks: the guardian when its `gate` slot is
+/// on a chat backend and `gate.toml` enables the guardian for its
+/// performer; otherwise the council when `gate.toml` enables it; otherwise
+/// nobody.
+fn gate_judge(
+    db: &crate::kernel_db::KernelDb,
+    config: &crate::kj::gate_policy::GateConfig,
+    context: ContextId,
+    performer: Option<&crate::kj::gate_policy::GatePerformer>,
+) -> Result<Option<GateJudge>, String> {
+    let slot = crate::model_resolution::role_slot(db, context, GATE).map_err(|e| {
+        format!("the gate could not read the context's `{GATE}` slot: {e} (fail-closed — a database fault, not a decision)")
+    })?;
+    if let crate::model_resolution::RoleSlot::Slot(bound) = slot
+        && judged_by_guardian(bound.kind())
+        && let Some(guardian) = crate::kj::gate_policy::guardian_for_context(db, config, context, performer)?
+    {
+        return Ok(Some(GateJudge::Guardian(guardian, bound)));
+    }
+    Ok(crate::kj::gate_policy::council_for_context(db, config, context, performer)?.map(GateJudge::Council))
+}
+
+/// Whether the council or the guardian judges `context`'s gate asks
+/// ([`gate_judge`]). `Err` is a fault reading the context.
+pub(crate) fn judged(
+    db: &crate::kernel_db::KernelDb,
+    config: &crate::kj::gate_policy::GateConfig,
+    context: ContextId,
+    performer: Option<&crate::kj::gate_policy::GatePerformer>,
+) -> Result<bool, String> {
+    Ok(gate_judge(db, config, context, performer)?.is_some())
+}
+
+/// Ask the guardian about one submission and shape its answer as a verdict.
+#[allow(clippy::too_many_arguments)]
+async fn consult_guardian(
+    kernel: &crate::Kernel,
+    caller: &KjCaller,
+    context_id: ContextId,
+    command: &str,
+    planned: &[kaish_kernel::PlannedStatement],
+    performer: Option<&crate::kj::gate_policy::GatePerformer>,
+    cwd: Option<&str>,
+    guardian: &crate::kj::gate_policy::GuardianConfig,
+    bound: &crate::model_resolution::BoundSlot,
+) -> CouncilVerdict {
+    let resolve_cwd = cwd.map(str::to_owned).unwrap_or_else(|| crate::runtime::shell_state::no_cwd_dir().to_string_lossy().into_owned());
+    let facts = super::shell_case::gather(kernel, caller, context_id, command, planned, &resolve_cwd).await;
+    let submission = Submission { command, planned, character: performer.map(|p| p.name.as_str()), cwd, facts: &facts };
+    let runs = super::programs::programs_in(planned, &resolve_cwd);
+    let read = super::programs::read_programs(kernel.vfs().as_ref(), &resolve_cwd, runs).await;
+    let programs: Vec<super::guardian::ShownProgram> = read
+        .into_iter()
+        .take(MAX_PROGRAMS)
+        .filter_map(|p| {
+            let text = p.text.ok()?;
+            let name = match (&text.file, &text.written) {
+                (Some(file), _) => file.path.clone(),
+                (None, Some(path)) => path.clone(),
+                (None, None) => format!("`{}`", p.run.command),
+            };
+            Some(super::guardian::ShownProgram { name, text: text.text })
+        })
+        .collect();
+    let state = case_state(&submission, &[], &[]);
+    let judged = super::guardian::judge(kernel, bound, guardian, context_id, &state, &programs).await;
+    tracing::info!(
+        target: "kaijutsu::council",
+        guardian = %judged.name(),
+        outcome = other_word(&judged.outcome),
+        ms = judged.elapsed.as_millis() as u64,
+        context_id = %context_id,
+        "guardian consulted on a submission"
+    );
+    guardian_verdict(caller, CaseInput { state, text: command.to_string() }, judged)
+}
+
 /// Consult the council for one gate ask, or return `None` and leave the gate
 /// as it is without one. `Err` is a fault reading the gate's own state, and
 /// the caller refuses the submission as gate unavailable.
@@ -1857,10 +2098,10 @@ pub(crate) async fn consult(
     if spec.planned.is_empty() {
         return Ok(None);
     }
-    let (performer, council, cwd) = {
+    let (performer, judge, cwd) = {
         let db = kernel.kernel_db().lock();
         let performer = crate::kj::gate_policy::performer_of(&db, Some(context_id))?;
-        let Some(council) = crate::kj::gate_policy::council_for_context(&db, config, context_id, performer.as_ref())? else {
+        let Some(judge) = gate_judge(&db, config, context_id, performer.as_ref())? else {
             return Ok(None);
         };
         let layers = Layers { config, performer: performer.as_ref() };
@@ -1872,7 +2113,19 @@ pub(crate) async fn consult(
             .get_context_shell(context_id)
             .map_err(|e| format!("the council could not read the context's working directory: {e}"))?
             .and_then(|row| row.cwd);
-        (performer, council, cwd)
+        (performer, judge, cwd)
+    };
+    let council = match judge {
+        GateJudge::Council(council) => council,
+        GateJudge::Guardian(guardian, bound) => {
+            // Boxed so the guardian's state does not grow every gate caller's
+            // future.
+            let verdict = Box::pin(consult_guardian(
+                kernel, caller, context_id, command, &spec.planned, performer.as_ref(), cwd.as_deref(), &guardian, &bound,
+            ))
+            .await;
+            return Ok(Some(verdict));
+        }
     };
     let Some(shell) = shell_spec(&council) else { return Ok(None) };
     let (routed, chain) = match seat_route(&kernel.kernel_db().lock(), &council, context_id, Some(caller.actor_id))? {

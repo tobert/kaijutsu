@@ -597,11 +597,12 @@ fn a_character_slot_of_another_role_refuses() {
         max_tokens: Some(10), temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
     }).unwrap_err().to_string();
     assert!(error.contains("kj character model set old-shape <backend>/<model>"), "{error}");
-    let error = w.db.set_character_slot(&CharacterSlotRow {
+    // A `gate` slot on a chat backend names the guardian.
+    w.db.set_character_slot(&CharacterSlotRow {
         principal_id: who, role: "gate".into(), backend_id: w.deepseek, model: "ds-flash".into(),
         max_tokens: Some(10), temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
-    }).unwrap_err().to_string();
-    assert!(error.contains("`gate` slot names a council server") && error.contains("not council"), "{error}");
+    }).unwrap();
+    w.db.delete_character_slot(who, "gate").unwrap();
 
     w.exec(
         "INSERT INTO character_slots (principal_id, role, backend_id, model, max_tokens) VALUES (?1, 'coder', ?2, 'ds-flash', 10)",

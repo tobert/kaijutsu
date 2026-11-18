@@ -147,6 +147,20 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
   - The plan route's default output ceiling is unknown.
 - **Failing kj tests on main.** `kj::reflect::tests::every_live_leaf_classifies` (`kj audio render` needs `<SOURCES>`) and `kj::db::tests::db_backup_help_documents_the_no_restore_verb_stance` (the `backup` long help lost its no-restore text) fail independent of this work.
 
+## The guardian: what the first pass leaves open (2026-11-18)
+
+A chat model on a context's `gate` slot judges escalated shell submissions (`council/guardian.rs`; `docs/approval-identity.md`, "The guardian"). Not done:
+
+- **No structured output.** No provider client sends a JSON schema (`text.format` on Responses, `response_format` on chat completions), so the answer format is asked for in the prompt and parsed strictly; drift is a recorded miss. Adding a schema to `BuildOpts` would remove most parse misses.
+- **The breaker resets only at restart.** Codex resets per turn. Candidates: a senpai's answer to an ask from the context, or a `kj` verb. Its state is in memory, so `kj` cannot show it either.
+- **No tools.** Codex's guardian may run read-only commands (check a path before a delete, read git remotes). Ours judges from the prompt alone; the policy says so.
+- **Spend has no turn.** The call's tokens are recorded with no turn and no context, so `kj` spend views do not attribute them to the judged context.
+- **The guardian reads only the shell gate.** `kj` verb asks and hook asks never reach it, as with the council.
+- **A judge shadow on a guardian context.** `[rc.<dir>.council] judge` still records a judge shadow on a guardian decision, which then reads against an empty council config and misses. Nothing sets both today.
+- **The allow names the layer `council (guardian)`.** The gate layer is `Layer::Council`; a `Layer::Guardian` would read better in auto reasons.
+- **`decisions` backends.** A backend kind that answers choice probabilities over allow, ask, and report belongs on the council path's threshold classification; `council::gate::judged_by_guardian` must return `false` for it.
+- **Not live-tested.** Every check runs on the mock provider; no chatgpt or anthropic guardian has judged a real submission yet.
+
 ## Sol's first task: friction from a GPT model driving kaijutsu (2026-11-18)
 
 Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-characters`, 30b07019) in 25 asks, all reviewed by its senpai. Its report and the review log surfaced:
