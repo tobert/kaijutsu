@@ -124,6 +124,10 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Model discovery.** `GET /v1/models` with a plan token answers `{models: [{slug, visibility, supported_in_api}]}` (kaibo found this live); nothing in kaijutsu reads it, so model names come from config.
 - **Pasted callback in history.** `kj backend login <name> --callback '<address>'` puts the single-use authorization code in the shell block. The kernel exchanges it at once, so a recorded code cannot be replayed, but it still appears in the context's history.
 - **Prompt cache key.** Requests send no `prompt_cache_key`. OpenAI's guide says that on GPT-5.6 and later it only separates cache accounting; whether it changes hits on the plan route is unmeasured.
+- **Tools on the Responses API.** kaijutsu sends a context's whole tool set as top-level `tools`, which OpenAI renders before the input, so any loadout change misses the cache from the first token. The Responses API offers two shapes that keep the prefix stable:
+  - **Namespaces:** a group of functions under one name and description. With `defer_loading`, the model sees only the namespace until it loads the schemas. OpenAI suggests fewer than 10 functions each, so one namespace per MCP server or tool family.
+  - **`additional_tools` input items:** tools that become callable at a point in the conversation. They are appended where they appear and must be replayed in place.
+  The ChatGPT plan route takes both but refuses `tool_search`, so deferred functions have no way to load. A loadout change could become an `additional_tools` item at the turn it happens instead of rewriting the prefix. Probe first that the plan route caches across an `additional_tools` item.
 - **Review leftovers (kaibo gpt-plan + deepseek).** Not fixed:
   - A 401 refreshes and resends even when its code is a permanent refusal, and a failed second `bearer` call hides the first 401's detail.
   - The refresh margin is a flat 300 s; an `expires_in` under that would refresh on every request.
