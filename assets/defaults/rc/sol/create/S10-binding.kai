@@ -1,0 +1,27 @@
+# coder: what a coding seat uses, and nothing else. Every tool schema rides
+# on every request, so the roster is the seat's largest cost.
+set -e
+# One shell: the writable one. Its facade also projects the shell-operation
+# tools and opens the person's shell box (`Broker::check_shell_facade`).
+kj binding allow "facade:shell_write"
+kj binding allow "builtin.file"
+kj binding allow "builtin.tasks"
+# `done` ends the task. In an autonomous turn, or on a headless kernel, a reply
+# with no tool call does not end the turn.
+# `*` does not cover builtin.turn; this grant is the opt-in. See
+# docs/conversation-session.md, "Ending a task with done".
+kj binding allow "builtin.turn"
+# The person's input surfaces in this context: compose edits, submit, capture.
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"
+# kj verb authorities a coder works with: fork a context, push and merge
+# drift, run host commands, and save through the editor.
+kj binding allow "fork"
+kj binding allow "drift"
+kj binding allow "exec"
+kj binding allow "editor"
+# Deliberately NOT granted: house (the kj administration verbs: ledger, rc,
+# binding, config, and the rest), operator, transport, drive, system.
+# A coder works on the task; the kernel's own running is not its work, and
+# every verb it can see costs a turn it may spend studying instead.
