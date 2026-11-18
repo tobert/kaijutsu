@@ -3594,11 +3594,15 @@ async fn run_llm_stream(
                 ) {
                     messages.push(assistant);
                 }
+                let limit = if provider.sends_output_limit() {
+                    format!("the output limit of {} tokens", build_opts.max_tokens)
+                } else {
+                    "the provider's output limit".to_string()
+                };
                 let notice = format!(
-                    "Your last response stopped at the output limit of {} tokens before you \
+                    "Your last response stopped at {limit} before you \
                      finished, and no tool call in it was complete. Continue from where you \
                      stopped. Keep your reasoning brief and act with a tool call.",
-                    build_opts.max_tokens,
                 );
                 tracing::warn!(
                     %context_id,

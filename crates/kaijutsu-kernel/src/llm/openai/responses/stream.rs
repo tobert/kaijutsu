@@ -334,7 +334,11 @@ pub fn error_kind(code: &str) -> StreamErrorKind {
 pub fn error_from(error: &Value) -> StreamError {
     let field = |name| error.get(name).and_then(Value::as_str);
     let code = field("code").or_else(|| field("type")).unwrap_or("error");
-    let mut message = field("message").map_or_else(|| error.to_string(), str::to_string);
+    let mut message = match field("message") {
+        Some(message) => message.to_string(),
+        None if error.is_null() => "the response failed without saying why".to_string(),
+        None => error.to_string(),
+    };
     if let Some(param) = field("param") {
         message = format!("{message} (param: {param})");
     }
@@ -486,6 +490,13 @@ mod tests {
             completed(),
         ]);
         assert!(matches!(&out[0], StreamEvent::ToolUseInvalid { id, .. } if id == "c"), "{out:?}");
+    }
+
+    /// A failure with no error object still says something readable.
+    #[test]
+    fn a_bare_failure_has_a_message() {
+        let out = run(vec![json!({ "type": "response.failed", "response": {} })]);
+        assert!(matches!(&out[0], StreamEvent::Error(e) if e.message == "the response failed without saying why"), "{out:?}");
     }
 
     /// A top-level `error` event fails the stream with its code's kind.

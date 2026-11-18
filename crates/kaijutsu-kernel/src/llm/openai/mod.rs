@@ -275,9 +275,9 @@ impl Client {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_else(|e| format!("(failed to read body: {e})"));
-            return Err(responses::open_error(status, &body));
+            return Err(responses::open_error(status, &body, bearer));
         }
-        Ok(responses::Stream::from_response(response, slot))
+        Ok(responses::Stream::from_response(response, slot, bearer))
     }
 
     /// Map an OpenAI-compatible 4xx/5xx response body into [`LlmError`].

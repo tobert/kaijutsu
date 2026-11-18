@@ -20,8 +20,11 @@
 //! request asks for `reasoning.encrypted_content`, the stream puts it in the
 //! [`crate::llm::StreamEvent::ThinkingEnd`] signature behind
 //! [`REASONING_SIGNATURE_PREFIX`], and this builder sends it back as a
-//! `reasoning` item. A reasoning block without that prefix came from another
-//! provider and is left out.
+//! `reasoning` item within the current turn: from the last user message
+//! that is not only tool results. Earlier reasoning is left out, since the
+//! model continues its reasoning only across a turn's tool calls, and each
+//! item is kilobytes of input. A reasoning block without that prefix came
+//! from another provider and is left out.
 
 use serde_json::{Value, json};
 
@@ -36,11 +39,12 @@ pub const REASONING_SIGNATURE_PREFIX: &str = "openai-responses:";
 /// Build a plan-contract `/v1/responses` body. `backend_label` names the
 /// backend in the warnings for knobs this route drops.
 pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str) -> Value {
+    let turn_start = messages.iter().rposition(opens_a_turn).unwrap_or(0);
     let mut input = Vec::with_capacity(messages.len());
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         match msg.role {
             Role::User => translate_user(msg, &mut input),
-            Role::Assistant => translate_assistant(msg, &mut input),
+            Role::Assistant => translate_assistant(msg, &mut input, i > turn_start),
             Role::System => input.push(text_message("developer", "input_text", &plain_text(&msg.content))),
         }
     }
@@ -80,6 +84,15 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
         body["parallel_tool_calls"] = Value::Bool(true);
     }
     body
+}
+
+/// Whether `msg` starts a turn: a user message with more than tool results.
+fn opens_a_turn(msg: &Message) -> bool {
+    msg.role == Role::User
+        && match &msg.content {
+            MessageContent::Text(_) => true,
+            MessageContent::Blocks(blocks) => blocks.iter().any(|b| !matches!(b, ContentBlock::ToolResult { .. })),
+        }
 }
 
 /// Warn once for each knob the binding set that this route cannot send.
@@ -166,8 +179,9 @@ fn translate_user(msg: &Message, out: &mut Vec<Value>) {
 }
 
 /// Assistant turn → reasoning, message and `function_call` items in block
-/// order. Adjacent text blocks share one message item.
-fn translate_assistant(msg: &Message, out: &mut Vec<Value>) {
+/// order. Adjacent text blocks share one message item. Reasoning goes only
+/// when `keep_reasoning`.
+fn translate_assistant(msg: &Message, out: &mut Vec<Value>, keep_reasoning: bool) {
     let blocks = match &msg.content {
         MessageContent::Text(text) => {
             out.push(text_message("assistant", "output_text", text));
@@ -189,6 +203,9 @@ fn translate_assistant(msg: &Message, out: &mut Vec<Value>) {
                 else {
                     continue;
                 };
+                if !keep_reasoning {
+                    continue;
+                }
                 flush(&mut text, out);
                 let summary: Vec<Value> = if summary.is_empty() {
                     Vec::new()
@@ -283,6 +300,27 @@ mod tests {
         assert_eq!(input[2], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "looking" }] }));
         assert_eq!(input[3], json!({ "type": "function_call", "call_id": "call_1", "name": "ls", "arguments": "{\"path\":\"/\"}" }));
         assert_eq!(input[4], json!({ "type": "function_call_output", "call_id": "call_1", "output": "[tool error]\ndenied" }));
+    }
+
+    /// Our reasoning goes back only within the current turn; an earlier
+    /// turn's is left out.
+    ///
+    /// Falsified by a reasoning item from before the last user message.
+    #[test]
+    fn reasoning_goes_back_only_within_the_turn() {
+        let thought = |enc: &str| Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Reasoning { text: String::new(), signature: Some(format!("{REASONING_SIGNATURE_PREFIX}{enc}")) },
+                ContentBlock::ToolUse { id: format!("c-{enc}"), name: "ls".into(), input: json!({}), signature: None },
+            ]),
+            turn_scoped: false,
+        };
+        let result = |enc: &str| Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: format!("c-{enc}"), content: "ok".into(), is_error: false }]);
+        let history = [Message::user("one"), thought("OLD"), result("OLD"), Message::assistant("done"), Message::user("two"), thought("NEW"), result("NEW")];
+        let v = body(BuildOpts::new("m", 1), &history);
+        let kept: Vec<&str> = v["input"].as_array().unwrap().iter().filter_map(|i| i["encrypted_content"].as_str()).collect();
+        assert_eq!(kept, ["NEW"], "{v}");
     }
 
     /// Tools are function tools; a request without tools names none.

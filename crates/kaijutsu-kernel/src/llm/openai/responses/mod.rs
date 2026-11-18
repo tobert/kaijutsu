@@ -7,7 +7,9 @@
 //!
 //! Errors before the stream opens arrive as `{"error": {code, message}}` or
 //! as `{"detail": "..."}`; [`OpenError`] keeps a 401 apart so the caller can
-//! refresh its token and send once more.
+//! refresh its token and send once more. The bearer is removed from every
+//! error message, before the stream opens and after, in case a provider
+//! echoes it.
 
 pub mod build;
 pub mod stream;
@@ -42,8 +44,15 @@ impl OpenError {
     }
 }
 
-/// Map a failing response's status and body to an [`OpenError`].
-pub fn open_error(status: reqwest::StatusCode, body: &str) -> OpenError {
+/// `message` with every occurrence of `secret` replaced.
+pub fn redact(message: &str, secret: &str) -> String {
+    if secret.is_empty() { message.to_string() } else { message.replace(secret, "[redacted]") }
+}
+
+/// Map a failing response's status and body to an [`OpenError`]. `bearer`
+/// is removed from the message.
+pub fn open_error(status: reqwest::StatusCode, body: &str, bearer: &str) -> OpenError {
+    let body = &redact(body, bearer);
     let parsed: Option<Value> = serde_json::from_str(body).ok();
     let error = parsed.as_ref().and_then(|v| v.get("error")).filter(|e| e.is_object());
     let code = error
@@ -60,6 +69,7 @@ pub fn open_error(status: reqwest::StatusCode, body: &str) -> OpenError {
         None => message,
     };
     let llm = match code.as_deref().map(error_kind) {
+        _ if code.as_deref() == Some("context_length_exceeded") => LlmError::ContextFull(detail),
         Some(StreamErrorKind::Billing) => LlmError::InsufficientBalance(detail),
         Some(StreamErrorKind::Auth) => LlmError::AuthError(detail),
         Some(StreamErrorKind::Overloaded | StreamErrorKind::ServerError) => LlmError::ApiError(detail),
@@ -90,15 +100,23 @@ pub struct Stream {
     pending: VecDeque<StreamEvent>,
     cancel: CancellationToken,
     finished: bool,
+    /// Released as soon as the response ends, before its last events are
+    /// read: the runtime stops reading at `Done`.
     slot: Option<Slot>,
+    /// Removed from every error message.
+    bearer: String,
 }
 
 impl Stream {
-    pub fn from_response(response: reqwest::Response, slot: Option<Slot>) -> Self {
-        Self::from_bytes(response.bytes_stream().boxed(), slot)
+    pub fn from_response(response: reqwest::Response, slot: Option<Slot>, bearer: &str) -> Self {
+        Self::from_bytes(response.bytes_stream().boxed(), slot, bearer)
     }
 
-    fn from_bytes(bytes: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>, slot: Option<Slot>) -> Self {
+    fn from_bytes(
+        bytes: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+        slot: Option<Slot>,
+        bearer: &str,
+    ) -> Self {
         use eventsource_stream::Eventsource;
         Self {
             inner: Some(bytes.eventsource()),
@@ -107,6 +125,7 @@ impl Stream {
             cancel: CancellationToken::new(),
             finished: false,
             slot,
+            bearer: bearer.to_string(),
         }
     }
 
@@ -144,7 +163,10 @@ impl Stream {
                                 let emitted = self.state.step(value);
                                 self.take(emitted);
                             }
-                            Err(e) => self.fail(StreamErrorKind::Protocol, format!("SSE decode: {e}: {data}")),
+                            Err(e) => {
+                                let shown: String = data.chars().take(200).collect();
+                                self.fail(StreamErrorKind::Protocol, format!("SSE decode: {e}: {shown}"))
+                            }
                         }
                     }
                     Some(Err(e)) => self.fail(StreamErrorKind::Transport, format!("SSE transport: {e}")),
@@ -154,8 +176,14 @@ impl Stream {
         }
     }
 
-    /// Queue `emitted`, and tell the slot how the answer went once it ends.
-    fn take(&mut self, emitted: Vec<StreamEvent>) {
+    /// Queue `emitted`, tell the slot how the answer went, and release it
+    /// once the response ends.
+    fn take(&mut self, mut emitted: Vec<StreamEvent>) {
+        for event in &mut emitted {
+            if let StreamEvent::Error(error) = event {
+                error.message = redact(&error.message, &self.bearer);
+            }
+        }
         for event in &emitted {
             match event {
                 StreamEvent::Done { .. } => {
@@ -179,19 +207,21 @@ impl Stream {
         if self.state.ended() {
             self.finished = true;
             self.inner = None;
+            self.slot = None;
         }
         self.pending.extend(emitted);
     }
 
     /// End the stream with an error raised below the state machine.
     fn fail(&mut self, kind: StreamErrorKind, message: String) {
-        let error = StreamError::new(kind, message);
+        let error = StreamError::new(kind, redact(&message, &self.bearer));
         let error = match self.state.spent() {
             Some(spent) => error.with_usage(spent),
             None => error,
         };
         self.finished = true;
         self.inner = None;
+        self.slot = None;
         self.pending.push_back(StreamEvent::Error(error));
     }
 
@@ -204,7 +234,7 @@ impl Stream {
     #[cfg(test)]
     pub(crate) fn for_test_bytes(payload: &'static str) -> Self {
         let bytes = futures::stream::iter(std::iter::once(Ok(bytes::Bytes::from(payload)))).boxed();
-        Self::from_bytes(bytes, None)
+        Self::from_bytes(bytes, None, "")
     }
 }
 
@@ -259,11 +289,16 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         let spent = open_error(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit"}}"#,
+            "sk-test-bearer",
         );
         assert!(matches!(&spent, OpenError::Other(LlmError::InsufficientBalance(m)) if m.contains(stream::PLAN_USAGE_URL)), "{spent:?}");
-        let detail = open_error(reqwest::StatusCode::UNAUTHORIZED, r#"{"detail":"token expired"}"#);
+        let detail = open_error(reqwest::StatusCode::UNAUTHORIZED, r#"{"detail":"token expired"}"#, "sk-test-bearer");
         assert!(matches!(&detail, OpenError::Unauthorized(LlmError::AuthError(m)) if m == "token expired"), "{detail:?}");
-        let forbidden = open_error(reqwest::StatusCode::FORBIDDEN, r#"{"detail":"no"}"#);
+        let forbidden = open_error(reqwest::StatusCode::FORBIDDEN, r#"{"detail":"no"}"#, "sk-test-bearer");
         assert!(matches!(forbidden, OpenError::Other(LlmError::AuthError(_))));
+        let full = open_error(reqwest::StatusCode::BAD_REQUEST, r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#, "sk-test-bearer");
+        assert!(matches!(full, OpenError::Other(LlmError::ContextFull(_))), "{full:?}");
+        let echoed = open_error(reqwest::StatusCode::FORBIDDEN, r#"{"detail":"bad bearer sk-secret-1"}"#, "sk-secret-1");
+        assert!(matches!(&echoed, OpenError::Other(LlmError::AuthError(m)) if m == "bad bearer [redacted]"), "{echoed:?}");
     }
 }

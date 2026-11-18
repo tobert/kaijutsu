@@ -142,6 +142,37 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         assert_eq!((body["store"].clone(), body["instructions"].clone()), (serde_json::json!(false), serde_json::json!("s")));
     }
 
+    /// The endpoint slot is free once `Done` is read: the runtime stops
+    /// reading there and runs tools with the stream still in scope.
+    ///
+    /// Falsified by a request still in flight after `Done`.
+    #[tokio::test]
+    async fn the_slot_is_free_at_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, _) = serve_with(|_| sse(COMPLETED)).await;
+        let creds = signed_in(tmp.path(), format!("{base}/token"), "tok");
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
+        let client = Client::new("gpt", creds).with_base_url(format!("{base}/v1")).with_endpoint(endpoint.clone());
+        let mut stream = client.stream(BuildOpts::new("m", 1), vec![Message::user("hi")]).await.unwrap();
+        while let Some(ev) = stream.next_event().await {
+            if matches!(ev, StreamEvent::Done { .. }) {
+                break;
+            }
+        }
+        assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// A provider error that echoes the bearer does not carry it on.
+    #[tokio::test]
+    async fn an_echoed_bearer_is_redacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, _) = serve_with(|_| reply(403, r#"{"detail":"refused sk-plan-secret"}"#)).await;
+        let creds = signed_in(tmp.path(), format!("{base}/token"), "sk-plan-secret");
+        let client = Client::new("gpt", creds).with_base_url(format!("{base}/v1"));
+        let err = client.stream(BuildOpts::new("m", 1), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(!err.to_string().contains("sk-plan-secret") && err.to_string().contains("[redacted]"), "{err}");
+    }
+
     /// Without a sign-in nothing is sent and the error names the command.
     #[tokio::test]
     async fn no_sign_in_sends_nothing() {

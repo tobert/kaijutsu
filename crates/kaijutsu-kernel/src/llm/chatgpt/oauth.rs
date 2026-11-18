@@ -57,7 +57,7 @@ pub const RESOURCE: &str = "https://api.openai.com/v1";
 /// The redirect URI. Only its port may differ between sign-ins.
 pub const REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
 
-/// How long a token request may take.
+/// How long a token request may take by default.
 pub const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One sign-in attempt's secrets. Fresh per attempt and held in memory only.
@@ -172,8 +172,9 @@ pub fn check_callback(attempt: &Attempt, pasted: &str, known_client_id: Option<&
     Ok(CallbackCode { code, client_id })
 }
 
-/// The token endpoint's reply to an exchange or a refresh.
-#[derive(Debug, Deserialize)]
+/// The token endpoint's reply to an exchange or a refresh. No `Debug`: it
+/// holds both tokens.
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
@@ -186,20 +187,29 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-/// Why a token request failed.
+/// Why a token request failed, by what it means for the refresh token it
+/// carried.
 #[derive(Debug)]
 pub enum TokenError {
     /// The grant can no longer be refreshed; only a new sign-in fixes it.
     Dead(String),
-    /// Anything else: the endpoint was unreachable, or answered an error a
-    /// later attempt may not.
-    Other(String),
+    /// The endpoint refused the request with a 4xx another attempt would
+    /// meet again.
+    Refused(String),
+    /// The request never reached the endpoint, or the endpoint answered a
+    /// server error, so the refresh token was not spent. A later attempt may
+    /// succeed.
+    Unspent(String),
+    /// The request went out and no usable answer came back: a timeout, a cut
+    /// connection, an unreadable reply. The refresh token may have been
+    /// spent, so it must not be sent again.
+    Uncertain(String),
 }
 
 impl std::fmt::Display for TokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Dead(m) | Self::Other(m) => f.write_str(m),
+            Self::Dead(m) | Self::Refused(m) | Self::Unspent(m) | Self::Uncertain(m) => f.write_str(m),
         }
     }
 }
@@ -219,7 +229,12 @@ fn is_dead(code: &str) -> bool {
     )
 }
 
-async fn post_form(http: &reqwest::Client, url: &str, pairs: &[(&str, &str)]) -> Result<TokenResponse, TokenError> {
+async fn post_form(
+    http: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    pairs: &[(&str, &str)],
+) -> Result<TokenResponse, TokenError> {
     let form = {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
         for (k, v) in pairs {
@@ -229,18 +244,21 @@ async fn post_form(http: &reqwest::Client, url: &str, pairs: &[(&str, &str)]) ->
     };
     let response = http
         .post(url)
-        .timeout(TOKEN_REQUEST_TIMEOUT)
+        .timeout(timeout)
         .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(reqwest::header::ACCEPT, "application/json")
         .body(form)
         .send()
         .await
-        .map_err(|e| TokenError::Other(format!("cannot reach the OpenAI token endpoint: {e}")))?;
+        .map_err(|e| {
+            let message = format!("the OpenAI token endpoint did not answer: {e}");
+            if e.is_connect() { TokenError::Unspent(message) } else { TokenError::Uncertain(message) }
+        })?;
     let status = response.status();
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| TokenError::Other(format!("reading the OpenAI token endpoint's reply: {e}")))?;
+        .map_err(|e| TokenError::Uncertain(format!("reading the OpenAI token endpoint's reply: {e}")))?;
     if !status.is_success() {
         // The body may echo request details; keep only the OAuth error code.
         let code = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| {
@@ -253,11 +271,19 @@ async fn post_form(http: &reqwest::Client, url: &str, pairs: &[(&str, &str)]) ->
         );
         return Err(match code.as_deref() {
             Some(code) if is_dead(code) => TokenError::Dead(message),
-            _ => TokenError::Other(message),
+            // A server error, a rate limit or a request timeout answered
+            // without rotating the token; a later attempt may succeed.
+            _ if status.is_server_error()
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT =>
+            {
+                TokenError::Unspent(message)
+            }
+            _ => TokenError::Refused(message),
         });
     }
     serde_json::from_slice(&bytes)
-        .map_err(|e| TokenError::Other(format!("the OpenAI token endpoint's reply is not a token response: {e}")))
+        .map_err(|e| TokenError::Uncertain(format!("the OpenAI token endpoint's reply is not a token response: {e}")))
 }
 
 /// Exchange a checked callback for a grant.
@@ -267,12 +293,13 @@ pub async fn exchange(
     attempt: &Attempt,
     callback: CallbackCode,
     known_client_id: Option<&str>,
+    timeout: Duration,
 ) -> Result<Grant, String> {
     let client_id = callback
         .client_id
         .or_else(|| known_client_id.map(str::to_string))
         .ok_or("the sign-in returned no client_id, and this backend has none from an earlier sign-in")?;
-    let tokens = post_form(http, &issuer.token_url, &[
+    let tokens = post_form(http, &issuer.token_url, timeout, &[
         ("grant_type", "authorization_code"),
         ("client_id", &client_id),
         ("code", &callback.code),
@@ -306,8 +333,8 @@ pub async fn exchange(
 
 /// Refresh `grant`, returning its successor. The refresh token rotates: the
 /// caller must store the result before the old one could be sent again.
-pub async fn refresh(http: &reqwest::Client, grant: &Grant) -> Result<Grant, TokenError> {
-    let tokens = post_form(http, &grant.token_url, &[
+pub async fn refresh(http: &reqwest::Client, grant: &Grant, timeout: Duration) -> Result<Grant, TokenError> {
+    let tokens = post_form(http, &grant.token_url, timeout, &[
         ("grant_type", "refresh_token"),
         ("client_id", &grant.client_id),
         ("refresh_token", &grant.refresh_token),

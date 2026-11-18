@@ -106,8 +106,10 @@ enum BackendCommand {
     /// Without --callback, prints an address to open in any browser. After
     /// you approve, the browser goes to http://127.0.0.1:1455/auth/callback,
     /// which fails to load; that is expected. Copy that whole address and run
-    /// this again with --callback '<address>' within 15 minutes. Plan usage
-    /// needs a ChatGPT Plus or Pro subscription.
+    /// this again with --callback '<address>' within 15 minutes; the waiting
+    /// sign-in is held in memory, so a kernel restart between the two calls
+    /// needs a fresh start. Plan usage needs a ChatGPT Plus or Pro
+    /// subscription.
     Login {
         /// Backend name (kind chatgpt)
         name: String,
@@ -329,8 +331,8 @@ impl KjDispatcher {
                 )
             }
             BackendCommand::Login { name, callback } => self.backend_login(&name, callback.as_deref()).await,
-            BackendCommand::Logout { name } => self.backend_logout(&name),
-            BackendCommand::Remove { name } => self.backend_remove(&name),
+            BackendCommand::Logout { name } => self.backend_logout(&name).await,
+            BackendCommand::Remove { name } => self.backend_remove(&name).await,
             BackendCommand::Model(cmd) => self.backend_model(cmd),
         };
 
@@ -470,11 +472,11 @@ impl KjDispatcher {
         }
     }
 
-    fn backend_logout(&self, name: &str) -> KjResult {
+    async fn backend_logout(&self, name: &str) -> KjResult {
         if let Err(e) = self.chatgpt_backend("logout", name) {
             return KjResult::Err(e);
         }
-        match self.kernel().credentials().remove(name) {
+        match self.kernel().credentials().remove(name).await {
             Ok(true) => KjResult::ok(format!("{name} is signed out")),
             Ok(false) => KjResult::ok(format!("{name} was not signed in")),
             Err(e) => KjResult::Err(format!("kj backend logout: {e}")),
@@ -675,10 +677,20 @@ impl KjDispatcher {
         }
     }
 
-    fn backend_remove(&self, name: &str) -> KjResult {
-        let db = self.kernel_db().lock();
-        match db.delete_backend(name) {
-            Ok(()) => KjResult::ok(format!("removed backend '{name}'")),
+    /// Remove the row; a `chatgpt` backend's sign-in goes with it, so a
+    /// later backend of the same name does not inherit it.
+    async fn backend_remove(&self, name: &str) -> KjResult {
+        let deleted = {
+            let db = self.kernel_db().lock();
+            let signs_in = matches!(db.get_backend_by_name(name), Ok(Some(row)) if row.kind == BackendKind::ChatGpt.as_str());
+            db.delete_backend(name).map(|()| signs_in)
+        };
+        match deleted {
+            Ok(true) => match self.kernel().credentials().remove(name).await {
+                Ok(_) => KjResult::ok(format!("removed backend '{name}' and its sign-in")),
+                Err(e) => KjResult::Err(format!("kj backend remove: removed '{name}', but not its sign-in: {e}")),
+            },
+            Ok(false) => KjResult::ok(format!("removed backend '{name}'")),
             Err(e) => KjResult::Err(format!("kj backend remove: {e}")),
         }
     }
@@ -1086,6 +1098,16 @@ mod tests {
         match d.dispatch(&argv(&["backend", "login", "ollama"]), &c).await {
             KjResult::Err(m) => assert!(m.contains("kind 'chatgpt'"), "{m}"),
             other => panic!("a keyed backend cannot sign in: {other:?}"),
+        }
+
+        // Removing the backend takes its sign-in with it.
+        let dir = d.kernel().credentials().clone();
+        assert!(dir.begin_sign_in("gpt-plan").is_ok());
+        let out = d.dispatch(&argv(&["backend", "remove", "gpt-plan"]), &c).await;
+        assert!(matches!(&out, KjResult::Ok { message, .. } if message.contains("its sign-in")), "{out:?}");
+        match d.dispatch(&argv(&["backend", "login", "gpt-plan", "--callback", stray]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("not found"), "{m}"),
+            other => panic!("{other:?}"),
         }
     }
 

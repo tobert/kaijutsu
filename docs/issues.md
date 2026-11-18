@@ -123,6 +123,14 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Model discovery.** `GET /v1/models` with a plan token answers `{models: [{slug, visibility, supported_in_api}]}` (kaibo found this live); nothing in kaijutsu reads it, so model names come from config.
 - **Pasted callback in history.** `kj backend login <name> --callback '<address>'` puts the single-use authorization code in the shell block. The kernel exchanges it at once, so a recorded code cannot be replayed, but it still appears in the context's history.
 - **Prompt cache key.** Requests send no `prompt_cache_key`; kaibo sends one per backend.
+- **Review leftovers (kaibo gpt-plan + deepseek).** Not fixed:
+  - A 401 refreshes and resends even when its code is a permanent refusal, and a failed second `bearer` call hides the first 401's detail.
+  - The refresh margin is a flat 300 s; an `expires_in` under that would refresh on every request.
+  - Only a connect error counts as an unsent refresh; a TLS failure before the request was written still drops the grant.
+  - The ID token's `azp` is not checked.
+  - `chatgpt::Client::stream` clones the history for the 401 resend.
+  - `redact` matches the bearer verbatim; a JSON-escaped or truncated echo survives.
+  - The plan route's default output ceiling is unknown.
 - **Failing kj tests on main.** `kj::reflect::tests::every_live_leaf_classifies` (`kj audio render` needs `<SOURCES>`) and `kj::db::tests::db_backup_help_documents_the_no_restore_verb_stance` (the `backup` long help lost its no-restore text) fail independent of this work.
 
 ## Council house rules, objects, and verbs (2026-11-08)

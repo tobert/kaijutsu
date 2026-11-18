@@ -1148,6 +1148,12 @@ impl Provider {
         }
     }
 
+    /// Whether a request carries the binding's `max_tokens`. The ChatGPT
+    /// plan route takes no output limit, so its ceiling is the provider's.
+    pub fn sends_output_limit(&self) -> bool {
+        !matches!(self, Self::ChatGpt(_))
+    }
+
     /// Models this provider exposes by default.
     pub fn available_models(&self) -> Vec<&'static str> {
         match self {
