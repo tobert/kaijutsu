@@ -33,6 +33,7 @@ pub mod chatgpt;
 pub mod config;
 pub mod council;
 pub mod db_config;
+pub mod decisions;
 pub mod deepseek;
 pub mod endpoint;
 pub mod gemini;
@@ -698,6 +699,9 @@ pub enum Provider {
     Council(council::Client),
     /// Google Gemini API (see `llm/gemini/`).
     Gemini(gemini::Client),
+    /// A hosted Decisions API (see `llm/decisions.rs`). It answers
+    /// [`Provider::decisions`] calls and refuses chat turns.
+    Decisions(decisions::Client),
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
@@ -869,6 +873,14 @@ impl Provider {
                 }
                 Ok(Self::Gemini(client))
             }
+            BackendKind::Decisions => {
+                let url = config.base_url.as_deref().unwrap_or_default();
+                let api_key = resolve_key_or_placeholder(config, "Decisions")?;
+                Ok(Self::Decisions(
+                    decisions::Client::new(config.name.clone(), url, api_key, resolve_request_timeout(config))?
+                        .with_endpoint(endpoint()?),
+                ))
+            }
             #[cfg(any(test, feature = "test-mock"))]
             BackendKind::Mock => {
                 let mock = MockClient::new(format!(
@@ -904,6 +916,7 @@ impl Provider {
             Self::ChatGpt(c) => c.provider_name(),
             Self::Council(c) => c.provider_name(),
             Self::Gemini(c) => c.provider_name(),
+            Self::Decisions(c) => c.provider_name(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => "mock",
         }
@@ -920,6 +933,7 @@ impl Provider {
             Self::ChatGpt(c) => c.endpoint(),
             Self::Council(c) => c.endpoint(),
             Self::Gemini(c) => c.endpoint(),
+            Self::Decisions(c) => c.endpoint(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => None,
         }
@@ -1007,7 +1021,7 @@ impl Provider {
             Self::DeepSeek(client) => client.one_shot_opts(opts),
             Self::Alibaba(client) => client.one_shot_opts(opts),
             Self::OpenAi(client) => client.one_shot_opts(opts),
-            Self::ChatGpt(_) => opts,
+            Self::ChatGpt(_) | Self::Decisions(_) => opts,
             Self::Council(client) => client.one_shot_opts(opts),
             Self::Gemini(client) => client.one_shot_opts(opts),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1035,6 +1049,13 @@ impl Provider {
         messages: Vec<Message>,
     ) -> LlmResult<ProviderStream> {
         hydrate::validate_tool_pairing(&messages)?;
+        if let Self::Decisions(client) = self {
+            return Err(LlmError::InvalidRequest(format!(
+                "backend '{}' has kind 'decisions', which answers gate decisions and runs no chat turn; \
+                 name it in a `gate` slot, and give the context's model a chat backend",
+                client.provider_name()
+            )));
+        }
         if !opts.controls.is_empty() && !matches!(self, Self::Council(_)) {
             return Err(LlmError::InvalidRequest(format!(
                 "provider '{}' cannot apply control vectors, and this context has {} control item(s); \
@@ -1074,6 +1095,7 @@ impl Provider {
             Self::ChatGpt(client) => Ok(ProviderStream::Responses(client.stream(opts, messages).await?)),
             Self::Council(client) => Ok(ProviderStream::Council(client.stream(opts, messages).await?)),
             Self::Gemini(client) => Ok(ProviderStream::Gemini(client.stream(opts, messages).await?)),
+            Self::Decisions(_) => unreachable!("a decisions backend was refused above"),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 if let Some(sent) = &mock.sent {
@@ -1149,6 +1171,15 @@ impl Provider {
         }
     }
 
+    /// The Decisions client of a `decisions` backend, or `None` for any
+    /// other kind. See `llm/decisions.rs` for a call.
+    pub fn decisions(&self) -> Option<&decisions::Client> {
+        match self {
+            Self::Decisions(client) => Some(client),
+            _ => None,
+        }
+    }
+
     /// Whether a request carries the binding's `max_tokens`. The ChatGPT
     /// plan route takes no output limit, so its ceiling is the provider's.
     pub fn sends_output_limit(&self) -> bool {
@@ -1164,6 +1195,7 @@ impl Provider {
             Self::ChatGpt(_) => BackendKind::ChatGpt,
             Self::Council(_) => BackendKind::Council,
             Self::Gemini(_) => BackendKind::Gemini,
+            Self::Decisions(_) => BackendKind::Decisions,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => BackendKind::Mock,
         }
@@ -1177,6 +1209,7 @@ impl Provider {
             Self::Alibaba(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
             Self::Gemini(c) => c.available_models(),
+            Self::Decisions(c) => c.wire().models(),
             Self::ChatGpt(_) | Self::Council(_) => Vec::new(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
@@ -2244,6 +2277,29 @@ mod tests {
             .expect("a bad key must not build a client");
         assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
         assert!(!err.to_string().contains("sk-"), "the error must not repeat the key: {err}");
+    }
+
+    /// A `decisions` backend builds a Decisions client the gate reaches by
+    /// name, and refuses a chat turn before sending anything.
+    #[tokio::test]
+    async fn a_decisions_backend_answers_decisions_and_refuses_chat_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("key");
+        std::fs::write(&key_file, "sk-or\n").unwrap();
+        let config = BackendConfig::new("jev", BackendKind::Decisions)
+            .with_base_url(decisions::OPENROUTER_DECISIONS_URL)
+            .with_api_key_file(key_file.to_str().unwrap());
+        let provider = Provider::from_backend(&config, &endpoint::Endpoints::default(), &test_credentials()).unwrap();
+        let client = provider.decisions().expect("a decisions backend has a Decisions client");
+        assert_eq!(client.wire(), decisions::Wire::OpenRouter);
+        assert_eq!(provider.name(), "jev");
+        assert!(!provider.sends_output_limit());
+        assert!(provider.available_models().contains(&"typesafe/jev-1.13"));
+        let err = provider.stream(BuildOpts::new("typesafe/jev-1.13", 64), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("'jev'") && m.contains("gate")), "{err:?}");
+        let anthropic = BackendConfig::new("a", BackendKind::Anthropic).with_api_key_file(key_file.to_str().unwrap());
+        let other = Provider::from_backend(&anthropic, &endpoint::Endpoints::default(), &test_credentials()).unwrap();
+        assert!(other.decisions().is_none());
     }
 
     #[test]

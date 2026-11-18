@@ -1811,3 +1811,62 @@ fn one_context_is_the_console_or_hub_of_one_sheet() {
     assert!(error.contains("amy") && error.contains("bob"), "{error}");
     assert!(w.db.is_console(shared.context_id).is_err());
 }
+
+/// A `decisions` backend answers gate decisions and runs no chat turn. A
+/// `gate` slot may name it and needs no max_tokens; a `distill` slot may
+/// not; and a context whose model would be on it refuses to be written,
+/// naming the fix.
+///
+/// Falsified by a decisions model copied into a context's `model` slot, or
+/// by a decisions gate slot that requires max_tokens.
+#[test]
+fn a_decisions_backend_serves_the_gate_and_never_a_chat_turn() {
+    let w = world();
+    let jev = w
+        .db
+        .upsert_backend(&BackendRow {
+            backend_id: BackendId::new(),
+            name: "jev".into(),
+            kind: "decisions".into(),
+            base_url: Some(crate::llm::decisions::OPENROUTER_DECISIONS_URL.into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: false,
+            request_timeout_secs: None,
+            idle_timeout_secs: None,
+            max_concurrent: None,
+            created_at: now_millis(),
+            created_by: PrincipalId::system(),
+        })
+        .unwrap()
+        .backend_id;
+    let slot = |who: PrincipalId, role: &str| CharacterSlotRow {
+        principal_id: who, role: role.into(), backend_id: jev, model: "typesafe/jev-1.13".into(),
+        max_tokens: None, temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
+    };
+
+    let judged = w.character("judged");
+    w.db.set_character_model(&CharacterModelRow {
+        principal_id: judged, backend_id: w.deepseek, model: "ds-flash".into(), max_tokens: Some(1024),
+        temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None,
+    }).unwrap();
+    w.db.set_character_slot(&slot(judged, "gate")).unwrap();
+    let error = w.db.set_character_slot(&slot(judged, "distill")).unwrap_err().to_string();
+    assert!(error.contains("jev") && error.contains("decisions") && error.contains("gate"), "{error}");
+    let conv = w.ctx("conv", "coder", None, None);
+    w.db.write_context_character(conv.context_id, judged, None, None).unwrap();
+    let gate = w.db.context_slot(conv.context_id, "gate").unwrap().unwrap();
+    assert_eq!((gate.backend_id, gate.max_tokens), (jev, None), "a decisions gate slot needs no max_tokens");
+
+    let chat = w.character("chat");
+    w.db.set_character_model(&CharacterModelRow {
+        principal_id: chat, backend_id: jev, model: "typesafe/jev-1.13".into(), max_tokens: None,
+        temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None,
+    }).unwrap();
+    let conv = w.ctx("conv2", "coder", None, None);
+    let error = w.db.write_context_character(conv.context_id, chat, None, None).unwrap_err().to_string();
+    for needle in ["typesafe/jev-1.13", "decisions", "runs no chat turn", "the model of character chat", "kj character model set"] {
+        assert!(error.contains(needle), "missing {needle:?}: {error}");
+    }
+    assert!(w.roles(&conv).is_empty(), "the refused write left no slot");
+}

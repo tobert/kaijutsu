@@ -137,16 +137,25 @@ fn validate_decide(decide: Option<&str>) -> KernelDbResult<()> {
 impl KernelDb {
     /// Insert or replace one slot of a character. The role is `distill`,
     /// `gate`, or `image`; anything else refuses, naming the fix. A `gate`
-    /// slot names a council server (a backend of kind `council`) or a chat
-    /// model, the guardian.
+    /// slot names a council server, a decisions backend, or a chat model (the
+    /// guardian). A decisions backend runs no chat turn, so only a `gate` slot
+    /// may name it.
     pub fn set_character_slot(&self, row: &CharacterSlotRow) -> KernelDbResult<()> {
         if row.role.trim().is_empty() {
             return Err(KernelDbError::Validation("role must not be empty".into()));
         }
         crate::model_resolution::refuse_character_slot_role(&row.role, &self.name_for(row.principal_id))
             .map_err(KernelDbError::Validation)?;
-        self.get_backend(row.backend_id)?
+        let backend = self.get_backend(row.backend_id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("backend {}", row.backend_id)))?;
+        let decisions = backend.kind == crate::llm::BackendKind::Decisions.as_str();
+        if row.role != crate::council::gate::GATE && decisions {
+            return Err(KernelDbError::Validation(format!(
+                "backend {} has kind decisions, which answers gate decisions and runs no chat turn, so it \
+                 cannot fill a `{}` slot; name it in a `gate` slot",
+                backend.name, row.role
+            )));
+        }
         if row.model.trim().is_empty() {
             return Err(KernelDbError::Validation("model must not be empty".into()));
         }
