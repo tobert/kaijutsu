@@ -10,6 +10,7 @@
 //! decision for a submission and records it; `shell_case` builds the
 //! statements its shell case shows.
 
+pub(crate) mod decisions_judge;
 pub(crate) mod gate;
 pub(crate) mod guardian;
 #[cfg(test)]

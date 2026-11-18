@@ -10,9 +10,11 @@
 //! a miss with its cause, and the gate then asks as it would without a
 //! guardian.
 //!
-//! A context whose guardian denies 3 submissions in a row, or 10 of its last
-//! 50, is no longer judged: each later submission is a miss naming the
-//! [`Breaker`], so it asks the senpai.
+//! The decisions judge ([`super::decisions_judge`]) reads the same evidence
+//! ([`evidence`]) and shares the breaker: a context whose model judge denies
+//! 3 submissions in a row, or 10 of its last 50, is no longer judged, and
+//! each later submission is a miss naming the [`Breaker`], so it asks the
+//! senpai.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -220,18 +222,65 @@ impl Breakers {
     }
 }
 
-/// What the guardian made of one submission, for
-/// [`super::gate::guardian_verdict`].
+/// Which model judge answered: the guardian, a chat model, or the
+/// decisions judge, a Decisions API ([`super::decisions_judge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JudgeKind {
+    Guardian,
+    Decisions,
+}
+
+impl JudgeKind {
+    /// The name its decisions are recorded under.
+    pub(crate) fn spec(self) -> &'static str {
+        match self {
+            Self::Guardian => SPEC,
+            Self::Decisions => super::decisions_judge::SPEC,
+        }
+    }
+
+    /// The judge as the ask and the log name it.
+    pub(crate) fn noun(self) -> &'static str {
+        match self {
+            Self::Guardian => "guardian",
+            Self::Decisions => "decisions judge",
+        }
+    }
+}
+
+/// A model judge's answer to one submission.
+#[derive(Clone, Debug)]
+pub(crate) enum Answer {
+    /// The guardian's parsed answer.
+    Assessment(Assessment),
+    /// The decisions judge's probabilities, and the threshold it allows at.
+    Choice { p: super::decisions_judge::Probabilities, allow_at: f64 },
+}
+
+impl Answer {
+    /// The answer as the ask and the log show it.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::Assessment(a) => a.summary(),
+            Self::Choice { p, allow_at } => p.summary(*allow_at),
+        }
+    }
+}
+
+/// What a model judge made of one submission, for
+/// [`super::gate::model_judge_verdict`].
 #[derive(Clone, Debug)]
 pub(crate) struct Judged {
+    pub(crate) kind: JudgeKind,
     pub(crate) outcome: Outcome,
-    /// The answer, when one parsed.
-    pub(crate) assessment: Option<Assessment>,
+    /// The answer, when one arrived and read.
+    pub(crate) answer: Option<Answer>,
     /// The slot's backend name.
     pub(crate) backend: String,
     pub(crate) model: String,
-    /// The digest of the system text the guardian read: the policy and the
-    /// answer format. Empty when the policy could not be read.
+    /// The digest of the instructions the judge read: the policy and the
+    /// answer format, or the decisions question. Empty when the evidence
+    /// could not be gathered.
     pub(crate) policy_digest: String,
     pub(crate) deadline_ms: u64,
     pub(crate) elapsed: std::time::Duration,
@@ -240,9 +289,44 @@ pub(crate) struct Judged {
 }
 
 impl Judged {
-    /// The guardian as the ask and the record name it: `<backend>/<model>`.
+    /// A judgment not yet made: a miss with no cause, which every path
+    /// replaces.
+    pub(crate) fn begin(
+        kind: JudgeKind,
+        bound: &crate::model_resolution::BoundSlot,
+        config: &crate::kj::gate_policy::GuardianConfig,
+    ) -> Self {
+        Judged {
+            kind,
+            outcome: Outcome::Miss(String::new()),
+            answer: None,
+            backend: bound.backend.clone(),
+            model: bound.slot.model.clone(),
+            policy_digest: String::new(),
+            deadline_ms: config.deadline_ms,
+            elapsed: std::time::Duration::ZERO,
+            tripped: None,
+        }
+    }
+
+    /// The judge as the ask and the record name it: `<backend>/<model>`.
     pub(crate) fn name(&self) -> String {
         format!("{}/{}", self.backend, self.model)
+    }
+
+    /// This judgment as a miss with `cause`, taken at `started`.
+    pub(crate) fn missed(mut self, started: std::time::Instant, cause: String) -> Self {
+        self.outcome = Outcome::Miss(cause);
+        self.elapsed = started.elapsed();
+        self
+    }
+
+    /// The guardian's parsed answer, when it gave one.
+    pub(crate) fn assessment(&self) -> Option<&Assessment> {
+        match &self.answer {
+            Some(Answer::Assessment(a)) => Some(a),
+            _ => None,
+        }
     }
 }
 
@@ -287,6 +371,59 @@ pub(crate) fn prompt(
     text
 }
 
+/// What a model judge reads about one submission.
+pub(crate) struct Evidence {
+    /// The policy, without its attribution comment.
+    pub(crate) policy: String,
+    /// The house rules, the transcript tail, the planned action, and the
+    /// text of each program it runs ([`prompt`]).
+    pub(crate) prompt: String,
+}
+
+/// Gather what a model judge reads about the planned `action` in
+/// `context`: the policy at [`POLICY_PATH`], the workspace's `AGENTS.md`,
+/// and the transcript tail, within `config`'s budgets. `Err` is a miss
+/// cause, and `judge` names the judge in it.
+pub(crate) async fn evidence(
+    kernel: &crate::Kernel,
+    config: &crate::kj::gate_policy::GuardianConfig,
+    judge: JudgeKind,
+    context: ContextId,
+    action: &serde_json::Value,
+    programs: &[ShownProgram],
+) -> Result<Evidence, String> {
+    use crate::vfs::VfsOps;
+    let noun = judge.noun();
+    let path = kaijutsu_types::paths::config_path(POLICY_PATH);
+    let policy = kernel
+        .vfs()
+        .read_all(std::path::Path::new(&path))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}")))
+        .map_err(|why| {
+            format!("the {noun} policy {path} could not be read ({why}); `kj config reset {POLICY_PATH}` restores the shipped one")
+        })?;
+    let house = super::sync::house_rules(kernel, context, config.house_rules_tokens).await;
+    let budget = usize::try_from(config.transcript_tokens.saturating_mul(super::projection::HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
+    let blocks = kernel
+        .blocks()
+        .block_snapshots(context)
+        .map_err(|e| format!("the {noun} could not read the context's transcript: {e}"))?;
+    let tail = transcript(&blocks, budget);
+    Ok(Evidence { policy: without_leading_comment(&policy).trim_end().to_string(), prompt: prompt(house.as_ref(), &tail, action, programs) })
+}
+
+/// The miss cause for a context whose breaker has tripped, naming `judge`.
+pub(crate) fn tripped_cause(kernel: &crate::Kernel, judge: JudgeKind, context: ContextId) -> Option<String> {
+    kernel.guardian_breakers().tripped(context).map(|cause| {
+        format!(
+            "the {} stopped judging this context because {cause}; its submissions ask until the kernel restarts",
+            judge.noun()
+        )
+    })
+}
+
 /// Ask the guardian on `bound` (the context's `gate` slot) about the
 /// planned `action`. Every failure is a miss with its cause: a tripped
 /// breaker, a policy that cannot be read, no provider for the slot, a call
@@ -300,57 +437,25 @@ pub(crate) async fn judge(
     action: &serde_json::Value,
     programs: &[ShownProgram],
 ) -> Judged {
-    use crate::vfs::VfsOps;
     let started = std::time::Instant::now();
-    let mut judged = Judged {
-        outcome: Outcome::Miss(String::new()),
-        assessment: None,
-        backend: bound.backend.clone(),
-        model: bound.slot.model.clone(),
-        policy_digest: String::new(),
-        deadline_ms: config.deadline_ms,
-        elapsed: std::time::Duration::ZERO,
-        tripped: None,
-    };
-    let missed = |mut judged: Judged, cause: String| {
-        judged.outcome = Outcome::Miss(cause);
-        judged.elapsed = started.elapsed();
-        judged
-    };
-    if let Some(cause) = kernel.guardian_breakers().tripped(context) {
-        return missed(
-            judged,
-            format!("the guardian stopped judging this context because {cause}; its submissions ask until the kernel restarts"),
-        );
+    let mut judged = Judged::begin(JudgeKind::Guardian, bound, config);
+    if let Some(cause) = tripped_cause(kernel, JudgeKind::Guardian, context) {
+        return judged.missed(started, cause);
     }
-    let path = kaijutsu_types::paths::config_path(POLICY_PATH);
-    let policy = kernel
-        .vfs()
-        .read_all(std::path::Path::new(&path))
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}")));
-    let policy = match policy {
-        Ok(policy) => policy,
-        Err(why) => {
-            return missed(judged, format!("the guardian policy {path} could not be read ({why}); `kj config reset {POLICY_PATH}` restores the shipped one"));
-        }
+    let evidence = match evidence(kernel, config, JudgeKind::Guardian, context, action, programs).await {
+        Ok(evidence) => evidence,
+        Err(cause) => return judged.missed(started, cause),
     };
-    let system = format!("{}\n\n{ANSWER_FORMAT}", without_leading_comment(&policy).trim_end());
+    let system = format!("{}\n\n{ANSWER_FORMAT}", evidence.policy);
     judged.policy_digest = super::gate::text_digest(&system);
-    let house = super::sync::house_rules(kernel, context, config.house_rules_tokens).await;
-    let budget = usize::try_from(config.transcript_tokens.saturating_mul(super::projection::HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
-    let tail = match kernel.blocks().block_snapshots(context) {
-        Ok(blocks) => transcript(&blocks, budget),
-        Err(e) => return missed(judged, format!("the guardian could not read the context's transcript: {e}")),
-    };
-    let text = prompt(house.as_ref(), &tail, action, programs);
+    let text = evidence.prompt;
     let Some(provider) = kernel.llm().read().await.get(&bound.backend) else {
-        return missed(judged, format!("backend {} has no provider in the kernel's registry", bound.backend));
+        let cause = format!("backend {} has no provider in the kernel's registry", bound.backend);
+        return judged.missed(started, cause);
     };
     let max_tokens = match bound.request_max_tokens(super::gate::GATE) {
         Ok(max_tokens) => max_tokens,
-        Err(e) => return missed(judged, e.to_string()),
+        Err(e) => return judged.missed(started, e.to_string()),
     };
     let slot = &bound.slot;
     let tunables = crate::llm::SlotTunables {
@@ -369,7 +474,7 @@ pub(crate) async fn judge(
     let deadline = std::time::Duration::from_millis(config.deadline_ms);
     let reply = match tokio::time::timeout(deadline, provider.prompt_with_system(opts, &text)).await {
         Ok(reply) => reply,
-        Err(_) => return missed(judged, format!("no answer within the {} ms deadline", config.deadline_ms)),
+        Err(_) => return judged.missed(started, format!("no answer within the {} ms deadline", config.deadline_ms)),
     };
     let usage = match &reply {
         Ok(reply) => Some(&reply.usage),
@@ -386,16 +491,16 @@ pub(crate) async fn judge(
         Ok(reply) => reply,
         Err(e) => {
             let cause = format!("{} failed: {e}", judged.name());
-            return missed(judged, cause);
+            return judged.missed(started, cause);
         }
     };
     let assessment = match parse_assessment(&reply.text) {
         Ok(assessment) => assessment,
-        Err(cause) => return missed(judged, cause),
+        Err(cause) => return judged.missed(started, cause),
     };
     judged.tripped = kernel.guardian_breakers().record(context, assessment.outcome);
     judged.outcome = assessment.outcome();
-    judged.assessment = Some(assessment);
+    judged.answer = Some(Answer::Assessment(assessment));
     judged.elapsed = started.elapsed();
     judged
 }

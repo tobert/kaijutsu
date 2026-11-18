@@ -159,7 +159,7 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 
 ## The guardian: what the first pass leaves open (2026-11-18)
 
-A chat model on a context's `gate` slot judges escalated shell submissions (`council/guardian.rs`; `docs/approval-identity.md`, "The guardian"). Not done:
+A chat model (the guardian) or a Decisions API (the decisions judge) on a context's `gate` slot judges escalated shell submissions (`council/guardian.rs`, `council/decisions_judge.rs`; `docs/approval-identity.md`, "The guardian"). Not done:
 
 - **No structured output.** No provider client sends a JSON schema (`text.format` on Responses, `response_format` on chat completions), so the answer format is asked for in the prompt and parsed strictly; drift is a recorded miss. Adding a schema to `BuildOpts` would remove most parse misses.
 - **The breaker resets only at restart.** Codex resets per turn. Candidates: a senpai's answer to an ask from the context, or a `kj` verb. Its state is in memory, so `kj` cannot show it either.
@@ -168,8 +168,10 @@ A chat model on a context's `gate` slot judges escalated shell submissions (`cou
 - **The guardian reads only the shell gate.** `kj` verb asks and hook asks never reach it, as with the council.
 - **A judge shadow on a guardian context.** `[rc.<dir>.council] judge` still records a judge shadow on a guardian decision, which then reads against an empty council config and misses. Nothing sets both today.
 - **The allow names the layer `council (guardian)`.** The gate layer is `Layer::Council`; a `Layer::Guardian` would read better in auto reasons.
-- **`decisions` backends.** A backend kind that answers choice probabilities over allow, ask, and report belongs on the council path's threshold classification; `council::gate::judged_by_guardian` must return `false` for it.
-- **Not live-tested.** Every check runs on the mock provider; no chatgpt or anthropic guardian has judged a real submission yet.
+- **Not live-tested.** Every check runs on the mock provider or a loopback Decisions server; no chatgpt, anthropic, or Decisions judge has judged a real submission yet.
+- **The decisions judge's threshold is not on its row.** `council_decisions.allow_at` needs a `mass_floor` beside it, which a Decisions answer has none of, so the row leaves the threshold empty; the ask note carries it. A comparison across judges reads `allow_at` from `gate.toml`.
+- **The decisions judge reads a policy written for the guardian.** `guardian.md` asks for `risk_level`, `user_authorization`, and a rationale the `verdict` question has no field for; a line maps its outcome onto the options. A policy written for a choice question may read better.
+- **`[guardian]` names both model judges.** Its keys and switch configure the decisions judge too. A rename to `[model_judge]` would read better; nothing depends on the name yet.
 
 ## Sol's first task: friction from a GPT model driving kaijutsu (2026-11-18)
 

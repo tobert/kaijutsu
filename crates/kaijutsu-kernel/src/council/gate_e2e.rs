@@ -4148,3 +4148,188 @@ async fn a_chat_gate_slot_without_the_guardian_stays_a_council_miss() {
     assert!(decision.decision.miss_cause.unwrap().contains("not council"));
     rig.finish().await;
 }
+
+// ── The decisions judge ──────────────────────────────────────────────────
+
+/// A Decisions API reply to the `verdict` question with these
+/// probabilities of allow, ask, and report.
+fn verdict_reply(allow: f64, ask: f64, report: f64) -> kaijutsu_council::test_server::Reply {
+    let choice = [("allow", allow), ("ask", ask), ("report", report)]
+        .into_iter()
+        .fold(("allow", f64::MIN), |best, (o, p)| if p > best.1 { (o, p) } else { best })
+        .0;
+    let body = serde_json::json!({
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": {"verdict": {"type": "choice", "choice": choice,
+                                "probabilities": {"allow": allow, "ask": ask, "report": report}}},
+        "usage": {"input_tokens": 900, "output_tokens": 1},
+    });
+    kaijutsu_council::test_server::reply(200, body.to_string())
+}
+
+type Captured = Arc<Mutex<Vec<kaijutsu_council::test_server::Captured>>>;
+
+/// A rig whose seat's `gate` slot names `typesafe/jev-1.13` on the
+/// `decisions` backend `jev`, served by a loopback Decisions server that
+/// answers `replies` in order. The guardian switch is on for `coder/` and
+/// the council is off.
+async fn decisions_rig(via: Via, replies: Vec<kaijutsu_council::test_server::Reply>) -> (Rig, Captured) {
+    let (base, seen) = kaijutsu_council::test_server::serve(replies).await;
+    let url = format!("{base}/api/alpha/decisions");
+    let gate = SlotSpec { model: "typesafe/jev-1.13", backend: "jev", kind: "decisions", base: Base::Url(url.clone()) };
+    let rig = rig(via, Setup { enabled: false, gate_slot: Some(gate), guardian: Some(5_000), ..Setup::default() }).await;
+    use crate::vfs::VfsOps;
+    rig.d
+        .kernel()
+        .vfs()
+        .write_all(
+            std::path::Path::new("/config/kernel/council/guardian.md"),
+            include_str!("../../../../assets/defaults/council/guardian.md").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let client = crate::llm::decisions::Client::new("jev", &url, "sk-test", Duration::from_secs(30)).unwrap();
+    rig.d.kernel().llm().write().await.register("jev", Arc::new(crate::llm::Provider::Decisions(client)));
+    (rig, seen)
+}
+
+fn pooled(decision: &CouncilDecision) -> Vec<(String, f64)> {
+    decision.decision.pooled.iter().map(|p| (format!("{}.{}", p.question_id, p.option), p.probability)).collect()
+}
+
+/// A decisions allow runs the submission with an auto-decided row naming
+/// the model. The request's state is the guardian's evidence (the
+/// transcript tail and the planned action), its question's instructions are
+/// the guardian's policy, and the probabilities are recorded.
+///
+/// Falsified by routing a `decisions` gate slot to the council path: it
+/// names no council server, so the decision misses and asks.
+#[tokio::test]
+async fn a_decisions_allow_runs_the_submission_and_records_the_probabilities() {
+    for via in BOTH {
+        let (rig, seen) = decisions_rig(via, vec![verdict_reply(0.95, 0.04, 0.01)]).await;
+        append_dialogue(rig.d.kernel(), rig.ctx.context_id, &["please print a greeting", "I will echo it"]);
+        rig.submit("echo decisions-ran").await.unwrap_or_else(|e| panic!("{via:?}: the decisions judge allows: {e:?}"));
+
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
+        let reason = ask.auto_reason.clone().expect("an auto-decided row");
+        assert!(reason.contains("council (decisions) allows") && reason.contains("jev/typesafe/jev-1.13"), "{via:?}: {reason}");
+
+        let decision = the_decision(&rig, &ask);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
+        assert_eq!(decision.decision.spec_name, "decisions");
+        assert_eq!(decision.decision.server.model, "typesafe/jev-1.13");
+        assert_eq!(decision.decision.server.engine, "jev");
+        assert_eq!(
+            pooled(&decision),
+            [("verdict.allow".to_string(), 0.95), ("verdict.ask".to_string(), 0.04), ("verdict.report".to_string(), 0.01)]
+        );
+        assert!(assessment(&rig, &decision).is_none(), "a decisions judge leaves no assessment");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{via:?}: one decisions call per submission");
+        assert_eq!(seen[0].header("authorization"), Some("Bearer sk-test"));
+        let body: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+        assert_eq!(body["model"], "typesafe/jev-1.13");
+        let state = body["state"].as_str().expect("the state is the prompt text");
+        for want in ["echo decisions-ran", "[user] please print a greeting", "[assistant] I will echo it", "council-seat-performer"] {
+            assert!(state.contains(want), "{via:?}: the state lacks {want}: {state}");
+        }
+        let question = &body["questions"]["verdict"];
+        let instructions = question["instructions"].as_str().unwrap();
+        assert!(instructions.starts_with("You judge one planned shell submission"), "{instructions}");
+        assert!(instructions.ends_with(super::decisions_judge::VERDICT_MAPPING), "{instructions}");
+        let options: Vec<&str> = question["criteria"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(options, ["allow", "ask", "report"]);
+        drop(seen);
+        assert!(rig.mock.decisions().is_empty(), "the council server is not asked");
+        rig.finish().await;
+    }
+}
+
+/// Under `allow_at` the submission asks, and the ask shows the three
+/// probabilities so the senpai sees how sure the judge was.
+#[tokio::test]
+async fn a_decisions_allow_under_the_threshold_asks_with_the_probabilities() {
+    for via in BOTH {
+        let (rig, _) = decisions_rig(via, vec![verdict_reply(0.6, 0.35, 0.05)]).await;
+        assert_pending(via, rig.submit("rm -rf cache").await);
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Pending);
+        for want in ["p(allow) 0.600", "p(ask) 0.350", "p(report) 0.050", ">= 0.9"] {
+            assert!(ask.description.contains(want), "{via:?}: lacks {want}: {}", ask.description);
+        }
+        assert_eq!(the_decision(&rig, &ask).decision.outcome, CouncilOutcome::Ask, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// A `report` argmax reports: an ask, recorded as a report.
+#[tokio::test]
+async fn a_decisions_report_argmax_reports() {
+    for via in BOTH {
+        let (rig, _) = decisions_rig(via, vec![verdict_reply(0.1, 0.2, 0.7)]).await;
+        assert_pending(via, rig.submit("cat key.txt").await);
+        assert_eq!(the_decision(&rig, &rig.only_ask()).decision.outcome, CouncilOutcome::Report, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// A provider error, a reply that does not match the question, and a
+/// server that is down are each a miss with its cause, and the submission
+/// asks. A miss never allows.
+#[tokio::test]
+async fn a_decisions_failure_is_a_miss_and_asks() {
+    use kaijutsu_council::test_server::reply;
+    let short = serde_json::json!({"answers": {"verdict": {"type": "choice", "choice": "allow",
+                                   "probabilities": {"allow": 0.99, "ask": 0.01}}}});
+    let cases = [
+        (reply(503, r#"{"error": {"message": "overloaded"}}"#), "HTTP 503: overloaded"),
+        (reply(200, short.to_string()), "option \"report\" has no probability"),
+    ];
+    for (answer, want) in cases {
+        let (rig, _) = decisions_rig(Via::Tool, vec![answer]).await;
+        assert_pending(Via::Tool, rig.submit("touch notes.txt").await);
+        let decision = the_decision(&rig, &rig.only_ask());
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Miss);
+        assert_eq!(decision.decision.spec_name, "decisions");
+        let cause = decision.decision.miss_cause.clone().unwrap();
+        assert!(cause.contains("jev/typesafe/jev-1.13") && cause.contains(want), "{cause}");
+        assert!(decision.decision.pooled.is_empty());
+        rig.finish().await;
+    }
+    let (rig, _) = decisions_rig(Via::Tool, vec![]).await;
+    rig.d.kernel().llm().write().await.register(
+        "jev",
+        Arc::new(crate::llm::Provider::Decisions(
+            crate::llm::decisions::Client::new("jev", &format!("{}/api/alpha/decisions", dead_server()), "k", Duration::from_secs(30))
+                .unwrap(),
+        )),
+    );
+    assert_pending(Via::Tool, rig.submit("touch notes.txt").await);
+    let decision = the_decision(&rig, &rig.only_ask());
+    assert_eq!(decision.decision.outcome, CouncilOutcome::Miss);
+    assert!(decision.decision.miss_cause.unwrap().contains("failed before an answer arrived"));
+    rig.finish().await;
+}
+
+/// The decisions judge shares the guardian's breaker: after three denials
+/// in a row (asks or reports) the next submission is a miss naming it, and
+/// nothing more is sent.
+#[tokio::test]
+async fn three_decisions_denials_stop_it_judging_the_context() {
+    let replies = vec![verdict_reply(0.3, 0.6, 0.1), verdict_reply(0.1, 0.2, 0.7), verdict_reply(0.5, 0.45, 0.05)];
+    let (rig, seen) = decisions_rig(Via::Tool, replies).await;
+    for i in 0..3 {
+        assert_pending(Via::Tool, rig.submit(&format!("touch denied-{i}")).await);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert_pending(Via::Tool, rig.submit("touch after-the-breaker").await);
+    assert_eq!(seen.lock().unwrap().len(), 3, "a tripped breaker sends nothing");
+    let latest = latest_decision(&rig);
+    assert_eq!(latest.decision.outcome, CouncilOutcome::Miss);
+    let cause = latest.decision.miss_cause.unwrap();
+    assert!(cause.contains("stopped judging") && cause.contains("3 submissions in a row"), "{cause}");
+    rig.finish().await;
+}

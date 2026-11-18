@@ -36,7 +36,7 @@ Top wins. A learned human allow overrides config deny. Structural conditions (re
 
 ## The council gate and Council v2 backend
 
-When enabled in `gate.toml`, the gate consults the council for statements left Uncovered by static rules. A context whose `gate` slot names a chat model is judged by the guardian instead (below).
+When enabled in `gate.toml`, the gate consults the council for statements left Uncovered by static rules. A context whose `gate` slot names a chat model or a `decisions` backend is judged by a model judge instead (below).
 
 ### The flow
 - **Allow**: Pooled probability $p(\text{allow}) \ge \text{allow\_at}$, mass floor met, agreement met, no control-text hit. Uncovered statements become council allows; submission runs with a durable auto-decision row naming the council.
@@ -49,19 +49,28 @@ When enabled in `gate.toml`, the gate consults the council for statements left U
 - **Council v2 backend (`kaijutsu-council`)**: Speaks Council v2 (`gogi-proto`). The kernel pins council seats under `kernel-<kernel_id>`, reads `/council/v2/identity`, streams `/council/v2/generations` for chat turns, and sends control vectors and CAS media objects.
 - **House rules**: Enabled via `[council] house_rules = true`, reading the first `AGENTS.md` up from working directory.
 - **Judge shadows & Bumper mode**: Judge shadows give opinions; bump shadows answer proceed or bump in **bumper mode** (`[council] mode = "bumper"` or `"bump-only"`).
-- **Decisions backend (`kind = decisions`)**: A hosted Decisions API, OpenRouter's (`https://openrouter.ai/api/alpha/decisions`, models `typesafe/jev-1.13` and `~typesafe/jev-latest`) or Gemini's (`https://generativelanguage.googleapis.com/v1beta/decisions`, model `gemini-decision-1`). It takes state plus a `choice` question and returns each option's probability (`llm/decisions.rs`). It runs no chat turn, so only a `gate` slot may name it; a context whose model is on one is refused at create.
+- **Decisions backend (`kind = decisions`)**: A hosted Decisions API, OpenRouter's (`https://openrouter.ai/api/alpha/decisions`, models `typesafe/jev-1.13` and `~typesafe/jev-latest`) or Gemini's (`https://generativelanguage.googleapis.com/v1beta/decisions`, model `gemini-decision-1`). It takes state plus a `choice` question and returns each option's probability (`llm/decisions.rs`). It runs no chat turn, so only a `gate` slot may name it; a context whose model is on one is refused at create. On a `gate` slot it is the decisions judge (below).
 
 ### The guardian
 
 `kj character slot set sol gate chatgpt/gpt-6.2-sol`, `[rc.sol.guardian] enabled = true` in `gate.toml`, then `kj context rotate`: a chat model judges what the rules escalate.
 
-The kind of backend a context's `gate` slot names picks who judges. A `council` backend runs the council above. A chat backend (`anthropic`, `deepseek`, `openai`, `chatgpt`, `alibaba`, `gemini`) runs the guardian when the performer's sections enable it (`[rc.<dir>.guardian]`, `[root.guardian]`, `[character.<name>.guardian]`; the last switch decides). The guardian is modeled on OpenAI Codex's auto-review.
+The kind of backend a context's `gate` slot names picks who judges. The two model judges run only when the performer's sections turn on the guardian switch (`[rc.<dir>.guardian]`, `[root.guardian]`, `[character.<name>.guardian]`; the last switch decides). With the switch off, the council judges when enabled. The guardian is modeled on OpenAI Codex's auto-review.
+
+| `gate` slot backend | Judge | It answers | Recorded spec |
+|---|---|---|---|
+| `council` | The council (above) | Pooled probabilities from council contexts | the council spec's name |
+| A chat kind: `anthropic`, `deepseek`, `openai`, `chatgpt`, `alibaba`, `gemini` | The guardian | One JSON object: outcome, risk, authorization, rationale | `guardian` |
+| `decisions` | The decisions judge | p(allow), p(ask), p(report) for one `verdict` question | `decisions` |
+
+Both model judges read the same evidence and share `[guardian]`, the breaker, and the outcomes the gate acts on. A miss never allows.
 
 - **The call.** One model call on the slot, bounded by `[guardian] deadline_ms` (default 30000). The system text is `/config/kernel/council/guardian.md` and the answer format. The user message holds the workspace's `AGENTS.md`, the tail of the context's transcript (user and model text, tool calls and results; `transcript_tokens`, default 8000), and the planned action as the council's shell case reads it, with the text of each program it runs.
 - **The answer.** One JSON object, `{outcome, risk_level, user_authorization, rationale}`, parsed strictly. Anything else is a miss. No provider client sends a JSON schema yet, so the format is asked for in the prompt.
 - **Outcomes.** `allow` runs the submission with an auto-decision row naming the guardian's model. `deny` asks, with the rationale in the ask. `deny` at `critical` risk reports. An `allow` at `critical` risk asks. A timeout, a transport error, or an unparseable answer is a miss.
 - **Circuit breaker.** After 3 denials in a row, or 10 of the last 50, the guardian stops judging that context until the kernel restarts; each later submission is a miss naming why, so it asks the senpai.
-- **Record.** Each decision is a `council_decisions` row with spec name `guardian`; the model's own answer is a `council_assessments` row beside it.
+- **The decisions judge.** One Decisions call on the slot, under the same deadline. Its state is the guardian's user message; its `verdict` question's instructions are the policy and a line mapping the policy's outcome to the options. It allows when p(allow) reaches `[guardian] allow_at` (default 0.9), reports when `report` is the most likely verdict (ties included), and otherwise asks with the three probabilities in the ask. A provider error, a timeout, a transport error, or a reply that does not match the question is a miss. An ask or a report counts as a denial on the breaker.
+- **Record.** Each decision is a `council_decisions` row with the spec name in the table. The guardian's answer is a `council_assessments` row beside it; the decisions judge's probabilities are the decision's pooled `verdict` rows.
 
 ## Standing rules for a character
 
