@@ -577,7 +577,7 @@ pub(crate) struct CouncilConfig {
 /// submissions the static rules escalate (`docs/approval-identity.md`,
 /// "The guardian"). Every key has a default, so a file may enable the
 /// guardian with a section switch alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GuardianConfig {
     /// Bounds the guardian's one model call.
     pub(crate) deadline_ms: u64,
@@ -586,11 +586,18 @@ pub(crate) struct GuardianConfig {
     pub(crate) transcript_tokens: u64,
     /// The budget for the workspace's `AGENTS.md`, estimated the same way.
     pub(crate) house_rules_tokens: u64,
+    /// The decisions judge allows when p(allow) reaches this, in (0, 1].
+    pub(crate) allow_at: f64,
 }
 
 impl Default for GuardianConfig {
     fn default() -> Self {
-        GuardianConfig { deadline_ms: 30_000, transcript_tokens: 8_000, house_rules_tokens: DEFAULT_HOUSE_RULES_TOKENS }
+        GuardianConfig {
+            deadline_ms: 30_000,
+            transcript_tokens: 8_000,
+            house_rules_tokens: DEFAULT_HOUSE_RULES_TOKENS,
+            allow_at: 0.9,
+        }
     }
 }
 
@@ -731,6 +738,7 @@ struct GuardianToml {
     deadline_ms: Option<i64>,
     transcript_tokens: Option<i64>,
     house_rules_tokens: Option<i64>,
+    allow_at: Option<f64>,
 }
 
 /// `[rc.<dir>.guardian]`, `[character.<name>.guardian]` or `[root.guardian]`.
@@ -946,6 +954,11 @@ impl GateConfig {
             deadline_ms: positive("deadline_ms", raw.deadline_ms, defaults.deadline_ms)?,
             transcript_tokens: positive("transcript_tokens", raw.transcript_tokens, defaults.transcript_tokens)?,
             house_rules_tokens: positive("house_rules_tokens", raw.house_rules_tokens, defaults.house_rules_tokens)?,
+            allow_at: match raw.allow_at {
+                None => defaults.allow_at,
+                Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => v,
+                Some(v) => return Err(GateConfigError::Parse(format!("[guardian] allow_at: {v} must satisfy 0 < allow_at <= 1"))),
+            },
         })
     }
 
@@ -4113,6 +4126,19 @@ enabled = false
         );
         let guardian = cfg.guardian_for(Some(&dir("sol"))).unwrap();
         assert_eq!((guardian.deadline_ms, guardian.transcript_tokens, guardian.house_rules_tokens), (45_000, 2000, 500));
+        assert_eq!(guardian.allow_at, 0.9, "the decisions judge's default threshold");
+    }
+
+    /// `[guardian] allow_at` is the decisions judge's threshold, in (0, 1].
+    #[test]
+    fn the_guardian_section_sets_the_decisions_threshold() {
+        let cfg = config("[guardian]\nallow_at = 0.75\n\n[rc.sol.guardian]\nenabled = true\n");
+        assert_eq!(cfg.guardian_for(Some(&dir("sol"))).unwrap().allow_at, 0.75);
+        config("[guardian]\nallow_at = 1\n");
+        for bad in ["0", "-0.5", "1.5", "nan"] {
+            let m = council_err(&format!("[guardian]\nallow_at = {bad}\n"));
+            assert!(m.contains("[guardian] allow_at") && m.contains("0 < allow_at <= 1"), "{bad}: {m}");
+        }
     }
 
     #[test]
