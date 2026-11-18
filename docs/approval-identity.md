@@ -49,6 +49,7 @@ When enabled in `gate.toml`, the gate consults the council for statements left U
 - **Council v2 backend (`kaijutsu-council`)**: Speaks Council v2 (`gogi-proto`). The kernel pins council seats under `kernel-<kernel_id>`, reads `/council/v2/identity`, streams `/council/v2/generations` for chat turns, and sends control vectors and CAS media objects.
 - **House rules**: Enabled via `[council] house_rules = true`, reading the first `AGENTS.md` up from working directory.
 - **Judge shadows & Bumper mode**: Judge shadows give opinions; bump shadows answer proceed or bump in **bumper mode** (`[council] mode = "bumper"` or `"bump-only"`).
+- **Decisions backend (`kind = decisions`)**: A hosted Decisions API, OpenRouter's (`https://openrouter.ai/api/alpha/decisions`, models `typesafe/jev-1.13` and `~typesafe/jev-latest`) or Gemini's (`https://generativelanguage.googleapis.com/v1beta/decisions`, model `gemini-decision-1`). It takes state plus a `choice` question and returns each option's probability (`llm/decisions.rs`). It runs no chat turn, so only a `gate` slot may name it; a context whose model is on one is refused at create.
 
 ## Standing rules for a character
 

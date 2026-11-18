@@ -123,6 +123,11 @@ kj backend set ollama --kind openai --base-url http://localhost:11434/v1 --key-o
 kj backend set gpt-plan --kind chatgpt
 kj backend login gpt-plan                          # prints an address to open
 kj backend login gpt-plan --callback '<address>'   # the address the browser ends on
+
+# A Decisions API, which answers gate decisions and runs no chat turn
+kj backend set jev --kind decisions --base-url https://openrouter.ai/api/alpha/decisions \
+  --api-key-file ~/.openrouter-key
+kj character slot set <character> gate jev/typesafe/jev-1.13
 ```
 
 The kernel reads an API key from the variable or the file the row names; it

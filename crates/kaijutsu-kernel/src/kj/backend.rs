@@ -2,7 +2,7 @@
 //!
 //! A **backend** is one configured endpoint: a free-form unique `name` (the
 //! handle you type) plus a closed `kind` (`anthropic` | `deepseek` | `openai` |
-//! `chatgpt` | `alibaba` | `council` | `gemini`) that picks which client speaks for it. That split is the point of this
+//! `chatgpt` | `alibaba` | `council` | `gemini` | `decisions`) that picks which client speaks for it. That split is the point of this
 //! renovation — the demolished `models.toml` made the `[providers.<name>]`
 //! table name BE the provider type, so two Anthropic gateways were
 //! inexpressible and a local server had to be called `ollama`/`lemonade`/
@@ -56,13 +56,16 @@ enum BackendCommand {
     Set {
         /// Backend name — free-form, unique (e.g. anthropic, gpt, zorak)
         name: String,
-        /// Wire dialect: anthropic | deepseek | openai | chatgpt | alibaba | council | gemini.
+        /// Wire dialect: anthropic | deepseek | openai | chatgpt | alibaba | council | gemini | decisions.
         /// chatgpt is OpenAI's Responses API on a ChatGPT Plus or Pro plan; it
         /// takes no key and no --base-url, and `kj backend login` signs it in.
         /// alibaba is Alibaba Model Studio; its key defaults to
         /// ALIBABA_API_KEY. council is a council v2 server, such as a nagaya,
         /// which serves chat turns, gate decisions and embeddings. gemini is
         /// Google's native Gemini API; its key defaults to GEMINI_API_KEY.
+        /// decisions is a hosted Decisions API, which answers gate decisions
+        /// with probabilities and runs no chat turn; name it in a character's
+        /// `gate` slot.
         #[arg(long)]
         kind: String,
         /// Endpoint URL. REQUIRED for --kind openai (it says WHICH
@@ -70,7 +73,11 @@ enum BackendCommand {
         /// https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1,
         /// or a workspace endpoint); optional gateway override for anthropic;
         /// unnecessary for deepseek; required for council (the server
-        /// address, such as http://100.65.47.5:8091).
+        /// address, such as http://100.65.47.5:8091) and for decisions, as
+        /// the full endpoint, https://openrouter.ai/api/alpha/decisions (key
+        /// defaults to OPENROUTER_API_KEY) or
+        /// https://generativelanguage.googleapis.com/v1beta/decisions (key
+        /// defaults to GEMINI_API_KEY).
         #[arg(long = "base-url")]
         base_url: Option<String>,
         /// Environment variable NAME holding the API key (never the key)
@@ -121,6 +128,33 @@ enum BackendCommand {
     Logout {
         /// Backend name
         name: String,
+    },
+    /// Ask a decisions backend one choice question, and print each option's
+    /// probability.
+    ///
+    /// kj backend decide jev typesafe/jev-1.13 --state 'cmd: git push --force'
+    /// --question 'Run this without asking a person?' --option 'allow=routine
+    /// and easy to undo' --option 'ask=a person should see it first'
+    ///
+    /// The provider is paid for each call.
+    Decide {
+        /// Backend name (kind decisions)
+        name: String,
+        /// The model, such as typesafe/jev-1.13 or gemini-decision-1
+        model: String,
+        /// The state the question is about, sent as text
+        #[arg(long)]
+        state: String,
+        /// The question, as the model reads it
+        #[arg(long)]
+        question: String,
+        /// One option, as LABEL=MEANING; repeat it for 2 to 255 options
+        #[arg(long = "option", value_name = "LABEL=MEANING")]
+        options: Vec<String>,
+        /// Seconds to wait for the answer, capped by the backend's
+        /// --request-timeout
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
     /// Remove a backend. Refused while a character slot, a context's slot, or an
     /// alias still names it.
@@ -287,7 +321,8 @@ impl KjDispatcher {
         // Which model runs every turn is exactly what `config-write` exists to
         // protect (it used to gate `kj config set models.toml`); list/show stay
         // ungated, discovery is not escalation.
-        let mutating = !matches!(parsed.command, BackendCommand::List | BackendCommand::Show { .. });
+        let mutating =
+            !matches!(parsed.command, BackendCommand::List | BackendCommand::Show { .. } | BackendCommand::Decide { .. });
         // A sign-in changes no backend row, so it reloads nothing.
         let reloads = mutating
             && !matches!(parsed.command, BackendCommand::Login { .. } | BackendCommand::Logout { .. });
@@ -332,6 +367,9 @@ impl KjDispatcher {
             }
             BackendCommand::Login { name, callback } => self.backend_login(&name, callback.as_deref()).await,
             BackendCommand::Logout { name } => self.backend_logout(&name).await,
+            BackendCommand::Decide { name, model, state, question, options, timeout } => {
+                self.backend_decide(&name, &model, state, question, &options, timeout).await
+            }
             BackendCommand::Remove { name } => self.backend_remove(&name).await,
             BackendCommand::Model(cmd) => self.backend_model(cmd),
         };
@@ -483,6 +521,77 @@ impl KjDispatcher {
         }
     }
 
+    /// One choice question to a decisions backend, answered with every
+    /// option's probability, most likely first.
+    async fn backend_decide(
+        &self,
+        name: &str,
+        model: &str,
+        state: String,
+        question: String,
+        options: &[String],
+        timeout: u64,
+    ) -> KjResult {
+        let mut parsed = Vec::new();
+        for option in options {
+            match option.split_once('=') {
+                Some((label, meaning)) if !label.trim().is_empty() => parsed.push((label.trim(), meaning.trim())),
+                _ => {
+                    return KjResult::Err(format!(
+                        "kj backend decide: option {option:?} is not LABEL=MEANING, such as --option 'allow=routine'"
+                    ));
+                }
+            }
+        }
+        let (provider, kind) = {
+            let registry = self.kernel().llm().read().await;
+            (registry.get(name), registry.backend_config(name).map(|b| b.kind.as_str()))
+        };
+        let Some(provider) = provider else {
+            return KjResult::Err(format!(
+                "kj backend decide: backend '{name}' is not registered (missing key? see `kj backend show {name}`)"
+            ));
+        };
+        let Some(client) = provider.decisions() else {
+            return KjResult::Err(format!(
+                "kj backend decide: '{name}' has kind '{}'; only a backend of kind 'decisions' answers decisions",
+                kind.unwrap_or("(unknown)")
+            ));
+        };
+        let choice = crate::llm::decisions::Choice::new(question, parsed);
+        let answer = client
+            .decide(model, state.into(), std::collections::BTreeMap::from([("q".to_string(), choice)]),
+                std::time::Duration::from_secs(timeout))
+            .await;
+        let response = match answer {
+            Ok(response) => response,
+            Err(e) => return KjResult::Err(format!("kj backend decide: {e}")),
+        };
+        let Some(answer) = response.answers.get("q") else {
+            return KjResult::Err("kj backend decide: the checked reply has no answer for the question asked".into());
+        };
+        let width = answer.probabilities.keys().map(|l| l.chars().count()).max().unwrap_or(0);
+        let mut ranked: Vec<(&String, &f64)> = answer.probabilities.iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(a.1).then(a.0.cmp(b.0)));
+        let mut lines = vec![format!("choice: {}", answer.choice)];
+        lines.extend(ranked.iter().map(|(label, p)| format!("  {label:<width$} {p:.3}")));
+        if let Some(confidence) = answer.confidence {
+            lines.push(format!("confidence: {confidence:.3}"));
+        }
+        lines.push(format!("model: {}", response.model));
+        let usage = &response.usage;
+        let cost = usage.cost.map(|c| format!(", ${c:.6}")).unwrap_or_default();
+        lines.push(format!("tokens: {} in, {} out{cost}", usage.input_tokens, usage.output_tokens));
+        let data = serde_json::json!({
+            "model": response.model,
+            "choice": answer.choice,
+            "probabilities": answer.probabilities,
+            "confidence": answer.confidence,
+            "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens, "cost": usage.cost},
+        });
+        KjResult::ok_with_data(lines.join("\n"), data)
+    }
+
     fn backend_show(&self, name: &str) -> KjResult {
         let db = self.kernel_db().lock();
         let backend = match db.get_backend_by_name(name) {
@@ -500,6 +609,12 @@ impl KjDispatcher {
         ];
         if let Some(u) = &backend.base_url {
             lines.push(format!("Base URL: {u}"));
+            if backend.kind == BackendKind::Decisions.as_str() {
+                lines.push(match crate::llm::decisions::Wire::for_url(u) {
+                    Ok(wire) => format!("Speaks: {}", wire.label()),
+                    Err(e) => format!("Speaks: nothing ({e})"),
+                });
+            }
         }
         // Key SOURCE, never the key. Report whether each declared source
         // currently resolves so a missing file/unset var is visible here
@@ -824,7 +939,10 @@ impl Classify for BackendCommand {
     fn effect(&self) -> Effect {
         match self {
             Self::List | Self::Show { .. } => Effect::Read,
-            Self::Set { .. } | Self::Remove { .. } | Self::Login { .. } | Self::Logout { .. } => Effect::Write,
+            // A decision sends the state to the provider and is paid for.
+            Self::Set { .. } | Self::Remove { .. } | Self::Login { .. } | Self::Logout { .. } | Self::Decide { .. } => {
+                Effect::Write
+            }
             Self::Model(cmd) => cmd.effect(),
         }
     }
@@ -1053,6 +1171,109 @@ mod tests {
             d.kernel().llm().read().await.get("anthropic-broken").is_none(),
             "a backend with no resolvable key must not be registered"
         );
+    }
+
+    /// `kj backend set --kind decisions` takes the full Decisions endpoint and
+    /// a key file, registers a Decisions client, and `show` names the API it
+    /// speaks and the key variable it falls back to. A chat-completions URL
+    /// is refused with both endpoints named, and nothing is written.
+    ///
+    /// Falsified by a decisions backend that registers on a URL that is not
+    /// a Decisions endpoint, or a `show` that does not say which API.
+    #[tokio::test]
+    async fn set_registers_a_decisions_backend_and_show_names_its_api() {
+        let d = seeded().await;
+        let c = test_caller();
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("gemini-key");
+        std::fs::write(&key, "AIza-test\n").unwrap();
+        let key = key.to_str().unwrap();
+
+        let refused = d
+            .dispatch(&argv(&["backend", "set", "gem", "--kind", "decisions", "--base-url",
+                "https://generativelanguage.googleapis.com/v1beta", "--api-key-file", key]), &c)
+            .await;
+        assert!(
+            matches!(&refused, KjResult::Err(m) if m.contains(crate::llm::decisions::GEMINI_DECISIONS_URL)
+                && m.contains(crate::llm::decisions::OPENROUTER_DECISIONS_URL)),
+            "{refused:?}"
+        );
+        assert!(d.kernel().llm().read().await.get("gem").is_none());
+
+        let set = d
+            .dispatch(&argv(&["backend", "set", "gem", "--kind", "decisions", "--base-url",
+                crate::llm::decisions::GEMINI_DECISIONS_URL, "--api-key-file", key]), &c)
+            .await;
+        assert!(matches!(&set, KjResult::Ok { .. }), "{set:?}");
+        let provider = d.kernel().llm().read().await.get("gem").expect("the decisions backend registered");
+        assert_eq!(provider.decisions().map(|c| c.wire()), Some(crate::llm::decisions::Wire::Gemini));
+
+        match d.dispatch(&argv(&["backend", "show", "gem"]), &c).await {
+            KjResult::Ok { message, .. } => {
+                assert!(message.contains("Speaks: Gemini Decisions API"), "{message}");
+                assert!(message.contains("Key env: GEMINI_API_KEY"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `kj backend decide` asks a decisions backend one choice question and
+    /// prints every option's probability. A malformed option, or a backend
+    /// of another kind, is refused before anything is sent.
+    ///
+    /// Falsified by a decide that reaches the provider with a bad option, or
+    /// that prints a choice without its probabilities.
+    #[tokio::test]
+    async fn decide_asks_one_choice_by_hand() {
+        use kaijutsu_council::test_server::{reply, serve};
+        let d = seeded().await;
+        let c = test_caller();
+        let answer = r#"{"model":"typesafe/jev-1.13-20260917","answers":{"q":{"type":"choice","choice":"ask",
+            "probabilities":{"allow":0.25,"ask":0.75},"confidence":0.75}},"usage":{"input_tokens":12,"output_tokens":3,"cost":0.00001}}"#;
+        let (base, seen) = serve(vec![reply(200, answer)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        std::fs::write(&key, "sk-or").unwrap();
+        let url = format!("{base}/api/alpha/decisions");
+        let set = d
+            .dispatch(&argv(&["backend", "set", "jev", "--kind", "decisions", "--base-url", &url,
+                "--api-key-file", key.to_str().unwrap()]), &c)
+            .await;
+        assert!(matches!(&set, KjResult::Ok { .. }), "{set:?}");
+
+        let ask = |options: &[&str]| {
+            let mut words = vec!["backend", "decide", "jev", "typesafe/jev-1.13", "--state", "cmd: git push", "--question", "Run it?"];
+            for o in options {
+                words.extend(["--option", o]);
+            }
+            argv(&words)
+        };
+        match d.dispatch(&ask(&["allow"]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("LABEL=MEANING") && m.contains("allow"), "{m}"),
+            other => panic!("an option with no meaning is refused: {other:?}"),
+        }
+        match d.dispatch(&ask(&["allow=runs"]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("2 to 255"), "{m}"),
+            other => panic!("one option is refused: {other:?}"),
+        }
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent for a refused question");
+
+        match d.dispatch(&ask(&["allow=routine", "ask=needs a person"]), &c).await {
+            KjResult::Ok { message, .. } => {
+                for needle in ["choice: ask", "allow 0.250", "ask   0.750", "typesafe/jev-1.13-20260917", "12 in"] {
+                    assert!(message.contains(needle), "missing {needle:?}: {message}");
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["questions"]["q"]["criteria"]["ask"], "needs a person");
+
+        match d.dispatch(&argv(&["backend", "decide", "ollama", "m", "--state", "s", "--question", "q",
+            "--option", "a=x", "--option", "b=y"]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("kind 'decisions'"), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// `kj backend login` signs a `chatgpt` backend in by paste-back: the

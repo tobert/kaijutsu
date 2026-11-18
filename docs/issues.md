@@ -117,6 +117,16 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Archive and promote do not resync the watcher.**
 - **A draft submit in the `llm_stream` fixture never completes its turn.**
 
+## Decisions backend (2026-11-18)
+
+`kind = decisions` (`llm/decisions.rs`) asks OpenRouter's or Gemini's Decisions API a `choice` question; the gate's model judge calls `Provider::decisions`. Open:
+
+- **Question types.** Only `choice`. kaibo's `decide.rs` also has `score` and `noul` (Gemini reads `noul` criteria; Jev ignores them).
+- **Wire from the URL path.** `--base-url` is the full endpoint and its path (`/api/alpha/decisions` or `/v1beta/decisions`) picks the wire. A proxy that rewrites the path needs an explicit setting, which the `backends` table has no column for.
+- **`data_collection`.** OpenRouter takes `provider.data_collection = "deny"` on a decisions request; kaijutsu backends have no such setting, so none is sent.
+- **Character model on a decisions backend.** `kj character model set` accepts one; the refusal comes at `kj context create`. A backend whose kind is changed to `decisions` after contexts copied its model fails at the turn instead (`Provider::stream` refuses).
+- **Cost and usage.** `kj backend decide` prints tokens and cost; a gate call records neither yet.
+
 ## ChatGPT plan backend (2026-11-18)
 
 - **Live validation.** Checked live on gpt-6-luna: function calls and outputs, `include: ["reasoning.encrypted_content"]`, reasoning items replayed without an id under `store: false`, and `reasoning.summary: "auto"`. Still fixture-only: the `subscription_sharing_*` error shapes and the raw event stream (capture one for the fixture tests; `KJ_LLM_REQUEST_DUMP` records requests, not responses).
