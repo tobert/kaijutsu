@@ -991,6 +991,20 @@ CREATE TABLE IF NOT EXISTS council_programs (
     CHECK ((unread_cause IS NULL) = (program_decision_id IS NOT NULL))
 );
 
+-- One row per guardian decision that parsed (`docs/approval-identity.md`,
+-- "The guardian"): the model's own verdict, risk level, user authorization,
+-- and rationale, hanging off the decision row that records the gate's
+-- outcome. `verdict`, `risk_level`, and `user_authorization` follow the
+-- growable-value-set rule in `DDL`'s doc comment; the kernel's guardian
+-- module owns the sets. A miss writes no row; its cause is on the decision.
+CREATE TABLE IF NOT EXISTS council_assessments (
+    decision_id        BLOB NOT NULL PRIMARY KEY REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
+    verdict            TEXT NOT NULL,
+    risk_level         TEXT NOT NULL,
+    user_authorization TEXT NOT NULL,
+    rationale          TEXT NOT NULL
+);
+
 -- ── Council observations ─────────────────────────────────────────────
 -- One row per read of a model character's council context
 -- (`council-<character>`) under its own spec, made after the gate decided

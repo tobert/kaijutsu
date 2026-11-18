@@ -721,6 +721,50 @@ pub fn list_council_programs(conn: &Connection, decision_id: &[u8]) -> Result<Ve
         .collect())
 }
 
+/// A guardian's own answer to one decision: its verdict (`allow` or
+/// `deny`), risk level, user authorization, and rationale, as the model
+/// wrote them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CouncilAssessment {
+    pub verdict: String,
+    pub risk_level: String,
+    pub user_authorization: String,
+    pub rationale: String,
+}
+
+/// Record `assessment` under `decision_id`, inside the caller's
+/// transaction. An empty field is refused.
+pub fn insert_council_assessment_within(conn: &Connection, decision_id: &[u8], assessment: &CouncilAssessment) -> Result<()> {
+    let a = assessment;
+    if [&a.verdict, &a.risk_level, &a.user_authorization, &a.rationale].iter().any(|v| v.trim().is_empty()) {
+        return Err(invalid("an assessment carries a verdict, risk level, user authorization, and rationale"));
+    }
+    conn.execute(
+        "INSERT INTO council_assessments (decision_id, verdict, risk_level, user_authorization, rationale)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![decision_id, a.verdict, a.risk_level, a.user_authorization, a.rationale],
+    )?;
+    Ok(())
+}
+
+/// The assessment recorded under `decision_id`, or `None` when it has none.
+pub fn load_council_assessment(conn: &Connection, decision_id: &[u8]) -> Result<Option<CouncilAssessment>> {
+    Ok(conn
+        .query_row(
+            "SELECT verdict, risk_level, user_authorization, rationale FROM council_assessments WHERE decision_id = ?1",
+            [decision_id],
+            |row| {
+                Ok(CouncilAssessment {
+                    verdict: row.get(0)?,
+                    risk_level: row.get(1)?,
+                    user_authorization: row.get(2)?,
+                    rationale: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1267,5 +1311,33 @@ mod tests {
         let mut both = programs[1].clone();
         both.program_decision_id = Some(shell.clone());
         assert!(insert_council_programs_within(&conn, &shell, &[both]).is_err(), "a read program has no unread cause");
+    }
+
+    /// A guardian decision's assessment round-trips under its decision, an
+    /// empty rationale is refused, and a decision with none reads `None`.
+    #[test]
+    fn a_guardian_assessment_round_trips_under_its_decision() {
+        let conn = open_memory();
+        let mut input = decision();
+        input.reads.clear();
+        input.pooled.clear();
+        input.control_text.clear();
+        input.threshold = None;
+        input.agreement = None;
+        input.outcome = CouncilOutcome::Ask;
+        let id = insert_council_decision(&conn, &input).unwrap();
+        let assessment = CouncilAssessment {
+            verdict: "deny".into(),
+            risk_level: "high".into(),
+            user_authorization: "low".into(),
+            rationale: "It deletes the home directory.".into(),
+        };
+        insert_council_assessment_within(&conn, &id, &assessment).unwrap();
+        assert_eq!(load_council_assessment(&conn, &id).unwrap(), Some(assessment.clone()));
+
+        let other = insert_council_decision(&conn, &input).unwrap();
+        assert_eq!(load_council_assessment(&conn, &other).unwrap(), None);
+        let empty = CouncilAssessment { rationale: "  ".into(), ..assessment };
+        assert!(insert_council_assessment_within(&conn, &other, &empty).is_err(), "a rationale is required");
     }
 }
