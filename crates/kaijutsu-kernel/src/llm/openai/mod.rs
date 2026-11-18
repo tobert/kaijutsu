@@ -242,17 +242,39 @@ impl Client {
 
     /// Start a streaming `/v1/responses` request under the ChatGPT plan
     /// contract, authorized by `bearer` rather than this client's key.
+    ///
+    /// With `websockets`, a request inside a turn goes on its context's
+    /// WebSocket ([`responses::ws`]) and over HTTP when that fails; without,
+    /// or outside a turn, it goes over HTTP. The dump records the full body
+    /// either way.
     pub async fn stream_responses(
         &self,
         opts: BuildOpts,
         messages: Vec<Message>,
         bearer: &str,
+        websockets: Option<&Arc<responses::ws::Pool>>,
     ) -> Result<responses::Stream, responses::OpenError> {
         use responses::OpenError;
         let body = responses::build::build_request(&opts, &messages, &self.provider_name);
         let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait())
             .await
             .map_err(OpenError::Other)?;
+        crate::llm::request_dump::record(
+            opts.trace.as_deref(), &self.provider_name, &opts.model, &self.base_url,
+            opts.system.as_deref(), &messages, &body,
+        );
+        let session = responses::build::cache_session(&opts);
+        let slot = match (websockets.filter(|pool| !pool.refused()), session.as_deref()) {
+            (Some(pool), Some(session)) => {
+                let target = responses::ws::Target { url: responses::ws::Target::url(&self.base_url), headers: &self.headers };
+                let request = responses::ws::Request { session, body: &body, bearer, wait: self.slot_wait() };
+                match responses::ws::open(pool, &target, request, slot).await? {
+                    responses::ws::Opened::Stream(stream) => return Ok(*stream),
+                    responses::ws::Opened::Http(slot) => slot,
+                }
+            }
+            _ => slot,
+        };
         let mut request = self
             .http
             .post(format!("{}/responses", self.base_url))
@@ -263,16 +285,12 @@ impl Client {
         for (name, value) in &self.headers {
             request = request.header(*name, *value);
         }
-        if let Some(session) = responses::build::cache_session(&opts) {
+        if let Some(session) = session {
             request = request.header("session-id", session);
         }
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
-        crate::llm::request_dump::record(
-            opts.trace.as_deref(), &self.provider_name, &opts.model, &self.base_url,
-            opts.system.as_deref(), &messages, &body,
-        );
         let response = request.send().await.map_err(|e| OpenError::Other(http_error(e)))?;
         crate::llm::endpoint::observe_open(slot.as_ref(), &response);
         let status = response.status();

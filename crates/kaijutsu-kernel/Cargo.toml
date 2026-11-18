@@ -159,6 +159,13 @@ base64 = "0.22"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 eventsource-stream = "0.2"
 bytes = "1"
+# The `chatgpt` backend's Responses WebSocket transport (`wss://`): rustls,
+# no OpenSSL. The TLS config is built here with aws-lc-rs and the platform
+# verifier, as reqwest's is, because rustls has two crypto providers enabled
+# in this tree and so no process default.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+rustls-platform-verifier = "0.6"
 
 # /r client shares (docs/slash-r.md): ShareFs plays the SFTP *client* role
 # against a client's share server (russh-sftp's role swap).

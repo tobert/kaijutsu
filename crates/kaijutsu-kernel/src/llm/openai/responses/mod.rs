@@ -1,7 +1,9 @@
 //! OpenAI's `/v1/responses` wire under the ChatGPT plan contract.
 //!
 //! The `chatgpt` backend speaks this wire (`crate::llm::chatgpt`). The
-//! request rules are in [`build`], the event mapping in [`stream`]. The
+//! request rules are in [`build`], the event mapping in [`stream`], and the
+//! WebSocket transport, with its connection reuse and continuation, in
+//! [`ws`]. The
 //! caller supplies the bearer for each request, because a plan access token
 //! expires within the hour and is refreshed between requests.
 //!
@@ -13,6 +15,7 @@
 
 pub mod build;
 pub mod stream;
+pub mod ws;
 
 use std::collections::VecDeque;
 
@@ -90,12 +93,42 @@ pub fn open_error(status: reqwest::StatusCode, body: &str, bearer: &str) -> Open
     }
 }
 
-/// A streaming `/v1/responses` reply.
+/// Where a reply's events come from.
+enum Source {
+    Sse(eventsource_stream::EventStream<BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>>),
+    WebSocket(Box<ws::Live>),
+}
+
+/// What a [`Source`] gave.
+enum Incoming {
+    /// One event's JSON text.
+    Data(String),
+    /// Nothing to decode, such as a ping.
+    Skip,
+    Closed,
+    Failed(StreamErrorKind, String),
+}
+
+impl Source {
+    async fn next(&mut self) -> Incoming {
+        match self {
+            Self::Sse(inner) => match inner.next().await {
+                Some(Ok(event)) => Incoming::Data(event.data),
+                Some(Err(e)) => Incoming::Failed(StreamErrorKind::Transport, format!("SSE transport: {e}")),
+                None => Incoming::Closed,
+            },
+            Self::WebSocket(live) => live.next().await,
+        }
+    }
+}
+
+/// A streaming `/v1/responses` reply, over SSE or a WebSocket ([`ws`]).
 ///
 /// [`Self::cancel`] is observed by the next [`Self::next_event`] poll, which
-/// drops the connection and emits `Done { stop_reason: None }`.
+/// drops the connection and emits `Done { stop_reason: None }`. A WebSocket
+/// goes back to its pool only when the response completes.
 pub struct Stream {
-    inner: Option<eventsource_stream::EventStream<BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>>>,
+    source: Option<Source>,
     state: StateMachine,
     pending: VecDeque<StreamEvent>,
     cancel: CancellationToken,
@@ -118,8 +151,19 @@ impl Stream {
         bearer: &str,
     ) -> Self {
         use eventsource_stream::Eventsource;
+        Self::from_source(Source::Sse(bytes.eventsource()), slot, bearer)
+    }
+
+    /// A reply on `live`, whose first event's text is `first`.
+    fn from_websocket(live: ws::Live, first: &str, slot: Option<Slot>, bearer: &str) -> Self {
+        let mut stream = Self::from_source(Source::WebSocket(Box::new(live)), slot, bearer);
+        stream.data(first);
+        stream
+    }
+
+    fn from_source(source: Source, slot: Option<Slot>, bearer: &str) -> Self {
         Self {
-            inner: Some(bytes.eventsource()),
+            source: Some(source),
             state: StateMachine::new(),
             pending: VecDeque::new(),
             cancel: CancellationToken::new(),
@@ -139,39 +183,52 @@ impl Stream {
                 self.slot = None;
                 return None;
             }
-            let Some(inner) = self.inner.as_mut() else {
+            let Some(source) = self.source.as_mut() else {
                 let tail = self.state.end_of_stream();
                 self.take(tail);
                 continue;
             };
             let cancel = self.cancel.clone();
-            tokio::select! {
+            let incoming = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
+                _ = cancel.cancelled() => None,
+                incoming = source.next() => Some(incoming),
+            };
+            match incoming {
+                None => {
                     self.finished = true;
-                    self.inner = None;
+                    self.source = None;
                     return Some(StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None });
                 }
-                item = inner.next() => match item {
-                    Some(Ok(event)) => {
-                        let data = event.data.trim();
-                        if data.is_empty() || data == "[DONE]" {
-                            continue;
-                        }
-                        match serde_json::from_str::<Value>(data) {
-                            Ok(value) => {
-                                let emitted = self.state.step(value);
-                                self.take(emitted);
-                            }
-                            Err(e) => {
-                                let shown: String = data.chars().take(200).collect();
-                                self.fail(StreamErrorKind::Protocol, format!("SSE decode: {e}: {shown}"))
-                            }
-                        }
-                    }
-                    Some(Err(e)) => self.fail(StreamErrorKind::Transport, format!("SSE transport: {e}")),
-                    None => self.inner = None,
+                Some(Incoming::Data(data)) => self.data(&data),
+                Some(Incoming::Skip) => {}
+                Some(Incoming::Closed) => self.source = None,
+                Some(Incoming::Failed(kind, message)) => self.fail(kind, message),
+            }
+        }
+    }
+
+    /// Decode one event and run it through the state machine.
+    fn data(&mut self, data: &str) {
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        match serde_json::from_str::<Value>(data) {
+            Ok(value) => {
+                if let Some(Source::WebSocket(live)) = self.source.as_mut() {
+                    live.note(&value);
                 }
+                let emitted = self.state.step(value);
+                self.take(emitted);
+            }
+            Err(e) => {
+                let shown: String = data.chars().take(200).collect();
+                let label = match self.source {
+                    Some(Source::WebSocket(_)) => "WebSocket",
+                    _ => "SSE",
+                };
+                self.fail(StreamErrorKind::Protocol, format!("{label} decode: {e}: {shown}"))
             }
         }
     }
@@ -206,7 +263,11 @@ impl Stream {
         }
         if self.state.ended() {
             self.finished = true;
-            self.inner = None;
+            if let Some(Source::WebSocket(live)) = self.source.take()
+                && !self.state.failed()
+            {
+                live.keep();
+            }
             self.slot = None;
         }
         self.pending.extend(emitted);
@@ -220,12 +281,12 @@ impl Stream {
             None => error,
         };
         self.finished = true;
-        self.inner = None;
+        self.source = None;
         self.slot = None;
         self.pending.push_back(StreamEvent::Error(error));
     }
 
-    /// Abort the underlying HTTP stream. Idempotent.
+    /// Abort the underlying stream. Idempotent.
     pub fn cancel(&self) {
         self.cancel.cancel();
     }

@@ -371,3 +371,15 @@ no tunnel. Grants are kernel state, not config: they live in a 0700
 `credentials/` directory, not the 0644 `kernel.db`, and rotating refresh tokens
 are written before use under a per-backend lock. Kaibo's #253 was the
 template.
+
+Plan prompt caching warms slowly over HTTP, and a probe showed that a
+Responses WebSocket under `store: false` continues a response on the same
+connection and hits the cache at once. So a `chatgpt` request inside a turn
+now goes on its context's WebSocket, and sends `previous_response_id` with
+only the new items when it extends the last exchange there. The comparison
+is on a normalized view of the input rather than the rendered JSON, because
+the builder drops reasoning from earlier turns and the server sends ids and
+annotations the builder never writes. Anything else sends in full, and a
+failed upgrade or a lost connection falls back to a full request, so the
+rule can be strict without losing a turn. HTTP stays as the fallback and as
+the off switch.

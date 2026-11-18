@@ -842,6 +842,7 @@ impl Provider {
             // builds, and its first request names `kj backend login`.
             BackendKind::ChatGpt => Ok(Self::ChatGpt(
                 chatgpt::Client::new(config.name.clone(), credentials.clone())
+                    .with_transport(chatgpt::Transport::from_env())
                     .with_request_timeout(resolve_request_timeout(config))
                     .with_endpoint(endpoint()?),
             )),

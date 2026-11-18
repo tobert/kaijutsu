@@ -12,7 +12,8 @@
 //!   the cached prefix, and billed uncached on every request.
 //! - No `max_output_tokens`, `temperature`, `top_p`, `previous_response_id`,
 //!   `metadata`, `truncation`, `user`, or `prompt_cache_retention`. The whole
-//!   history goes in `input` on every request.
+//!   history goes in `input`; only the WebSocket transport ([`super::ws`])
+//!   replaces it with `previous_response_id` and the new items.
 //!
 //! The binding's `max_tokens`, `temperature`, `top_p` and `thinking_budget`
 //! therefore have no sink here; an explicitly set sampling knob or budget is
