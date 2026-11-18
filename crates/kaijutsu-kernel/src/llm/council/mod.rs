@@ -331,7 +331,7 @@ mod tests {
         BuildOpts {
             model: "qwen".into(),
             system: Some("rules".into()),
-            max_tokens,
+            max_tokens: Some(max_tokens),
             temperature: None,
             top_p: None,
             effort: Some("none".into()),

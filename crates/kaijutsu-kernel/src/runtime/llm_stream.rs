@@ -2536,7 +2536,7 @@ async fn process_llm_stream(
     tools: Vec<ToolDefinition>,
     after_block_id: kaijutsu_types::BlockId,
     system_prompt: String,
-    max_output_tokens: u64,
+    max_output_tokens: Option<u64>,
     // The binding's context window; `None` shows as unknown.
     context_window: Option<u64>,
     // This backend's total and idle guards (`StreamTimeouts::resolve`).
@@ -2765,7 +2765,7 @@ async fn run_llm_stream(
     tools: Vec<ToolDefinition>,
     mut after_block_id: kaijutsu_types::BlockId,
     system_prompt: String,
-    max_output_tokens: u64,
+    max_output_tokens: Option<u64>,
     // The binding's context window; `None` shows as unknown.
     context_window: Option<u64>,
     // This backend's total and idle guards (`StreamTimeouts::resolve`).
@@ -3060,7 +3060,7 @@ async fn run_llm_stream(
         };
 
         let build_opts = apply_tunables(
-            BuildOpts::new(&model_name, max_output_tokens)
+            BuildOpts::with_output_limit(&model_name, max_output_tokens)
                 .with_system(&system_prompt)
                 .with_tools(tools.clone())
                 .with_cache_breakpoints(cache_breakpoints)
@@ -3594,8 +3594,8 @@ async fn run_llm_stream(
                 ) {
                     messages.push(assistant);
                 }
-                let limit = if provider.sends_output_limit() {
-                    format!("the output limit of {} tokens", build_opts.max_tokens)
+                let limit = if provider.sends_output_limit() && let Some(max) = build_opts.max_tokens {
+                    format!("the output limit of {max} tokens")
                 } else {
                     "the provider's output limit".to_string()
                 };
@@ -4022,7 +4022,7 @@ mod publish_tests {
             tools,
             after,
             "system".to_string(),
-            1024,
+            Some(1024),
             None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
@@ -5929,7 +5929,7 @@ mod publish_tests {
             vec![],
             after,
             "system".to_string(),
-            1024,
+            Some(1024),
             None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
@@ -6716,7 +6716,7 @@ mod usage_tests {
             vec![],
             after,
             "system".to_string(),
-            1024,
+            Some(1024),
             None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
@@ -7367,7 +7367,7 @@ mod error_child_anchor_tests {
             vec![],
             after,
             "system".to_string(),
-            1024,
+            Some(1024),
             None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
@@ -7573,7 +7573,7 @@ mod authorship_tests {
             vec![],
             after,
             "system".to_string(),
-            1024,
+            Some(1024),
             None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
@@ -7718,7 +7718,7 @@ mod gate_resume_cache_eviction_tests {
             vec![],
             after,
             "system".to_string(),
-            1024,
+            Some(1024),
             None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),

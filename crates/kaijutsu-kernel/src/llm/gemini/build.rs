@@ -79,7 +79,7 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message]) -> LlmResult<Genera
 
     let thinking_config = resolve_thinking(opts)?;
     let generation_config = Some(GenerationConfig {
-        max_output_tokens: Some(opts.max_tokens),
+        max_output_tokens: Some(opts.required_max_tokens()?),
         temperature: opts.temperature,
         top_p: opts.top_p,
         thinking_config,

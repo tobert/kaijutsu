@@ -365,12 +365,12 @@ impl KernelDb {
     /// character's model under `model`, and under `distill` when the
     /// character has no `distill` slot and the model is no council server;
     /// then its `distill` and `gate` slots under their roles. A character
-    /// with no model gives the context no `model` slot. A parameter left unset takes the model's
-    /// `backend_models` value; nothing else supplies one. A chat model with
-    /// no `max_tokens` in either place refuses, and so does
-    /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`;
-    /// a council server (a backend of kind `council`) is exempt from both. A
-    /// character slot of any other role is corruption and refuses.
+    /// with no model gives the context no `model` slot. An unset parameter
+    /// takes the model's `backend_models` value. Backends that send an output
+    /// limit require `max_tokens`, except that council slots may serve the gate
+    /// without a limit. When a limit is required, `thinking_style=budget`
+    /// requires a `thinking_budget` below `max_tokens`. Other slot roles are
+    /// refused.
     ///
     /// With `model_role`, the `model` slot is copied from the character's slot
     /// of that role, not from its model, and a character with none refuses.
@@ -435,15 +435,18 @@ impl KernelDb {
         let model_row = self.list_backend_models(backend_id)?.into_iter().find(|m| m.model_id == model);
         let tunables = over(&own, &model_row.as_ref().map(|m| m.tunables.clone()).unwrap_or_default());
         let max_tokens = tunables.max_tokens;
-        let council_server = self.backend_is_council_server(backend_id)?;
-        if max_tokens.is_none() && !council_server {
+        let backend = self.get_backend(backend_id)?
+            .ok_or_else(|| KernelDbError::NotFound(format!("backend {backend_id}")))?;
+        let kind = crate::llm::BackendKind::parse(&backend.kind).map_err(KernelDbError::Validation)?;
+        let requires_limit = kind.requires_slot_output_limit();
+        if max_tokens.is_none() && requires_limit {
             return Err(KernelDbError::Validation(format!(
                 "{subject} runs model {model}, which has no max_tokens in the {} or in its \
-                 backend_models row; every request carries max_tokens, so set it on one of them",
+                 backend_models row; this backend requires max_tokens, so set it on one of them",
                 if subject.starts_with("slot") { "slot" } else { "model" }
             )));
         }
-        if !council_server && tunables.thinking_style.as_deref() == Some("budget") {
+        if requires_limit && tunables.thinking_style.as_deref() == Some("budget") {
             let Some(budget) = tunables.thinking_budget else {
                 return Err(KernelDbError::Validation(format!(
                     "{subject} runs model {model} with thinking_style=budget and no \
@@ -488,7 +491,7 @@ impl KernelDb {
     /// Make `principal_id` the performer of `context_id`, answering to
     /// `senpai`, with slots copied fresh from the character's own slots
     /// (none gives a context with no slots). Refuses, and writes nothing,
-    /// when a slot has no `max_tokens`, the performer has no character sheet,
+    /// when a slot is missing a required parameter, the performer has no character sheet,
     /// the context already has a performer,
     /// or a `senpai` is not a valid edge ([`Self::check_senpai_edge`]). A
     /// `None` senpai is the creator's to justify: the row was written by

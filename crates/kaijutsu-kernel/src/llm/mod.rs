@@ -1152,7 +1152,21 @@ impl Provider {
     /// Whether a request carries the binding's `max_tokens`. The ChatGPT
     /// plan route takes no output limit, so its ceiling is the provider's.
     pub fn sends_output_limit(&self) -> bool {
-        !matches!(self, Self::ChatGpt(_))
+        self.kind().sends_output_limit()
+    }
+
+    fn kind(&self) -> BackendKind {
+        match self {
+            Self::Claude(_) => BackendKind::Anthropic,
+            Self::DeepSeek(_) => BackendKind::DeepSeek,
+            Self::Alibaba(_) => BackendKind::Alibaba,
+            Self::OpenAi(_) => BackendKind::OpenAi,
+            Self::ChatGpt(_) => BackendKind::ChatGpt,
+            Self::Council(_) => BackendKind::Council,
+            Self::Gemini(_) => BackendKind::Gemini,
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => BackendKind::Mock,
+        }
     }
 
     /// Models this provider exposes by default.

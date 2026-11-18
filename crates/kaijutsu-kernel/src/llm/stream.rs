@@ -295,7 +295,8 @@ impl StreamEvent {
 pub struct BuildOpts {
     pub model: String,
     pub system: Option<String>,
-    pub max_tokens: u64,
+    /// `None` for a backend whose requests carry no output limit.
+    pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
     /// Nucleus-sampling cutoff. `None` = provider default. Dropped alongside
     /// `temperature` on Anthropic requests where thinking is enabled (see
@@ -352,6 +353,10 @@ impl BuildOpts {
     /// supplies the limit: the binding's slot for a turn, or the slot a
     /// one-shot prompt runs on.
     pub fn new(model: impl Into<String>, max_tokens: u64) -> Self {
+        Self::with_output_limit(model, Some(max_tokens))
+    }
+
+    pub(crate) fn with_output_limit(model: impl Into<String>, max_tokens: Option<u64>) -> Self {
         Self {
             model: model.into(),
             system: None,
@@ -381,8 +386,14 @@ impl BuildOpts {
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u64) -> Self {
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
         self
+    }
+
+    pub(crate) fn required_max_tokens(&self) -> super::LlmResult<u64> {
+        self.max_tokens.ok_or_else(|| {
+            super::LlmError::InvalidRequest(format!("model {} requires max_tokens", self.model))
+        })
     }
 
     pub fn with_temperature(mut self, temperature: f64) -> Self {
@@ -729,7 +740,7 @@ mod tests {
             .with_temperature(0.7);
         assert_eq!(opts.model, "claude-haiku-4-5");
         assert_eq!(opts.system.as_deref(), Some("be helpful"));
-        assert_eq!(opts.max_tokens, 1024);
+        assert_eq!(opts.max_tokens, Some(1024));
         assert_eq!(opts.temperature, Some(0.7));
         assert!(opts.tools.is_empty());
     }
@@ -792,7 +803,7 @@ mod tests {
         #[test]
         fn every_optional_parameter_reaches_the_request() {
             let opts = apply_tunables(BuildOpts::new("m", 777), &tunables(Some(8000)));
-            assert_eq!(opts.max_tokens, 777, "max_tokens comes from the caller, not the tunables");
+            assert_eq!(opts.max_tokens, Some(777), "max_tokens comes from the caller, not the tunables");
             assert_eq!(opts.temperature, Some(0.5));
             assert_eq!(opts.top_p, Some(0.8));
             assert_eq!(opts.effort.as_deref(), Some("low"));

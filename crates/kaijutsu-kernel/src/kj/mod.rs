@@ -1076,24 +1076,14 @@ impl KjDispatcher {
                 .map_err(|e| format!("could not read the distill slot: {e}"))?
         };
         let bound = match bound {
-            crate::model_resolution::RoleSlot::Slot(bound) if bound.council_server && bound.slot.max_tokens.is_none() => {
+            crate::model_resolution::RoleSlot::Slot(bound) if bound.is_gate_only() => {
                 return Err(crate::model_resolution::NoModel::no_max_tokens(&bound, crate::model_resolution::DISTILL)
                     .refusal_as("cannot distill"));
             }
             crate::model_resolution::RoleSlot::Slot(bound) => bound,
             crate::model_resolution::RoleSlot::None(none) => return Err(none.refusal_as("cannot distill")),
         };
-        let max_tokens = bound
-            .slot
-            .max_tokens
-            .and_then(|m| u64::try_from(m).ok())
-            .filter(|m| *m > 0)
-            .ok_or_else(|| {
-                format!(
-                    "the distill slot of {} has no max_tokens, which every request carries",
-                    bound.context
-                )
-            })?;
+        let max_tokens = bound.request_max_tokens(crate::model_resolution::DISTILL).map_err(|e| e.to_string())?;
         let provider_name = bound.backend.clone();
         let model = bound.slot.model.clone();
         let provider = self.kernel.llm().read().await.get(&provider_name).ok_or_else(|| {
@@ -1135,7 +1125,7 @@ impl KjDispatcher {
             decide: None,
         };
         let opts = crate::llm::apply_tunables(
-            crate::llm::BuildOpts::new(&model, max_tokens).with_system(&system_prompt),
+            crate::llm::BuildOpts::with_output_limit(&model, max_tokens).with_system(&system_prompt),
             &tunables,
         );
         let reply = provider.prompt_with_system(opts, &user_prompt).await;

@@ -47,11 +47,9 @@ pub(super) enum CharacterSlotCommand {
         /// `kj backend list` names the backends and `kj models` the models
         #[arg(value_name = "BACKEND/MODEL")]
         model: String,
-        /// Maximum RESPONSE tokens. Omit to read it from the model's
-        /// `kj backend model set` row when a context's slots are copied;
-        /// making a context refuses a `distill` slot with neither. A council
-        /// server needs none, except in an `image` slot, whose request
-        /// carries one
+        /// Maximum response tokens. Omit to use the backend model's limit.
+        /// ChatGPT ignores this setting. Council slots can omit the limit for
+        /// gate decisions, but need it to generate text.
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0
@@ -101,9 +99,9 @@ pub(super) enum CharacterModelCommand {
         /// `kj backend list` names the backends and `kj models` the models
         #[arg(value_name = "BACKEND/MODEL")]
         model: String,
-        /// Maximum RESPONSE tokens. Omit to read it from the model's
-        /// `kj backend model set` row when a context is made; making a
-        /// context refuses a model with neither
+        /// Maximum response tokens. Omit to use the backend model's limit.
+        /// ChatGPT ignores this setting. A council model without a limit can
+        /// judge gate decisions but cannot generate text.
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0
@@ -284,7 +282,7 @@ impl KjDispatcher {
                     return KjResult::Err(format!("kj character model set: {e}"));
                 }
                 let mut msg = format!("set the model of {character} → {backend}/{model}");
-                msg.push_str(&max_tokens_warnings(&db, &character, &backend, &model, b.backend_id, max_tokens, thinking_budget, !crate::model_resolution::is_council_kind(&b.kind)));
+                msg.push_str(&max_tokens_warnings(&db, &character, &b, &model, max_tokens, thinking_budget));
                 KjResult::ok(msg)
             }
             CharacterModelCommand::Unset { character } => {
@@ -332,30 +330,31 @@ impl KjDispatcher {
 /// Write-time warnings against the values a context would copy: the
 /// source's own, else the model's row. Warn, not error: the write lands
 /// either way, since pinning `max_tokens` on the model row right after can
-/// make it valid. `needs_max_tokens` is false for a council server.
-#[allow(clippy::too_many_arguments)]
+/// make it valid.
 fn max_tokens_warnings(
     db: &crate::kernel_db::KernelDb,
     character: &str,
-    backend: &str,
+    backend: &crate::kernel_db::BackendRow,
     model: &str,
-    backend_id: kaijutsu_types::BackendId,
     max_tokens: Option<u64>,
     thinking_budget: Option<u64>,
-    needs_max_tokens: bool,
 ) -> String {
+    let kind = crate::llm::BackendKind::parse(&backend.kind);
+    if kind.as_ref().is_ok_and(|kind| !kind.sends_output_limit()) {
+        return String::new();
+    }
+    let needs_max_tokens = kind.map_or(true, crate::llm::BackendKind::requires_slot_output_limit);
     let row_max_tokens = db
-        .list_backend_models(backend_id)
+        .list_backend_models(backend.backend_id)
         .ok()
         .and_then(|rows| rows.into_iter().find(|r| r.model_id == model))
         .and_then(|r| r.tunables.max_tokens)
         .and_then(|v| u64::try_from(v).ok());
     match max_tokens.or(row_max_tokens) {
         None if needs_max_tokens => format!(
-            " — WARN: no max_tokens in the settings or in the model's row, and every \
-             request carries max_tokens; making a context for {character} will \
-             refuse until one is set (`--max-tokens` here, or `kj backend model \
-             set {backend} {model} --max-tokens N`)"
+            " — WARN: no max_tokens in the settings or in the model's row. This backend \
+             requires it to create a context for {character}. Set `--max-tokens` here or run \
+             `kj backend model set {} {model} --max-tokens N`", backend.name
         ),
         Some(effective) => match thinking_budget {
             Some(tb) if tb >= effective => format!(
@@ -424,16 +423,7 @@ impl KjDispatcher {
                 }) {
                     Ok(()) => {
                         let mut msg = format!("set {character}/{role} → {backend}/{model}");
-                        msg.push_str(&max_tokens_warnings(
-                            &db,
-                            &character,
-                            &backend,
-                            &model,
-                            b.backend_id,
-                            max_tokens,
-                            thinking_budget,
-                            !crate::model_resolution::is_council_kind(&b.kind),
-                        ));
+                        msg.push_str(&max_tokens_warnings(&db, &character, &b, &model, max_tokens, thinking_budget));
                         KjResult::ok(msg)
                     }
                     Err(e) => KjResult::Err(format!("kj character slot set: {e}")),

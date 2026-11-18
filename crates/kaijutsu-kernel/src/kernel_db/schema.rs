@@ -181,10 +181,9 @@ CREATE TABLE IF NOT EXISTS senpai_migration_report (
 -- ── Context slots (docs/senpai-kohai.md, "The model") ────────────
 -- A copy of the character's model (role `model`) or of one character slot
 -- (`distill`, `gate`), with every unset parameter filled from the model's
--- `backend_models` row. `max_tokens` is required: every provider request
--- carries it, except on a council server (a backend of kind `council`). NULL
--- optional parameters are left out of the request. A trigger refuses an
--- UPDATE or DELETE.
+-- `backend_models` row. `max_tokens` may be NULL for a backend that sends
+-- no output limit (`chatgpt`) or a council slot used only for the gate.
+-- A trigger refuses an UPDATE or DELETE.
 CREATE TABLE IF NOT EXISTS context_slots (
     context_id      BLOB    NOT NULL REFERENCES contexts(context_id),
     role            TEXT    NOT NULL,

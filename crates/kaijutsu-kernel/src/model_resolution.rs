@@ -8,7 +8,7 @@
 use kaijutsu_types::ContextId;
 
 use crate::kernel_db::{ContextSlotRow, KernelDb, KernelDbError, KernelDbResult};
-use crate::llm::SlotTunables;
+use crate::llm::{BackendKind, SlotTunables};
 
 /// The slot role a context's chat model runs on: the character's one model,
 /// copied when the context is made.
@@ -64,7 +64,7 @@ pub struct ContextModel {
     /// Backend NAME, the registry key.
     pub backend: String,
     pub model: String,
-    pub max_tokens: u64,
+    pub max_tokens: Option<u64>,
     pub context_window: Option<u64>,
     /// The slot's optional parameters. `max_tokens` is not repeated here.
     pub tunables: SlotTunables,
@@ -298,16 +298,15 @@ pub fn role_slot(db: &KernelDb, context_id: ContextId, role: &str) -> KernelDbRe
         }));
     };
     let backend = db
-        .list_backends()?
-        .into_iter()
-        .find(|b| b.backend_id == slot.backend_id)
+        .get_backend(slot.backend_id)?
         .ok_or_else(|| corrupt(format!("context {context} slot {role} names a backend that does not exist")))?;
+    let kind = BackendKind::parse(&backend.kind).map_err(corrupt)?;
     Ok(RoleSlot::Slot(BoundSlot {
         context,
         context_ref,
         character,
         backend: backend.name,
-        council_server: is_council_kind(&backend.kind),
+        kind,
         slot,
     }))
 }
@@ -322,9 +321,25 @@ pub struct BoundSlot {
     pub character: String,
     /// Backend NAME.
     pub backend: String,
-    /// The backend is a council server (kind `council`).
-    pub council_server: bool,
+    kind: BackendKind,
     pub slot: ContextSlotRow,
+}
+
+impl BoundSlot {
+    pub(crate) fn is_gate_only(&self) -> bool {
+        self.kind == BackendKind::Council && self.slot.max_tokens.is_none()
+    }
+
+    /// The limit for a generation request. A backend that does not send a
+    /// limit ignores even a configured value.
+    pub(crate) fn request_max_tokens(&self, role: &str) -> KernelDbResult<Option<u64>> {
+        if !self.kind.sends_output_limit() {
+            return Ok(None);
+        }
+        non_negative(self.slot.max_tokens).filter(|m| *m > 0).map(Some).ok_or_else(|| {
+            corrupt(format!("context {} slot {role} has no max_tokens, which backend {} requires", self.context, self.backend))
+        })
+    }
 }
 
 /// What [`role_slot`] found.
@@ -339,23 +354,17 @@ fn non_negative(value: Option<i64>) -> Option<u64> {
 }
 
 /// The model context `context_id` runs, from its [`MODEL`] slot. A slot on a
-/// council server with no `max_tokens` (a judge's) runs no chat turn. `Err`
-/// is a fault reading the slot, or a slot on another backend with no
-/// `max_tokens` (which a context character write refuses).
+/// council server with no `max_tokens` runs no chat turn. `Err` is a fault
+/// reading the slot or a missing `max_tokens` on a backend that requires it.
 pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<ContextModelLookup> {
     match role_slot(db, context_id, MODEL)? {
         RoleSlot::None(none) => Ok(ContextModelLookup::None(none)),
-        RoleSlot::Slot(bound) if bound.council_server && bound.slot.max_tokens.is_none() => {
+        RoleSlot::Slot(bound) if bound.is_gate_only() => {
             Ok(ContextModelLookup::None(NoModel::no_max_tokens(&bound, MODEL)))
         }
         RoleSlot::Slot(bound) => {
             let slot = &bound.slot;
-            let max_tokens = non_negative(slot.max_tokens).filter(|m| *m > 0).ok_or_else(|| {
-                corrupt(format!(
-                    "context {} slot {MODEL} has no max_tokens, which every request carries",
-                    bound.context
-                ))
-            })?;
+            let max_tokens = bound.request_max_tokens(MODEL)?;
             Ok(ContextModelLookup::Model(ContextModel {
                 character: bound.character.clone(),
                 backend: bound.backend.clone(),

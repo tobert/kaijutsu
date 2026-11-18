@@ -114,7 +114,7 @@ impl Client {
                 self.name
             )));
         }
-        let max_tokens = reply_max_tokens(&self.name, opts.max_tokens, identity.limits.context_tokens)?;
+        let max_tokens = reply_max_tokens(&self.name, opts.required_max_tokens()?, identity.limits.context_tokens)?;
         let sample = (opts.temperature.is_some() || opts.top_p.is_some())
             .then(|| Sample { temperature: opts.temperature, top_p: opts.top_p, ..Sample::default() });
         let request = GenerationRequest {

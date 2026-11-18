@@ -78,6 +78,17 @@ pub enum BackendKind {
 pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "chatgpt", "alibaba", "council", "gemini"];
 
 impl BackendKind {
+    /// Whether generation requests carry the slot's output limit.
+    pub fn sends_output_limit(self) -> bool {
+        !matches!(self, Self::ChatGpt)
+    }
+
+    /// Whether a copied slot must name a limit. Council slots may serve
+    /// the gate without making a generation request.
+    pub(crate) fn requires_slot_output_limit(self) -> bool {
+        self != Self::Council && self.sends_output_limit()
+    }
+
     /// The canonical lowercase token — what lands in the `kind` column.
     pub fn as_str(&self) -> &'static str {
         match self {

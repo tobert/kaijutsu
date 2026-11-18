@@ -502,7 +502,7 @@ fn a_character_models_decision_program_reaches_the_model_slot_and_the_turn() {
     else {
         panic!("the context has a model");
     };
-    let opts = crate::llm::apply_tunables(crate::llm::BuildOpts::new(&bound.model, bound.max_tokens), &bound.tunables);
+    let opts = crate::llm::apply_tunables(crate::llm::BuildOpts::with_output_limit(&bound.model, bound.max_tokens), &bound.tunables);
     assert_eq!(opts.decide.as_deref(), Some("/config/rc/musician/programs/bass-bars.json"));
 }
 

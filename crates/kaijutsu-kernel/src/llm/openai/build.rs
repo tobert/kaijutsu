@@ -128,10 +128,11 @@ pub fn build_request(
         })
         .collect();
 
+    let limit = opts.required_max_tokens()?;
     let (max_tokens, max_completion_tokens) = if hosted_openai {
-        (None, Some(opts.max_tokens))
+        (None, Some(limit))
     } else {
-        (Some(opts.max_tokens), None)
+        (Some(limit), None)
     };
 
     let alibaba = match dialect {
@@ -730,10 +731,10 @@ mod tests {
     #[test]
     fn max_tokens_is_sent_as_given() {
         let mut o = opts();
-        o.max_tokens = 0;
+        o.max_tokens = Some(0);
         let req = build_request(&o, &[Message::user("hi")], false, true);
         assert_eq!(req.max_tokens, Some(0));
-        o.max_tokens = 777;
+        o.max_tokens = Some(777);
         let req = build_request(&o, &[Message::user("hi")], false, true);
         assert_eq!(req.max_tokens, Some(777));
     }
@@ -819,7 +820,7 @@ mod tests {
         #[test]
         fn hosted_openai_uses_max_completion_tokens_not_max_tokens() {
             let mut o = BuildOpts::new("gpt-5.6-terra", 4096);
-            o.max_tokens = 4096;
+            o.max_tokens = Some(4096);
             let req = super::super::build_request(
                 &o,
                 &[Message::user("hi")],

@@ -4369,7 +4369,7 @@ mod tests {
         let db = d.kernel_db().lock();
         match crate::model_resolution::context_model(&db, shadow).unwrap() {
             crate::model_resolution::ContextModelLookup::Model(m) => {
-                assert_eq!((m.backend.as_str(), m.model.as_str(), m.max_tokens), ("nagaya", "judge-model", 2048));
+                assert_eq!((m.backend.as_str(), m.model.as_str(), m.max_tokens), ("nagaya", "judge-model", Some(2048)));
             }
             other => panic!("a council model with max_tokens runs chat turns: {other:?}"),
         }

@@ -234,18 +234,13 @@ impl KjDispatcher {
             return Ok(Described { text, rendition, shadow: shadow.context_id, maker, media_type, hash: hash_text, reused: true });
         }
 
-        let max_tokens = bound
-            .slot
-            .max_tokens
-            .and_then(|m| u64::try_from(m).ok())
-            .filter(|m| *m > 0)
-            .ok_or_else(|| {
-                format!(
-                    "the image slot {maker} of {} has no max_tokens, which every request carries; \
-                     `kj character slot set {} describe {maker} --max-tokens <n>`, then archive {} so the next request makes a new shadow",
-                    bound.context, bound.character, bound.context
-                )
-            })?;
+        let max_tokens = bound.request_max_tokens(crate::model_resolution::IMAGE).map_err(|error| {
+            format!(
+                "{error}; `kj character slot set {} image {maker} --max-tokens <n>`, \
+                 then archive {} so the next request makes a new shadow",
+                bound.character, bound.context
+            )
+        })?;
         let provider = self.kernel.llm().read().await.get(&bound.backend).ok_or_else(|| {
             format!(
                 "backend '{}' of the image slot is not registered (missing key? see `kj backend show {}`)",
@@ -452,7 +447,7 @@ impl KjDispatcher {
         bound: &crate::model_resolution::BoundSlot,
         shadow: ContextId,
         performer: kaijutsu_types::PrincipalId,
-        max_tokens: u64,
+        max_tokens: Option<u64>,
         instruction: &str,
         messages: Vec<Message>,
         timeout: Duration,
@@ -484,7 +479,7 @@ impl KjDispatcher {
             decide: None,
         };
         let opts = crate::llm::apply_tunables(
-            crate::llm::BuildOpts::new(&model, max_tokens).with_system(instruction),
+            crate::llm::BuildOpts::with_output_limit(&model, max_tokens).with_system(instruction),
             &tunables,
         );
         let reply = match tokio::time::timeout(timeout, provider.prompt_messages(opts, messages)).await {

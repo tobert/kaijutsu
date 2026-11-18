@@ -197,12 +197,13 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         let client = Client::new("gpt", creds).with_base_url(format!("{base}/v1")).with_transport(Transport::Http);
         let context = kaijutsu_types::ContextId::new();
         let trace = crate::llm::request_dump::RequestTrace::new(context, kaijutsu_types::TurnId::new(), 1, None);
-        let mut stream = client.stream(BuildOpts::new("m", 1).with_trace(trace), vec![Message::user("hi")]).await.unwrap();
+        let mut stream = client.stream(BuildOpts::with_output_limit("m", None).with_trace(trace), vec![Message::user("hi")]).await.unwrap();
         while stream.next_event().await.is_some() {}
         let seen = seen.lock().unwrap();
         let body: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
         assert_eq!(seen[0].header("session-id"), Some(context.to_string().as_str()));
         assert_eq!(body["prompt_cache_key"], context.to_string());
+        assert!(body.get("max_output_tokens").is_none(), "{body}");
     }
 
     /// The endpoint slot is free once `Done` is read: the runtime stops

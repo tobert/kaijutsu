@@ -234,7 +234,7 @@ pub fn build_request(
 
     Ok(MessagesRequest {
         model: opts.model.clone(),
-        max_tokens: opts.max_tokens,
+        max_tokens: opts.required_max_tokens()?,
         messages: request_messages,
         system,
         tools,
@@ -330,11 +330,12 @@ pub fn resolve_thinking(opts: &BuildOpts, dialect: Dialect) -> Result<Option<Thi
                     opts.model
                 ))
             })?;
-            if opts.max_tokens <= budget {
+            let max_tokens = opts.required_max_tokens()?;
+            if max_tokens <= budget {
                 return Err(LlmError::InvalidRequest(format!(
-                    "thinking_budget ({budget}) must be less than max_tokens ({}) for model {} \
+                    "thinking_budget ({budget}) must be less than max_tokens ({max_tokens}) for model {} \
                      — Anthropic 400s on an inverted budget/max_tokens pair",
-                    opts.max_tokens, opts.model
+                    opts.model
                 )));
             }
             Some(Thinking::Enabled {
@@ -1650,7 +1651,7 @@ mod tests {
         #[test]
         fn budget_style_with_budget_gte_max_tokens_is_a_loud_error() {
             let mut o = opts("claude-opus-4-8");
-            o.max_tokens = 1000;
+            o.max_tokens = Some(1000);
             o.thinking_style = Some("budget".into());
             o.thinking_budget = Some(1000); // inverted: budget == max_tokens
             let err = resolve_thinking(&o, Dialect::Anthropic).unwrap_err();
@@ -1660,7 +1661,7 @@ mod tests {
         #[test]
         fn budget_style_with_valid_budget_produces_enabled() {
             let mut o = opts("claude-opus-4-8");
-            o.max_tokens = 8192;
+            o.max_tokens = Some(8192);
             o.thinking_style = Some("budget".into());
             o.thinking_budget = Some(4096);
             let t = resolve_thinking(&o, Dialect::Anthropic).unwrap();
@@ -1675,7 +1676,7 @@ mod tests {
             // effort has no field on the Enabled shape — it's dropped (and
             // warned at the tracing layer), never an error.
             let mut o = opts("claude-opus-4-8");
-            o.max_tokens = 8192;
+            o.max_tokens = Some(8192);
             o.thinking_style = Some("budget".into());
             o.thinking_budget = Some(4096);
             o.effort = Some("high".into());

@@ -49,6 +49,72 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
 }
 
 #[test]
+fn only_backends_that_send_an_output_limit_require_max_tokens() {
+    use kaijutsu_kernel::kernel_db::BackendRow;
+    use kaijutsu_types::{BackendId, PrincipalId};
+
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let parent = choose_parent(None, &kj.list_contexts().await.unwrap()).unwrap().context_id;
+
+        for binding in ["model", "slot"] {
+            let argv = ["character", binding, "set", "--help"].map(String::from);
+            let help = kj.execute_kj_quiet(parent, &argv).await.unwrap();
+            assert_eq!(help.exit_code, 0, "{}", help.stderr);
+            assert!(help.stdout.contains("ChatGPT ignores this setting"), "{}", help.stdout);
+        }
+
+        for kind in ["openai", "chatgpt"] {
+            let model = "plan-model";
+            let backend_model = format!("test-{kind}/{model}");
+            kernel.kernel_db.lock().upsert_backend(&BackendRow {
+                backend_id: BackendId::new(),
+                name: format!("test-{kind}"),
+                kind: kind.into(),
+                base_url: None,
+                api_key_env: None,
+                api_key_file: None,
+                key_optional: false,
+                request_timeout_secs: None,
+                idle_timeout_secs: None,
+                max_concurrent: None,
+                created_at: 0,
+                created_by: PrincipalId::system(),
+            }).unwrap();
+            for binding in [vec!["model", "set", PERFORMER], vec!["slot", "set", PERFORMER, "image"]] {
+                let argv = ["character"].into_iter().chain(binding).chain([backend_model.as_str()]).map(String::from).collect::<Vec<_>>();
+                let set = kj.execute_kj_quiet(parent, &argv).await.unwrap();
+                assert_eq!(set.exit_code, 0, "{}", set.stderr);
+                assert_eq!(set.stdout.contains("WARN: no max_tokens"), kind == "openai", "{}", set.stdout);
+            }
+
+            let label = format!("no-limit-{kind}");
+            let result = kj.execute_kj_quiet(parent, &context_create_argv(&label, PERFORMER, None)).await.unwrap();
+            let created = context_id_from_create_result(&result);
+            if kind == "openai" {
+                let error = created.expect_err("OpenAI API requests need an output limit");
+                assert!(error.contains("no max_tokens"), "{error}");
+                assert!(!kj.list_contexts().await.unwrap().iter().any(|ctx| ctx.label == label));
+                continue;
+            }
+
+            let lane = created.unwrap_or_else(|error| panic!("ChatGPT plan creation failed: {error}"));
+            let info = kj.execute_kj_quiet(lane, &["context".into(), "info".into()]).await.unwrap();
+            assert_eq!(info.exit_code, 0, "{}", info.stderr);
+            assert!(info.stdout.contains("test-chatgpt/plan-model"), "{}", info.stdout);
+            let db = kernel.kernel_db.lock();
+            for role in ["model", "distill", "image"] {
+                let slot = db.context_slot(lane, role).unwrap().unwrap();
+                assert_eq!(slot.model, model);
+                assert_eq!(slot.max_tokens, None);
+            }
+        }
+    });
+}
+
+#[test]
 fn a_duplicate_label_is_refused_with_a_label_conflict() {
     run_local(async {
         let addr = start_server().await;
