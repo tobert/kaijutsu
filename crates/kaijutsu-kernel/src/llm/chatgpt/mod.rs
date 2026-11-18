@@ -383,6 +383,76 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
             assert_eq!(resent["input"].as_array().unwrap().len(), 5, "{resent}");
         }
 
+        /// A fresh connection that closes after the request went out is not
+        /// sent again, over WebSocket or HTTP: the server may already have
+        /// run it. The error is a retryable network error.
+        ///
+        /// Falsified by a second connection or an HTTP request.
+        #[tokio::test]
+        async fn a_fresh_connection_lost_after_send_is_not_resent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, seen) = serve(|_, ask| match ask {
+                Ask::Upgrade(_) => Answer::Accept,
+                Ask::Frame(_) => Answer::Close,
+            })
+            .await;
+            let client = ws_client(&base, signed_in(tmp.path(), format!("{base}/token"), "tok"));
+            let err = client.stream(opts(ContextId::new()), vec![Message::user("go")]).await.err().expect("no stream");
+            assert!(matches!(err, crate::llm::LlmError::NetworkError(_)), "{err:?}");
+            assert_eq!(seen.lock().unwrap().len(), 1, "one connection, no resend");
+        }
+
+        /// A continuation the server rejects is sent once more in full on a
+        /// new connection, whichever shape the error takes: the code under
+        /// `error`, or at the top level.
+        ///
+        /// Falsified by a failed turn or a second continuation.
+        #[tokio::test]
+        async fn a_rejected_continuation_resends_in_full() {
+            for rejection in [
+                json!({ "type": "error", "status": 400, "code": "previous_response_not_found", "message": "not found" }),
+                json!({ "type": "error", "status": 400, "error": { "code": "invalid_request_error", "message": "previous_response_id not supported" } }),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (base, seen) = serve(move |conn, ask| match (conn, ask) {
+                    (_, Ask::Upgrade(_)) => Answer::Accept,
+                    (0, Ask::Frame(0)) => Answer::Events(response("resp_1", vec![call("call_1")])),
+                    (0, Ask::Frame(_)) => Answer::Events(vec![rejection.clone()]),
+                    (_, Ask::Frame(_)) => Answer::Events(response("resp_2", vec![text("done")])),
+                })
+                .await;
+                let client = ws_client(&base, signed_in(tmp.path(), format!("{base}/token"), "tok"));
+                let context = ContextId::new();
+                drain(&client, opts(context), vec![Message::user("go")]).await;
+                let events = drain(&client, opts(context), after_call()).await;
+                assert!(matches!(events.last(), Some(StreamEvent::Done { .. })), "{events:?}");
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 2, "{seen:?}");
+                assert!(seen[1].frames[0].get("previous_response_id").is_none());
+            }
+        }
+
+        /// A first frame that does not start a response (a stray event left
+        /// from the last one) is not read as the new response: the
+        /// connection is dropped and the request sent in full on a new one.
+        #[tokio::test]
+        async fn a_stray_first_frame_is_not_taken_for_the_response() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, seen) = serve(|conn, ask| match (conn, ask) {
+                (_, Ask::Upgrade(_)) => Answer::Accept,
+                (0, Ask::Frame(0)) => Answer::Events(response("resp_1", vec![call("call_1")])),
+                (0, Ask::Frame(_)) => Answer::Events(vec![json!({ "type": "response.completed", "response": { "id": "resp_1" } })]),
+                (_, Ask::Frame(_)) => Answer::Events(response("resp_2", vec![text("done")])),
+            })
+            .await;
+            let client = ws_client(&base, signed_in(tmp.path(), format!("{base}/token"), "tok"));
+            let context = ContextId::new();
+            drain(&client, opts(context), vec![Message::user("go")]).await;
+            let events = drain(&client, opts(context), after_call()).await;
+            assert!(matches!(events.as_slice(), [.., StreamEvent::TextEnd, StreamEvent::Done { .. }]), "{events:?}");
+            assert_eq!(seen.lock().unwrap().len(), 2);
+        }
+
         /// A pooled connection the server closed while idle is replaced and
         /// the request sent in full, with no error in the stream.
         #[tokio::test]

@@ -23,13 +23,26 @@
 //! The plan route accepts `previous_response_id` only here, never over
 //! HTTP.
 //!
-//! Fallback: before the first event reaches the caller, a closed
-//! connection or a `previous_response_not_found` or
-//! `websocket_connection_limit_reached` error sends the request once more
-//! in full on a new connection. An upgrade that fails, or a second failure,
-//! sends it over HTTP. A 401 at the upgrade goes back to the caller to
-//! refresh its bearer; an error event with an HTTP status before the first
-//! event maps as the HTTP route's error status would ([`super::open_error`]).
+//! Fallback: a request is sent again only when the server cannot have run
+//! it, at most once over WebSocket, before the first event reaches the
+//! caller:
+//!
+//! - A pooled connection that closes before the first event (the server
+//!   closed it while idle) resends in full on a new connection. A fresh
+//!   connection that closes after the request went out is a network error
+//!   with no resend, since the server may be running it.
+//! - A rejected continuation (an error event whose refusal does not stand
+//!   for any request), `previous_response_not_found`, or
+//!   `websocket_connection_limit_reached` resends in full on a new
+//!   connection.
+//! - A first event that does not start a response drops the connection and
+//!   resends in full.
+//! - An upgrade that fails or takes longer than [`UPGRADE_LIMIT`], or a send
+//!   that fails twice, goes over HTTP.
+//!
+//! A 401 at the upgrade goes back to the caller to refresh its bearer; an
+//! error event with an HTTP status maps as the HTTP route's error status
+//! would ([`super::open_error`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -65,6 +78,9 @@ pub const AGE_LIMIT: Duration = Duration::from_secs(55 * 60);
 /// Error codes that mean the request may succeed in full on a new
 /// connection.
 const RESEND_CODES: [&str; 2] = ["previous_response_not_found", "websocket_connection_limit_reached"];
+
+/// The longest a WebSocket upgrade may take; a slower one goes over HTTP.
+const UPGRADE_LIMIT: Duration = Duration::from_secs(30);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -259,7 +275,7 @@ pub(crate) async fn open(
         let reused = kept.is_some();
         let mut conn = match kept.take() {
             Some(conn) => conn,
-            None => match connect(target, session, bearer, wait).await {
+            None => match connect(target, session, bearer, wait.min(UPGRADE_LIMIT)).await {
                 Ok(conn) => conn,
                 Err(ConnectError::Refused { status, body: text }) => {
                     if let Some(slot) = &slot {
@@ -299,9 +315,17 @@ pub(crate) async fn open(
         }
         let text = match first_frame(&mut conn.socket, wait).await {
             First::Text(text) => text,
-            First::Lost(why) => {
-                tracing::debug!(session, why, "the Responses WebSocket closed before the first event; sending in full on a new connection");
+            // A pooled connection the server closed while idle never read the
+            // request. A fresh one may have, and the server may be running it,
+            // so it is not sent again.
+            First::Lost(why) if reused && attempt == 0 => {
+                tracing::debug!(session, why, "the pooled Responses WebSocket closed before the first event; sending in full on a new connection");
                 continue;
+            }
+            First::Lost(why) => {
+                return Err(OpenError::Other(LlmError::NetworkError(format!(
+                    "the Responses WebSocket closed after the request was sent ({why}); not sending it again"
+                ))));
             }
             First::TimedOut => {
                 return Err(OpenError::Other(LlmError::NetworkError(format!(
@@ -310,20 +334,44 @@ pub(crate) async fn open(
             }
         };
         let event: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if event["type"] == "error" {
-            let code = event.pointer("/error/code").and_then(Value::as_str).unwrap_or("");
-            if attempt == 0 && RESEND_CODES.contains(&code) {
-                tracing::debug!(session, code, "sending in full on a new connection");
+        match event["type"].as_str() {
+            Some("error") => {
+                let code = error_code(&event);
+                let status = event
+                    .get("status")
+                    .and_then(Value::as_u64)
+                    .and_then(|s| u16::try_from(s).ok())
+                    .filter(|s| !(200..300).contains(s));
+                let error = status.map(|s| {
+                    open_error(reqwest::StatusCode::from_u16(s).unwrap_or(reqwest::StatusCode::BAD_GATEWAY), &text, bearer)
+                });
+                // The server refused the request outright, so it ran nothing:
+                // a rejected continuation, or a lost previous response, goes
+                // once more in full on a new connection.
+                let rejected_continuation = continued.is_some() && error.as_ref().is_some_and(|e| !refusal_stands(e));
+                if attempt == 0 && (RESEND_CODES.contains(&code) || rejected_continuation) {
+                    tracing::debug!(session, code, "sending in full on a new connection");
+                    continue;
+                }
+                if let (Some(status), Some(error)) = (status, error) {
+                    if let Some(slot) = &slot {
+                        slot.answered_with(status, None);
+                    }
+                    return Err(error);
+                }
+            }
+            Some("response.created" | "response.in_progress") => {}
+            // Not the start of this response: a frame left from an earlier
+            // one. The connection cannot be trusted to pair events with
+            // requests, so it is dropped.
+            other if attempt == 0 => {
+                tracing::warn!(session, first = ?other, "the Responses WebSocket answered with an event that does not start a response; sending in full on a new connection");
                 continue;
             }
-            if let Some(status) = event.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok())
-                && !(200..300).contains(&status)
-            {
-                if let Some(slot) = &slot {
-                    slot.answered_with(status, None);
-                }
-                let status = reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
-                return Err(open_error(status, &text, bearer));
+            other => {
+                return Err(OpenError::Other(LlmError::NetworkError(format!(
+                    "the Responses WebSocket answered with {other:?}, not the start of a response"
+                ))));
             }
         }
         let live = Live {
@@ -341,6 +389,15 @@ pub(crate) async fn open(
     Ok(Opened::Http(slot))
 }
 
+/// The `code` of an error event, under `error` or at the top level.
+fn error_code(event: &Value) -> &str {
+    event
+        .pointer("/error/code")
+        .or_else(|| event.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
 /// Whether an upgrade refusal is the answer to the request itself, which
 /// HTTP would give too: an expired bearer, a spent plan, a refused sign-in,
 /// or a rate limit.
@@ -348,7 +405,9 @@ fn refusal_stands(error: &OpenError) -> bool {
     matches!(
         error,
         OpenError::Unauthorized(_)
-            | OpenError::Other(LlmError::InsufficientBalance(_) | LlmError::AuthError(_) | LlmError::RateLimited(_))
+            | OpenError::Other(
+                LlmError::InsufficientBalance(_) | LlmError::AuthError(_) | LlmError::RateLimited(_) | LlmError::ContextFull(_)
+            )
     )
 }
 
@@ -403,6 +462,13 @@ impl Live {
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
                     self.output.push(item.clone());
+                }
+            }
+            // The completed response lists its whole output; it outranks the
+            // items gathered one by one.
+            Some("response.completed") => {
+                if let Some(output) = event.pointer("/response/output").and_then(Value::as_array).filter(|o| !o.is_empty()) {
+                    self.output = output.clone();
                 }
             }
             _ => {}
