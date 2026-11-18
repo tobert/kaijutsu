@@ -131,12 +131,14 @@ impl StateMachine {
         let input = usage.get("input_tokens").and_then(Value::as_u64);
         let output = usage.get("output_tokens").and_then(Value::as_u64);
         let cached = usage.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let written = usage.pointer("/input_tokens_details/cache_write_tokens").and_then(Value::as_u64).unwrap_or(0);
         let reasoning = usage.pointer("/output_tokens_details/reasoning_tokens").and_then(Value::as_u64).unwrap_or(0);
+        // `input_tokens` holds reads and writes; the miss is the rest.
         let extra = UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
             prompt_cache_hit_tokens: cached,
-            prompt_cache_miss_tokens: input.unwrap_or(0).saturating_sub(cached),
+            prompt_cache_miss_tokens: input.unwrap_or(0).saturating_sub(cached).saturating_sub(written),
             reasoning_tokens: reasoning,
-            prompt_cache_write_tokens: 0,
+            prompt_cache_write_tokens: written,
         });
         Some((input, output, Some(extra)))
     }
@@ -430,6 +432,25 @@ mod tests {
                     })),
                 },
             ]
+        );
+    }
+
+    /// A cache write is counted, and the miss is what was neither read nor
+    /// written: OpenAI's ordinary input is `input - cached - write`.
+    ///
+    /// Falsified by a write left at 0, or a miss that still holds the write.
+    #[test]
+    fn cache_writes_are_counted_apart_from_misses() {
+        let usage = json!({
+            "input_tokens": 1000,
+            "input_tokens_details": { "cached_tokens": 600, "cache_write_tokens": 300 },
+            "output_tokens": 5,
+        });
+        let out = run(vec![json!({ "type": "response.completed", "response": { "usage": usage } })]);
+        let Some(StreamEvent::Done { extra: Some(UsageExtra::OpenAiCompat(extra)), .. }) = out.last() else { panic!("{out:?}") };
+        assert_eq!(
+            (extra.prompt_cache_hit_tokens, extra.prompt_cache_write_tokens, extra.prompt_cache_miss_tokens),
+            (600, 300, 100)
         );
     }
 
