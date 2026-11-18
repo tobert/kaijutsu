@@ -5,9 +5,11 @@
 //! narrower request than the API-key route:
 //!
 //! - `store: false` and `stream: true` on every request.
-//! - The system prompt goes in `instructions`. An input item with role
-//!   `system` is refused, so a later system message becomes a `developer`
-//!   message.
+//! - An input item with role `system` is refused, so the system prompt is a
+//!   `developer` message at the start of `input`, and a later system message
+//!   is a `developer` message where it stands. Not `instructions`: from
+//!   GPT-6.2 on, top-level instructions are placed after the input, outside
+//!   the cached prefix, and billed uncached on every request.
 //! - No `max_output_tokens`, `temperature`, `top_p`, `previous_response_id`,
 //!   `metadata`, `truncation`, `user`, or `prompt_cache_retention`. The whole
 //!   history goes in `input` on every request.
@@ -40,7 +42,10 @@ pub const REASONING_SIGNATURE_PREFIX: &str = "openai-responses:";
 /// backend in the warnings for knobs this route drops.
 pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str) -> Value {
     let turn_start = messages.iter().rposition(opens_a_turn).unwrap_or(0);
-    let mut input = Vec::with_capacity(messages.len());
+    let mut input = Vec::with_capacity(messages.len() + 1);
+    if let Some(system) = &opts.system {
+        input.push(text_message("developer", "input_text", system));
+    }
     for (i, msg) in messages.iter().enumerate() {
         match msg.role {
             Role::User => translate_user(msg, &mut input),
@@ -59,9 +64,6 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
         "include": ["reasoning.encrypted_content"],
         "reasoning": { "summary": "auto" },
     });
-    if let Some(system) = &opts.system {
-        body["instructions"] = Value::String(system.clone());
-    }
     if let Some(effort) = &opts.effort {
         body["reasoning"]["effort"] = Value::String(effort.clone());
     }
@@ -239,9 +241,11 @@ mod tests {
     }
 
     /// The plan contract's fixed fields ride on every request, and the system
-    /// prompt is `instructions`, never a `system` input item.
+    /// prompt is the first input item, a `developer` message: never a
+    /// `system` item, and never `instructions`, which GPT-6.2 bills uncached.
     ///
-    /// Falsified by a missing `store: false`, a `system` role in `input`, or
+    /// Falsified by a missing `store: false`, a `system` role in `input`, an
+    /// `instructions` field, or
     /// any field the plan route refuses.
     #[test]
     fn a_request_carries_the_plan_contract() {
@@ -253,10 +257,11 @@ mod tests {
         let v = body(opts, &[Message::user("hi")]);
         assert_eq!(v["store"], false);
         assert_eq!(v["stream"], true);
-        assert_eq!(v["instructions"], "be brief");
+        assert!(v.get("instructions").is_none(), "{v}");
+        assert_eq!(v["input"][0], json!({ "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "be brief" }] }));
         assert_eq!(v["reasoning"], json!({ "summary": "auto", "effort": "high" }));
         assert_eq!(v["include"], json!(["reasoning.encrypted_content"]));
-        assert_eq!(v["input"], json!([{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]));
+        assert_eq!(v["input"][1], json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }));
         for refused in [
             "max_output_tokens", "temperature", "top_p", "previous_response_id", "metadata",
             "truncation", "user", "prompt_cache_retention", "max_tokens",

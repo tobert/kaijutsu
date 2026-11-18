@@ -139,7 +139,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         let paths: Vec<_> = seen.iter().map(|r| (r.path.as_str(), r.header("authorization"))).collect();
         assert_eq!(paths, [("/v1/responses", Some("Bearer stale")), ("/token", None), ("/v1/responses", Some("Bearer fresh"))]);
         let body: serde_json::Value = serde_json::from_str(&seen[2].body).unwrap();
-        assert_eq!((body["store"].clone(), body["instructions"].clone()), (serde_json::json!(false), serde_json::json!("s")));
+        assert_eq!(body["store"], serde_json::json!(false));
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"][0]["text"], "s");
     }
 
     /// The endpoint slot is free once `Done` is read: the runtime stops
