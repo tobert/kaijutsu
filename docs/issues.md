@@ -148,6 +148,19 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
   - The plan route's default output ceiling is unknown.
 - **Failing kj tests on main.** `kj::reflect::tests::every_live_leaf_classifies` (`kj audio render` needs `<SOURCES>`) and `kj::db::tests::db_backup_help_documents_the_no_restore_verb_stance` (the `backup` long help lost its no-restore text) fail independent of this work.
 
+## Sol's first task: friction from a GPT model driving kaijutsu (2026-11-18)
+
+Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-characters`, 30b07019) in 25 asks, all reviewed by its senpai. Its report and the review log surfaced:
+
+- **Every read asks.** `[rc.coder.council] enabled = false` and the global allow list has only `rg` and `wc`, so each `grep`, `ls`, `help`, `glob`, and `git status` waits on the reviewer. For a GPT seat in an auto mode, this is the load a council or an OpenAI-style reviewer would carry (see the auto-review notes under the ChatGPT plan backend).
+- **A denial carries no reason.** `kj ledger deny` has no message, so the model sees only that the reviewer said no. A correction has to go in a separate `kj block create -c <ctx> --role user` block, which arrives at the next request and can miss a turn that ends first (it did).
+- **`source FILE` is approved blind.** The ask shows the path, not the file, and the file can change between approval and execution. The reviewer had to read it from outside the kernel.
+- **No in-kernel kaish parse check.** `contrib/kai-parse-check.sh` needs a standalone `kaish` binary that the container does not have. Sol wrapped each script in `if false; then … fi` and sourced it.
+- **The shell guard's parse-error advice suggests `bash FILE`,** which cannot validate kaish syntax.
+- **`${var#prefix}` fails indirectly.** The gate reported that it could not restore an invalid environment name rather than naming the unsupported expansion.
+- **No git identity in the container.** HOME is a tmpfs, so git has no `user.name`; Sol supplied its own identity per command and the reviewer denied it. The quadlet now sets `GIT_AUTHOR_*` and `GIT_COMMITTER_*`.
+- **A reviewer's piped read asks too.** `kj character show sol | grep …` from the senpai console waited on Amy, while the same command without the pipe ran.
+
 ## Council house rules, objects, and verbs (2026-11-08)
 
 - **Council house rules deadline.** An edited `AGENTS.md` reaches the council at the next decision, not at rotation.

@@ -18,6 +18,10 @@ NoNewPrivileges=true
 ReadOnly=true
 Tmpfs=/tmp:rw,nosuid,nodev,size=8g
 PublishPort=127.0.0.1:2224:2222
+# Git finds no ~/.gitconfig inside, so commits need an identity. Set only the identity; the host gitconfig can
+# carry credential helpers.
+#Environment=GIT_AUTHOR_NAME="Your Name" GIT_AUTHOR_EMAIL=you@example.com
+#Environment=GIT_COMMITTER_NAME="Your Name" GIT_COMMITTER_EMAIL=you@example.com
 
 # The GPU (ROCm). The devices are world-readable on the host.
 AddDevice=/dev/kfd
