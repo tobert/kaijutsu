@@ -23,6 +23,9 @@ serde = { workspace = true }
 # back to a model as it wrote it (the council server re-renders it).
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = "0.10"
+# ChatGPT sign-in (`llm/chatgpt/oauth.rs`): PKCE secrets and the authorize URL.
+rand = { workspace = true }
+url = "2"
 uuid = { workspace = true }
 tracing = { workspace = true }
 dunce = { workspace = true }

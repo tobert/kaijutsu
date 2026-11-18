@@ -6932,6 +6932,7 @@ dependencies = [
  "kaish-types",
  "notify",
  "parking_lot",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "rmcp",
@@ -6953,6 +6954,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
  "usvg 0.46.0",
  "uuid",
 ]

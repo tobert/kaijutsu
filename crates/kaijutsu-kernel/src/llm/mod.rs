@@ -29,6 +29,7 @@
 
 pub mod alibaba;
 pub mod claude;
+pub mod chatgpt;
 pub mod codex;
 pub mod config;
 pub mod council;
