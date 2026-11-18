@@ -694,7 +694,7 @@ fn a_rebuilt_table_has_the_shape_a_fresh_database_gets() {
 
     let fresh = KernelDb::temporary().unwrap();
     let rebuilt = KernelDb::temporary().unwrap();
-    put_backends_back_on_its_pre_codex_shape(&rebuilt.conn);
+    put_backends_back_on_its_kind_check_shape(&rebuilt.conn);
     put_roster_entity_back_on_its_legacy_shape(&rebuilt.conn);
     put_roster_presence_back_on_its_legacy_shape(&rebuilt.conn);
     put_roster_activity_back_on_its_legacy_shape(&rebuilt.conn);

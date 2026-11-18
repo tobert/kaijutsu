@@ -2,7 +2,7 @@
 //!
 //! A **backend** is one configured endpoint: a free-form unique `name` (the
 //! handle you type) plus a closed `kind` (`anthropic` | `deepseek` | `openai` |
-//! `alibaba` | `codex-app` | `council`) that picks which client speaks for it. That split is the point of this
+//! `alibaba` | `council` | `gemini`) that picks which client speaks for it. That split is the point of this
 //! renovation — the demolished `models.toml` made the `[providers.<name>]`
 //! table name BE the provider type, so two Anthropic gateways were
 //! inexpressible and a local server had to be called `ollama`/`lemonade`/
@@ -55,7 +55,7 @@ enum BackendCommand {
     Set {
         /// Backend name — free-form, unique (e.g. anthropic, gpt, zorak)
         name: String,
-        /// Wire dialect: anthropic | deepseek | openai | alibaba | codex-app | council | gemini.
+        /// Wire dialect: anthropic | deepseek | openai | alibaba | council | gemini.
         /// alibaba is Alibaba Model Studio; its key defaults to
         /// ALIBABA_API_KEY. council is a council v2 server, such as a nagaya,
         /// which serves chat turns, gate decisions and embeddings. gemini is
@@ -66,8 +66,8 @@ enum BackendCommand {
         /// OpenAI-compatible server) and for alibaba (the Token Plan,
         /// https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1,
         /// or a workspace endpoint); optional gateway override for anthropic;
-        /// unnecessary for deepseek; required for codex-app and for council
-        /// (the server address, such as http://100.65.47.5:8091).
+        /// unnecessary for deepseek; required for council (the server
+        /// address, such as http://100.65.47.5:8091).
         #[arg(long = "base-url")]
         base_url: Option<String>,
         /// Environment variable NAME holding the API key (never the key)
@@ -94,7 +94,7 @@ enum BackendCommand {
         /// host, and port of --base-url; a backend with no --base-url is its
         /// own endpoint). A request past the limit waits for a slot until its
         /// own deadline. Backends at one endpoint use the smallest limit.
-        /// Unset is unlimited. Refused for codex-app, which takes no slot.
+        /// Unset is unlimited.
         #[arg(long = "max-concurrent")]
         max_concurrent: Option<u32>,
     },
@@ -1238,21 +1238,6 @@ mod tests {
                 assert_eq!(data["max_concurrent_applied"], false);
             }
             other => panic!("expected show text and data: {other:?}"),
-        }
-    }
-
-    /// `--max-concurrent` on a codex-app backend is refused: codex-app
-    /// takes no slot.
-    #[tokio::test]
-    async fn set_refuses_a_max_concurrent_on_codex_app() {
-        let d = seeded().await;
-        let c = test_caller();
-        let r = d
-            .dispatch(&argv(&["backend", "set", "codex", "--kind", "codex-app", "--base-url", "ws://127.0.0.1:4500", "--max-concurrent", "2"]), &c)
-            .await;
-        match r {
-            KjResult::Err(msg) => assert!(msg.contains("codex-app takes no slot"), "{msg}"),
-            other => panic!("a limit on codex-app must fail: {other:?}"),
         }
     }
 }

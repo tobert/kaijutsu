@@ -758,11 +758,11 @@ CREATE TABLE IF NOT EXISTS client_views (
 --
 -- `name` is free-form and unique (the handle you type: `anthropic`, `gpt`,
 -- `ollama`, `zorak`); `kind` is a CLOSED enum owned by code, mapping onto
--- the `Provider` variants (Claude / DeepSeek / OpenAi / Codex app-server).
+-- the `Provider` variants (Claude / DeepSeek / Alibaba / OpenAi / Council /
+-- Gemini).
 -- The old TOML conflated the two — the `[providers.<name>]` table name WAS
 -- the type, so you could not run two Anthropic gateways or name a local
--- server anything but `ollama`/`lemonade`/`local`. `codex-app` is the
--- experimental local Codex app-server JSONL backend. `mock` is a test-only
+-- server anything but `ollama`/`lemonade`/`local`. `mock` is a test-only
 -- kind that `BackendKind::parse` rejects unless the `test-mock` feature is
 -- on. `kind` carries no CHECK — SQLite cannot alter one, so widening it for
 -- a new provider would only reach a fresh database. `BackendKind::parse`

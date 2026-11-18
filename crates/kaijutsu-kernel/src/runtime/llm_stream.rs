@@ -17,7 +17,7 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status, summarize_thinking};
 use crate::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use crate::kernel_db::KernelDb;
 use crate::llm::stream::{
-    BuildOpts, CacheTarget, InlineToolResult, RetryDisposition, StreamError, StreamErrorKind,
+    BuildOpts, CacheTarget, RetryDisposition, StreamError, StreamErrorKind,
     StreamEvent, apply_tunables, longest_cache_ttl_secs,
 };
 use crate::llm::SlotTunables;
@@ -60,7 +60,7 @@ fn validate_content_event(open: Option<OpenContent>, event: &StreamEvent) -> Res
         StreamEvent::ThinkingDelta(_) | StreamEvent::ThinkingEnd { .. } => matches!(open, Some(OpenContent::Thinking(_))),
         StreamEvent::TextDelta(_) | StreamEvent::TextEnd => matches!(open, Some(OpenContent::Text(_))),
         StreamEvent::ThinkingStart | StreamEvent::TextStart | StreamEvent::ToolUse { .. }
-            | StreamEvent::ToolUseInvalid { .. } | StreamEvent::InlineToolUse { .. }
+            | StreamEvent::ToolUseInvalid { .. }
             | StreamEvent::Done { .. } => open.is_none(),
         StreamEvent::ToolResult { .. } => return Err(StreamFailure::Protocol("provider emitted ToolResult; only the runtime authors tool results".into())),
         StreamEvent::Error(_) => true,
@@ -71,7 +71,6 @@ fn validate_content_event(open: Option<OpenContent>, event: &StreamEvent) -> Res
         StreamEvent::ThinkingEnd { .. } => "ThinkingEnd", StreamEvent::TextStart => "TextStart",
         StreamEvent::TextDelta(_) => "TextDelta", StreamEvent::TextEnd => "TextEnd",
         StreamEvent::ToolUse { .. } => "ToolUse", StreamEvent::ToolUseInvalid { .. } => "ToolUseInvalid",
-        StreamEvent::InlineToolUse { .. } => "InlineToolUse",
         StreamEvent::ToolResult { .. } => "ToolResult", StreamEvent::Done { .. } => "Done", StreamEvent::Error(_) => "Error",
     };
     let state = match open { Some(OpenContent::Thinking(_)) => "an open thinking block",
@@ -1971,15 +1970,21 @@ struct PendingCall {
     unparsed: Option<String>,
 }
 
+/// What the model reads back for one tool call.
+struct ToolAnswer {
+    content: String,
+    is_error: bool,
+}
+
 /// Settle the placed answer of a call whose arguments did not parse with its
 /// error, the way a dispatched call's result is settled.
 fn answer_unparsed_call(
     documents: &SharedBlockStore, context_id: ContextId,
     call: kaijutsu_types::BlockId, answer: kaijutsu_types::BlockId, detail: String,
-) -> crate::block_store::BlockStoreResult<(InlineToolResult, kaijutsu_types::BlockId)> {
+) -> crate::block_store::BlockStoreResult<(ToolAnswer, kaijutsu_types::BlockId)> {
     documents.settle_tool_result_as(context_id, &call, &answer, &detail, Default::default(),
         Status::Error, true, PrincipalId::system(), None, None)?;
-    Ok((InlineToolResult { content: detail, is_error: true }, answer))
+    Ok((ToolAnswer { content: detail, is_error: true }, answer))
 }
 
 /// Place a model call's Running result after `after`. A batch places every
@@ -1997,14 +2002,13 @@ fn place_running_result(
 }
 
 /// Execute a recorded model call only after its Running result exists
-/// (`place_running_result`). Both ordinary and inline providers use this
-/// content projection and settlement.
+/// (`place_running_result`).
 async fn dispatch_recorded_tool_result(
     documents: &SharedBlockStore, context_id: ContextId, kernel: &Arc<Kernel>,
     tool_name: &str, input: &serde_json::Value, tool_ctx: &crate::ExecContext,
     cancel: tokio_util::sync::CancellationToken, interrupt: &ContextInterruptState,
     call: kaijutsu_types::BlockId, result: kaijutsu_types::BlockId,
-) -> crate::block_store::BlockStoreResult<(InlineToolResult, kaijutsu_types::BlockId)> {
+) -> crate::block_store::BlockStoreResult<(ToolAnswer, kaijutsu_types::BlockId)> {
     tokio::task::yield_now().await;
 
     let mut tool_ctx = tool_ctx.clone();
@@ -2118,7 +2122,7 @@ async fn dispatch_recorded_tool_result(
                 Some(Err(denial)) => {
                     documents.settle_tool_result_as(context_id, &call, &result, &denial, Default::default(),
                         Status::Error, true, PrincipalId::system(), None, None)?;
-                    return Ok((InlineToolResult { content: denial, is_error: true }, result));
+                    return Ok((ToolAnswer { content: denial, is_error: true }, result));
                 }
                 None => return Ok((held_result(documents, context_id, &result, ask, HoldEnd::Settled), result)),
             }
@@ -2130,7 +2134,7 @@ async fn dispatch_recorded_tool_result(
         let anchor = if let Some(payload) = payload {
             documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
         } else { result };
-        return Ok((InlineToolResult { content: model_content, is_error }, anchor));
+        return Ok((ToolAnswer { content: model_content, is_error }, anchor));
     }
 }
 
@@ -2201,16 +2205,16 @@ enum HoldEnd {
 /// hydration reads it, so a later hydration replays what was sent. The
 /// block is settled, or still `Waiting` when the ask was kept.
 fn held_result(documents: &SharedBlockStore, context_id: ContextId, result: &kaijutsu_types::BlockId,
-    ask: &str, end: HoldEnd) -> InlineToolResult {
+    ask: &str, end: HoldEnd) -> ToolAnswer {
     match documents.get_block_snapshot(context_id, result).ok().flatten() {
         Some(block) if matches!(block.status, Status::Done | Status::Error)
             || (end == HoldEnd::Kept && block.status == Status::Waiting) => {
             let stdout = (block.content_type == kaijutsu_types::ContentType::Diff && !block.content.is_empty())
                 .then(|| crate::llm::hydrate::project_diff_for_hydration(&block.content));
             let content = crate::llm::hydrate::model_tool_result_text(&block, stdout.as_deref().unwrap_or(&block.content));
-            InlineToolResult { content, is_error: block.is_error }
+            ToolAnswer { content, is_error: block.is_error }
         }
-        _ => InlineToolResult {
+        _ => ToolAnswer {
             content: match end {
                 HoldEnd::Settled => format!("The approval worker released ask {ask} without settling this result; inspect block {}.", result.to_key()),
                 HoldEnd::Interrupted => format!("The turn was interrupted while waiting for ask {ask}."),
@@ -2219,33 +2223,6 @@ fn held_result(documents: &SharedBlockStore, context_id: ContextId, result: &kai
             is_error: true,
         },
     }
-}
-
-/// An inline provider waits for this callback. Reply only after durable
-/// settlement and retain the final result/error block as the next anchor.
-async fn dispatch_inline_tool_result(
-    documents: &SharedBlockStore,
-    context_id: ContextId,
-    last_block_id: &mut kaijutsu_types::BlockId,
-    kernel: &Arc<Kernel>,
-    tool_name: &str,
-    input: serde_json::Value,
-    tool_ctx: &crate::ExecContext,
-    cancel: tokio_util::sync::CancellationToken,
-    interrupt: &ContextInterruptState,
-    tool_use_id: &str,
-    actor_principal: PrincipalId,
-    turn_lease: &TurnLease,
-) -> crate::block_store::BlockStoreResult<InlineToolResult> {
-    let call = documents.insert_tool_call_as(context_id, None, Some(last_block_id), tool_name,
-        input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal), Some(tool_use_id.to_owned()), None)?;
-    turn_lease.track_block(call);
-    *last_block_id = call;
-    let placed = place_running_result(documents, context_id, call, call, tool_use_id, turn_lease)?;
-    let (result, anchor) = dispatch_recorded_tool_result(documents, context_id, kernel, tool_name, &input,
-        tool_ctx, cancel, interrupt, call, placed).await?;
-    *last_block_id = anchor;
-    Ok(result)
 }
 
 /// The `llm.turn` span's usage fields, recorded exactly once per turn.
@@ -2839,8 +2816,7 @@ async fn run_llm_stream(
     // The principal stamped on blocks this stream authors. Two provenance
     // categories share the turn: PROVIDER-OUTPUT is content the LLM itself
     // produced — the streamed Thinking and Text blocks and their appends,
-    // and a ToolCall block, whether it arrives as an ordinary tool-use event
-    // or an inline provider callback — and stamps `actor_principal` at its
+    // and a ToolCall block — and stamps `actor_principal` at its
     // insert and at every append/edit that extends the same block.
     // KERNEL-OUTPUT is everything the kernel itself authors about the turn —
     // tool results, structured tool errors, the max-iterations halt,
@@ -3409,56 +3385,6 @@ async fn run_llm_stream(
                     tool_calls.push(PendingCall { id, name, input, signature: None, call, unparsed: Some(detail) });
                 }
 
-                StreamEvent::InlineToolUse { id, name, input } => {
-                    let result = dispatch_inline_tool_result(
-                        &documents,
-                        context_id,
-                        &mut last_block_id,
-                        &kernel,
-                        &name,
-                        input,
-                        &tool_ctx,
-                        interrupt.cancel.clone(),
-                        &interrupt,
-                        &id,
-                        actor_principal,
-                        turn_lease,
-                    )
-                    .await?;
-
-                    // Reply only after the durable blocks have reached their
-                    // final states.  A failed reply is fatal: continuing to
-                    // consume this stream would leave the provider waiting on
-                    // a callback it never received.
-                    if let Err(error) = stream.respond_inline_tool(&id, result).await {
-                        let detail = format!(
-                            "failed to return inline tool result for {name} ({id}): {error}"
-                        );
-                        tracing::error!("{}", detail);
-                        let payload = kaijutsu_types::ErrorPayload {
-                            category: kaijutsu_types::ErrorCategory::Stream,
-                            severity: kaijutsu_types::ErrorSeverity::Error,
-                            code: Some("stream.inline_tool_reply".into()),
-                            detail: Some(detail.clone()),
-                            span: None,
-                            source_kind: Some(BlockKind::ToolResult),
-                        };
-                        let _ = documents.insert_error_block_as(
-                            context_id,
-                            &last_block_id,
-                            &payload,
-                            payload.summary_line(),
-                            Some(PrincipalId::system()),
-                        );
-                        return Ok(TurnFlow::Failed {
-                            turn_id, context_id,
-                            principal_id: user_principal_id,
-                            error: detail,
-                            origin,
-                        });
-                    }
-                }
-
                 StreamEvent::ToolResult { .. } => {
                     unreachable!("provider results are rejected by content validation");
                 }
@@ -3560,11 +3486,9 @@ async fn run_llm_stream(
                     }
                     // A failure the kind marks transient is sent again when
                     // this attempt wrote no block: every durable write moves
-                    // `last_block_id`, so nothing is duplicated. An inline
-                    // tool call is a durable write too (see
-                    // `dispatch_inline_tool_result`); a tool call that waits
-                    // for the stream's end has not run, and a failure drops
-                    // it. A step whose total cap has passed gets no resend:
+                    // `last_block_id`, so nothing is duplicated. A tool call
+                    // waits for the stream's end, so it has not run, and a
+                    // failure drops it. A step whose total cap has passed gets no resend:
                     // it would hit the same cap at once.
                     if last_block_id == attempt_start_block
                         && stream_retries < MAX_LLM_RETRIES
@@ -4134,7 +4058,6 @@ mod publish_tests {
             ("thinking end during text", vec![StreamEvent::TextStart, StreamEvent::ThinkingEnd { signature: Some("wrong signature".into()) }, done()]),
             ("nested start", vec![StreamEvent::TextStart, StreamEvent::ThinkingStart, StreamEvent::ThinkingEnd { signature: None }, done()]),
             ("tool inside text", vec![StreamEvent::TextStart, tool(), StreamEvent::TextEnd, done()]),
-            ("inline tool inside text", vec![StreamEvent::TextStart, StreamEvent::InlineToolUse { id: "unrun".into(), name: "missing_tool".into(), input: serde_json::json!({}) }, done()]),
             ("provider result", vec![StreamEvent::ToolResult { tool_use_id: "invented".into(), content: "invented result".into(), is_error: false }, done()]),
             ("done inside text", vec![StreamEvent::TextStart, StreamEvent::TextDelta("partial".into()), done()]),
             ("empty EOF", vec![]),
@@ -6553,197 +6476,6 @@ mod tool_dispatch_timeout_tests {
             !is_error,
             "`kj policy set` raising call_timeout above 120s must actually take effect once \
              the redundant loop-level timeout is gone — got: {content:?}"
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // dispatch_inline_tool_result — the error child's anchor
-    // ─────────────────────────────────────────────────────────────────
-
-    /// A single-tool `McpServerLike` that always refuses — stands in for a
-    /// denied gate without wiring up the hook machinery that normally
-    /// produces one.
-    struct RefusingServer {
-        id: InstanceId,
-        notif_tx: broadcast::Sender<ServerNotification>,
-    }
-
-    impl RefusingServer {
-        fn new(id: &str) -> Self {
-            let (notif_tx, _) = broadcast::channel(4);
-            Self { id: InstanceId::new(id), notif_tx }
-        }
-    }
-
-    #[async_trait]
-    impl McpServerLike for RefusingServer {
-        fn instance_id(&self) -> &InstanceId {
-            &self.id
-        }
-
-        async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
-            Ok(vec![KernelTool {
-                instance: self.id.clone(),
-                name: "denyme".to_string(),
-                description: None,
-                input_schema: serde_json::json!({ "type": "object" }),
-            }])
-        }
-
-        async fn call_tool(
-            &self,
-            _params: KernelCallParams,
-            _ctx: &CallContext,
-            _cancel: CancellationToken,
-        ) -> McpResult<KernelToolResult> {
-            Err(McpError::refused_gate(
-                kaijutsu_types::RefusalKind::Denied,
-                "denyme",
-                None,
-                "not this time",
-            ))
-        }
-
-        fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
-            self.notif_tx.subscribe()
-        }
-    }
-
-    /// Build an ephemeral kernel with `refuser`/`denyme` registered and bound
-    /// into a fresh context that already holds one anchor block. Returns
-    /// `(kernel, documents, context_id, tool_ctx, anchor)`.
-    async fn kernel_with_refusing_tool(
-        name: &str,
-    ) -> (
-        Arc<Kernel>,
-        SharedBlockStore,
-        ContextId,
-        crate::ExecContext,
-        kaijutsu_types::BlockId,
-    ) {
-        let kernel = Arc::new(Kernel::new_ephemeral(name).await);
-        let ctx = ContextId::new();
-        let documents = kernel.blocks().clone();
-        documents
-            .create_document(ctx, crate::DocumentKind::Conversation, None)
-            .expect("create document");
-        let anchor = documents
-            .insert_block_as(
-                ctx,
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "run it",
-                Status::Done,
-                ContentType::Plain,
-                Some(PrincipalId::new()),
-            )
-            .expect("insert anchor block");
-
-        let server = Arc::new(RefusingServer::new("refuser"));
-        kernel
-            .broker()
-            .register(
-                server,
-                InstancePolicy {
-                    call_timeout: Duration::from_secs(5),
-                    max_result_bytes: 1024,
-                    max_concurrency: 4,
-                },
-            )
-            .await
-            .unwrap();
-        kernel
-            .broker()
-            .set_binding(
-                ctx,
-                ContextToolBinding::with_instances(vec![InstanceId::new("refuser")]),
-            )
-            .await
-            .unwrap();
-        let tool_ctx = crate::ExecContext::new(
-            PrincipalId::new(),
-            ctx,
-            PathBuf::from("/"),
-            SessionId::new(),
-            kernel.id(),
-        );
-        (kernel, documents, ctx, tool_ctx, anchor)
-    }
-
-    /// `insert_error_block_as` anchors the error child `after_id:
-    /// Some(result_block_id)` — the child, not the result, is the tail of a
-    /// denied tool's output. Before this, `dispatch_inline_tool_result` left
-    /// `last_block_id` at the result, so the next block inserted after this
-    /// call landed BETWEEN the result and its own error child. Document
-    /// order must be call, result, error child, next.
-    ///
-    /// Falsified by anchoring `last_block_id` at `result_block_id` again.
-    #[tokio::test]
-    async fn a_denied_inline_tool_anchors_the_next_block_past_its_error_child() {
-        let (kernel, documents, ctx, tool_ctx, anchor) =
-            kernel_with_refusing_tool("inline-anchor").await;
-        let mut last_block_id = anchor;
-
-        dispatch_inline_tool_result(
-            &documents,
-            ctx,
-            &mut last_block_id,
-            &kernel,
-            "denyme",
-            serde_json::json!({}),
-            &tool_ctx,
-            CancellationToken::new(),
-            &ContextInterruptState::new(),
-            "call-1",
-            PrincipalId::new(),
-            &kernel.turns().begin(ctx),
-        )
-        .await.unwrap();
-
-        // Simulate the next iteration's block, anchored wherever this
-        // dispatch left `last_block_id`.
-        let next = documents
-            .insert_block_as(
-                ctx,
-                None,
-                Some(&last_block_id),
-                Role::Model,
-                BlockKind::Text,
-                "continuing",
-                Status::Done,
-                ContentType::Plain,
-                Some(PrincipalId::new()),
-            )
-            .expect("insert next block");
-
-        let blocks = documents.block_snapshots(ctx).expect("read blocks");
-        let call = blocks
-            .iter()
-            .find(|b| b.kind == BlockKind::ToolCall)
-            .expect("tool call block must exist")
-            .id;
-        let result = blocks
-            .iter()
-            .find(|b| b.kind == BlockKind::ToolResult)
-            .expect("tool result block must exist")
-            .id;
-        let error_child = blocks
-            .iter()
-            .find(|b| b.kind == BlockKind::Error)
-            .expect("a denied refusal must author an error child")
-            .id;
-
-        let ordered: Vec<_> = blocks.iter().map(|b| b.id).collect();
-        let pos = |id: &kaijutsu_types::BlockId| ordered.iter().position(|x| x == id).unwrap();
-        assert!(
-            pos(&call) < pos(&result)
-                && pos(&result) < pos(&error_child)
-                && pos(&error_child) < pos(&next),
-            "expected document order call, result, error child, next; \
-             got positions {:?}",
-            [pos(&call), pos(&result), pos(&error_child), pos(&next)]
         );
     }
 }
@@ -9179,35 +8911,32 @@ mod lifetime_tests {
                 tokio::sync::broadcast::channel(1).1
             }
         }
-        for inline in [false, true] {
-            for refused in ["result", "call", "settlement"] {
-                let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
-                let first = if inline { vec![StreamEvent::InlineToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}) }] }
-                    else { vec![StreamEvent::ToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}), signature: None }, done()] };
-                let mock = MockClient::new("").with_scripted_stream(vec![first,
-                    vec![StreamEvent::TextStart, StreamEvent::TextDelta("continued past lost result".into()), StreamEvent::TextEnd, done()]]);
-                let (kernel, context, after, call) = fixture(Some(mock)).await;
-                let calls = Arc::new(AtomicUsize::new(0));
-                let instance = InstanceId::new("count-test");
-                kernel.broker().register(Arc::new(CountingTool { id: instance.clone(), calls: calls.clone(),
-                    documents: kernel.blocks().clone(), reject_settlement: refused == "settlement" }), InstancePolicy::default()).await.unwrap();
-                kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
-                let session = kernel.turns().conversations().get_or_create(context);
-                let held = session.lock().await;
-                let mut terminal = kernel.turn_flows().subscribe("turn.*");
-                start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
-                kernel.blocks().arm_accept_fault(match refused { "call" => 1, "result" => 2, _ => 0 });
-                drop(held);
-                let event = tokio::time::timeout(Duration::from_secs(3), terminal.recv()).await.unwrap().unwrap().payload;
-                assert_eq!(calls.load(Ordering::SeqCst), usize::from(refused == "settlement"), "inline={inline} refused={refused}: must create durable pair before execution");
-                let TurnFlow::Failed { error, .. } = event else { panic!("inline={inline} refused={refused}: {event:?}") };
-                assert!(error.contains("Could not persist model output") && error.contains("injected acceptance refusal"), "{error}");
-                let blocks = kernel.blocks().block_snapshots(context).unwrap();
-                assert!(!blocks.iter().any(|block| block.status == Status::Running || block.content == "continued past lost result"));
-                assert!(!blocks.iter().any(|block| block.kind == BlockKind::ToolResult && (block.status == Status::Done || !block.is_error)), "a refused result cannot look complete or hydrate as success");
-                kernel.shutdown_runtime_worker().await.unwrap();
-                assert!(terminal.try_recv().is_none());
-            }
+        for refused in ["result", "call", "settlement"] {
+            let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
+            let first = vec![StreamEvent::ToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}), signature: None }, done()];
+            let mock = MockClient::new("").with_scripted_stream(vec![first,
+                vec![StreamEvent::TextStart, StreamEvent::TextDelta("continued past lost result".into()), StreamEvent::TextEnd, done()]]);
+            let (kernel, context, after, call) = fixture(Some(mock)).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let instance = InstanceId::new("count-test");
+            kernel.broker().register(Arc::new(CountingTool { id: instance.clone(), calls: calls.clone(),
+                documents: kernel.blocks().clone(), reject_settlement: refused == "settlement" }), InstancePolicy::default()).await.unwrap();
+            kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+            let session = kernel.turns().conversations().get_or_create(context);
+            let held = session.lock().await;
+            let mut terminal = kernel.turn_flows().subscribe("turn.*");
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+            kernel.blocks().arm_accept_fault(match refused { "call" => 1, "result" => 2, _ => 0 });
+            drop(held);
+            let event = tokio::time::timeout(Duration::from_secs(3), terminal.recv()).await.unwrap().unwrap().payload;
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(refused == "settlement"), "refused={refused}: must create durable pair before execution");
+            let TurnFlow::Failed { error, .. } = event else { panic!("refused={refused}: {event:?}") };
+            assert!(error.contains("Could not persist model output") && error.contains("injected acceptance refusal"), "{error}");
+            let blocks = kernel.blocks().block_snapshots(context).unwrap();
+            assert!(!blocks.iter().any(|block| block.status == Status::Running || block.content == "continued past lost result"));
+            assert!(!blocks.iter().any(|block| block.kind == BlockKind::ToolResult && (block.status == Status::Done || !block.is_error)), "a refused result cannot look complete or hydrate as success");
+            kernel.shutdown_runtime_worker().await.unwrap();
+            assert!(terminal.try_recv().is_none());
         }
     }
 
@@ -9231,14 +8960,17 @@ mod lifetime_tests {
                 tokio::sync::broadcast::channel(1).1
             }
         }
-        let (kernel, context, mut anchor, call) = fixture(None).await;
+        let (kernel, context, anchor, call) = fixture(None).await;
         let instance = InstanceId::new("pending-test");
         kernel.broker().register(Arc::new(PendingTool { id: instance.clone() }), InstancePolicy::default()).await.unwrap();
         kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
         let lease = kernel.turns().begin(context);
-        let result = dispatch_inline_tool_result(kernel.blocks(), context, &mut anchor, &kernel,
-            "pending", serde_json::json!({}), &call, tokio_util::sync::CancellationToken::new(),
-            &ContextInterruptState::new(), "pending-call", call.actor_id, &lease).await;
+        let id = kernel.blocks().insert_tool_call_as(context, None, Some(&anchor), "pending", serde_json::json!({}),
+            Some(TypesToolKind::Builtin), Some(call.actor_id), Some("pending-call".into()), None).unwrap();
+        lease.track_block(id);
+        let placed = place_running_result(kernel.blocks(), context, id, id, "pending-call", &lease).unwrap();
+        let result = dispatch_recorded_tool_result(kernel.blocks(), context, &kernel, "pending", &serde_json::json!({}),
+            &call, tokio_util::sync::CancellationToken::new(), &ContextInterruptState::new(), id, placed).await;
         assert!(result.is_err(), "failed ask linkage cannot acknowledge a waiting result");
         let db = kernel.blocks().db().unwrap().clone();
         let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
@@ -9248,7 +8980,7 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_and_inline_tools_preserve_the_same_shell_projection() {
+    async fn a_model_tool_call_preserves_the_shell_projection() {
         use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
             KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
         struct EnvelopeTool { id: InstanceId, tool_call: Arc<std::sync::Mutex<Option<BlockId>>> }
@@ -9272,47 +9004,37 @@ mod lifetime_tests {
                 tokio::sync::broadcast::channel(1).1
             }
         }
-        for inline in [false, true] {
-            let (kernel, context, after, call) = fixture(None).await;
-            let instance = InstanceId::new("envelope-test");
-            let tool_call = Arc::new(std::sync::Mutex::new(None));
-            kernel.broker().register(Arc::new(EnvelopeTool { id: instance.clone(), tool_call: tool_call.clone() }), InstancePolicy::default()).await.unwrap();
-            kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
-            let lease = kernel.turns().begin(context);
-            let mut anchor = after;
-            let result = if inline {
-                dispatch_inline_tool_result(kernel.blocks(), context, &mut anchor, &kernel, "envelope", serde_json::json!({}),
-                    &call, lease.interrupt().cancel.clone(), &lease.interrupt(), "envelope-call", call.actor_id, &lease).await.unwrap()
-            } else {
-                let id = kernel.blocks().insert_tool_call_as(context, None, Some(&after), "envelope", serde_json::json!({}),
-                    Some(TypesToolKind::Builtin), Some(call.actor_id), Some("envelope-call".into()), None).unwrap();
-                lease.track_block(id);
-                let placed = place_running_result(kernel.blocks(), context, id, id, "envelope-call", &lease).unwrap();
-                let (result, tail) = dispatch_recorded_tool_result(kernel.blocks(), context, &kernel, "envelope", &serde_json::json!({}),
-                    &call, lease.interrupt().cancel.clone(), &lease.interrupt(), id, placed).await.unwrap();
-                anchor = tail;
-                assert_eq!(*tool_call.lock().unwrap(), Some(id), "the broker is told which model call it answers");
-                result
-            };
-            let named = tool_call.lock().unwrap().expect("model dispatch names its call to the broker");
-            let named = kernel.blocks().get_block_snapshot(context, &named).unwrap().unwrap();
-            assert_eq!((named.kind, named.tool_name.as_deref()), (kaijutsu_types::BlockKind::ToolCall, Some("envelope")), "inline={inline}");
-            assert!(!result.is_error);
-            // The model reads the clean output with the facts rendered below
-            // it (docs/shell-envelope.md, "What a model turn reads").
-            assert_eq!(result.content, "red\n[data] {\"phase\":3}", "inline={inline}");
-            let block = kernel.blocks().get_block_snapshot(context, &anchor).unwrap().unwrap();
-            assert_eq!(block.content, "red");
-            assert_eq!(block.model_content.as_deref(), Some(result.content.as_str()), "inline={inline}");
-            let record = ShellEnvelope::from_tool_result(block.shell_envelope.as_deref().unwrap()).unwrap();
-            assert_eq!(record.data, Some(serde_json::json!({"phase": 3})));
-            assert_eq!(record.stdout, "", "the record does not store the output a second time");
-            assert_eq!(block.status, Status::Done);
-            assert!(!block.style_spans.is_empty());
-            assert!(block.provenance.is_some());
-            assert!(!block.is_error);
-            assert_eq!(lease.settle_blocks(kernel.blocks()).unwrap(), 0);
-        }
+        let (kernel, context, after, call) = fixture(None).await;
+        let instance = InstanceId::new("envelope-test");
+        let tool_call = Arc::new(std::sync::Mutex::new(None));
+        kernel.broker().register(Arc::new(EnvelopeTool { id: instance.clone(), tool_call: tool_call.clone() }), InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+        let lease = kernel.turns().begin(context);
+        let id = kernel.blocks().insert_tool_call_as(context, None, Some(&after), "envelope", serde_json::json!({}),
+            Some(TypesToolKind::Builtin), Some(call.actor_id), Some("envelope-call".into()), None).unwrap();
+        lease.track_block(id);
+        let placed = place_running_result(kernel.blocks(), context, id, id, "envelope-call", &lease).unwrap();
+        let (result, anchor) = dispatch_recorded_tool_result(kernel.blocks(), context, &kernel, "envelope", &serde_json::json!({}),
+            &call, lease.interrupt().cancel.clone(), &lease.interrupt(), id, placed).await.unwrap();
+        assert_eq!(*tool_call.lock().unwrap(), Some(id), "the broker is told which model call it answers");
+        let named = tool_call.lock().unwrap().expect("model dispatch names its call to the broker");
+        let named = kernel.blocks().get_block_snapshot(context, &named).unwrap().unwrap();
+        assert_eq!((named.kind, named.tool_name.as_deref()), (kaijutsu_types::BlockKind::ToolCall, Some("envelope")));
+        assert!(!result.is_error);
+        // The model reads the clean output with the facts rendered below
+        // it (docs/shell-envelope.md, "What a model turn reads").
+        assert_eq!(result.content, "red\n[data] {\"phase\":3}");
+        let block = kernel.blocks().get_block_snapshot(context, &anchor).unwrap().unwrap();
+        assert_eq!(block.content, "red");
+        assert_eq!(block.model_content.as_deref(), Some(result.content.as_str()));
+        let record = ShellEnvelope::from_tool_result(block.shell_envelope.as_deref().unwrap()).unwrap();
+        assert_eq!(record.data, Some(serde_json::json!({"phase": 3})));
+        assert_eq!(record.stdout, "", "the record does not store the output a second time");
+        assert_eq!(block.status, Status::Done);
+        assert!(!block.style_spans.is_empty());
+        assert!(block.provenance.is_some());
+        assert!(!block.is_error);
+        assert_eq!(lease.settle_blocks(kernel.blocks()).unwrap(), 0);
     }
 
     /// `make_pending_shell_receipt` reads the model's raw, unparsed call
@@ -9445,26 +9167,23 @@ mod lifetime_tests {
                 tokio::sync::broadcast::channel(1).1
             }
         }
-        for inline in [false, true] {
-            let events = if inline { vec![StreamEvent::InlineToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}) }] }
-            else { vec![StreamEvent::ToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}), signature: None },
-                StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None }] };
-            let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![events]))).await;
-            let cancel = Arc::new(parking_lot::Mutex::new(None));
-            let instance = InstanceId::new("panic-test");
-            kernel.broker().register(Arc::new(PanickingTool { id: instance.clone(), cancel: cancel.clone() }), InstancePolicy::default()).await.unwrap();
-            kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
-            let mut failures = kernel.turn_flows().subscribe("turn.failed");
-            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
-                call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.unwrap().unwrap();
-            let blocks = kernel.blocks().block_snapshots(context).unwrap();
-            let pair: Vec<_> = blocks.iter().filter(|b| b.tool_use_id.as_deref() == Some("call-panic")).collect();
-            assert_eq!(pair.len(), 2, "call and result are both owned: inline={inline}");
-            assert!(pair.iter().all(|b| b.status == Status::Error));
-            assert!(cancel.lock().as_ref().unwrap().is_cancelled(), "panic must stop its outstanding call");
-            assert!(kernel.shutdown_runtime_worker().await.is_err());
-        }
+        let events = vec![StreamEvent::ToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}), signature: None },
+            StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None }];
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![events]))).await;
+        let cancel = Arc::new(parking_lot::Mutex::new(None));
+        let instance = InstanceId::new("panic-test");
+        kernel.broker().register(Arc::new(PanickingTool { id: instance.clone(), cancel: cancel.clone() }), InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+        let mut failures = kernel.turn_flows().subscribe("turn.failed");
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.unwrap().unwrap();
+        let blocks = kernel.blocks().block_snapshots(context).unwrap();
+        let pair: Vec<_> = blocks.iter().filter(|b| b.tool_use_id.as_deref() == Some("call-panic")).collect();
+        assert_eq!(pair.len(), 2, "call and result are both owned");
+        assert!(pair.iter().all(|b| b.status == Status::Error));
+        assert!(cancel.lock().as_ref().unwrap().is_cancelled(), "panic must stop its outstanding call");
+        assert!(kernel.shutdown_runtime_worker().await.is_err());
     }
 
     #[tokio::test]

@@ -30,7 +30,6 @@
 pub mod alibaba;
 pub mod claude;
 pub mod chatgpt;
-pub mod codex;
 pub mod config;
 pub mod council;
 pub mod db_config;
@@ -56,19 +55,15 @@ pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, CouncilUsageExtra, GeminiUsageExtra, OpenAiCompatUsageExtra,
-    InlineToolResult, RetryDisposition, SpentUsage, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
+    RetryDisposition, SpentUsage, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
 pub use system_prompt::{CharacterIdentity, SenpaiFact, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
 pub(crate) use system_prompt::is_system_prompt_section;
 
 use serde::{Deserialize, Serialize};
-use futures::{SinkExt, StreamExt};
-use std::io;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Mock LLM client for testing — returns a canned response.
 #[cfg(any(test, feature = "test-mock"))]
@@ -696,9 +691,6 @@ pub enum Provider {
     /// lemonade / llama.cpp server, Ollama, or OpenAI itself (see
     /// `llm/openai/`). Auth is optional; the provider name is config-driven.
     OpenAi(openai::Client),
-    /// Experimental Codex app-server daemon, reached over a configured
-    /// `ws://`/`wss://` endpoint. The provider never launches Codex itself.
-    CodexApp(CodexAppClient),
     /// A council v2 server (see `llm/council/`).
     Council(council::Client),
     /// Google Gemini API (see `llm/gemini/`).
@@ -706,211 +698,6 @@ pub enum Provider {
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
-}
-
-/// Connect-only Codex app-server backend configuration.
-#[derive(Clone, Debug)]
-pub struct CodexAppClient {
-    name: String,
-    endpoint: String,
-    timeout: std::time::Duration,
-}
-
-struct CodexWsTransport {
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    timeout: std::time::Duration,
-}
-
-impl CodexWsTransport {
-    async fn connect(endpoint: &str, timeout: std::time::Duration) -> codex::Result<Self> {
-        let uri: http::Uri = endpoint.parse().map_err(|error| {
-            codex::CodexError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid Codex app-server endpoint {endpoint}: {error}"),
-            ))
-        })?;
-        // The WS upgrade is an HTTP request too — it carries the same
-        // kernel identity as every other outbound provider request.
-        let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
-            .with_header("User-Agent", http_user_agent());
-        let connected = tokio::time::timeout(timeout, connect_async(request)).await.map_err(|_| {
-            codex::CodexError::Io(io::Error::new(io::ErrorKind::TimedOut, "timed out connecting to Codex app-server"))
-        })?;
-        let (socket, _) = connected.map_err(|error| {
-            codex::CodexError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, error.to_string()))
-        })?;
-        Ok(Self { socket, timeout })
-    }
-}
-
-#[async_trait::async_trait]
-impl codex::JsonlTransport for CodexWsTransport {
-    async fn receive(&mut self) -> codex::Result<Option<serde_json::Value>> {
-        loop {
-            let message = tokio::time::timeout(self.timeout, self.socket.next())
-                .await
-                .map_err(|_| {
-                    codex::CodexError::Io(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "timed out waiting for Codex app-server",
-                    ))
-                })?;
-            match message {
-                Some(Ok(WsMessage::Text(text))) => {
-                    return Ok(Some(serde_json::from_str(text.as_ref())?));
-                }
-                Some(Ok(WsMessage::Binary(bytes))) => {
-                    return Ok(Some(serde_json::from_slice(&bytes)?));
-                }
-                Some(Ok(WsMessage::Ping(payload))) => {
-                    tokio::time::timeout(self.timeout, self.socket.send(WsMessage::Pong(payload)))
-                        .await
-                        .map_err(|_| {
-                            codex::CodexError::Io(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "timed out replying to Codex app-server ping",
-                            ))
-                        })?
-                        .map_err(|error| {
-                            codex::CodexError::Io(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                error.to_string(),
-                            ))
-                        })?;
-                }
-                Some(Ok(WsMessage::Close(_))) | None => return Ok(None),
-                Some(Ok(_)) => continue,
-                Some(Err(error)) => {
-                    return Err(codex::CodexError::Io(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        error.to_string(),
-                    )));
-                }
-            }
-        }
-    }
-
-    async fn send(&mut self, value: serde_json::Value) -> codex::Result<()> {
-        let encoded = serde_json::to_string(&value)?;
-        tokio::time::timeout(self.timeout, self.socket.send(WsMessage::Text(encoded.into())))
-            .await
-            .map_err(|_| {
-                codex::CodexError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out sending to Codex app-server",
-                ))
-            })?
-            .map_err(|error| {
-                codex::CodexError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
-            })
-    }
-
-    async fn close(&mut self) -> codex::Result<()> {
-        tokio::time::timeout(self.timeout, self.socket.close(None))
-            .await
-            .map_err(|_| {
-                codex::CodexError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out closing Codex app-server connection",
-                ))
-            })?
-            .map_err(|error| {
-            codex::CodexError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
-        })
-    }
-}
-
-pub struct CodexStream {
-    client: codex::Client<CodexWsTransport>,
-}
-
-impl CodexAppClient {
-    async fn stream(&self, opts: BuildOpts, messages: Vec<Message>) -> LlmResult<ProviderStream> {
-        let transport = CodexWsTransport::connect(&self.endpoint, self.timeout)
-            .await
-            .map_err(|error| LlmError::NetworkError(error.to_string()))?;
-        let mut client = codex::Client::new(transport);
-        let dynamic_tools = opts
-            .tools
-            .iter()
-            .map(|tool| {
-                codex::DynamicToolSpec::Function(codex::DynamicToolFunction {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    input_schema: tool.input_schema.clone(),
-                    defer_loading: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        client
-            .initialize_with_experimental_api(
-                "kaijutsu",
-                env!("CARGO_PKG_VERSION"),
-                !dynamic_tools.is_empty(),
-            )
-            .await
-            .map_err(|error| LlmError::ApiError(error.to_string()))?;
-        let thread_id = client
-            .start_thread(codex::ThreadStart {
-                model: Some(opts.model.clone()),
-                developer_instructions: opts.system.clone(),
-                sandbox: Some("read-only".to_string()),
-                approval_policy: Some("untrusted".to_string()),
-                dynamic_tools,
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| LlmError::ApiError(error.to_string()))?;
-        client
-            .start_turn(codex::TurnStart {
-                thread_id,
-                text: flatten_codex_messages(&messages),
-                model: Some(opts.model),
-                effort: opts.effort,
-            })
-            .await
-            .map_err(|error| LlmError::ApiError(error.to_string()))?;
-        Ok(ProviderStream::Codex(CodexStream { client }))
-    }
-
-}
-
-fn flatten_codex_messages(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .map(|message| {
-            let role = match message.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-            };
-            format!("[{role}] {}", flatten_codex_content(&message.content))
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-fn flatten_codex_content(content: &MessageContent) -> String {
-    match content {
-        MessageContent::Text(text) => text.clone(),
-        MessageContent::Blocks(blocks) => blocks
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => text.clone(),
-                ContentBlock::ToolUse { name, input, .. } => {
-                    format!("tool call {name}: {input}")
-                }
-                ContentBlock::ToolResult { content, is_error, .. } => {
-                    format!("tool result (error={is_error}): {content}")
-                }
-                ContentBlock::Media { hash, media_type, .. } => {
-                    format!("[media {media_type}, CAS {hash}]")
-                }
-                ContentBlock::Reasoning { text, .. } => format!("[reasoning] {text}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
 }
 
 /// Resolve a backend's API key, falling back to a placeholder when
@@ -926,16 +713,14 @@ fn resolve_key_or_placeholder(config: &BackendConfig, label: &str) -> LlmResult<
 }
 
 /// Outbound `User-Agent` for the kernel's provider HTTP requests (every
-/// dialect in this module tree: OpenAI-compatible, DeepSeek, Anthropic, and
-/// the Codex app-server's WebSocket upgrade). Providers log it, so it
-/// identifies the *product*, not the HTTP library — reqwest 0.13 sends no
-/// default UA, so without this the requests carry no UA at all. The
-/// identity deliberately matches the two other places the kernel names
-/// itself on the wire: the Codex `initialize` handshake (this file, name +
-/// version as separate JSON-RPC fields) and MCP `client_info`
-/// (`mcp::servers::external`, same two fields) — product name + this
-/// crate's version. Lives in `llm/mod.rs` rather than a provider module
-/// because it is cross-provider; each provider's client builder applies it.
+/// provider in this module tree). Providers log it, so it identifies the
+/// *product*, not the HTTP library — reqwest 0.13 sends no default UA, so
+/// without this the requests carry no UA at all. The identity matches the
+/// other place the kernel names itself on the wire: MCP `client_info`
+/// (`mcp::servers::external`, name and version as separate fields) —
+/// product name + this crate's version. Lives in `llm/mod.rs` rather than a
+/// provider module because it is cross-provider; each provider's client
+/// builder applies it.
 pub(crate) const fn http_user_agent() -> &'static str {
     concat!("kaijutsu/", env!("CARGO_PKG_VERSION"))
 }
@@ -1044,26 +829,6 @@ impl Provider {
                 }
                 Ok(Self::OpenAi(client))
             }
-            BackendKind::CodexApp => {
-                let endpoint = config.base_url.clone().ok_or_else(|| {
-                    LlmError::InvalidRequest(format!(
-                        "backend '{}' has kind 'codex-app', which requires --base-url \
-                         (ws:// or wss:// Codex app-server endpoint)",
-                        config.name
-                    ))
-                })?;
-                if !(endpoint.starts_with("ws://") || endpoint.starts_with("wss://")) {
-                    return Err(LlmError::InvalidRequest(format!(
-                        "backend '{}' codex-app endpoint must use ws:// or wss://, got {}",
-                        config.name, endpoint
-                    )));
-                }
-                Ok(Self::CodexApp(CodexAppClient {
-                    name: config.name.clone(),
-                    endpoint,
-                    timeout: resolve_request_timeout(config),
-                }))
-            }
             // No key: the service is for the tailnet.
             BackendKind::Council => {
                 let base_url = config.base_url.as_deref().ok_or_else(|| {
@@ -1119,7 +884,6 @@ impl Provider {
             Self::DeepSeek(_) => "deepseek",
             Self::Alibaba(c) => c.provider_name(),
             Self::OpenAi(c) => c.provider_name(),
-            Self::CodexApp(c) => &c.name,
             Self::Council(c) => c.provider_name(),
             Self::Gemini(c) => c.provider_name(),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1128,8 +892,7 @@ impl Provider {
     }
 
     /// The endpoint this provider takes a slot from before each request.
-    /// `None` for codex-app, which reaches a daemon rather than a model
-    /// endpoint, and for a client built without one.
+    /// `None` for a client built without one.
     pub fn endpoint(&self) -> Option<&Arc<endpoint::Endpoint>> {
         match self {
             Self::Claude(c) => c.endpoint(),
@@ -1138,7 +901,6 @@ impl Provider {
             Self::OpenAi(c) => c.endpoint(),
             Self::Council(c) => c.endpoint(),
             Self::Gemini(c) => c.endpoint(),
-            Self::CodexApp(_) => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => None,
         }
@@ -1193,13 +955,6 @@ impl Provider {
                 StreamEvent::ToolUse { name, .. } | StreamEvent::ToolUseInvalid { name, .. } => {
                     tracing::warn!(tool = %name, "a one-shot prompt offers no tools; dropping the call the model made");
                 }
-                // The provider waits for an answer the one-shot cannot give.
-                StreamEvent::InlineToolUse { name, .. } => {
-                    stream.cancel();
-                    return Err(LlmError::InvalidRequest(format!(
-                        "the model called {name} inside a one-shot prompt, which offers no tools"
-                    )).into());
-                }
                 _ => {}
             }
         }
@@ -1214,7 +969,6 @@ impl Provider {
     pub async fn media_refusal(&self, model: &str, media_type: &str) -> LlmResult<Option<String>> {
         match self {
             Self::Council(client) => client.media_refusal(model, media_type).await,
-            Self::CodexApp(_) => Ok(Some(format!("{model} on codex-app is sent no media, so it cannot read {media_type}"))),
             _ if !media_type_is_recorded(media_type) => Ok(Some(UNRECORDED_MEDIA_TYPE.to_string())),
             _ if media_type.starts_with("image/") => Ok(None),
             _ => Ok(Some(format!("{model} on provider {} reads images only, so it cannot read {media_type}", self.name()))),
@@ -1236,7 +990,6 @@ impl Provider {
             Self::OpenAi(client) => client.one_shot_opts(opts),
             Self::Council(client) => client.one_shot_opts(opts),
             Self::Gemini(client) => client.one_shot_opts(opts),
-            Self::CodexApp(_) => opts,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => opts,
         }
@@ -1298,7 +1051,6 @@ impl Provider {
                 let stream = client.stream(opts, messages).await?;
                 Ok(ProviderStream::OpenAi(stream))
             }
-            Self::CodexApp(client) => client.stream(opts, messages).await,
             Self::Council(client) => Ok(ProviderStream::Council(client.stream(opts, messages).await?)),
             Self::Gemini(client) => Ok(ProviderStream::Gemini(client.stream(opts, messages).await?)),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1384,7 +1136,7 @@ impl Provider {
             Self::Alibaba(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
             Self::Gemini(c) => c.available_models(),
-            Self::CodexApp(_) | Self::Council(_) => Vec::new(),
+            Self::Council(_) => Vec::new(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
         }
@@ -1401,8 +1153,6 @@ pub enum ProviderStream {
     /// Every OpenAI-compatible provider (DeepSeek and the generic `OpenAi`
     /// variant) streams through the one `openai::Stream`.
     OpenAi(openai::Stream),
-    /// Codex app-server's translated event stream.
-    Codex(CodexStream),
     /// A council v2 generation stream.
     Council(council::Stream),
     /// A native Google Gemini generation stream.
@@ -1431,7 +1181,6 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.next_event().await,
             Self::OpenAi(s) => s.next_event().await,
-            Self::Codex(s) => s.client.next_event().await,
             Self::Council(s) => s.next_event().await,
             Self::Gemini(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
@@ -1447,34 +1196,6 @@ impl ProviderStream {
         }
     }
 
-    /// Return the result of a provider-owned, in-flight tool request.
-    ///
-    /// Ordinary `ToolUse` calls end an LLM completion and are driven by the
-    /// server's existing agentic loop.  This narrow seam is for runtimes that
-    /// keep one turn alive while asking their client to execute a dynamic
-    /// tool.  Unsupported providers fail loudly rather than dropping a tool
-    /// result and leaving their turn hung.
-    pub async fn respond_inline_tool(
-        &mut self,
-        id: &str,
-        result: InlineToolResult,
-    ) -> Result<(), String> {
-        match self {
-            Self::Codex(s) => s
-                .client
-                .respond_inline_tool(id, result)
-                .await
-                .map_err(|error| error.to_string()),
-            Self::Claude(_) | Self::OpenAi(_) | Self::Council(_) | Self::Gemini(_) => Err(format!(
-                "provider does not support inline tool response for callback {id}"
-            )),
-            #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(_) => Err(format!(
-                "mock provider does not support inline tool response for callback {id}"
-            )),
-        }
-    }
-
     /// Abort the underlying HTTP stream.
     pub fn cancel(&self) {
         match self {
@@ -1482,9 +1203,6 @@ impl ProviderStream {
             Self::OpenAi(s) => s.cancel(),
             Self::Council(s) => s.cancel(),
             Self::Gemini(s) => s.cancel(),
-            // Phase 0 has no synchronous interrupt hook in ProviderStream;
-            // dropping the stream closes the daemon connection at turn end.
-            Self::Codex(_) => {}
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => {}
         }
@@ -2093,26 +1811,6 @@ mod tests {
             assert!(matches!(&failed.error, LlmError::CompletionError(m) if m.contains("before the provider said it was done")), "{failed}");
         }
 
-        /// A one-shot offers no tools, so a call that waits for the kernel's
-        /// answer ends the reply as an error at once, instead of holding the
-        /// request until its timeout.
-        ///
-        /// Falsified by a one-shot that keeps waiting after an inline call.
-        #[tokio::test]
-        async fn an_inline_tool_call_ends_a_one_shot_as_an_error() {
-            let mock = MockClient::new("x")
-                .with_scripted_stream(vec![vec![StreamEvent::InlineToolUse {
-                    id: "i".into(), name: "shell".into(), input: serde_json::json!({}),
-                }]])
-                .hangs_when_exhausted();
-            let reply = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                Provider::Mock(mock).prompt_with_system(opts("m"), "hi"),
-            ).await.expect("an inline call ends the one-shot");
-            let failed = reply.expect_err("an inline call fails the one-shot");
-            assert!(failed.to_string().contains("shell"), "{failed}");
-        }
-
         fn opts(model: &str) -> BuildOpts {
             BuildOpts::new(model, 64)
         }
@@ -2160,54 +1858,6 @@ mod tests {
                 assert_ne!(body["thinking"]["type"], "disabled", "an always-on model keeps its default: {body}");
             }
         }
-    }
-
-    /// The Codex app-server connection is a WebSocket, not a `reqwest`
-    /// client, but the upgrade is still an HTTP request — it must carry the
-    /// same kernel identity as the OpenAI-, DeepSeek-, and Anthropic-dialect
-    /// clients. A loopback server inspects the real upgrade request via
-    /// tungstenite's server-side handshake callback rather than trusting
-    /// the client-side request builder.
-    #[tokio::test]
-    async fn codex_ws_handshake_carries_the_kaijutsu_user_agent() {
-        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("loopback bind");
-        let port = listener.local_addr().expect("local addr").port();
-
-        let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-        let captured_in_cb = captured.clone();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                let ua = req
-                    .headers()
-                    .get("user-agent")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                *captured_in_cb.lock().expect("mutex") = ua;
-                Ok(resp)
-            };
-            tokio_tungstenite::accept_hdr_async(stream, callback)
-                .await
-                .expect("server-side handshake");
-        });
-
-        let endpoint = format!("ws://127.0.0.1:{port}/");
-        CodexWsTransport::connect(&endpoint, std::time::Duration::from_secs(5))
-            .await
-            .expect("client-side handshake");
-        server.await.expect("server task");
-
-        let ua = captured.lock().expect("mutex").clone();
-        assert_eq!(
-            ua.as_deref(),
-            Some(http_user_agent()),
-            "Codex app-server WS upgrade must carry the kaijutsu User-Agent"
-        );
     }
 
     #[test]

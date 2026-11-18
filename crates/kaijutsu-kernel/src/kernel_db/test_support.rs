@@ -177,7 +177,7 @@ pub(super) fn insert_test_preset(db: &KernelDb, label: &str) -> PresetId {
 /// SELECT` has something to carry across.
 pub(super) const BACKENDS_LEGACY_COLS: &str = "backend_id, name, kind, key_optional, created_at, created_by";
 
-pub(super) fn put_backends_back_on_its_pre_codex_shape(conn: &Connection) {
+pub(super) fn put_backends_back_on_its_kind_check_shape(conn: &Connection) {
     conn.execute_batch(
         "PRAGMA foreign_keys = OFF;
          DROP TABLE backends;

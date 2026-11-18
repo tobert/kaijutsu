@@ -54,12 +54,6 @@ pub enum BackendKind {
     /// Ollama, lemonade, llama.cpp, a proxy (`llm/openai/`). `base_url` is
     /// what distinguishes them, which is why it is required for this kind.
     OpenAi,
-    /// The Codex app-server JSONL protocol (`codex app-server --stdio`).
-    /// This is an experimental daemon backend: it has no API key and connects
-    /// to the configured WebSocket endpoint; the daemon must be launched by
-    /// an external process owner.
-    #[serde(rename = "codex-app")]
-    CodexApp,
     /// A council v2 server (gogi's `docs/council-api.md`; the nagaya serves
     /// it). It serves chat turns, gate decisions and embeddings. No key;
     /// `base_url` is the server address.
@@ -76,7 +70,7 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "codex-app", "council", "gemini"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "council", "gemini"];
 
 impl BackendKind {
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -86,7 +80,6 @@ impl BackendKind {
             Self::DeepSeek => "deepseek",
             Self::Alibaba => "alibaba",
             Self::OpenAi => "openai",
-            Self::CodexApp => "codex-app",
             Self::Council => "council",
             Self::Gemini => "gemini",
             #[cfg(any(test, feature = "test-mock"))]
@@ -103,7 +96,6 @@ impl BackendKind {
             "deepseek" => Ok(Self::DeepSeek),
             "alibaba" => Ok(Self::Alibaba),
             "openai" => Ok(Self::OpenAi),
-            "codex-app" => Ok(Self::CodexApp),
             "council" => Ok(Self::Council),
             "gemini" => Ok(Self::Gemini),
             #[cfg(any(test, feature = "test-mock"))]
@@ -126,7 +118,7 @@ impl BackendKind {
             Self::OpenAi => base_url
                 .is_some_and(crate::llm::openai::is_hosted_openai)
                 .then_some("OPENAI_API_KEY"),
-            Self::CodexApp | Self::Council => None,
+            Self::Council => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
         }
@@ -135,15 +127,15 @@ impl BackendKind {
     /// Does this kind require a `base_url`?
     ///
     /// `openai` means "some OpenAI-compatible server", `alibaba` means the
-    /// Token Plan or one workspace (different hosts, different keys),
-    /// `codex-app` means a reachable Codex app-server daemon, and `council` means a
-    /// council v2 server. Each needs the endpoint in `base_url`, because
-    /// which server is exactly the information `base_url` carries. Anthropic accepts one
+    /// Token Plan or one workspace (different hosts, different keys), and
+    /// `council` means a council v2 server. Each needs the endpoint in
+    /// `base_url`, because which server is exactly the information
+    /// `base_url` carries. Anthropic accepts one
     /// as a gateway override; DeepSeek's endpoint is fixed, so a `base_url`
     /// there is accepted-and-ignored rather than silently changing where a
     /// key goes.
     pub fn requires_base_url(&self) -> bool {
-        matches!(self, Self::OpenAi | Self::Alibaba | Self::CodexApp | Self::Council)
+        matches!(self, Self::OpenAi | Self::Alibaba | Self::Council)
     }
 }
 
@@ -202,8 +194,7 @@ pub struct BackendConfig {
     pub kind: BackendKind,
 
     /// Endpoint override. Required for [`BackendKind::OpenAi`],
-    /// [`BackendKind::Alibaba`], [`BackendKind::CodexApp`] and
-    /// [`BackendKind::Council`], optional for Anthropic (a gateway), ignored for
+    /// [`BackendKind::Alibaba`] and [`BackendKind::Council`], optional for Anthropic (a gateway), ignored for
     /// DeepSeek.
     pub base_url: Option<String>,
 
@@ -376,13 +367,6 @@ impl BackendConfig {
                 self.name
             ));
         }
-        if matches!(self.kind, BackendKind::CodexApp) && self.max_concurrent.is_some() {
-            return Err(format!(
-                "backend '{}': codex-app takes no slot, so --max-concurrent does not apply to it; \
-                 omit --max-concurrent (codex-app reaches a local Codex daemon, not a model endpoint)",
-                self.name
-            ));
-        }
         if self.max_concurrent == Some(0) {
             return Err(format!(
                 "backend '{}': --max-concurrent must be at least 1; omit it for no limit",
@@ -538,17 +522,6 @@ mod tests {
         for url in [Some(plan), Some("https://api.openai.com/v1"), None] {
             assert_eq!(BackendKind::Alibaba.standard_env_var(url), Some("ALIBABA_API_KEY"), "{url:?}");
         }
-    }
-
-    #[test]
-    fn codex_app_kind_is_local_and_keyless() {
-        let config = BackendConfig::new("codex", BackendKind::CodexApp);
-        assert_eq!(config.kind.as_str(), "codex-app");
-        assert_eq!(config.kind.standard_env_var(None), None);
-        assert!(config.kind.requires_base_url());
-        assert!(config.validate().is_err());
-        assert!(config.clone().with_base_url("ws://127.0.0.1:4500").validate().is_ok());
-        assert_eq!(config.resolve_api_key(), None);
     }
 
     #[test]

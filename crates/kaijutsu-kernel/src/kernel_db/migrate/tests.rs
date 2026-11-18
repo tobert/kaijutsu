@@ -127,14 +127,14 @@ fn retired_gate_action_tables_are_dropped_on_open() {
     assert_eq!(table_count("gate_action_argv"), 0, "gate_action_argv must be dropped");
 }
 
-/// A database carrying `backends`' pre-`codex-app` CHECK must lose it on
+/// A database carrying `backends`' legacy `kind` CHECK must lose it on
 /// the next `apply_additive_migrations` (the real "next open" path),
 /// keep the row it already had, and accept a `kind` the old CHECK
 /// rejected.
 #[test]
-fn drop_legacy_value_enum_checks_drops_the_pre_codex_backends_check_and_keeps_rows() {
+fn drop_legacy_value_enum_checks_drops_the_backends_kind_check_and_keeps_rows() {
     let db = KernelDb::temporary().unwrap();
-    put_backends_back_on_its_pre_codex_shape(&db.conn);
+    put_backends_back_on_its_kind_check_shape(&db.conn);
     let kept_id = BackendId::new();
     db.conn
         .execute(
@@ -158,14 +158,13 @@ fn drop_legacy_value_enum_checks_drops_the_pre_codex_backends_check_and_keeps_ro
     assert!(!sql.contains("CHECK (kind IN ("), "the value-enum CHECK must be gone, got: {sql}");
     assert_eq!(db.get_backend_by_name("kept").unwrap().unwrap().kind, "anthropic");
 
-    // `codex-app` is the kind whose arrival needed the CHECK widened in
-    // the first place: the fixture's constraint rejects it, and
-    // `BackendKind::parse` accepts it. Writing it here is what proves the
-    // old constraint is gone rather than merely absent from `SCHEMA`.
-    let codex = BackendRow {
+    // The fixture's constraint rejects `gemini`, and `BackendKind::parse`
+    // accepts it. Writing it here is what proves the old constraint is gone
+    // rather than merely absent from `SCHEMA`.
+    let gemini = BackendRow {
         backend_id: BackendId::new(),
-        name: "codex".into(),
-        kind: "codex-app".into(),
+        name: "gemini".into(),
+        kind: "gemini".into(),
         base_url: None,
         api_key_env: None,
         api_key_file: None,
@@ -176,9 +175,9 @@ fn drop_legacy_value_enum_checks_drops_the_pre_codex_backends_check_and_keeps_ro
         created_at: now_millis(),
         created_by: PrincipalId::system(),
     };
-    db.upsert_backend(&codex).unwrap();
-    let stored = db.get_backend_by_name("codex").unwrap().unwrap();
-    assert_eq!(stored.kind, "codex-app");
+    db.upsert_backend(&gemini).unwrap();
+    let stored = db.get_backend_by_name("gemini").unwrap().unwrap();
+    assert_eq!(stored.kind, "gemini");
     // The rebuild carries the column the additive ladder added first.
     assert_eq!(stored.max_concurrent, Some(3));
 }
@@ -194,7 +193,7 @@ fn drop_legacy_value_enum_checks_drops_the_pre_codex_backends_check_and_keeps_ro
 #[test]
 fn rebuild_table_dropping_check_is_a_true_no_op_on_its_second_call() {
     let db = KernelDb::temporary().unwrap();
-    put_backends_back_on_its_pre_codex_shape(&db.conn);
+    put_backends_back_on_its_kind_check_shape(&db.conn);
 
     let column_defs = "backend_id           BLOB NOT NULL PRIMARY KEY,
              name                 TEXT NOT NULL UNIQUE,
