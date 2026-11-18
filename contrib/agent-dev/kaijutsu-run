@@ -85,13 +85,21 @@ while :; do
 done
 ran=$(( $(date +%s) - started ))
 
+# A run that lasted the trial window passes it however it ended, a stop included.
+if [ "$ran" -ge "$trial_seconds" ] && [ -e "$bin/trial" ]; then
+  log "the set in $bin/current passed its trial"
+  rm -f "$bin/trial" "$bin/crashes"
+fi
+
 if [ "$stopping" = 1 ]; then
   log "stopped by signal after ${ran}s; the kernel exited $status"
   exit "$status"
 fi
 
 if [ "$status" = 0 ] || [ "$ran" -ge "$trial_seconds" ]; then
-  [ -e "$bin/trial" ] && log "the set in $bin/current passed its trial"
+  if [ -e "$bin/trial" ]; then
+    log "the set in $bin/current passed its trial"
+  fi
   rm -f "$bin/trial" "$bin/crashes"
   log "the kernel exited $status after ${ran}s"
   exit "$status"
