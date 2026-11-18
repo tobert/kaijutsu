@@ -1,0 +1,116 @@
+#!/bin/sh
+# Run the kernel from a binary set under kernel state, so it can be updated without a new image.
+# Usage: kaijutsu-run [kaijutsu-server arguments]   (the image's entrypoint)
+#
+# $KJ_BIN (default /var/lib/kaijutsu/bin) holds three directories of binary sets:
+#   current/   what runs. Seeded from the image's /usr/local/bin when it has no kaijutsu-server.
+#   staged/    an update. At start, a staged kaijutsu-server is promoted: current/ becomes previous/, and
+#              staged/ becomes current/ with any binary it lacks copied from the old set.
+#   previous/  the set before the last update, kept for rollback.
+# A COMMIT file in a set names its source commit; every start logs it and each binary's sha256.
+#
+# A promoted set is on trial until one run of it lasts $KJ_TRIAL_SECONDS (default 60). If it exits nonzero
+# sooner $KJ_TRIAL_CRASHES times in a row (default 3), current/ moves to failed-<time>/, previous/ becomes
+# current/, and the wrapper exits nonzero so the unit restarts on the restored set. A set off trial is never
+# rolled back: its failures are logged and the unit restarts it. SIGTERM or SIGINT stops the kernel and exits
+# with its status; a stop is never counted as a crash.
+#
+# Promotion copies kernel.db and its -wal and -shm files to previous/db/ first. Rollback does not restore them:
+# a newer binary may have migrated the database, and the operator decides whether to restore that copy.
+set -eu
+
+bin="${KJ_BIN:-/var/lib/kaijutsu/bin}"
+db_dir="${XDG_DATA_HOME:-/var/lib/kaijutsu/data}/kaijutsu/kernel"
+trial_seconds="${KJ_TRIAL_SECONDS:-60}"
+trial_crashes="${KJ_TRIAL_CRASHES:-3}"
+binaries="kaijutsu-server kaijutsu-mcp kaijutsu-acp"
+
+log() { echo "kaijutsu-run: $*" >&2; }
+
+mkdir -p "$bin"
+
+if [ ! -x "$bin/current/kaijutsu-server" ]; then
+  log "seeding $bin/current from the image (commit ${KAIJUTSU_COMMIT:-unknown})"
+  rm -rf "$bin/current.new"
+  mkdir -p "$bin/current.new"
+  for b in $binaries; do
+    [ -x "/usr/local/bin/$b" ] && cp -p "/usr/local/bin/$b" "$bin/current.new/"
+  done
+  echo "${KAIJUTSU_COMMIT:-unknown}" > "$bin/current.new/COMMIT"
+  mv "$bin/current.new" "$bin/current"
+  rm -f "$bin/trial" "$bin/crashes"
+fi
+
+if [ -x "$bin/staged/kaijutsu-server" ]; then
+  log "promoting $bin/staged (commit $(cat "$bin/staged/COMMIT" 2>/dev/null || echo unknown)); the old set goes to $bin/previous"
+  for b in $binaries; do
+    [ -e "$bin/staged/$b" ] || [ ! -x "$bin/current/$b" ] || cp -p "$bin/current/$b" "$bin/staged/"
+  done
+  rm -rf "$bin/previous"
+  mv "$bin/current" "$bin/previous"
+  mkdir -p "$bin/previous/db"
+  for f in kernel.db kernel.db-wal kernel.db-shm; do
+    [ -e "$db_dir/$f" ] && cp -p "$db_dir/$f" "$bin/previous/db/"
+  done
+  mv "$bin/staged" "$bin/current"
+  : > "$bin/trial"
+  rm -f "$bin/crashes"
+fi
+
+server="$bin/current/kaijutsu-server"
+state="settled"
+[ -e "$bin/trial" ] && state="on trial"
+log "running $server, commit $(cat "$bin/current/COMMIT" 2>/dev/null || echo unknown), $state"
+for b in $binaries; do
+  [ -x "$bin/current/$b" ] && log "  $(sha256sum "$bin/current/$b")"
+done
+
+# Programs the kernel starts find the matching bridges first.
+PATH="$bin/current:$PATH"
+export PATH
+
+stopping=0
+child=""
+trap 'stopping=1; [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || true' TERM INT
+started="$(date +%s)"
+"$server" "$@" &
+child=$!
+[ "$stopping" = 0 ] || kill -TERM "$child" 2>/dev/null || true
+
+# wait returns early when a trapped signal arrives; wait again until the kernel has exited.
+status=0
+while :; do
+  wait "$child" && status=0 || status=$?
+  kill -0 "$child" 2>/dev/null || break
+done
+ran=$(( $(date +%s) - started ))
+
+if [ "$stopping" = 1 ]; then
+  log "stopped by signal after ${ran}s; the kernel exited $status"
+  exit "$status"
+fi
+
+if [ "$status" = 0 ] || [ "$ran" -ge "$trial_seconds" ]; then
+  [ -e "$bin/trial" ] && log "the set in $bin/current passed its trial"
+  rm -f "$bin/trial" "$bin/crashes"
+  log "the kernel exited $status after ${ran}s"
+  exit "$status"
+fi
+
+crashes=$(( $(cat "$bin/crashes" 2>/dev/null || echo 0) + 1 ))
+echo "$crashes" > "$bin/crashes"
+log "CRASH: the kernel exited $status after ${ran}s ($crashes in a row under ${trial_seconds}s)"
+
+if [ -e "$bin/trial" ] && [ "$crashes" -ge "$trial_crashes" ]; then
+  if [ -x "$bin/previous/kaijutsu-server" ]; then
+    failed="$bin/failed-$(date +%Y%m%d-%H%M%S)"
+    log "ROLLBACK: the set on trial failed $crashes times; moving it to $failed and restoring $bin/previous"
+    log "ROLLBACK: the database was not restored; the copy taken at promotion is in $bin/current/db/"
+    mv "$bin/current" "$failed"
+    mv "$bin/previous" "$bin/current"
+    rm -f "$bin/trial" "$bin/crashes"
+  else
+    log "the set on trial failed $crashes times, and there is no previous set to restore"
+  fi
+fi
+exit "$status"

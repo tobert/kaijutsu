@@ -113,7 +113,7 @@ GATE
 sed -i '/^\[root\]$/,/^\]$/ s/^allow = \[$/allow = [\n  "kj context create",/' "$kernel_cfg/gate.toml"
 cat >> "$kernel_cfg/mcp.toml" <<MCP
 
-# A second opinion from another model family than the coder's (docs/container.md).
+# A second opinion from another model family than the coder's.
 [servers.kaibo]
 command = "/usr/local/bin/kaibo"
 args = ["--root", "/workspace", "--allow-path", "$repo", "--cast", "crusoe"]

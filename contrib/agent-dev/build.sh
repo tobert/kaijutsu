@@ -22,9 +22,12 @@ fi
 
 ctx="$(mktemp -d)"
 trap 'rm -rf "$ctx"' EXIT
-cp "$here/Containerfile" "$repo"/target/release/{kaijutsu-server,kaijutsu-mcp,kaijutsu-acp} "$kaibo" "$ctx/"
+cp "$here/Containerfile" "$here/packages" "$here/kaijutsu-run" "$repo"/target/release/{kaijutsu-server,kaijutsu-mcp,kaijutsu-acp} "$kaibo" "$ctx/"
 
 podman build --network=none \
+  --volume "/var/cache/pacman/pkg:/var/cache/pacman/host:ro" \
+  --volume "${XDG_CACHE_HOME:-$HOME/.cache}/homelab-arch-containers/pkg:/var/cache/pacman/prime:ro" \
+  --build-arg "BASE=${KJ_DEV_BASE:-localhost/arch-rocm:latest}" \
   --build-arg "USER_NAME=$(id -un)" \
   --build-arg "KAIJUTSU_COMMIT=$commit" \
   --tag "localhost/kaijutsu-agent-dev:$commit" \

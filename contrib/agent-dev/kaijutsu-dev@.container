@@ -1,7 +1,7 @@
 # Rootless Podman Quadlet for one project's agent development kernel. The instance name is the project:
 #   cp contrib/agent-dev/kaijutsu-dev@.container ~/.config/containers/systemd/
 #   systemctl --user daemon-reload && systemctl --user start kaijutsu-dev@nagaya
-# bootstrap.sh prepares ~/kj-dev/<project>/ first. See docs/container.md, "Agent development container".
+# bootstrap.sh prepares ~/kj-dev/<project>/ first. See docs/operating.md, "Agent development image".
 [Unit]
 Description=Kaijutsu agent development kernel for %i
 

@@ -1,0 +1,5 @@
+# Packages the agent-dev layer adds to its base, to build Kaijutsu in the container.
+# The capnpc build scripts run the capnp compiler.
+capnproto
+# The repository's .cargo/config.toml links with mold.
+mold
