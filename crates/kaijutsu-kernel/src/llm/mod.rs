@@ -33,6 +33,7 @@ pub mod chatgpt;
 pub mod config;
 pub mod council;
 pub mod db_config;
+pub mod decisions;
 pub mod deepseek;
 pub mod endpoint;
 pub mod gemini;
