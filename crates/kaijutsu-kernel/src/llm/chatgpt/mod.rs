@@ -432,6 +432,29 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
             }
         }
 
+        /// A metadata event before `response.created`, which the plan route
+        /// sends first, is not taken for a stray frame: the response streams
+        /// on that connection.
+        ///
+        /// Falsified by a second connection or a failed request.
+        #[tokio::test]
+        async fn a_metadata_event_before_the_response_is_skipped() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, seen) = serve(|_, ask| match ask {
+                Ask::Upgrade(_) => Answer::Accept,
+                Ask::Frame(_) => {
+                    let mut events = vec![json!({ "type": "codex.response.metadata", "metadata": {} })];
+                    events.extend(response("resp_1", vec![text("hi")]));
+                    Answer::Events(events)
+                }
+            })
+            .await;
+            let client = ws_client(&base, signed_in(tmp.path(), format!("{base}/token"), "tok"));
+            let events = drain(&client, opts(ContextId::new()), vec![Message::user("go")]).await;
+            assert!(matches!(events.as_slice(), [.., StreamEvent::TextEnd, StreamEvent::Done { .. }]), "{events:?}");
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+
         /// A first frame that does not start a response (a stray event left
         /// from the last one) is not read as the new response: the
         /// connection is dropped and the request sent in full on a new one.

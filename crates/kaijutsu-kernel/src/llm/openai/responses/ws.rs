@@ -236,6 +236,9 @@ async fn first_frame(socket: &mut Socket, wait: Duration) -> First {
     loop {
         match tokio::time::timeout_at(deadline, socket.next()).await {
             Err(_) => return First::TimedOut,
+            // Metadata about the request (the plan route sends
+            // `codex.response.metadata` first) precedes the response's events.
+            Ok(Some(Ok(Message::Text(text)))) if is_metadata(&text) => {}
             Ok(Some(Ok(Message::Text(text)))) => return First::Text(text.to_string()),
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => {}
             Ok(Some(Ok(Message::Binary(_)))) => return First::Lost("a binary frame".into()),
@@ -387,6 +390,14 @@ pub(crate) async fn open(
     }
     tracing::warn!(session, "the Responses WebSocket failed twice; sending over HTTP");
     Ok(Opened::Http(slot))
+}
+
+/// Whether a frame is a metadata event, which carries no part of a response.
+fn is_metadata(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("type").and_then(Value::as_str).map(|t| t.ends_with("metadata")))
+        .unwrap_or(false)
 }
 
 /// The `code` of an error event, under `error` or at the top level.
