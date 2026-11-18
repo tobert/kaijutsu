@@ -1,0 +1,8 @@
+Kaijutsu is licensed under the MIT License (LICENSE). Some files carry
+material from other projects under their own licenses:
+
+assets/defaults/council/guardian.md
+    Adapted from OpenAI Codex (codex-rs/prompts/templates/guardian/,
+    commit 5a6fb36). OpenAI Codex, Copyright 2025 OpenAI. Licensed under
+    the Apache License, Version 2.0 (LICENSES/Apache-2.0.txt); changed
+    for kaijutsu.

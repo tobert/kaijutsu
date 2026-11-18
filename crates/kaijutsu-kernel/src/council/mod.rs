@@ -11,6 +11,7 @@
 //! statements its shell case shows.
 
 pub(crate) mod gate;
+pub(crate) mod guardian;
 #[cfg(test)]
 mod gate_e2e;
 pub(crate) mod observe;
