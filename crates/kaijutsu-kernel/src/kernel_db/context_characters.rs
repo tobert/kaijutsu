@@ -438,6 +438,18 @@ impl KernelDb {
         let backend = self.get_backend(backend_id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("backend {backend_id}")))?;
         let kind = crate::llm::BackendKind::parse(&backend.kind).map_err(KernelDbError::Validation)?;
+        if !kind.runs_chat_turns() && role != crate::council::gate::GATE {
+            let fix = if subject.starts_with("slot") {
+                format!("`kj character slot set` names a chat backend for the `{role}` slot")
+            } else {
+                "`kj character model set <character> <backend>/<model>` names a chat model".to_string()
+            };
+            return Err(KernelDbError::Validation(format!(
+                "{subject} runs model {model} on backend {}, whose kind {} answers gate decisions and runs no chat \
+                 turn, so it cannot fill the `{role}` slot; {fix}, and a `gate` slot may keep {}/{model}",
+                backend.name, backend.kind, backend.name
+            )));
+        }
         let requires_limit = kind.requires_slot_output_limit();
         if max_tokens.is_none() && requires_limit {
             return Err(KernelDbError::Validation(format!(

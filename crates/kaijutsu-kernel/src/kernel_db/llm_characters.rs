@@ -136,9 +136,9 @@ fn validate_decide(decide: Option<&str>) -> KernelDbResult<()> {
 
 impl KernelDb {
     /// Insert or replace one slot of a character. The role is `distill` or
-    /// `gate`. A `gate` slot names a council server (a backend of kind `council`),
-    /// and a `distill` slot names a chat model (any other kind); anything
-    /// else refuses, naming the fix.
+    /// `gate`. A `gate` slot names a council server or a decisions backend
+    /// (kind `council` or `decisions`), and a `distill` slot names a chat
+    /// model (any kind but `decisions`); anything else refuses, naming the fix.
     pub fn set_character_slot(&self, row: &CharacterSlotRow) -> KernelDbResult<()> {
         if row.role.trim().is_empty() {
             return Err(KernelDbError::Validation("role must not be empty".into()));
@@ -149,11 +149,19 @@ impl KernelDb {
             .get_backend(row.backend_id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("backend {}", row.backend_id)))?;
         let council_server = crate::model_resolution::is_council_kind(&backend.kind);
-        if row.role == crate::council::gate::GATE && !council_server {
+        let decisions = backend.kind == crate::llm::BackendKind::Decisions.as_str();
+        if row.role == crate::council::gate::GATE && !council_server && !decisions {
             return Err(KernelDbError::Validation(format!(
-                "a `gate` slot names a council server, and backend {} is kind {}, not council; \
-                 `kj backend list` names the council backends",
+                "a `gate` slot names a council server or a decisions backend, and backend {} is kind {}, \
+                 not council or decisions; `kj backend list` names the backends and their kinds",
                 backend.name, backend.kind
+            )));
+        }
+        if row.role != crate::council::gate::GATE && decisions {
+            return Err(KernelDbError::Validation(format!(
+                "backend {} has kind decisions, which answers gate decisions and runs no chat turn, so it \
+                 cannot fill a `{}` slot; name it in a `gate` slot",
+                backend.name, row.role
             )));
         }
         if row.model.trim().is_empty() {

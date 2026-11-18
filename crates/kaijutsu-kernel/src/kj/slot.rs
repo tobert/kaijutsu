@@ -8,7 +8,7 @@
 //!
 //! A character also holds up to three **slots**: `distill`, a cheaper model
 //! that summarizes for `kj fork --compact` and `kj drift pull|merge`,
-//! `gate`, the council server (a backend of kind `council`) that judges the gate
+//! `gate`, the backend of kind `council` or `decisions` that judges the gate
 //! (`docs/council.md`, "Configuration"), and `image`, the model that reads
 //! images for the character (`docs/shadows.md`). No other role exists: the judge is
 //! a character of its own, whose model is its council server.
@@ -36,8 +36,8 @@ pub(super) enum CharacterSlotCommand {
         /// The character's name
         character: String,
         /// Role: `distill` for the model that summarizes for `kj fork
-        /// --compact` and `kj drift pull|merge`, `gate` for the council
-        /// server (a council backend) that judges the gate, or `image` for the
+        /// --compact` and `kj drift pull|merge`, `gate` for the backend
+        /// that judges the gate (kind council or decisions), or `image` for the
         /// model that reads images for the character, which `kj shadow
         /// describe` asks for a description. The character's chat model is
         /// `kj character model set`

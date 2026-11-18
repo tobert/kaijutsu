@@ -67,6 +67,10 @@ pub enum BackendKind {
     /// (`generativelanguage.googleapis.com/v1beta`); optional `base_url` for a
     /// proxy or Vertex gateway.
     Gemini,
+    /// A hosted Decisions API (`llm/decisions.rs`): state plus typed
+    /// questions in, probabilities out. It runs no chat turn and serves a
+    /// `gate` slot. `base_url` is the full endpoint, whose path names the API.
+    Decisions,
     /// Canned-response client for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock,
@@ -75,18 +79,25 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "chatgpt", "alibaba", "council", "gemini"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "chatgpt", "alibaba", "council", "gemini", "decisions"];
 
 impl BackendKind {
     /// Whether generation requests carry the slot's output limit.
     pub fn sends_output_limit(self) -> bool {
-        !matches!(self, Self::ChatGpt)
+        !matches!(self, Self::ChatGpt | Self::Decisions)
     }
 
     /// Whether a copied slot must name a limit. Council slots may serve
     /// the gate without making a generation request.
     pub(crate) fn requires_slot_output_limit(self) -> bool {
         self != Self::Council && self.sends_output_limit()
+    }
+
+    /// Whether a backend of this kind can run a chat turn. A `decisions`
+    /// backend only answers decisions, so a context's `model`, `distill`
+    /// or `image` slot may not name it.
+    pub fn runs_chat_turns(self) -> bool {
+        self != Self::Decisions
     }
 
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -99,6 +110,7 @@ impl BackendKind {
             Self::ChatGpt => "chatgpt",
             Self::Council => "council",
             Self::Gemini => "gemini",
+            Self::Decisions => "decisions",
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => "mock",
         }
@@ -116,6 +128,7 @@ impl BackendKind {
             "chatgpt" => Ok(Self::ChatGpt),
             "council" => Ok(Self::Council),
             "gemini" => Ok(Self::Gemini),
+            "decisions" => Ok(Self::Decisions),
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => Ok(Self::Mock),
             other => Err(unknown_backend_kind_message(other)),
@@ -136,6 +149,9 @@ impl BackendKind {
             Self::OpenAi => base_url
                 .is_some_and(crate::llm::openai::is_hosted_openai)
                 .then_some("OPENAI_API_KEY"),
+            Self::Decisions => base_url
+                .and_then(|url| crate::llm::decisions::Wire::for_url(url).ok())
+                .map(crate::llm::decisions::Wire::standard_env_var),
             Self::ChatGpt | Self::Council => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
@@ -146,14 +162,15 @@ impl BackendKind {
     ///
     /// `openai` means "some OpenAI-compatible server", `alibaba` means the
     /// Token Plan or one workspace (different hosts, different keys), and
-    /// `council` means a council v2 server. Each needs the endpoint in
+    /// `council` means a council v2 server, and `decisions` means one
+    /// Decisions endpoint. Each needs the endpoint in
     /// `base_url`, because which server is exactly the information
     /// `base_url` carries. Anthropic accepts one
     /// as a gateway override; DeepSeek's endpoint is fixed, so a `base_url`
     /// there is accepted-and-ignored rather than silently changing where a
     /// key goes.
     pub fn requires_base_url(&self) -> bool {
-        matches!(self, Self::OpenAi | Self::Alibaba | Self::Council)
+        matches!(self, Self::OpenAi | Self::Alibaba | Self::Council | Self::Decisions)
     }
 }
 
@@ -212,7 +229,8 @@ pub struct BackendConfig {
     pub kind: BackendKind,
 
     /// Endpoint override. Required for [`BackendKind::OpenAi`],
-    /// [`BackendKind::Alibaba`] and [`BackendKind::Council`], optional for Anthropic (a gateway), ignored for
+    /// [`BackendKind::Alibaba`], [`BackendKind::Council`] and
+    /// [`BackendKind::Decisions`], optional for Anthropic (a gateway), ignored for
     /// DeepSeek.
     pub base_url: Option<String>,
 
@@ -358,6 +376,10 @@ impl BackendConfig {
                 self.name
             ));
         }
+        if self.kind == BackendKind::Decisions {
+            crate::llm::decisions::Wire::for_url(self.base_url.as_deref().unwrap_or(""))
+                .map_err(|e| format!("backend '{}' has kind 'decisions': {e}", self.name))?;
+        }
         if self.kind.requires_base_url() && self.base_url.as_deref().unwrap_or("").trim().is_empty()
         {
             return Err(format!(
@@ -386,6 +408,7 @@ impl BackendConfig {
             crate::llm::chatgpt::credentials::check_backend_name(&self.name)
                 .map_err(|e| format!("backend '{}': {e}", self.name))?;
         }
+
         if let Some(secs) = self.request_timeout_secs
             && secs == 0
         {
@@ -561,6 +584,34 @@ mod tests {
             let err = bad.validate().unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
+    }
+
+    /// A `decisions` backend names its full Decisions endpoint, whose path
+    /// says which API it speaks, reads that API's key by default, and sends
+    /// no output limit.
+    ///
+    /// Falsified by a `decisions` row that validates with no URL or with a
+    /// chat-completions URL, or that reads another API's key.
+    #[test]
+    fn decisions_kind_names_its_endpoint_and_reads_that_apis_key() {
+        use crate::llm::decisions::{GEMINI_DECISIONS_URL, OPENROUTER_DECISIONS_URL};
+        assert_eq!(BackendKind::parse("decisions"), Ok(BackendKind::Decisions));
+        assert!(SUPPORTED_BACKEND_KINDS.contains(&"decisions"));
+        let bare = BackendConfig::new("jev", BackendKind::Decisions);
+        assert!(bare.validate().unwrap_err().contains("--base-url"));
+        let chat = bare.clone().with_base_url("https://openrouter.ai/api/v1");
+        let err = chat.validate().unwrap_err();
+        assert!(err.contains(OPENROUTER_DECISIONS_URL) && err.contains("'jev'"), "{err}");
+        assert!(bare.clone().with_base_url(OPENROUTER_DECISIONS_URL).validate().is_ok());
+        assert!(bare.clone().with_base_url(GEMINI_DECISIONS_URL).validate().is_ok());
+        let kind = BackendKind::Decisions;
+        assert_eq!(kind.standard_env_var(Some(OPENROUTER_DECISIONS_URL)), Some("OPENROUTER_API_KEY"));
+        assert_eq!(kind.standard_env_var(Some(GEMINI_DECISIONS_URL)), Some("GEMINI_API_KEY"));
+        assert_eq!(kind.standard_env_var(Some("https://openrouter.ai/api/v1")), None);
+        assert!(!kind.sends_output_limit());
+        assert!(!kind.requires_slot_output_limit());
+        assert!(!kind.runs_chat_turns());
+        assert!(BackendKind::Council.runs_chat_turns());
     }
 
     /// An `alibaba` backend names its endpoint, because the Token Plan and a
