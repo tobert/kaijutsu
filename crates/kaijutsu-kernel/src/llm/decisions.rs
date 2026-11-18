@@ -79,17 +79,23 @@ impl Wire {
     /// `/api/alpha/decisions` is OpenRouter and `/v1beta/decisions` is
     /// Gemini, on any host. Any other URL is refused, naming both.
     pub fn for_url(url: &str) -> Result<Self, String> {
-        let parsed = reqwest::Url::parse(url.trim()).map_err(|e| format!("{url} is not a URL: {e}"))?;
+        let refuse = |why: String| {
+            format!(
+                "{why}; a decisions backend's --base-url is the full endpoint, {OPENROUTER_DECISIONS_URL} \
+                 or {GEMINI_DECISIONS_URL} (another host with the same path works too)"
+            )
+        };
+        if url.trim().is_empty() {
+            return Err(refuse("it has no --base-url".into()));
+        }
+        let parsed = reqwest::Url::parse(url.trim()).map_err(|e| refuse(format!("{url} is not a URL ({e})")))?;
         let path = parsed.path().trim_end_matches('/');
         if path.ends_with("/api/alpha/decisions") {
             Ok(Self::OpenRouter)
         } else if path.ends_with("/v1beta/decisions") {
             Ok(Self::Gemini)
         } else {
-            Err(format!(
-                "{url} is not a Decisions endpoint; a decisions backend's --base-url is the full endpoint, \
-                 {OPENROUTER_DECISIONS_URL} or {GEMINI_DECISIONS_URL} (another host with the same path works too)"
-            ))
+            Err(refuse(format!("{url} is not a Decisions endpoint")))
         }
     }
 
