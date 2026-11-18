@@ -358,3 +358,16 @@ one unified contract (gogi).
 
 Reasoning and long tool outputs fold into collapsible summary lines in both UI
 and TUI, keeping conversation flow readable.
+
+## Signing in to a ChatGPT plan (November 18)
+
+OpenAI's "Sign in with ChatGPT" plan usage lets an open-source app call the
+Responses API on a Plus or Pro subscriber's plan, so the `codex-app` bridge,
+which existed to reach the plan through Codex, was deleted along with its
+inline tool seam. A `chatgpt` backend is a preset over the OpenAI client that
+speaks `/v1/responses` under the plan's narrower contract. Sign-in is
+paste-back rather than a loopback listener, so a kernel on another host needs
+no tunnel. Grants are kernel state, not config: they live in a 0700
+`credentials/` directory, not the 0644 `kernel.db`, and rotating refresh tokens
+are written before use under a per-backend lock. Kaibo's #253 was the
+template.

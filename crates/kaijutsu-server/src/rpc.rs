@@ -1015,7 +1015,7 @@ async fn initialize_kernel_models(
 ) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
     let (registry, embedding) = {
         let db = kernel_db.lock();
-        let registry = match kaijutsu_kernel::build_llm_registry(&db, kernel.endpoints()) {
+        let registry = match kaijutsu_kernel::build_llm_registry(&db, kernel.endpoints(), kernel.credentials()) {
             Ok(r) => r,
             Err(e) => {
                 log::error!(

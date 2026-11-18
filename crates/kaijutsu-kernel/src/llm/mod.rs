@@ -691,6 +691,9 @@ pub enum Provider {
     /// lemonade / llama.cpp server, Ollama, or OpenAI itself (see
     /// `llm/openai/`). Auth is optional; the provider name is config-driven.
     OpenAi(openai::Client),
+    /// OpenAI's Responses API on a signed-in ChatGPT plan (see
+    /// `llm/chatgpt/`).
+    ChatGpt(chatgpt::Client),
     /// A council v2 server (see `llm/council/`).
     Council(council::Client),
     /// Google Gemini API (see `llm/gemini/`).
@@ -760,9 +763,15 @@ impl Provider {
     /// (it labels the provider in wire logs), so a local server is finally
     /// nameable as itself.
     ///
-    /// Each anthropic, deepseek, alibaba, openai, and council client takes a slot
-    /// from its endpoint in `endpoints` before each request (`llm::endpoint`).
-    pub fn from_backend(config: &BackendConfig, endpoints: &endpoint::Endpoints) -> LlmResult<Self> {
+    /// Each anthropic, deepseek, alibaba, openai, chatgpt, and council client
+    /// takes a slot from its endpoint in `endpoints` before each request
+    /// (`llm::endpoint`). A `chatgpt` client takes its tokens from
+    /// `credentials`.
+    pub fn from_backend(
+        config: &BackendConfig,
+        endpoints: &endpoint::Endpoints,
+        credentials: &Arc<chatgpt::credentials::Credentials>,
+    ) -> LlmResult<Self> {
         let endpoint = || {
             endpoints.for_backend(config).map_err(|e| {
                 LlmError::InvalidRequest(format!("backend '{}' has no endpoint: {e}", config.name))
@@ -829,6 +838,13 @@ impl Provider {
                 }
                 Ok(Self::OpenAi(client))
             }
+            // Signed in, not keyed: a backend that is not signed in still
+            // builds, and its first request names `kj backend login`.
+            BackendKind::ChatGpt => Ok(Self::ChatGpt(
+                chatgpt::Client::new(config.name.clone(), credentials.clone())
+                    .with_request_timeout(resolve_request_timeout(config))
+                    .with_endpoint(endpoint()?),
+            )),
             // No key: the service is for the tailnet.
             BackendKind::Council => {
                 let base_url = config.base_url.as_deref().ok_or_else(|| {
@@ -884,6 +900,7 @@ impl Provider {
             Self::DeepSeek(_) => "deepseek",
             Self::Alibaba(c) => c.provider_name(),
             Self::OpenAi(c) => c.provider_name(),
+            Self::ChatGpt(c) => c.provider_name(),
             Self::Council(c) => c.provider_name(),
             Self::Gemini(c) => c.provider_name(),
             #[cfg(any(test, feature = "test-mock"))]
@@ -899,6 +916,7 @@ impl Provider {
             Self::DeepSeek(c) => c.endpoint(),
             Self::Alibaba(c) => c.endpoint(),
             Self::OpenAi(c) => c.endpoint(),
+            Self::ChatGpt(c) => c.endpoint(),
             Self::Council(c) => c.endpoint(),
             Self::Gemini(c) => c.endpoint(),
             #[cfg(any(test, feature = "test-mock"))]
@@ -988,6 +1006,7 @@ impl Provider {
             Self::DeepSeek(client) => client.one_shot_opts(opts),
             Self::Alibaba(client) => client.one_shot_opts(opts),
             Self::OpenAi(client) => client.one_shot_opts(opts),
+            Self::ChatGpt(_) => opts,
             Self::Council(client) => client.one_shot_opts(opts),
             Self::Gemini(client) => client.one_shot_opts(opts),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1051,6 +1070,7 @@ impl Provider {
                 let stream = client.stream(opts, messages).await?;
                 Ok(ProviderStream::OpenAi(stream))
             }
+            Self::ChatGpt(client) => Ok(ProviderStream::Responses(client.stream(opts, messages).await?)),
             Self::Council(client) => Ok(ProviderStream::Council(client.stream(opts, messages).await?)),
             Self::Gemini(client) => Ok(ProviderStream::Gemini(client.stream(opts, messages).await?)),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1136,7 +1156,7 @@ impl Provider {
             Self::Alibaba(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
             Self::Gemini(c) => c.available_models(),
-            Self::Council(_) => Vec::new(),
+            Self::ChatGpt(_) | Self::Council(_) => Vec::new(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
         }
@@ -1153,6 +1173,8 @@ pub enum ProviderStream {
     /// Every OpenAI-compatible provider (DeepSeek and the generic `OpenAi`
     /// variant) streams through the one `openai::Stream`.
     OpenAi(openai::Stream),
+    /// An OpenAI `/v1/responses` stream (the `chatgpt` backend).
+    Responses(openai::responses::Stream),
     /// A council v2 generation stream.
     Council(council::Stream),
     /// A native Google Gemini generation stream.
@@ -1181,6 +1203,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.next_event().await,
             Self::OpenAi(s) => s.next_event().await,
+            Self::Responses(s) => s.next_event().await,
             Self::Council(s) => s.next_event().await,
             Self::Gemini(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
@@ -1201,6 +1224,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.cancel(),
             Self::OpenAi(s) => s.cancel(),
+            Self::Responses(s) => s.cancel(),
             Self::Council(s) => s.cancel(),
             Self::Gemini(s) => s.cancel(),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1345,6 +1369,13 @@ impl LlmRegistry {
 // ============================================================================
 // Hydration: BlockSnapshot[] → Message[]
 // ============================================================================
+
+/// A credentials store for tests that build no `chatgpt` backend. It
+/// touches the disk only when a `chatgpt` client uses it.
+#[cfg(test)]
+pub(crate) fn test_credentials() -> Arc<chatgpt::credentials::Credentials> {
+    Arc::new(chatgpt::credentials::Credentials::at(std::env::temp_dir().join("kaijutsu-test-credentials-unused")))
+}
 
 /// The image bytes of a media part a provider that reads only images can
 /// send, or the marker text that stands in for the part and says why it was
@@ -2067,7 +2098,7 @@ mod tests {
             std::env::remove_var("KJ_MOCK_SCRIPT_DIR");
         }
         let config = config::BackendConfig::new("mock", config::BackendKind::Mock);
-        let provider = Provider::from_backend(&config, &endpoint::Endpoints::default()).expect("build mock provider");
+        let provider = Provider::from_backend(&config, &endpoint::Endpoints::default(), &test_credentials()).expect("build mock provider");
         let mut stream = provider
             .stream(BuildOpts::new("mock-model", 4096), vec![Message::user("go")])
             .await
@@ -2168,7 +2199,7 @@ mod tests {
     fn from_backend_missing_key_is_an_auth_error_mentioning_key() {
         let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
             .with_api_key_env("KAIJUTSU_TEST_DEFINITELY_UNSET_XYZ");
-        let err = Provider::from_backend(&config, &endpoint::Endpoints::default()).unwrap_err();
+        let err = Provider::from_backend(&config, &endpoint::Endpoints::default(), &test_credentials()).unwrap_err();
         assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
         assert!(
             err.to_string().to_lowercase().contains("key"),
@@ -2187,7 +2218,7 @@ mod tests {
         std::fs::write(&key_file, "sk-first\nsk-second\n").unwrap();
         let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
             .with_api_key_file(key_file.to_str().unwrap());
-        let err = Provider::from_backend(&config, &endpoint::Endpoints::default())
+        let err = Provider::from_backend(&config, &endpoint::Endpoints::default(), &test_credentials())
             .err()
             .expect("a bad key must not build a client");
         assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
@@ -2222,7 +2253,7 @@ mod tests {
         let config = BackendConfig::new("ollama", BackendKind::OpenAi)
             .with_base_url("http://localhost:11434/v1")
             .with_key_optional(true);
-        assert!(Provider::from_backend(&config, &endpoint::Endpoints::default()).is_ok());
+        assert!(Provider::from_backend(&config, &endpoint::Endpoints::default(), &test_credentials()).is_ok());
     }
 
     /// An `openai` backend with no `base_url` does not build: the row does
@@ -2237,7 +2268,7 @@ mod tests {
         for base_url in [None, Some("  ")] {
             let mut config = BackendConfig::new("bare", BackendKind::OpenAi).with_key_optional(true);
             config.base_url = base_url.map(str::to_string);
-            let err = Provider::from_backend(&config, &endpoint::Endpoints::default())
+            let err = Provider::from_backend(&config, &endpoint::Endpoints::default(), &test_credentials())
                 .err()
                 .unwrap_or_else(|| panic!("{base_url:?}: must not build"));
             assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("--base-url")), "{base_url:?}: {err:?}");
@@ -2255,12 +2286,12 @@ mod tests {
         let config = BackendConfig::new("alibaba-token", BackendKind::Alibaba)
             .with_base_url("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")
             .with_key_optional(true);
-        let provider = Provider::from_backend(&config, &endpoint::Endpoints::default()).unwrap();
+        let provider = Provider::from_backend(&config, &endpoint::Endpoints::default(), &test_credentials()).unwrap();
         assert!(matches!(provider, Provider::Alibaba(_)), "{provider:?}");
         assert_eq!(provider.name(), "alibaba-token");
 
         let bare = BackendConfig::new("alibaba", BackendKind::Alibaba).with_key_optional(true);
-        let err = Provider::from_backend(&bare, &endpoint::Endpoints::default()).err().expect("no URL, no client");
+        let err = Provider::from_backend(&bare, &endpoint::Endpoints::default(), &test_credentials()).err().expect("no URL, no client");
         assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("--base-url")), "{err:?}");
     }
 
@@ -2275,8 +2306,8 @@ mod tests {
         let zorak = BackendConfig::new("zorak", BackendKind::OpenAi)
             .with_base_url("http://zorak:8080/v1")
             .with_key_optional(true);
-        assert_eq!(Provider::from_backend(&gpt, &endpoint::Endpoints::default()).unwrap().name(), "gpt");
-        assert_eq!(Provider::from_backend(&zorak, &endpoint::Endpoints::default()).unwrap().name(), "zorak");
+        assert_eq!(Provider::from_backend(&gpt, &endpoint::Endpoints::default(), &test_credentials()).unwrap().name(), "gpt");
+        assert_eq!(Provider::from_backend(&zorak, &endpoint::Endpoints::default(), &test_credentials()).unwrap().name(), "zorak");
     }
 
     #[test]

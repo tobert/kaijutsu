@@ -183,6 +183,8 @@ pub struct Kernel {
     /// Each model endpoint's limit, in-flight slots, and cooldown, shared by
     /// every provider and council call (`llm/endpoint.rs`).
     endpoints: crate::llm::endpoint::Endpoints,
+    /// Signed-in model credentials; see [`Self::credentials`].
+    credentials: Arc<crate::llm::chatgpt::credentials::Credentials>,
     /// Open in-app editor sessions (`vi`/`kj vi`). The registry is
     /// kernel-owned so any peer can drive it and the app renders it. Behind a
     /// sync mutex because every editor op is synchronous — modalkit's `!Send`
@@ -493,6 +495,7 @@ impl Kernel {
             temp_cleanup: None,
             council_sync: crate::council::sync::CouncilSync::default(),
             endpoints: crate::llm::endpoint::Endpoints::default(),
+            credentials: Arc::new(crate::llm::chatgpt::credentials::Credentials::at(data_dir.join("credentials"))),
             editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions({
                 let mut sessions = crate::editor::EditorSessions::new();
                 sessions.set_register_loader(Self::register_loader(db.clone()));
@@ -1572,6 +1575,12 @@ impl Kernel {
     /// outbound model request takes a slot here first.
     pub fn endpoints(&self) -> &crate::llm::endpoint::Endpoints {
         &self.endpoints
+    }
+
+    /// Signed-in model credentials (`chatgpt` backends), kept under the
+    /// kernel's data directory.
+    pub fn credentials(&self) -> &Arc<crate::llm::chatgpt::credentials::Credentials> {
+        &self.credentials
     }
 
     /// What the council server is believed to hold for this kernel.

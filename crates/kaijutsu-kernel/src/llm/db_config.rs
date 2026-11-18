@@ -101,13 +101,17 @@ pub fn load_backends(db: &KernelDb) -> LlmResult<Vec<BackendConfig>> {
 /// Each client takes its slots from `endpoints`, the kernel's one set, whose
 /// limits this rebuild sets from the backends that built. A skipped backend
 /// sets no limit.
-pub fn build_llm_registry(db: &KernelDb, endpoints: &Endpoints) -> LlmResult<LlmRegistry> {
+pub fn build_llm_registry(
+    db: &KernelDb,
+    endpoints: &Endpoints,
+    credentials: &Arc<crate::llm::chatgpt::credentials::Credentials>,
+) -> LlmResult<LlmRegistry> {
     let backends = load_backends(db)?;
     let mut registry = LlmRegistry::new();
     let mut built = Vec::new();
 
     for backend in &backends {
-        match Provider::from_backend(backend, endpoints) {
+        match Provider::from_backend(backend, endpoints, credentials) {
             Ok(provider) => {
                 built.push(backend.clone());
                 tracing::info!(
@@ -267,7 +271,7 @@ mod tests {
             .unwrap();
         }
         let endpoints = Endpoints::default();
-        let registry = build_llm_registry(&db, &endpoints).unwrap();
+        let registry = build_llm_registry(&db, &endpoints, &crate::llm::test_credentials()).unwrap();
         assert!(registry.get("broken").is_none(), "the anthropic row has no key");
         let status = endpoints.get("http://nagaya:8091").status();
         assert_eq!(status.limit, None);
@@ -281,7 +285,7 @@ mod tests {
         let db = KernelDb::temporary().unwrap();
         assert!(db.list_backends().unwrap().is_empty());
         assert!(db.list_model_aliases().unwrap().is_empty());
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
+        let registry = build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap();
         assert!(registry.list().is_empty());
     }
 
@@ -291,7 +295,7 @@ mod tests {
         // `ollama`, which the old TOML could only express by making the
         // provider-type string be the name.
         let db = seeded_db();
-        let registry = build_llm_registry(&db, &Endpoints::default()).expect("registry builds");
+        let registry = build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).expect("registry builds");
         let mut names = registry.list();
         names.sort();
         assert!(names.contains(&"ollama"), "names: {names:?}");
@@ -316,7 +320,7 @@ mod tests {
     #[test]
     fn context_windows_come_from_the_db() {
         let db = seeded_db();
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
+        let registry = build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap();
         assert_eq!(
             registry.context_window_for("anthropic", "claude-opus-4-8"),
             Some(1_000_000)
@@ -335,7 +339,7 @@ mod tests {
         let db = seeded_db();
         alias(&db, "opus", "anthropic", "claude-opus-5");
         alias(&db, "local", "ollama", "gemma4:31b");
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
+        let registry = build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap();
         assert_eq!(registry.resolve_alias("opus"), Some(("anthropic", "claude-opus-5")));
         assert_eq!(registry.resolve_alias("local"), Some(("ollama", "gemma4:31b")));
     }
@@ -346,7 +350,7 @@ mod tests {
         // only ever fail to find a row that provably exists.
         let db = seeded_db();
         alias(&db, "opus", "anthropic", "claude-opus-5");
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
+        let registry = build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap();
         assert!(registry.resolve_alias("OPUS").is_some());
         assert!(registry.resolve_alias("Opus").is_some());
     }
@@ -377,7 +381,7 @@ mod tests {
         .unwrap();
         // Under cfg(test) 'mock' parses, so the registry builds. What we pin
         // here is that an unparseable kind never reaches the table at all.
-        assert!(build_llm_registry(&db, &Endpoints::default()).is_ok());
+        assert!(build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).is_ok());
         let err = db
             .upsert_backend(&crate::kernel_db::BackendRow {
                 backend_id: BackendId::new(),
@@ -482,12 +486,12 @@ mod tests {
         // change without any process restart.
         let db = seeded_db();
         alias(&db, "fast", "anthropic", "claude-haiku-4-5");
-        let before = build_llm_registry(&db, &Endpoints::default()).unwrap();
+        let before = build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap();
         assert_eq!(before.resolve_alias("fast").map(|(b, _)| b), Some("anthropic"));
 
         alias(&db, "fast", "ollama", "qwen3.5:9b-bf16");
 
-        let after = build_llm_registry(&db, &Endpoints::default()).unwrap();
+        let after = build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap();
         assert_eq!(
             after.resolve_alias("fast"),
             Some(("ollama", "qwen3.5:9b-bf16"))
@@ -499,7 +503,7 @@ mod tests {
         let db = seeded_db();
         let gpt = db.get_backend_by_name("gpt").unwrap().unwrap();
         assert_eq!(
-            build_llm_registry(&db, &Endpoints::default()).unwrap().context_window_for("gpt", "gpt-5.6-terra"),
+            build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap().context_window_for("gpt", "gpt-5.6-terra"),
             None
         );
         db.set_backend_model(&BackendModelRow {
@@ -511,7 +515,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            build_llm_registry(&db, &Endpoints::default()).unwrap().context_window_for("gpt", "gpt-5.6-terra"),
+            build_llm_registry(&db, &Endpoints::default(), &crate::llm::test_credentials()).unwrap().context_window_for("gpt", "gpt-5.6-terra"),
             Some(400_000)
         );
     }

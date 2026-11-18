@@ -54,6 +54,11 @@ pub enum BackendKind {
     /// Ollama, lemonade, llama.cpp, a proxy (`llm/openai/`). `base_url` is
     /// what distinguishes them, which is why it is required for this kind.
     OpenAi,
+    /// OpenAI's Responses API on a signed-in ChatGPT plan (`llm/chatgpt/`).
+    /// No key and no `base_url`: `kj backend login <name>` signs it in, and
+    /// its tokens go only to api.openai.com.
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
     /// A council v2 server (gogi's `docs/council-api.md`; the nagaya serves
     /// it). It serves chat turns, gate decisions and embeddings. No key;
     /// `base_url` is the server address.
@@ -70,7 +75,7 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "council", "gemini"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "chatgpt", "alibaba", "council", "gemini"];
 
 impl BackendKind {
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -80,6 +85,7 @@ impl BackendKind {
             Self::DeepSeek => "deepseek",
             Self::Alibaba => "alibaba",
             Self::OpenAi => "openai",
+            Self::ChatGpt => "chatgpt",
             Self::Council => "council",
             Self::Gemini => "gemini",
             #[cfg(any(test, feature = "test-mock"))]
@@ -96,6 +102,7 @@ impl BackendKind {
             "deepseek" => Ok(Self::DeepSeek),
             "alibaba" => Ok(Self::Alibaba),
             "openai" => Ok(Self::OpenAi),
+            "chatgpt" => Ok(Self::ChatGpt),
             "council" => Ok(Self::Council),
             "gemini" => Ok(Self::Gemini),
             #[cfg(any(test, feature = "test-mock"))]
@@ -118,7 +125,7 @@ impl BackendKind {
             Self::OpenAi => base_url
                 .is_some_and(crate::llm::openai::is_hosted_openai)
                 .then_some("OPENAI_API_KEY"),
-            Self::Council => None,
+            Self::ChatGpt | Self::Council => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
         }
@@ -344,12 +351,29 @@ impl BackendConfig {
         {
             return Err(format!(
                 "backend '{}' has kind '{}', which needs --base-url \
-                 (e.g. https://api.openai.com/v1, http://localhost:11434/v1, or \
-                 ws://127.0.0.1:4500) — the kind says which protocol, the URL \
-                 says which endpoint",
+                 (e.g. https://api.openai.com/v1 or http://localhost:11434/v1) — \
+                 the kind says which protocol, the URL says which endpoint",
                 self.name,
                 self.kind.as_str(),
             ));
+        }
+        if self.kind == BackendKind::ChatGpt {
+            if self.base_url.is_some() {
+                return Err(format!(
+                    "backend '{}' has kind 'chatgpt', which takes no --base-url: \
+                     its signed-in tokens go only to api.openai.com",
+                    self.name
+                ));
+            }
+            if self.api_key_env.is_some() || self.api_key_file.is_some() {
+                return Err(format!(
+                    "backend '{}' has kind 'chatgpt', which takes no API key: \
+                     sign it in with `kj backend login {}`",
+                    self.name, self.name
+                ));
+            }
+            crate::llm::chatgpt::credentials::check_backend_name(&self.name)
+                .map_err(|e| format!("backend '{}': {e}", self.name))?;
         }
         if let Some(secs) = self.request_timeout_secs
             && secs == 0
@@ -502,6 +526,30 @@ mod tests {
         // The other kinds have real endpoints of their own.
         assert!(BackendConfig::new("anthropic", BackendKind::Anthropic).validate().is_ok());
         assert!(BackendConfig::new("deepseek", BackendKind::DeepSeek).validate().is_ok());
+    }
+
+    /// A `chatgpt` backend signs in instead of carrying a key, and its
+    /// tokens go only to api.openai.com: it takes no key source and no
+    /// `base_url`, and its name must also name a credentials file.
+    ///
+    /// Falsified by a `chatgpt` row that validates with a key source or a
+    /// URL, or by one that reads `OPENAI_API_KEY`.
+    #[test]
+    fn chatgpt_kind_signs_in_and_names_no_endpoint() {
+        assert_eq!(BackendKind::parse("chatgpt"), Ok(BackendKind::ChatGpt));
+        assert!(SUPPORTED_BACKEND_KINDS.contains(&"chatgpt"));
+        assert_eq!(BackendKind::ChatGpt.standard_env_var(Some("https://api.openai.com/v1")), None);
+        let plain = BackendConfig::new("gpt-plan", BackendKind::ChatGpt);
+        assert!(plain.validate().is_ok());
+        for (bad, needle) in [
+            (plain.clone().with_base_url("https://api.openai.com/v1"), "--base-url"),
+            (plain.clone().with_api_key_env("OPENAI_API_KEY"), "key"),
+            (plain.clone().with_api_key_file("/k"), "key"),
+            (BackendConfig::new("gpt plan", BackendKind::ChatGpt), "letters"),
+        ] {
+            let err = bad.validate().unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
     }
 
     /// An `alibaba` backend names its endpoint, because the Token Plan and a

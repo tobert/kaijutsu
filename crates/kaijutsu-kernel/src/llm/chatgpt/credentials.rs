@@ -41,6 +41,21 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Refuse a backend name that cannot name a credentials file.
+pub fn check_backend_name(backend: &str) -> Result<(), String> {
+    let safe = !backend.is_empty()
+        && !backend.starts_with('.')
+        && backend.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if safe {
+        Ok(())
+    } else {
+        Err(format!(
+            "a chatgpt backend's name must use letters, digits, '-', '_' or '.' (not leading), \
+             because it names its credentials file; {backend:?} does not"
+        ))
+    }
+}
+
 /// One backend's sign-in.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Grant {
@@ -111,15 +126,7 @@ impl Credentials {
     }
 
     fn grant_path(&self, backend: &str) -> Result<PathBuf, String> {
-        let safe = !backend.is_empty()
-            && !backend.starts_with('.')
-            && backend.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        if !safe {
-            return Err(format!(
-                "backend name {backend:?} cannot name a credentials file; \
-                 use letters, digits, '-', '_' or '.' (not leading)"
-            ));
-        }
+        check_backend_name(backend)?;
         Ok(self.dir.join(format!("{backend}.chatgpt.json")))
     }
 
@@ -212,7 +219,7 @@ impl Credentials {
     pub fn begin_sign_in(&self, backend: &str) -> Result<String, String> {
         let known = self.grant(backend)?.map(|g| g.client_id);
         let host_id = self.host_id()?;
-        let attempt = Attempt::new();
+        let attempt = Attempt::fresh();
         let url = oauth::authorize_url(&self.issuer, &attempt, known.as_deref(), &host_id);
         self.pending.lock().insert(backend.to_string(), Pending { attempt, started: Instant::now() });
         Ok(url)

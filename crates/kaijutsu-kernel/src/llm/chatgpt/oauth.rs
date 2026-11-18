@@ -86,7 +86,8 @@ pub fn code_challenge(verifier: &str) -> String {
 }
 
 impl Attempt {
-    pub fn new() -> Self {
+    /// A fresh attempt with new random secrets.
+    pub fn fresh() -> Self {
         Self { verifier: random_token(), state: random_token(), nonce: random_token() }
     }
 }
@@ -389,7 +390,7 @@ pub(crate) mod tests {
     #[test]
     fn the_authorize_url_registers_once() {
         let issuer = Issuer::openai();
-        let attempt = Attempt::new();
+        let attempt = Attempt::fresh();
         let first = url::Url::parse(&authorize_url(&issuer, &attempt, None, "urn:uuid:h")).unwrap();
         let q: std::collections::HashMap<_, _> = first.query_pairs().into_owned().collect();
         assert_eq!(q["client_id"], BOOTSTRAP_CLIENT_ID);
@@ -407,7 +408,7 @@ pub(crate) mod tests {
     /// full address and a bare query both work.
     #[test]
     fn a_callback_is_checked_state_first() {
-        let attempt = Attempt::new();
+        let attempt = Attempt::fresh();
         let s = &attempt.state;
         let good = check_callback(&attempt, &format!("{REDIRECT_URI}?code=c1&state={s}&client_id=oaiapp_1"), None).unwrap();
         assert_eq!(good, CallbackCode { code: "c1".into(), client_id: Some("oaiapp_1".into()) });

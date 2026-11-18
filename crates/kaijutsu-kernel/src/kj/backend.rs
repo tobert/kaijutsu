@@ -2,7 +2,7 @@
 //!
 //! A **backend** is one configured endpoint: a free-form unique `name` (the
 //! handle you type) plus a closed `kind` (`anthropic` | `deepseek` | `openai` |
-//! `alibaba` | `council` | `gemini`) that picks which client speaks for it. That split is the point of this
+//! `chatgpt` | `alibaba` | `council` | `gemini`) that picks which client speaks for it. That split is the point of this
 //! renovation — the demolished `models.toml` made the `[providers.<name>]`
 //! table name BE the provider type, so two Anthropic gateways were
 //! inexpressible and a local server had to be called `ollama`/`lemonade`/
@@ -11,7 +11,8 @@
 //! Rows live in `kernel_db` (`backends`, `backend_models`).
 //! There is no TOML in this path and no host file to edit. **No key material
 //! is ever stored** — only an env-var NAME (`--api-key-env`) or a file path
-//! (`--api-key-file`).
+//! (`--api-key-file`). A `chatgpt` backend has no key: `kj backend login`
+//! signs it in, and its tokens live in the kernel's credentials directory.
 //!
 //! Every mutation ends with [`KjDispatcher::reload_llm_registry`], so a
 //! backend change takes effect on the next turn with no kernel restart.
@@ -55,7 +56,9 @@ enum BackendCommand {
     Set {
         /// Backend name — free-form, unique (e.g. anthropic, gpt, zorak)
         name: String,
-        /// Wire dialect: anthropic | deepseek | openai | alibaba | council | gemini.
+        /// Wire dialect: anthropic | deepseek | openai | chatgpt | alibaba | council | gemini.
+        /// chatgpt is OpenAI's Responses API on a ChatGPT Plus or Pro plan; it
+        /// takes no key and no --base-url, and `kj backend login` signs it in.
         /// alibaba is Alibaba Model Studio; its key defaults to
         /// ALIBABA_API_KEY. council is a council v2 server, such as a nagaya,
         /// which serves chat turns, gate decisions and embeddings. gemini is
@@ -97,6 +100,25 @@ enum BackendCommand {
         /// Unset is unlimited.
         #[arg(long = "max-concurrent")]
         max_concurrent: Option<u32>,
+    },
+    /// Sign a chatgpt backend in to a ChatGPT plan.
+    ///
+    /// Without --callback, prints an address to open in any browser. After
+    /// you approve, the browser goes to http://127.0.0.1:1455/auth/callback,
+    /// which fails to load; that is expected. Copy that whole address and run
+    /// this again with --callback '<address>' within 15 minutes. Plan usage
+    /// needs a ChatGPT Plus or Pro subscription.
+    Login {
+        /// Backend name (kind chatgpt)
+        name: String,
+        /// The address the browser ended on after you approved
+        #[arg(long)]
+        callback: Option<String>,
+    },
+    /// Remove a chatgpt backend's sign-in. The backend row stays.
+    Logout {
+        /// Backend name
+        name: String,
     },
     /// Remove a backend. Refused while a character slot, a context's slot, or an
     /// alias still names it.
@@ -264,6 +286,9 @@ impl KjDispatcher {
         // protect (it used to gate `kj config set models.toml`); list/show stay
         // ungated, discovery is not escalation.
         let mutating = !matches!(parsed.command, BackendCommand::List | BackendCommand::Show { .. });
+        // A sign-in changes no backend row, so it reloads nothing.
+        let reloads = mutating
+            && !matches!(parsed.command, BackendCommand::Login { .. } | BackendCommand::Logout { .. });
         if mutating
             && let Err(denied) =
                 self.require_cap(caller, crate::mcp::Capability::ConfigWrite, "backend")
@@ -303,11 +328,13 @@ impl KjDispatcher {
                     caller,
                 )
             }
+            BackendCommand::Login { name, callback } => self.backend_login(&name, callback.as_deref()).await,
+            BackendCommand::Logout { name } => self.backend_logout(&name),
             BackendCommand::Remove { name } => self.backend_remove(&name),
             BackendCommand::Model(cmd) => self.backend_model(cmd),
         };
 
-        if mutating && matches!(result, KjResult::Ok { .. }) {
+        if reloads && matches!(result, KjResult::Ok { .. }) {
             // Live reload: the registry is a snapshot, so a write is only real
             // once it's swapped in. A failure here is loud — a silent one
             // would leave the operator's change invisible until a restart,
@@ -327,7 +354,14 @@ impl KjDispatcher {
             if let Some(name) = &newly_set_backend {
                 let registered = self.kernel().llm().read().await.get(name).is_some();
                 if let KjResult::Ok { message, .. } = &mut result {
-                    if registered {
+                    let signed_out = registered
+                        && self.kernel().llm().read().await.backend_config(name).is_some_and(|b| b.kind == BackendKind::ChatGpt)
+                        && matches!(self.kernel().credentials().grant(name), Ok(None));
+                    if signed_out {
+                        message.push_str(&format!(
+                            " — registered; sign it in with `kj backend login {name}` before its first turn"
+                        ));
+                    } else if registered {
                         message.push_str(" — registered and live");
                     } else {
                         message.push_str(
@@ -393,6 +427,60 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), names)
     }
 
+    /// The named backend, refused unless it is a `chatgpt` backend.
+    fn chatgpt_backend(&self, verb: &str, name: &str) -> Result<(), String> {
+        let row = self
+            .kernel_db()
+            .lock()
+            .get_backend_by_name(name)
+            .map_err(|e| format!("kj backend {verb}: {e}"))?
+            .ok_or_else(|| format!("kj backend {verb}: '{name}' not found"))?;
+        if row.kind != BackendKind::ChatGpt.as_str() {
+            return Err(format!(
+                "kj backend {verb}: '{name}' has kind '{}'; only a backend of kind 'chatgpt' signs in \
+                 (`kj backend set <name> --kind chatgpt`)",
+                row.kind
+            ));
+        }
+        Ok(())
+    }
+
+    async fn backend_login(&self, name: &str, callback: Option<&str>) -> KjResult {
+        if let Err(e) = self.chatgpt_backend("login", name) {
+            return KjResult::Err(e);
+        }
+        let credentials = self.kernel().credentials();
+        let Some(callback) = callback else {
+            return match credentials.begin_sign_in(name) {
+                Ok(url) => KjResult::ok(format!(
+                    "Open this address in a browser and approve the sign-in:\n\n{url}\n\n\
+                     The browser then goes to http://127.0.0.1:1455/auth/callback?... and fails to load; \
+                     that is expected. Copy that whole address and run, within 15 minutes:\n\n  \
+                     kj backend login {name} --callback '<address>'"
+                )),
+                Err(e) => KjResult::Err(format!("kj backend login: {e}")),
+            };
+        };
+        match credentials.finish_sign_in(name, callback).await {
+            Ok(grant) => KjResult::ok(format!(
+                "{name} is signed in{}; requests now use the ChatGPT plan's usage",
+                grant.account.map(|a| format!(" as {a}")).unwrap_or_default()
+            )),
+            Err(e) => KjResult::Err(format!("kj backend login: {e}")),
+        }
+    }
+
+    fn backend_logout(&self, name: &str) -> KjResult {
+        if let Err(e) = self.chatgpt_backend("logout", name) {
+            return KjResult::Err(e);
+        }
+        match self.kernel().credentials().remove(name) {
+            Ok(true) => KjResult::ok(format!("{name} is signed out")),
+            Ok(false) => KjResult::ok(format!("{name} was not signed in")),
+            Err(e) => KjResult::Err(format!("kj backend logout: {e}")),
+        }
+    }
+
     fn backend_show(&self, name: &str) -> KjResult {
         let db = self.kernel_db().lock();
         let backend = match db.get_backend_by_name(name) {
@@ -441,6 +529,20 @@ impl KjDispatcher {
             None => lines.push("Key env: (none)".to_string()),
         }
         lines.push(format!("Key optional: {}", backend.key_optional));
+        if backend.kind == BackendKind::ChatGpt.as_str() {
+            lines.push(match self.kernel().credentials().grant(&backend.name) {
+                Ok(Some(grant)) => {
+                    let left = grant.expires_at - crate::llm::chatgpt::credentials::now();
+                    format!(
+                        "Sign-in: {} (access token {}; refreshed as needed)",
+                        grant.account.as_deref().unwrap_or("signed in"),
+                        if left > 0 { format!("expires in {}m", left / 60) } else { "expired".to_string() },
+                    )
+                }
+                Ok(None) => format!("Sign-in: none; run `kj backend login {}`", backend.name),
+                Err(e) => format!("Sign-in: unreadable ({e})"),
+            });
+        }
         if let Some(t) = backend.request_timeout_secs {
             lines.push(format!("Request timeout: {t}s"));
         }
@@ -659,7 +761,7 @@ impl KjDispatcher {
     pub(crate) async fn reload_llm_registry(&self) -> Result<(), String> {
         let registry = {
             let db = self.kernel_db().lock();
-            crate::llm::build_llm_registry(&db, self.kernel().endpoints()).map_err(|e| e.to_string())?
+            crate::llm::build_llm_registry(&db, self.kernel().endpoints(), self.kernel().credentials()).map_err(|e| e.to_string())?
         };
         *self.kernel().llm().write().await = registry;
         Ok(())
@@ -710,7 +812,7 @@ impl Classify for BackendCommand {
     fn effect(&self) -> Effect {
         match self {
             Self::List | Self::Show { .. } => Effect::Read,
-            Self::Set { .. } | Self::Remove { .. } => Effect::Write,
+            Self::Set { .. } | Self::Remove { .. } | Self::Login { .. } | Self::Logout { .. } => Effect::Write,
             Self::Model(cmd) => cmd.effect(),
         }
     }
@@ -939,6 +1041,52 @@ mod tests {
             d.kernel().llm().read().await.get("anthropic-broken").is_none(),
             "a backend with no resolvable key must not be registered"
         );
+    }
+
+    /// `kj backend login` signs a `chatgpt` backend in by paste-back: the
+    /// first call prints the address to open, a callback from another attempt
+    /// is refused, and `logout` clears the waiting sign-in. A keyed backend
+    /// cannot sign in.
+    ///
+    /// Falsified by a login URL that does not register a client, a callback
+    /// accepted without its attempt's state, or login on an `openai` backend.
+    #[tokio::test]
+    async fn login_signs_a_chatgpt_backend_in_by_paste_back() {
+        let d = seeded().await;
+        let c = test_caller();
+        let set = d.dispatch(&argv(&["backend", "set", "gpt-plan", "--kind", "chatgpt"]), &c).await;
+        assert!(matches!(&set, KjResult::Ok { message, .. } if message.contains("kj backend login gpt-plan")), "{set:?}");
+        assert!(d.kernel().llm().read().await.get("gpt-plan").is_some(), "a chatgpt backend registers before sign-in");
+
+        let message = match d.dispatch(&argv(&["backend", "login", "gpt-plan"]), &c).await {
+            KjResult::Ok { message, .. } => message,
+            other => panic!("expected the sign-in address: {other:?}"),
+        };
+        assert!(message.contains("https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client"), "{message}");
+        assert!(message.contains("--callback"), "the output says how to finish: {message}");
+
+        let stray = "http://127.0.0.1:1455/auth/callback?code=c&state=not-this-one";
+        match d.dispatch(&argv(&["backend", "login", "gpt-plan", "--callback", stray]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("state does not match"), "{m}"),
+            other => panic!("a stray callback must be refused: {other:?}"),
+        }
+
+        match d.dispatch(&argv(&["backend", "show", "gpt-plan"]), &c).await {
+            KjResult::Ok { message, .. } => assert!(message.contains("Sign-in: none"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+
+        let out = d.dispatch(&argv(&["backend", "logout", "gpt-plan"]), &c).await;
+        assert!(matches!(&out, KjResult::Ok { message, .. } if message.contains("was not signed in")), "{out:?}");
+        match d.dispatch(&argv(&["backend", "login", "gpt-plan", "--callback", stray]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("no sign-in is waiting"), "{m}"),
+            other => panic!("logout clears the waiting sign-in: {other:?}"),
+        }
+
+        match d.dispatch(&argv(&["backend", "login", "ollama"]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("kind 'chatgpt'"), "{m}"),
+            other => panic!("a keyed backend cannot sign in: {other:?}"),
+        }
     }
 
     /// A model is written `<backend>/<model>` and split at the first `/`, so

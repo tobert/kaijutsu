@@ -117,6 +117,14 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Archive and promote do not resync the watcher.**
 - **A draft submit in the `llm_stream` fixture never completes its turn.**
 
+## ChatGPT plan backend (2026-11-18)
+
+- **Live validation.** The `/v1/responses` event stream, the `subscription_sharing_*` error shapes, and whether the plan route accepts `include: ["reasoning.encrypted_content"]` and replayed reasoning items under `store: false` are checked only against fixtures. Capture a live stream for the fixture tests.
+- **Model discovery.** `GET /v1/models` with a plan token answers `{models: [{slug, visibility, supported_in_api}]}` (kaibo found this live); nothing in kaijutsu reads it, so model names come from config.
+- **Pasted callback in history.** `kj backend login <name> --callback '<address>'` puts the single-use authorization code in the shell block. The kernel exchanges it at once, so a recorded code cannot be replayed, but it still appears in the context's history.
+- **Prompt cache key.** Requests send no `prompt_cache_key`; kaibo sends one per backend.
+- **Failing kj tests on main.** `kj::reflect::tests::every_live_leaf_classifies` (`kj audio render` needs `<SOURCES>`) and `kj::db::tests::db_backup_help_documents_the_no_restore_verb_stance` (the `backup` long help lost its no-restore text) fail independent of this work.
+
 ## Council house rules, objects, and verbs (2026-11-08)
 
 - **Council house rules deadline.** An edited `AGENTS.md` reaches the council at the next decision, not at rotation.

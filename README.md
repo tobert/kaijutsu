@@ -118,10 +118,17 @@ kj backend set anthropic --kind anthropic --api-key-env ANTHROPIC_API_KEY --api-
 
 # An OpenAI-compatible local server that takes no key
 kj backend set ollama --kind openai --base-url http://localhost:11434/v1 --key-optional
+
+# OpenAI models on a ChatGPT Plus or Pro plan, signed in rather than keyed
+kj backend set gpt-plan --kind chatgpt
+kj backend login gpt-plan                          # prints an address to open
+kj backend login gpt-plan --callback '<address>'   # the address the browser ends on
 ```
 
 The kernel reads an API key from the variable or the file the row names; it
-never stores the key. `kj backend --help` lists every flag.
+never stores the key. A `chatgpt` backend has no key: its sign-in tokens live
+in `credentials/` under the kernel's data directory, at mode 0700, and refresh
+as needed. `kj backend --help` lists every flag.
 
 ## Code Style
 
