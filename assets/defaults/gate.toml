@@ -87,6 +87,15 @@
 #   enabled = true
 #   contexts = ["council-amy", "council-banto"]  # replaces the shared contexts for this directory; spec contexts still join
 
+# Optional shared policy for any judge. Without this table, model judges
+# use bumper with a limit of 3 and a 3-bump streak within 30 minutes;
+# Council v2 defaults to gatekeeper.
+#
+#   [judge]
+#   mode = "bumper"                         # gatekeeper | bumper | bump-only
+#   bump_limit = 3                          # omit in bump-only mode
+#   escalate = { bumps = 3, minutes = 30 }   # omit to disable streak escalation
+
 # Guardian: a chat model that judges what the tiers above escalate, by the
 # policy in /config/kernel/council/guardian.md. It is off. A context is judged
 # by the guardian when its `gate` slot names a chat backend (`kj character

@@ -11,12 +11,9 @@
 //! guardian.
 //!
 //! The decisions judge ([`super::decisions_judge`]) reads the same evidence
-//! ([`evidence`]) and shares the breaker: a context whose model judge denies
-//! 3 submissions in a row, or 10 of its last 50, is no longer judged, and
-//! each later submission is a miss naming the [`Breaker`], so it asks the
-//! senpai.
+//! ([`evidence`]). Both use the gate's durable bump history.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Role, Status};
 use serde::Deserialize;
@@ -163,67 +160,6 @@ impl Assessment {
     }
 }
 
-/// Denials in a row that stop the guardian judging a context.
-pub(crate) const MAX_CONSECUTIVE_DENIALS: u32 = 3;
-/// Denials among the last [`DENIAL_WINDOW`] answers that stop it.
-pub(crate) const MAX_RECENT_DENIALS: usize = 10;
-pub(crate) const DENIAL_WINDOW: usize = 50;
-
-/// One context's guardian answers, for the circuit breaker: once it trips,
-/// the guardian judges nothing more in that context until the kernel
-/// restarts, and each submission asks the senpai.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Breaker {
-    consecutive: u32,
-    recent: VecDeque<bool>,
-    tripped: Option<String>,
-}
-
-impl Breaker {
-    /// Count one answer. Returns the cause when this answer trips the
-    /// breaker.
-    pub(crate) fn record(&mut self, verdict: Verdict) -> Option<String> {
-        let denied = verdict == Verdict::Deny;
-        self.consecutive = if denied { self.consecutive.saturating_add(1) } else { 0 };
-        self.recent.push_back(denied);
-        if self.recent.len() > DENIAL_WINDOW {
-            self.recent.pop_front();
-        }
-        if self.tripped.is_some() {
-            return None;
-        }
-        let recent = self.recent.iter().filter(|d| **d).count();
-        let cause = if self.consecutive >= MAX_CONSECUTIVE_DENIALS {
-            format!("it denied {} submissions in a row", self.consecutive)
-        } else if recent >= MAX_RECENT_DENIALS {
-            format!("it denied {recent} of the last {} submissions", self.recent.len())
-        } else {
-            return None;
-        };
-        self.tripped = Some(cause.clone());
-        Some(cause)
-    }
-
-    /// Why the guardian no longer judges this context, once tripped.
-    pub(crate) fn tripped(&self) -> Option<&str> {
-        self.tripped.as_deref()
-    }
-}
-
-/// Every context's [`Breaker`]. Kept in memory: a kernel restart resets them.
-#[derive(Debug, Default)]
-pub(crate) struct Breakers(parking_lot::Mutex<HashMap<ContextId, Breaker>>);
-
-impl Breakers {
-    pub(crate) fn tripped(&self, context: ContextId) -> Option<String> {
-        self.0.lock().get(&context).and_then(|b| b.tripped().map(str::to_owned))
-    }
-
-    pub(crate) fn record(&self, context: ContextId, verdict: Verdict) -> Option<String> {
-        self.0.lock().entry(context).or_default().record(verdict)
-    }
-}
-
 /// Which model judge answered: the guardian, a chat model, or the
 /// decisions judge, a Decisions API ([`super::decisions_judge`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,8 +222,6 @@ pub(crate) struct Judged {
     pub(crate) policy_digest: String,
     pub(crate) deadline_ms: u64,
     pub(crate) elapsed: std::time::Duration,
-    /// The breaker's cause, when this answer tripped it.
-    pub(crate) tripped: Option<String>,
 }
 
 impl Judged {
@@ -307,7 +241,6 @@ impl Judged {
             policy_digest: String::new(),
             deadline_ms: config.deadline_ms,
             elapsed: std::time::Duration::ZERO,
-            tripped: None,
         }
     }
 
@@ -503,19 +436,9 @@ pub(crate) async fn evidence(
     Ok(Evidence { policy, prompt })
 }
 
-/// The miss cause for a context whose breaker has tripped, naming `judge`.
-pub(crate) fn tripped_cause(kernel: &crate::Kernel, judge: JudgeKind, context: ContextId) -> Option<String> {
-    kernel.guardian_breakers().tripped(context).map(|cause| {
-        format!(
-            "the {} stopped judging this context because {cause}; its submissions ask until the kernel restarts",
-            judge.noun()
-        )
-    })
-}
-
 /// Ask the guardian on `bound` (the context's `gate` slot) about the
-/// planned `action`. Every failure is a miss with its cause: a tripped
-/// breaker, a policy that cannot be read, no provider for the slot, a call
+/// planned `action`. Every failure is a miss with its cause: a policy that
+/// cannot be read, no provider for the slot, a call
 /// that fails or passes `config.deadline_ms`, or an answer that does not
 /// parse. Runs with no database lock held.
 pub(crate) async fn judge(
@@ -528,9 +451,6 @@ pub(crate) async fn judge(
 ) -> Judged {
     let started = std::time::Instant::now();
     let mut judged = Judged::begin(JudgeKind::Guardian, bound, config);
-    if let Some(cause) = tripped_cause(kernel, JudgeKind::Guardian, context) {
-        return judged.missed(started, cause);
-    }
     let evidence = match evidence(kernel, config, JudgeKind::Guardian, context, action, programs).await {
         Ok(evidence) => evidence,
         Err(cause) => return judged.missed(started, cause),
@@ -587,7 +507,6 @@ pub(crate) async fn judge(
         Ok(assessment) => assessment,
         Err(cause) => return judged.missed(started, cause),
     };
-    judged.tripped = kernel.guardian_breakers().record(context, assessment.outcome);
     judged.outcome = assessment.outcome();
     judged.answer = Some(Answer::Assessment(assessment));
     judged.elapsed = started.elapsed();
@@ -836,60 +755,6 @@ mod tests {
         assert!(within_prompt_cap("p", "q").is_ok());
         let cause = within_prompt_cap("p", &"q".repeat(MAX_PROMPT_BYTES)).unwrap_err();
         assert!(cause.contains(&MAX_PROMPT_BYTES.to_string()), "{cause}");
-    }
-
-    #[test]
-    fn three_denials_in_a_row_trip_the_breaker_once() {
-        let mut b = Breaker::default();
-        assert_eq!(b.record(Verdict::Deny), None);
-        assert_eq!(b.record(Verdict::Deny), None);
-        let cause = b.record(Verdict::Deny).expect("the third denial trips");
-        assert!(cause.contains("3 submissions in a row"), "{cause}");
-        assert_eq!(b.tripped(), Some(cause.as_str()));
-        assert_eq!(b.record(Verdict::Deny), None, "it trips once");
-        assert_eq!(b.record(Verdict::Allow), None);
-        assert!(b.tripped().is_some(), "an allow does not reset a tripped breaker");
-    }
-
-    #[test]
-    fn an_allow_resets_the_run_but_ten_of_fifty_still_trip() {
-        let mut b = Breaker::default();
-        for _ in 0..4 {
-            assert_eq!(b.record(Verdict::Deny), None);
-            assert_eq!(b.record(Verdict::Deny), None);
-            assert_eq!(b.record(Verdict::Allow), None);
-        }
-        assert_eq!(b.record(Verdict::Deny), None, "nine of the last twelve");
-        let cause = b.record(Verdict::Deny).expect("ten of the last thirteen");
-        assert!(cause.contains("10 of the last 14"), "{cause}");
-    }
-
-    #[test]
-    fn denials_older_than_the_window_do_not_count() {
-        let mut b = Breaker::default();
-        for _ in 0..9 {
-            b.record(Verdict::Deny);
-            b.record(Verdict::Allow);
-        }
-        for _ in 0..DENIAL_WINDOW {
-            assert_eq!(b.record(Verdict::Allow), None);
-        }
-        for _ in 0..2 {
-            assert_eq!(b.record(Verdict::Deny), None);
-            assert_eq!(b.record(Verdict::Allow), None);
-        }
-        assert!(b.tripped().is_none());
-    }
-
-    #[test]
-    fn breakers_are_per_context() {
-        let breakers = Breakers::default();
-        let (a, other) = (ContextId::new(), ContextId::new());
-        for _ in 0..3 {
-            breakers.record(a, Verdict::Deny);
-        }
-        assert!(breakers.tripped(a).is_some());
-        assert!(breakers.tripped(other).is_none());
     }
 
     fn block_by(author: PrincipalId, seq: u64, kind: BlockKind, role: Role, content: &str) -> BlockSnapshot {

@@ -397,3 +397,10 @@ A removed working directory is a tool error, not an ask. The failed call
 runs nothing even if the kernel found a parent to use for the next call.
 Model tool batches read the saved directory once so dispatch and file write
 ordering agree after a shell `cd`.
+
+## A judge bumps before it asks (November 19)
+
+Model judges use the gate's durable bump history, not an in-memory breaker.
+The third would-be bump within 30 minutes asks; the judge keeps judging.
+The same policy keys apply to Council v2 when set under `[judge]`.
+Existing host council policies still load until the host is migrated.

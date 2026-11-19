@@ -173,19 +173,15 @@ Second kaibo review (DeepSeek, of 1bdec2df) confirmed the first round's fixes an
 A chat model (the guardian) or a Decisions API (the decisions judge) on a context's `gate` slot judges escalated shell submissions (`council/guardian.rs`, `council/decisions_judge.rs`; `docs/approval-identity.md`, "The guardian"). Not done:
 
 - **No structured output.** No provider client sends a JSON schema (`text.format` on Responses, `response_format` on chat completions), so the answer format is asked for in the prompt and parsed strictly; drift is a recorded miss. Adding a schema to `BuildOpts` would remove most parse misses.
-- **The breaker resets only at restart.** Codex resets per turn. Candidates: a senpai's answer to an ask from the context, or a `kj` verb. Its state is in memory, so `kj` cannot show it either.
 - **No tools.** Codex's guardian may run read-only commands (check a path before a delete, read git remotes). Ours judges from the prompt alone; the policy says so.
 - **Spend has no turn.** The call's tokens are recorded with no turn and no context, so `kj` spend views do not attribute them to the judged context.
 - **The guardian reads only the shell gate.** `kj` verb asks and hook asks never reach it, as with the council.
-- **A judge shadow on a guardian context.** `[rc.<dir>.council] judge` still records a judge shadow on a guardian decision, which then reads against an empty council config and misses. Nothing sets both today.
-- **The allow names the layer `council (guardian)`.** The gate layer is `Layer::Council`; a `Layer::Guardian` would read better in auto reasons.
 - **Not live-tested.** Every check runs on the mock provider or a loopback Decisions server; no chatgpt, anthropic, or Decisions judge has judged a real submission yet.
 - **The decisions judge's threshold is not on its row.** `council_decisions.allow_at` needs a `mass_floor` beside it, which a Decisions answer has none of, so the row leaves the threshold empty; the ask note carries it. A comparison across judges reads `allow_at` from `gate.toml`.
 - **The decisions judge reads a policy written for the guardian.** `guardian.md` asks for `risk_level`, `user_authorization`, and a rationale the `verdict` question has no field for; a line maps its outcome onto the options. A policy written for a choice question may read better.
 - **Model-writable trusted input.** The judges trust `AGENTS.md` and read their policy from `/config/kernel`, and a context with `file:write` can change both. `gate.toml` rules are command prefixes, so it cannot statically deny writes to `/config/kernel`; that needs a path rule in the gate.
 - **`kj stage exclude` hides blocks from the judges.** An excluded block leaves the transcript tail, so an agent can drop the refusal or the user's "no" before it submits again.
 - **No secret redaction.** The transcript tail goes to the `gate` slot's backend as written; a key printed in a tool result goes with it.
-- **The breaker.** Its map is unbounded (one entry per context judged since restart), and `tripped` and `record` take the lock separately, so concurrent submissions from one context can all pass a check before any records.
 - **The ledger does not show what a judge read.** `kj ledger show` surfaces neither `house_rules_head` nor the `council_assessments` row.
 - **The tail loads the whole log.** `evidence` reads every block of the context to keep the last few kilobytes.
 - **Trust names no requester.** A `user` block is trusted when the performer did not write it; a stricter rule would trust only a person's blocks, or the context's requester's.
