@@ -106,9 +106,8 @@ pub(crate) enum Layer {
     /// `uncovered = "allow"` in `gate.toml` — the sandbox posture, naming
     /// the section that set it.
     UncoveredAllow(Section),
-    /// The council's allow for a statement no other layer covered, naming
-    /// the spec it read the submission under (`docs/council.md`).
-    Council(String),
+    /// A judge allowed a statement no other layer covered.
+    Judge { spec: String, council: bool },
     /// A drift along the caller's senpai edge — to its senpai or to a context
     /// that answers to it — that no key decided (`docs/senpai-kohai.md`, "Reports and drift").
     SenpaiEdge,
@@ -122,7 +121,8 @@ impl std::fmt::Display for Layer {
             Self::Config(section) => write!(f, "{section}"),
             Self::Builtin => f.write_str("builtin"),
             Self::UncoveredAllow(section) => write!(f, "{section} uncovered tier"),
-            Self::Council(spec) => write!(f, "council ({spec})"),
+            Self::Judge { spec, council: true } => write!(f, "council ({spec})"),
+            Self::Judge { spec, council: false } => write!(f, "judge ({spec})"),
             Self::SenpaiEdge => f.write_str("senpai edge"),
         }
     }
@@ -252,13 +252,13 @@ impl PolicyEvaluation {
         AskVerdict::Escalate
     }
 
-    /// Turn every `Uncovered` statement into the council's allow, keyed by
+    /// Turn every `Uncovered` statement into the judge's allow, keyed by
     /// `key(index)`. An `Ask` stays firm and a `Deny` stays a deny, so a
     /// submission holding either is decided as before.
-    pub(crate) fn apply_council_allow(&mut self, spec: &str, key: impl Fn(usize) -> String) {
+    pub(crate) fn apply_judge_allow(&mut self, spec: &str, council: bool, key: impl Fn(usize) -> String) {
         for (i, verdict) in self.per_statement.iter_mut().enumerate() {
             if matches!(verdict, PolicyVerdict::Uncovered) {
-                *verdict = PolicyVerdict::Allow(vec![Decision { layer: Layer::Council(spec.to_string()), key: key(i) }]);
+                *verdict = PolicyVerdict::Allow(vec![Decision { layer: Layer::Judge { spec: spec.to_string(), council }, key: key(i) }]);
             }
         }
     }
@@ -456,6 +456,7 @@ pub(crate) struct GateConfig {
     council: Option<CouncilConfig>,
     /// `[guardian]`, or its defaults when the file has none.
     guardian: GuardianConfig,
+    judge: Option<JudgePolicy>,
     /// The `[rc.<dir>]` and `[character.<name>]` sections that name no rc
     /// directory or character, found by [`load_config`].
     nobody: Vec<Section>,
@@ -477,7 +478,7 @@ pub(crate) enum CouncilPoolWeights {
 
 /// How the council's answer acts (`docs/council.md`, "Bumper mode").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CouncilMode {
+pub(crate) enum JudgeMode {
     /// Allow runs the submission; anything else opens an ask. The default.
     Gatekeeper,
     /// Proceed runs the submission; anything else refuses it with guidance
@@ -556,14 +557,14 @@ pub(crate) struct CouncilConfig {
     /// estimated at four bytes a token.
     pub(crate) house_rules_tokens: u64,
     /// `[council] mode`: gatekeeper (default) or bumper.
-    pub(crate) mode: CouncilMode,
+    pub(crate) mode: JudgeMode,
     /// `[council] bump_limit`: in bumper mode, the bumps one submission gets
     /// before the next would-be bump is an ordinary ask.
     pub(crate) bump_limit: Option<u64>,
     /// `[council] escalate`: in a bumper mode, the would-be bump that makes
     /// `bumps` in a row for one seat within `minutes` is an ordinary ask to
     /// the seat's reviewer. Off when unset.
-    pub(crate) escalate: Option<CouncilEscalate>,
+    pub(crate) escalate: Option<JudgeEscalate>,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
     /// `judge = "<character>"` in a council block of the seat's performer:
@@ -603,7 +604,7 @@ impl Default for GuardianConfig {
 
 /// `[council] escalate = { bumps = N, minutes = M }`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CouncilEscalate {
+pub(crate) struct JudgeEscalate {
     pub(crate) bumps: u64,
     pub(crate) minutes: u64,
 }
@@ -645,12 +646,11 @@ struct CouncilToml {
     /// the new name.
     #[serde(default)]
     voices: Option<toml::Value>,
-    #[serde(default = "default_mode")]
-    mode: String,
+    mode: Option<String>,
     #[serde(default)]
     bump_limit: Option<i64>,
     #[serde(default)]
-    escalate: Option<CouncilEscalateToml>,
+    escalate: Option<JudgeEscalateToml>,
     #[serde(default)]
     spec: Vec<CouncilSpecToml>,
     #[serde(default)]
@@ -659,7 +659,30 @@ struct CouncilToml {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CouncilEscalateToml {
+struct JudgePolicyToml {
+    mode: String,
+    bump_limit: Option<i64>,
+    escalate: Option<JudgeEscalateToml>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JudgePolicy {
+    pub(crate) mode: JudgeMode,
+    pub(crate) bump_limit: Option<u64>,
+    pub(crate) escalate: Option<JudgeEscalate>,
+}
+
+impl JudgePolicy {
+    const MODEL_DEFAULT: Self = Self {
+        mode: JudgeMode::Bumper,
+        bump_limit: Some(DEFAULT_BUMP_LIMIT),
+        escalate: Some(JudgeEscalate { bumps: 3, minutes: 30 }),
+    };
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgeEscalateToml {
     bumps: i64,
     minutes: i64,
 }
@@ -674,10 +697,6 @@ pub(crate) const DEFAULT_HOUSE_RULES_TOKENS: u64 = 2000;
 /// The bumps one submission gets by default before it asks.
 pub(crate) const DEFAULT_BUMP_LIMIT: u64 = 3;
 
-
-fn default_mode() -> String {
-    "gatekeeper".into()
-}
 
 fn default_house_rules_tokens() -> i64 {
     DEFAULT_HOUSE_RULES_TOKENS as i64
@@ -765,6 +784,7 @@ struct GateToml {
     context_type: Option<toml::Value>,
     council: Option<CouncilToml>,
     guardian: Option<GuardianToml>,
+    judge: Option<JudgePolicyToml>,
 }
 
 #[derive(Deserialize, Default)]
@@ -869,7 +889,14 @@ impl GateConfig {
             ));
         }
         let guardian = raw.guardian.as_ref().map(Self::guardian_from).transpose()?.unwrap_or_default();
-        let council = raw.council.as_ref().map(Self::council_from).transpose()?;
+        let judge = raw.judge.as_ref().map(|raw|
+            Self::judge_policy("[judge]", &raw.mode, raw.bump_limit, raw.escalate.as_ref())).transpose()?;
+        if judge.is_some() && raw.council.as_ref().is_some_and(|c|
+            c.mode.is_some() || c.bump_limit.is_some() || c.escalate.is_some())
+        {
+            return Err(GateConfigError::Parse("move mode, bump_limit, and escalate from [council] to [judge]; do not set them in both".into()));
+        }
+        let council = raw.council.as_ref().map(|raw| Self::council_from(raw, judge)).transpose()?;
         let table = |tier: &TierToml, section: Section| Self::table_from(tier, &section, council.as_ref());
         let mut config = GateConfig {
             global: table(&raw.global, Section::Global)?,
@@ -878,6 +905,7 @@ impl GateConfig {
             root: raw.root.as_ref().map(|tier| table(tier, Section::Root)).transpose()?,
             council: None,
             guardian,
+            judge,
             nobody: Vec::new(),
         };
         for (dir, tier) in &raw.rc {
@@ -962,7 +990,56 @@ impl GateConfig {
         })
     }
 
-    fn council_from(raw: &CouncilToml) -> Result<CouncilConfig, GateConfigError> {
+    fn judge_policy(
+        section: &str, mode: &str, bump_limit: Option<i64>, escalate: Option<&JudgeEscalateToml>,
+    ) -> Result<JudgePolicy, GateConfigError> {
+        let err = GateConfigError::Parse;
+        let mode = match mode {
+            "gatekeeper" => JudgeMode::Gatekeeper,
+            "bumper" => JudgeMode::Bumper,
+            "bump-only" => JudgeMode::BumpOnly,
+            other => {
+                return Err(err(format!(
+                    "{section} mode: `{other}` is not one of gatekeeper, bumper, bump-only"
+                )))
+            }
+        };
+        let bump_limit = match (mode, bump_limit) {
+            (JudgeMode::BumpOnly, Some(_)) => {
+                return Err(err(
+                    format!("{section} bump_limit: bump-only mode has no bump limit; remove the key"),
+                ))
+            }
+            (JudgeMode::BumpOnly, None) => None,
+            (_, Some(limit)) if limit <= 0 => {
+                return Err(err(format!("{section} bump_limit: {limit} must be an integer greater than 0")))
+            }
+            (_, Some(limit)) => Some(limit as u64),
+            (_, None) => Some(DEFAULT_BUMP_LIMIT),
+        };
+        let escalate = match (mode, escalate) {
+            (_, None) => None,
+            (JudgeMode::Gatekeeper, Some(_)) => {
+                return Err(err(
+                    format!("{section} escalate: gatekeeper mode asks already; escalate needs mode = \"bumper\" or \"bump-only\""),
+                ))
+            }
+            (_, Some(e)) if !(1..=1000).contains(&e.bumps) || !(1..=10080).contains(&e.minutes) => {
+                return Err(err(format!(
+                    "{section} escalate: bumps ({}) must be 1 to 1000 and minutes ({}) 1 to 10080",
+                    e.bumps, e.minutes
+                )))
+            }
+            (_, Some(e)) => Some(JudgeEscalate { bumps: e.bumps as u64, minutes: e.minutes as u64 }),
+        };
+        Ok(JudgePolicy { mode, bump_limit, escalate })
+    }
+
+    pub(crate) fn model_judge_policy(&self) -> JudgePolicy {
+        self.judge.unwrap_or(JudgePolicy::MODEL_DEFAULT)
+    }
+
+    fn council_from(raw: &CouncilToml, judge: Option<JudgePolicy>) -> Result<CouncilConfig, GateConfigError> {
         let err = |m: String| GateConfigError::Parse(m);
         if raw.contexts.is_empty() {
             return Err(err("[council] contexts: must list at least one context label".into()));
@@ -1014,43 +1091,9 @@ impl GateConfig {
                 raw.house_rules_tokens
             )));
         }
-        let mode = match raw.mode.as_str() {
-            "gatekeeper" => CouncilMode::Gatekeeper,
-            "bumper" => CouncilMode::Bumper,
-            "bump-only" => CouncilMode::BumpOnly,
-            other => {
-                return Err(err(format!(
-                    "[council] mode: `{other}` is not one of gatekeeper, bumper, bump-only"
-                )))
-            }
-        };
-        let bump_limit = match (mode, raw.bump_limit) {
-            (CouncilMode::BumpOnly, Some(_)) => {
-                return Err(err(
-                    "[council] bump_limit: bump-only mode has no bump limit; remove the key".into(),
-                ))
-            }
-            (CouncilMode::BumpOnly, None) => None,
-            (_, Some(limit)) if limit <= 0 => {
-                return Err(err(format!("[council] bump_limit: {limit} must be an integer greater than 0")))
-            }
-            (_, Some(limit)) => Some(limit as u64),
-            (_, None) => Some(DEFAULT_BUMP_LIMIT),
-        };
-        let escalate = match (mode, &raw.escalate) {
-            (_, None) => None,
-            (CouncilMode::Gatekeeper, Some(_)) => {
-                return Err(err(
-                    "[council] escalate: gatekeeper mode asks already; escalate needs mode = \"bumper\" or \"bump-only\"".into(),
-                ))
-            }
-            (_, Some(e)) if !(1..=1000).contains(&e.bumps) || !(1..=10080).contains(&e.minutes) => {
-                return Err(err(format!(
-                    "[council] escalate: bumps ({}) must be 1 to 1000 and minutes ({}) 1 to 10080",
-                    e.bumps, e.minutes
-                )))
-            }
-            (_, Some(e)) => Some(CouncilEscalate { bumps: e.bumps as u64, minutes: e.minutes as u64 }),
+        let JudgePolicy { mode, bump_limit, escalate } = match judge {
+            Some(judge) => judge,
+            None => Self::judge_policy("[council]", raw.mode.as_deref().unwrap_or("gatekeeper"), raw.bump_limit, raw.escalate.as_ref())?,
         };
         if raw.spec.is_empty() {
             return Err(err("[council]: declare at least one [[council.spec]]".into()));
@@ -2853,7 +2896,7 @@ mod tests {
         let cfg = config("[global]\nask = [\"git push\"]\ndeny = [\"dd\"]\n");
         let layers = Layers { config: &cfg, performer: None };
         let mut mixed = evaluate_planned(&plan("kj block list; touch x"), layers);
-        mixed.apply_council_allow("shell-gate", |i| format!("statement #{i} at p=0.991"));
+        mixed.apply_judge_allow("shell-gate", true, |i| format!("statement #{i} at p=0.991"));
         assert_eq!(mixed.verdict(), AskVerdict::Allow);
         assert!(matches!(&mixed.per_statement[0], PolicyVerdict::Allow(d) if d[0].layer == Layer::Builtin));
         assert_eq!(
@@ -2862,12 +2905,12 @@ mod tests {
         );
 
         let mut asked = evaluate_planned(&plan("touch x; git push origin main"), layers);
-        asked.apply_council_allow("shell-gate", |_| "at p=0.991".into());
+        asked.apply_judge_allow("shell-gate", true, |_| "at p=0.991".into());
         assert_eq!(asked.verdict(), AskVerdict::Escalate, "a static ask stays firm");
         assert!(matches!(asked.per_statement[1], PolicyVerdict::Ask(_)));
 
         let mut denied = evaluate_planned(&plan("touch x; dd if=/dev/zero"), layers);
-        denied.apply_council_allow("shell-gate", |_| "at p=0.991".into());
+        denied.apply_judge_allow("shell-gate", true, |_| "at p=0.991".into());
         assert_eq!(denied.verdict(), AskVerdict::Deny, "a deny stays a deny");
     }
 
@@ -4031,13 +4074,29 @@ enabled = false
     #[test]
     fn the_council_mode_defaults_to_gatekeeper_and_parses_bumper() {
         let c = config(COUNCIL_FULL);
-        assert_eq!(c.council().unwrap().mode, CouncilMode::Gatekeeper);
+        assert_eq!(c.council().unwrap().mode, JudgeMode::Gatekeeper);
         assert_eq!(c.council().unwrap().bump_limit, Some(DEFAULT_BUMP_LIMIT));
         let bumper = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bumper\"\nbump_limit = 5"));
-        assert_eq!(bumper.council().unwrap().mode, CouncilMode::Bumper);
+        assert_eq!(bumper.council().unwrap().mode, JudgeMode::Bumper);
         assert_eq!(bumper.council().unwrap().bump_limit, Some(5));
         let gatekeeper = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"gatekeeper\""));
-        assert_eq!(gatekeeper.council().unwrap().mode, CouncilMode::Gatekeeper);
+        assert_eq!(gatekeeper.council().unwrap().mode, JudgeMode::Gatekeeper);
+    }
+
+    #[test]
+    fn judge_policy_is_shared_and_legacy_council_mode_does_not_override_model_defaults() {
+        let legacy = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\""));
+        assert_eq!(legacy.council().unwrap().mode, JudgeMode::BumpOnly);
+        assert_eq!(legacy.model_judge_policy(), JudgePolicy::MODEL_DEFAULT);
+        let shared = config(&format!("{COUNCIL_FULL}\n[judge]\nmode = \"bumper\"\nbump_limit = 2\nescalate = {{ bumps = 4, minutes = 15 }}"));
+        let council = shared.council().unwrap();
+        assert_eq!(shared.model_judge_policy(), JudgePolicy {
+            mode: council.mode, bump_limit: council.bump_limit, escalate: council.escalate,
+        });
+        assert_eq!(council.escalate, Some(JudgeEscalate { bumps: 4, minutes: 15 }));
+        let conflict = council_err(&(council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\"")
+            + "\n[judge]\nmode = \"bumper\""));
+        assert!(conflict.contains("do not set them in both"), "{conflict}");
     }
 
     #[test]
@@ -4055,7 +4114,7 @@ enabled = false
     #[test]
     fn bump_only_mode_parses_and_takes_no_bump_limit() {
         let c = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\""));
-        assert_eq!(c.council().unwrap().mode, CouncilMode::BumpOnly);
+        assert_eq!(c.council().unwrap().mode, JudgeMode::BumpOnly);
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\"\nbump_limit = 3"));
         assert!(m.contains("bump_limit") && m.contains("bump-only"), "{m}");
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bouncer\""));
@@ -4068,9 +4127,9 @@ enabled = false
     fn escalate_parses_in_the_bumper_modes_and_rejects_junk() {
         assert_eq!(config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\"")).council().unwrap().escalate, None);
         let c = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\"\nescalate = { bumps = 4, minutes = 10 }"));
-        assert_eq!(c.council().unwrap().escalate, Some(CouncilEscalate { bumps: 4, minutes: 10 }));
+        assert_eq!(c.council().unwrap().escalate, Some(JudgeEscalate { bumps: 4, minutes: 10 }));
         let c = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bumper\"\nescalate = { bumps = 2, minutes = 1 }"));
-        assert_eq!(c.council().unwrap().escalate, Some(CouncilEscalate { bumps: 2, minutes: 1 }));
+        assert_eq!(c.council().unwrap().escalate, Some(JudgeEscalate { bumps: 2, minutes: 1 }));
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nescalate = { bumps = 4, minutes = 10 }"));
         assert!(m.contains("escalate") && m.contains("gatekeeper"), "{m}");
         for junk in ["{ bumps = 0, minutes = 10 }", "{ bumps = 3, minutes = 0 }", "{ bumps = 5000000000, minutes = 10 }", "{ bumps = 3 }", "{ bumps = 3, minutes = 5, extra = 1 }"] {
@@ -4450,7 +4509,7 @@ enabled = true
 "#,
         );
         let c = cfg.council().expect("the gate declares a council");
-        assert_eq!(c.mode, CouncilMode::BumpOnly);
+        assert_eq!(c.mode, JudgeMode::BumpOnly);
         assert_eq!(c.bump_limit, None);
         assert_eq!(c.specs[0].name, "shell-bump");
         assert_eq!(c.specs[0].contexts, ["council-shell"]);

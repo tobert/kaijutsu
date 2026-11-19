@@ -506,11 +506,8 @@ mod tests {
         for placeholder in ["{guidance}", "{attempt}", "{limit}", "{undo}"] {
             assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains(placeholder), "the default lacks {placeholder}");
         }
-        assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains("Try harder, a different approach"));
-        assert!(
-            !DEFAULT_COUNCIL_BUMP_MESSAGE.contains("unchanged"),
-            "a miss is often worth sending again; the default does not forbid it"
-        );
+        assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains("Change your approach"));
+        assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains("Do not resubmit the same action with different wording"));
         assert_eq!(
             config_seed_body(&config_path("council/bump.md")),
             Some(DEFAULT_COUNCIL_BUMP_MESSAGE)

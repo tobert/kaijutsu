@@ -91,11 +91,9 @@ fn classify(choice: &str, p: Probabilities, allow_at: f64) -> Outcome {
 
 /// Ask the decisions judge on `bound` (the context's `gate` slot) about the
 /// planned `action`. Every failure is a miss with its cause: a tripped
-/// breaker, evidence that cannot be gathered, a slot whose backend is not a
-/// registered decisions backend, or a call that fails, passes
-/// `config.deadline_ms`, or answers other than the question asked. An ask
-/// or a report counts as a denial on the breaker the guardian uses. Runs
-/// with no database lock held.
+/// missing evidence, a slot whose backend is not a decisions client, a
+/// failed request, or an answer that does not match the question. Runs with
+/// no database lock held.
 pub(crate) async fn judge(
     kernel: &crate::Kernel,
     bound: &crate::model_resolution::BoundSlot,
@@ -106,9 +104,6 @@ pub(crate) async fn judge(
 ) -> Judged {
     let started = std::time::Instant::now();
     let mut judged = Judged::begin(JudgeKind::Decisions, bound, config);
-    if let Some(cause) = super::guardian::tripped_cause(kernel, JudgeKind::Decisions, context) {
-        return judged.missed(started, cause);
-    }
     let evidence = match super::guardian::evidence(kernel, config, JudgeKind::Decisions, context, action, programs).await {
         Ok(evidence) => evidence,
         Err(cause) => return judged.missed(started, cause),
@@ -149,11 +144,6 @@ pub(crate) async fn judge(
         }
     };
     judged.outcome = classify(&answer.choice, p, config.allow_at);
-    let verdict = match judged.outcome {
-        Outcome::Allow => super::guardian::Verdict::Allow,
-        _ => super::guardian::Verdict::Deny,
-    };
-    judged.tripped = kernel.guardian_breakers().record(context, verdict);
     judged.answer = Some(Answer::Choice { p, allow_at: config.allow_at });
     judged.elapsed = started.elapsed();
     judged

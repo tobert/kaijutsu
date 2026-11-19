@@ -2726,9 +2726,9 @@ async fn a_bump_refuses_with_guidance_and_opens_no_ask() {
         let rig = rig(via, bumper(3)).await;
         rig.mock.bumper_says(TRY_HARDER);
         let text = refusal_text(via, rig.submit("touch /work/marker").await);
-        assert!(text.contains("Bumped by the council (attempt 1 of 3)"), "{via:?}: {text}");
+        assert!(text.contains("Bumped by the judge (attempt 1 of 3)"), "{via:?}: {text}");
         assert!(text.contains("the goal is allowed, but it changes an original"), "{via:?}: {text}");
-        assert!(text.contains("Try harder, a different approach"), "{via:?}: {text}");
+        assert!(text.contains("Change your approach"), "{via:?}: {text}");
         assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
         let decisions = rig.decisions();
         assert_eq!(decisions.len(), 1, "{via:?}");
@@ -3190,7 +3190,7 @@ async fn bump_only_escalates_after_n_bumps_in_a_row() {
         );
         // The escalated decision links its ask, which ends the streak.
         let again = refusal_text(via, rig.submit("touch /work/d").await);
-        assert!(again.contains("Bumped by the council"), "{via:?}: {again}");
+        assert!(again.contains("Bumped by the judge"), "{via:?}: {again}");
         rig.finish().await;
     }
 }
@@ -3303,7 +3303,7 @@ async fn the_bump_template_is_read_at_each_bump() {
         let rig = self::rig(via, Setup { no_bump_template: true, ..bumper(3) }).await;
         rig.mock.bumper_says(TRY_HARDER);
         let text = refusal_text(via, rig.submit("touch /work/a").await);
-        assert!(text.contains("Bumped by the council (attempt 1 of 3)"), "{via:?}: {text}");
+        assert!(text.contains("Bumped by the judge (attempt 1 of 3)"), "{via:?}: {text}");
         assert!(text.contains("could not be read"), "{via:?}: {text}");
         rig.finish().await;
     }
@@ -4045,7 +4045,7 @@ async fn a_guardian_allow_runs_the_submission_with_a_row_naming_the_guardian() {
         let ask = rig.only_ask();
         assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
         let reason = ask.auto_reason.clone().expect("an auto-decided row");
-        assert!(reason.contains("council (guardian) allows") && reason.contains("guardian/guardian-model"), "{via:?}: {reason}");
+        assert!(reason.contains("judge (guardian) allows") && reason.contains("guardian/guardian-model"), "{via:?}: {reason}");
 
         let decision = the_decision(&rig, &ask);
         assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
@@ -4107,22 +4107,34 @@ async fn the_guardian_reads_the_opening_prompt_and_senpai_instruction_before_the
     rig.finish().await;
 }
 
-/// A guardian deny asks, and the ask carries the guardian's rationale so the
-/// senpai sees why.
+/// A guardian bump leaves the rationale in the refusal without opening an ask.
 #[tokio::test]
-async fn a_guardian_deny_asks_with_its_rationale() {
+async fn a_guardian_deny_bumps_with_its_rationale() {
     for via in BOTH {
         let (rig, _) = guardian_rig(via, GUARDIAN_DENY).await;
-        assert_pending(via, rig.submit("rm -rf cache").await);
-        let ask = rig.only_ask();
-        assert_eq!(ask.status, ApprovalStatus::Pending);
-        assert!(ask.description.contains("Nobody asked to wipe the cache."), "{via:?}: {}", ask.description);
-        assert!(ask.description.contains("deny at high risk"), "{via:?}: {}", ask.description);
-        let decision = the_decision(&rig, &ask);
-        assert_eq!(decision.decision.outcome, CouncilOutcome::Ask);
+        let text = refusal_text(via, rig.submit("rm -rf cache").await);
+        assert!(text.contains("Nobody asked to wipe the cache."), "{via:?}: {text}");
+        assert!(text.contains("Change your approach"), "{via:?}: {text}");
+        assert!(rig.asks().is_empty(), "{via:?}: a bump is not an ask");
+        let decision = latest_decision(&rig);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Bump);
+        assert_eq!(decision.decision.seat_bump.as_deref(), Some("guardian"));
         assert_eq!(assessment(&rig, &decision).unwrap().verdict, "deny");
         rig.finish().await;
     }
+}
+
+#[tokio::test]
+async fn the_guardian_in_gatekeeper_mode_asks_with_its_rationale() {
+    let (rig, _) = guardian_rig(Via::Tool, GUARDIAN_DENY).await;
+    rig.write("/config/kernel/gate.toml", "[judge]\nmode = \"gatekeeper\"\n[rc.coder.guardian]\nenabled = true\n").await;
+    assert_pending(Via::Tool, rig.submit("touch needs-review").await);
+    let ask = rig.only_ask();
+    assert!(ask.description.contains("Nobody asked to wipe the cache."), "{}", ask.description);
+    let decision = the_decision(&rig, &ask);
+    assert_eq!(decision.decision.outcome, CouncilOutcome::Ask);
+    assert!(decision.decision.seat_bump.is_none());
+    rig.finish().await;
 }
 
 /// A deny at critical risk reports: an ask, recorded as a report.
@@ -4154,25 +4166,22 @@ async fn an_unparseable_guardian_answer_is_a_miss_and_asks() {
     }
 }
 
-/// After three denials in a row the guardian stops judging the context: the
-/// next submission is a miss naming the breaker, and the model is not
-/// called again.
-///
-/// Falsified by never consulting the breaker: the fourth submission calls
-/// the model and is recorded as an ask.
 #[tokio::test]
-async fn three_guardian_denials_stop_it_judging_the_context() {
+async fn the_third_guardian_bump_in_a_row_asks() {
     let (rig, sent) = guardian_rig(Via::Tool, GUARDIAN_DENY).await;
-    for i in 0..3 {
-        assert_pending(Via::Tool, rig.submit(&format!("touch denied-{i}")).await);
+    for i in 0..2 {
+        let text = refusal_text(Via::Tool, rig.submit(&format!("touch denied-{i}")).await);
+        assert!(text.contains("Nobody asked to wipe the cache."), "{text}");
     }
-    assert_eq!(sent.calls(), 3);
-    assert_pending(Via::Tool, rig.submit("touch after-the-breaker").await);
-    assert_eq!(sent.calls(), 3, "a tripped breaker calls no model");
-    let latest = latest_decision(&rig);
-    assert_eq!(latest.decision.outcome, CouncilOutcome::Miss);
-    let cause = latest.decision.miss_cause.unwrap();
-    assert!(cause.contains("stopped judging") && cause.contains("3 submissions in a row"), "{cause}");
+    assert!(rig.asks().is_empty());
+    assert_pending(Via::Tool, rig.submit("touch third-denial").await);
+    let ask = rig.only_ask();
+    assert!(ask.description.contains("2 times in a row"), "{}", ask.description);
+    assert!(ask.description.contains("Nobody asked to wipe the cache."), "{}", ask.description);
+    assert!(the_decision(&rig, &ask).decision.seat_bump.is_none());
+    let text = refusal_text(Via::Tool, rig.submit("touch after-escalation").await);
+    assert!(text.contains("Nobody asked to wipe the cache."), "{text}");
+    assert_eq!(sent.calls(), 4, "the streak does not disable the judge");
     rig.finish().await;
 }
 
@@ -4255,7 +4264,7 @@ async fn a_decisions_allow_runs_the_submission_and_records_the_probabilities() {
         let ask = rig.only_ask();
         assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
         let reason = ask.auto_reason.clone().expect("an auto-decided row");
-        assert!(reason.contains("council (decisions) allows") && reason.contains("jev/typesafe/jev-1.13"), "{via:?}: {reason}");
+        assert!(reason.contains("judge (decisions) allows") && reason.contains("jev/typesafe/jev-1.13"), "{via:?}: {reason}");
 
         let decision = the_decision(&rig, &ask);
         assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
@@ -4294,19 +4303,17 @@ async fn a_decisions_allow_runs_the_submission_and_records_the_probabilities() {
     }
 }
 
-/// Under `allow_at` the submission asks, and the ask shows the three
-/// probabilities so the senpai sees how sure the judge was.
+/// Under `allow_at` the decisions judge bumps with the three probabilities.
 #[tokio::test]
-async fn a_decisions_allow_under_the_threshold_asks_with_the_probabilities() {
+async fn a_decisions_allow_under_the_threshold_bumps_with_the_probabilities() {
     for via in BOTH {
         let (rig, _) = decisions_rig(via, vec![verdict_reply(0.6, 0.35, 0.05)]).await;
-        assert_pending(via, rig.submit("rm -rf cache").await);
-        let ask = rig.only_ask();
-        assert_eq!(ask.status, ApprovalStatus::Pending);
+        let text = refusal_text(via, rig.submit("rm -rf cache").await);
         for want in ["p(allow) 0.600", "p(ask) 0.350", "p(report) 0.050", ">= 0.9"] {
-            assert!(ask.description.contains(want), "{via:?}: lacks {want}: {}", ask.description);
+            assert!(text.contains(want), "{via:?}: lacks {want}: {text}");
         }
-        assert_eq!(the_decision(&rig, &ask).decision.outcome, CouncilOutcome::Ask, "{via:?}");
+        assert!(rig.asks().is_empty());
+        assert_eq!(latest_decision(&rig).decision.seat_bump.as_deref(), Some("decisions"));
         rig.finish().await;
     }
 }
@@ -4360,23 +4367,15 @@ async fn a_decisions_failure_is_a_miss_and_asks() {
     rig.finish().await;
 }
 
-/// The decisions judge shares the guardian's breaker: after three denials
-/// in a row (asks or reports) the next submission is a miss naming it, and
-/// nothing more is sent.
 #[tokio::test]
-async fn three_decisions_denials_stop_it_judging_the_context() {
+async fn a_decisions_report_breaks_the_bump_streak() {
     let replies = vec![verdict_reply(0.3, 0.6, 0.1), verdict_reply(0.1, 0.2, 0.7), verdict_reply(0.5, 0.45, 0.05)];
     let (rig, seen) = decisions_rig(Via::Tool, replies).await;
-    for i in 0..3 {
-        assert_pending(Via::Tool, rig.submit(&format!("touch denied-{i}")).await);
-    }
+    refusal_text(Via::Tool, rig.submit("touch before-report").await);
+    assert_pending(Via::Tool, rig.submit("touch report").await);
+    assert_eq!(the_decision(&rig, &rig.only_ask()).decision.outcome, CouncilOutcome::Report);
+    refusal_text(Via::Tool, rig.submit("touch after-report").await);
     assert_eq!(seen.lock().unwrap().len(), 3);
-    assert_pending(Via::Tool, rig.submit("touch after-the-breaker").await);
-    assert_eq!(seen.lock().unwrap().len(), 3, "a tripped breaker sends nothing");
-    let latest = latest_decision(&rig);
-    assert_eq!(latest.decision.outcome, CouncilOutcome::Miss);
-    let cause = latest.decision.miss_cause.unwrap();
-    assert!(cause.contains("stopped judging") && cause.contains("3 submissions in a row"), "{cause}");
     rig.finish().await;
 }
 

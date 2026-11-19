@@ -575,11 +575,11 @@ pub(crate) fn approved_run_unsettled(
     Ok(None)
 }
 
-/// The key a council-allowed statement's decision names.
-fn council_key(spec: &GateSpec, index: usize, council: &crate::council::gate::CouncilVerdict) -> String {
+/// The key a judge-allowed statement's decision names.
+fn judge_key(spec: &GateSpec, index: usize, judge: &crate::council::gate::JudgeVerdict) -> String {
     match (spec.origin, spec.statements.get(index).and_then(|s| s.source_index)) {
-        (Origin::ShellGate, Some(source)) => format!("statement #{source} {}", council.allow_key()),
-        _ => council.allow_key(),
+        (Origin::ShellGate, Some(source)) => format!("statement #{source} {}", judge.allow_key()),
+        _ => judge.allow_key(),
     }
 }
 
@@ -594,36 +594,36 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
 
 /// Record caller state in the ask transaction, before any ledger notification.
 ///
-/// `council` is the council's verdict on this submission, when one was
+/// `judge` is the judge's verdict on this submission, when one was
 /// consulted. An allow turns the statements no other layer covered into
-/// council allows, unless an earlier ask still holds the submission
+/// judge allows, unless an earlier ask still holds the submission
 /// ([`ask_holding_submission`]) or an approved run of it has not settled
 /// ([`approved_run_unsettled`]); both are read under the guard that applies
 /// the allow. A bump is dropped, unrecorded, when the rules decide the
-/// submission or an ask or approved run holds it by the time the council
+/// submission or an ask or approved run holds it by the time the judge
 /// answers (`council::gate::decided_without_council`). Every other verdict
 /// is recorded with its reviewer context
 /// skips: with the ask it led to, in the transaction that creates it, or
 /// unlinked when the gate stopped before an ask existed. A record that
 /// cannot be written refuses the call as gate unavailable. A report whose
 /// ask exists stops the seat when it is autonomous and leaves the ask
-/// redeemable (`CouncilVerdict::report`). Once the record commits, the
+/// redeemable (`JudgeVerdict::report`). Once the record commits, the
 /// verdict's observing reviewer contexts are read on a task of their own
-/// (`CouncilVerdict::observe`); the gate does not wait for them.
+/// (`JudgeVerdict::observe`); the gate does not wait for them.
 pub(crate) async fn run_gate_recorded(
     kernel: &Arc<crate::Kernel>,
     caller: &KjCaller,
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
-    council: Option<crate::council::gate::CouncilVerdict>,
+    judge: Option<crate::council::gate::JudgeVerdict>,
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
-    let mut council = council;
-    // A bump refuses before the gate runs, so the rules and asks the council
+    let mut judge = judge;
+    // A bump refuses before the gate runs, so the rules and asks the judge
     // was consulted under are read again first: one that arrived while the
-    // council read decides the submission, and the bump is dropped.
-    if council.as_ref().is_some_and(|c| c.submission_bump().is_some())
+    // judge read decides the submission, and the bump is dropped.
+    if judge.as_ref().is_some_and(|c| c.submission_bump().is_some())
         && let Ok(gate_config) = config
     {
         let decided = {
@@ -635,38 +635,38 @@ pub(crate) async fn run_gate_recorded(
         };
         match decided {
             Ok(Some(why)) => {
-                tracing::info!("{why}; the council's bump is not applied");
-                council = None;
+                tracing::info!("{why}; the judge's bump is not applied");
+                judge = None;
             }
             Ok(None) => {}
             Err(reason) => return GateOutcome::unavailable_without_row(reason),
         }
     }
-    if let Some(verdict) = council.as_mut()
+    if let Some(verdict) = judge.as_mut()
         && let Some(refused) = refuse_bump(kernel, caller, verdict).await
     {
         return refused;
     }
     let recorded = std::sync::OnceLock::new();
-    let mut outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, council.as_ref(), &recorded, record).await;
-    let Some(mut council) = council else { return outcome };
-    if outcome.allowed() && council.allows() {
-        outcome.judged = council.judged();
+    let mut outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, judge.as_ref(), &recorded, record).await;
+    let Some(mut judge) = judge else { return outcome };
+    if outcome.allowed() && judge.allows() {
+        outcome.judged = judge.judged();
     }
     // A report stops an autonomous seat once its ask exists; the decision
     // is recorded with the ask, so a linked record means the ask exists.
-    council.report(kernel, caller, recorded.get().is_some());
+    judge.report(kernel, caller, recorded.get().is_some());
     if let Some(decision_id) = recorded.get() {
-        council.observe(kernel.clone(), decision_id.clone());
+        judge.observe(kernel.clone(), decision_id.clone());
         return outcome;
     }
     let written = {
         let db = kernel.kernel_db().lock();
-        record_unlinked_council_decision(db.conn_for_ledger(), &council)
+        record_unlinked_judge_decision(db.conn_for_ledger(), &judge)
     };
     match written {
         Ok(decision_id) => {
-            council.observe(kernel.clone(), decision_id);
+            judge.observe(kernel.clone(), decision_id);
             outcome
         }
         Err(e) => GateOutcome {
@@ -674,7 +674,7 @@ pub(crate) async fn run_gate_recorded(
             ask: outcome.ask,
             cwd: ShellCwd::Context,
             reason: format!(
-                "{} — and the council's decision could not be recorded: {e} (fail-closed — a ledger \
+                "{} — and the judge's decision could not be recorded: {e} (fail-closed — a ledger \
                  fault, not a decision)",
                 outcome.reason
             ),
@@ -683,90 +683,87 @@ pub(crate) async fn run_gate_recorded(
     }
 }
 
-/// Bumper mode: refuse a submission the council bumped, with no ask. The
+/// Bumper mode: refuse a submission the judge bumped, with no ask. The
 /// bump is recorded as an unlinked decision, so the same submission sent
 /// again is decided again; nothing here closes it the way a durable denial
 /// does. Returns the refusal, or `None` to go on: the verdict is no bump;
 /// the submission has been bumped `bump_limit` times and asks, carrying the
-/// bumps' flavors (`CouncilVerdict::at_bump_limit`); or this bump would
-/// make `[council] escalate`'s streak and asks, carrying the streak
-/// (`CouncilVerdict::escalated`). A refused bump is recorded as
+/// bumps' flavors (`JudgeVerdict::at_bump_limit`); or this bump would
+/// make `[judge] escalate`'s streak and asks, carrying the streak
+/// (`JudgeVerdict::escalated`). A refused bump is recorded as
 /// `seat_bump`, which is what the streak counts.
 async fn refuse_bump(
     kernel: &Arc<crate::Kernel>,
     caller: &KjCaller,
-    council: &mut crate::council::gate::CouncilVerdict,
+    judge: &mut crate::council::gate::JudgeVerdict,
 ) -> Option<GateOutcome> {
-    let bump = council.submission_bump()?;
+    let bump = judge.submission_bump()?;
     let context = caller.context_id?;
-    let limit = council.bump_limit();
-    let history = {
+    let limit = judge.bump_limit();
+    // Count and record under one guard so concurrent bumps cannot both see
+    // the same streak. The template read must not hold the database lock.
+    let (attempt, written) = {
         let db = kernel.kernel_db().lock();
-        approval_ledger::council::list_bump_flavors(
-            db.conn_for_ledger(), context.as_bytes(), council.submission_digest(),
-        )
-    };
-    let history = match history {
-        Ok(history) => history,
-        Err(e) => {
-            return Some(GateOutcome::unavailable_without_row(format!(
-                "the council could not count earlier bumps of this submission: {e} \
-                 (fail-closed — a ledger fault, not a decision)"
-            )));
-        }
-    };
-    if limit.is_some_and(|limit| history.len() as u64 >= limit) {
-        tracing::info!(bumps = history.len(), limit = ?limit, "the submission reached its bump limit; it asks");
-        council.at_bump_limit(history);
-        return None;
-    }
-    if let Some(escalate) = council.escalate() {
-        let filter = approval_ledger::council::SubmissionFilter {
-            context_id: Some(context.as_bytes().to_vec()),
-            since_ms: Some(kaijutsu_types::now_millis() as i64 - escalate.minutes as i64 * 60_000),
-            limit: escalate.bumps as u32,
-        };
-        let streak = {
-            let db = kernel.kernel_db().lock();
-            approval_ledger::council::list_council_submissions(db.conn_for_ledger(), &filter)
-                .map(|rows| approval_ledger::council::bump_streak(&rows))
-        };
-        match streak {
-            Ok(streak) => {
-                let count = streak.as_ref().map_or(0, |s| s.count) as u64;
-                if count + 1 >= escalate.bumps {
-                    let streak = streak.unwrap_or(approval_ledger::council::BumpStreak {
-                        count: 0,
-                        first_at: 0,
-                        last_at: 0,
-                        flavors: Vec::new(),
-                    });
-                    tracing::info!(bumps = count, minutes = escalate.minutes, "the seat's bump streak escalates; it asks");
-                    council.escalated(&streak, escalate.minutes);
-                    return None;
-                }
-            }
+        let history = approval_ledger::council::list_bump_flavors(
+            db.conn_for_ledger(), context.as_bytes(), judge.submission_digest(),
+        );
+        let history = match history {
+            Ok(history) => history,
             Err(e) => {
                 return Some(GateOutcome::unavailable_without_row(format!(
-                    "the council could not read this seat's bump streak: {e} \
+                    "the judge could not count earlier bumps of this submission: {e} \
                      (fail-closed — a ledger fault, not a decision)"
                 )));
             }
+        };
+        if limit.is_some_and(|limit| history.len() as u64 >= limit) {
+            tracing::info!(bumps = history.len(), limit = ?limit, "the submission reached its bump limit; it asks");
+            judge.at_bump_limit(history);
+            return None;
         }
-    }
-    let attempt = history.len() as u64 + 1;
-    let message = crate::council::gate::bump_message(kernel, &bump, attempt, limit).await;
-    council.refused_as(&bump.flavor);
-    let written = {
-        let db = kernel.kernel_db().lock();
-        require_live_context_for_gate(&db, context)
+        if let Some(escalate) = judge.escalate() {
+            let filter = approval_ledger::council::SubmissionFilter {
+                context_id: Some(context.as_bytes().to_vec()),
+                since_ms: Some(kaijutsu_types::now_millis() as i64 - escalate.minutes as i64 * 60_000),
+                limit: escalate.bumps as u32,
+            };
+            let streak = approval_ledger::council::list_council_submissions(db.conn_for_ledger(), &filter)
+                .map(|rows| approval_ledger::council::bump_streak(&rows));
+            match streak {
+                Ok(streak) => {
+                    let count = streak.as_ref().map_or(0, |s| s.count) as u64;
+                    if count + 1 >= escalate.bumps {
+                        let streak = streak.unwrap_or(approval_ledger::council::BumpStreak {
+                            count: 0,
+                            first_at: 0,
+                            last_at: 0,
+                            flavors: Vec::new(),
+                        });
+                        tracing::info!(bumps = count, minutes = escalate.minutes, "the seat's bump streak escalates; it asks");
+                        judge.escalated(&streak, escalate.minutes);
+                        return None;
+                    }
+                }
+                Err(e) => {
+                    return Some(GateOutcome::unavailable_without_row(format!(
+                        "the judge could not read this seat's bump streak: {e} \
+                         (fail-closed — a ledger fault, not a decision)"
+                    )));
+                }
+            }
+        }
+        let attempt = history.len() as u64 + 1;
+        judge.refused_as(&bump.flavor);
+        let written = require_live_context_for_gate(&db, context)
             .map_err(|e| e.to_string())
-            .and_then(|()| record_unlinked_council_decision(db.conn_for_ledger(), council).map_err(|e| e.to_string()))
+            .and_then(|()| record_unlinked_judge_decision(db.conn_for_ledger(), judge).map_err(|e| e.to_string()));
+        (attempt, written)
     };
     match written {
         Ok(decision_id) => {
-            tracing::info!(attempt, limit = ?limit, flavor = %bump.flavor, "the council bumped the submission; nothing ran");
-            council.observe(kernel.clone(), decision_id);
+            let message = crate::council::gate::bump_message(kernel, &bump, attempt, limit).await;
+            tracing::info!(attempt, limit = ?limit, flavor = %bump.flavor, "the judge bumped the submission; nothing ran");
+            judge.observe(kernel.clone(), decision_id);
             Some(GateOutcome {
                 verdict: GateVerdict::Denied,
                 ask: None,
@@ -776,20 +773,20 @@ async fn refuse_bump(
             })
         }
         Err(e) => Some(GateOutcome::unavailable_without_row(format!(
-            "the council bumped this submission, and the bump could not be recorded: {e} \
+            "the judge bumped this submission, and the bump could not be recorded: {e} \
              (fail-closed — a ledger fault, not a decision)"
         ))),
     }
 }
 
-/// Record a council decision no ask links to, with its reviewer skips, in one
+/// Record a judge decision no ask links to, with its reviewer skips, in one
 /// transaction, and return its id.
-fn record_unlinked_council_decision(
+fn record_unlinked_judge_decision(
     conn: &rusqlite::Connection,
-    council: &crate::council::gate::CouncilVerdict,
+    judge: &crate::council::gate::JudgeVerdict,
 ) -> approval_ledger::error::Result<Vec<u8>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let decision_id = council.insert_within(&tx, None)?;
+    let decision_id = judge.insert_within(&tx, None)?;
     tx.commit()?;
     Ok(decision_id)
 }
@@ -812,8 +809,8 @@ async fn run_gate_once(
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
-    council: Option<&crate::council::gate::CouncilVerdict>,
-    council_recorded: &std::sync::OnceLock<Vec<u8>>,
+    judge: Option<&crate::council::gate::JudgeVerdict>,
+    judge_recorded: &std::sync::OnceLock<Vec<u8>>,
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
     let db = kernel.kernel_db();
@@ -892,7 +889,7 @@ async fn run_gate_once(
     //    half" of one submitted blob). Both terminal outcomes leave a
     //    durable row.
     //
-    //    A council allow (`docs/council.md`) covers only the statements no
+    //    A judge allow (`docs/approval-identity.md`) covers only the statements no
     //    layer decided, and never a submission an earlier ask still holds.
     let policy = {
         let db = db.lock();
@@ -910,7 +907,7 @@ async fn run_gate_once(
                 ));
             }
         };
-        if let Some(council) = council.filter(|c| c.allows()) {
+        if let Some(judge) = judge.filter(|c| c.allows()) {
             let held = ask_holding_submission(&db, &spec, caller)
                 .map(|held| held.map(|id| (id, "an earlier ask holds this submission")))
                 .and_then(|held| match held {
@@ -919,10 +916,10 @@ async fn run_gate_once(
                         .map(|run| run.map(|id| (id, "the approval worker has not finished running this command"))),
                 });
             match held {
-                Ok(None) => policy.apply_council_allow(&council.spec, |i| council_key(&spec, i, council)),
+                Ok(None) => policy.apply_judge_allow(&judge.spec, judge.is_council(), |i| judge_key(&spec, i, judge)),
                 Ok(Some((request_id, why))) => tracing::info!(
                     ask.held_by = %request_id,
-                    "{why}; the council's allow is not applied"
+                    "{why}; the judge's allow is not applied"
                 ),
                 Err(e) => {
                     return GateOutcome::unavailable_without_row(format!(
@@ -1089,9 +1086,9 @@ async fn run_gate_once(
         Err(error) => return GateOutcome::unavailable_without_row(format!(
             "approval gate could not capture command inputs: {error}")),
     };
-    if let Some(council) = council {
-        ask.signals.extend(council.signals());
-        ask.description = format!("{}\n\n{}", ask.description, council.note());
+    if let Some(judge) = judge {
+        ask.signals.extend(judge.signals());
+        ask.description = format!("{}\n\n{}", ask.description, judge.note());
     }
 
     // 3. Durable before asked — the row commits before anyone is told. A
@@ -1138,8 +1135,8 @@ async fn run_gate_once(
             if let Some(call) = &tool_call {
                 crate::kernel_db::record_approval_tool_call(conn, request, context, call)?;
             }
-            if let Some(council) = council {
-                decision_id = Some(council.insert_within(conn, Some(request))?);
+            if let Some(judge) = judge {
+                decision_id = Some(judge.insert_within(conn, Some(request))?);
             }
             record(conn, request)?;
             if let (Some(allow), Some(auto_reason)) = (decided, auto_reason.as_deref()) {
@@ -1156,7 +1153,7 @@ async fn run_gate_once(
         match db.create_approval_ask_recorded(&ask, spec.publishes_pair, recorded) {
             Ok(id) => {
                 if let Some(decision) = decision_id {
-                    council_recorded.set(decision).expect("the gate records one council decision per call");
+                    judge_recorded.set(decision).expect("the gate records one judge decision per call");
                 }
                 #[cfg(test)]
                 tests::ASK_COMMITTED.with(|seam| if let Some(seam) = seam.borrow_mut().as_mut() { seam(&db, &id) });

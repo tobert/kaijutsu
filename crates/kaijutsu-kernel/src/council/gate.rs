@@ -34,7 +34,7 @@
 //! (`super::reviewer_contexts`): the voting reviewer contexts join the decision's contexts, the
 //! skipped characters are recorded with the decision, and the observing
 //! reviewer contexts are read after the decision's record commits
-//! ([`CouncilVerdict::observe`]).
+//! ([`JudgeVerdict::observe`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,7 +59,7 @@ use crate::llm::endpoint::SlotWaits;
 use super::reviewer_contexts::{SkippedReviewerContext, ReviewerContextChain};
 use crate::kj::gate::GateSpec;
 use crate::kj::gate_policy::{
-    CouncilCase, CouncilConfig, CouncilMode, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
+    CouncilCase, CouncilConfig, JudgeMode, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
     CouncilThreshold, GateConfigLoad, Layers, PolicyVerdict,
 };
 use crate::kj::KjCaller;
@@ -78,9 +78,9 @@ pub(crate) const GATE: &str = "gate";
 /// The option of [`VERDICT`] that lets a submission run: `allow` for a
 /// gatekeeper, and `proceed` for a bumper's shell spec. A program spec keeps
 /// its `allow` in both modes.
-pub(crate) fn pass_option(case: CouncilCase, mode: CouncilMode) -> &'static str {
+pub(crate) fn pass_option(case: CouncilCase, mode: JudgeMode) -> &'static str {
     match (case, mode) {
-        (CouncilCase::Shell, CouncilMode::Bumper | CouncilMode::BumpOnly) => "proceed",
+        (CouncilCase::Shell, JudgeMode::Bumper | JudgeMode::BumpOnly) => "proceed",
         _ => "allow",
     }
 }
@@ -491,7 +491,7 @@ pub(crate) fn classify_case(
     };
     let outcome = if pooled_allows && (!council.require_agree_for(spec_name) || every_read_allows) {
         Outcome::Allow
-    } else if council.mode != CouncilMode::Gatekeeper {
+    } else if council.mode != JudgeMode::Gatekeeper {
         match bump_flavor(by_rubric, &pooled, pass, &rubric, &allows) {
             Some(flavor) => Outcome::Bump(flavor),
             None => {
@@ -710,9 +710,9 @@ pub(crate) async fn ask_within(
     }
 }
 
-/// A council verdict for the gate, with the record and the signal it leaves.
+/// A judge verdict for the gate, with its durable record and advisory signal.
 #[derive(Clone, Debug)]
-pub(crate) struct CouncilVerdict {
+pub(crate) struct JudgeVerdict {
     /// The spec's name, as `gate.toml` declares it.
     pub(crate) spec: String,
     pub(crate) outcome: Outcome,
@@ -729,7 +729,8 @@ pub(crate) struct CouncilVerdict {
     skipped: Vec<SkippedReviewerContext>,
     /// Reviewer context labels read after the decision, under the `direction-check` spec.
     observing: Vec<String>,
-    council: CouncilConfig,
+    policy: crate::kj::gate_policy::JudgePolicy,
+    council: Option<CouncilConfig>,
     /// The case state the decision read; the observations read it too.
     state: serde_json::Value,
     /// For a report: the submission and each read's answer, for the
@@ -783,7 +784,7 @@ pub(crate) struct ProgramVerdict {
     pub(crate) file: Option<super::programs::JudgedFile>,
     pub(crate) imports_not_shown: Vec<String>,
     /// The program's decision, or why there is none.
-    pub(crate) decision: Result<CouncilVerdict, String>,
+    pub(crate) decision: Result<JudgeVerdict, String>,
 }
 
 impl ProgramVerdict {
@@ -824,8 +825,12 @@ struct ReportedAnswers {
     answers: serde_json::Value,
 }
 
-impl CouncilVerdict {
-    /// Whether the council allows the statements no static layer covered:
+impl JudgeVerdict {
+    pub(crate) fn is_council(&self) -> bool {
+        self.council.is_some()
+    }
+
+    /// Whether the judge allows the statements no static layer covered:
     /// the shell decision and every program decision allow, and every
     /// program the submission runs was judged.
     pub(crate) fn allows(&self) -> bool {
@@ -838,7 +843,7 @@ impl CouncilVerdict {
     /// a bump: a miss, an ask, a program not judged, or no bump at all
     /// leaves the submission to the ordinary ask or run.
     pub(crate) fn submission_bump(&self) -> Option<BumpReason> {
-        if self.council.mode == CouncilMode::BumpOnly {
+        if self.council.is_some() && self.policy.mode == JudgeMode::BumpOnly {
             return self.first_unpassed();
         }
         let passes_or_bumps = |o: &Outcome| matches!(o, Outcome::Allow | Outcome::Bump(_));
@@ -894,10 +899,10 @@ impl CouncilVerdict {
         })
     }
 
-    /// `[council] bump_limit`, as this decision read it; `None` in
+    /// `[judge] bump_limit`, as this decision read it; `None` in
     /// bump-only mode, which has no limit.
     pub(crate) fn bump_limit(&self) -> Option<u64> {
-        self.council.bump_limit
+        self.policy.bump_limit
     }
 
     /// The digest of the submission this decision read, as its record
@@ -918,9 +923,9 @@ impl CouncilVerdict {
         self.record.seat_bump = Some(flavor.to_string());
     }
 
-    /// `[council] escalate`, as this decision read it.
-    pub(crate) fn escalate(&self) -> Option<crate::kj::gate_policy::CouncilEscalate> {
-        self.council.escalate
+    /// `[judge] escalate`, as this decision read it.
+    pub(crate) fn escalate(&self) -> Option<crate::kj::gate_policy::JudgeEscalate> {
+        self.policy.escalate
     }
 
     /// The seat has been bumped `streak.count` times in a row within the
@@ -1028,10 +1033,10 @@ impl CouncilVerdict {
             });
         }
         if !self.bump_history.is_empty() {
-            lines.push(format!("The council bumped this submission before it asked: {}.", self.bump_history_text()));
+            lines.push(format!("The judge bumped this submission before it asked: {}.", self.bump_history_text()));
         }
         if let Some(escalation) = &self.escalation {
-            lines.push(format!("The council {escalation}, so this one asks."));
+            lines.push(format!("The judge {escalation}, so this one asks."));
         }
         lines.join("\n")
     }
@@ -1122,12 +1127,13 @@ impl CouncilVerdict {
     /// decision's record has committed; nothing waits for the tasks, and
     /// their failures are their own records.
     pub(crate) fn observe(&self, kernel: Arc<crate::Kernel>, decision_id: Vec<u8>) {
+        let Some(council) = &self.council else { return };
         if let Some(judge) = &self.judge {
-            super::shadow::spawn_judge(kernel.clone(), self.council.clone(), decision_id.clone(), self.state.clone(), judge.clone());
+            super::shadow::spawn_judge(kernel.clone(), council.clone(), decision_id.clone(), self.state.clone(), judge.clone());
         }
         let _detached = super::observe::spawn_observe(
             kernel,
-            self.council.clone(),
+            council.clone(),
             decision_id,
             self.observing.clone(),
             self.state.clone(),
@@ -1246,7 +1252,7 @@ fn build_verdict(
     classification: Classification,
     elapsed: Duration,
     carried: Carried,
-) -> CouncilVerdict {
+) -> JudgeVerdict {
     let (outcome, miss_cause) = classification.outcome.recorded();
     let (pool_method, pool_weights) = pool_words(council);
     let server = match &seen {
@@ -1393,7 +1399,7 @@ fn build_verdict(
         ),
         (other, None) => format!("council ({}) answered {}", spec.name, other_word(other)),
     };
-    CouncilVerdict {
+    JudgeVerdict {
         spec: spec.name.clone(),
         outcome: classification.outcome,
         p_allow,
@@ -1402,7 +1408,10 @@ fn build_verdict(
         note,
         skipped: carried.chain.skipped,
         observing: carried.chain.observing,
-        council: council.clone(),
+        policy: crate::kj::gate_policy::JudgePolicy {
+            mode: council.mode, bump_limit: council.bump_limit, escalate: council.escalate,
+        },
+        council: Some(council.clone()),
         state: carried.state,
         report: None,
         decide_span: None,
@@ -1444,7 +1453,7 @@ pub(crate) async fn decide(
     council: &CouncilConfig,
     spec: &CouncilSpec,
     chain: Result<ReviewerContextChain, String>,
-) -> CouncilVerdict {
+) -> JudgeVerdict {
     let span = tracing::info_span!(
         "council.decide",
         council.spec = %spec.name,
@@ -1513,7 +1522,7 @@ async fn decide_inner(
     council: &CouncilConfig,
     spec: &CouncilSpec,
     chain: Result<ReviewerContextChain, String>,
-) -> CouncilVerdict {
+) -> JudgeVerdict {
     let span = tracing::Span::current();
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(council.deadline_ms);
@@ -1870,9 +1879,10 @@ pub(crate) fn decided_without_council(
 pub(crate) fn model_judge_verdict(
     caller: &KjCaller,
     case: CaseInput,
-    judged: super::guardian::Judged,
+    mut judged: super::guardian::Judged,
+    policy: crate::kj::gate_policy::JudgePolicy,
     pinned: Vec<super::programs::JudgedFile>,
-) -> CouncilVerdict {
+) -> JudgeVerdict {
     use super::guardian::Answer;
     let spec = judged.kind.spec();
     let noun = judged.kind.noun();
@@ -1881,6 +1891,16 @@ pub(crate) fn model_judge_verdict(
         Some(Answer::Choice { p, .. }) => Some(*p),
         _ => None,
     };
+    let bump = if judged.outcome == Outcome::Ask && policy.mode != JudgeMode::Gatekeeper {
+        match &judged.answer {
+            Some(Answer::Assessment(a)) if a.outcome == super::guardian::Verdict::Deny => Some(a.rationale.trim().to_string()),
+            Some(answer @ Answer::Choice { .. }) => Some(answer.summary()),
+            _ => None,
+        }.map(|guidance| BumpReason { flavor: spec.to_string(), guidance, undo: None })
+    } else { None };
+    if let Some(bump) = &bump {
+        judged.outcome = Outcome::Bump(bump.flavor.clone());
+    }
     let (outcome, miss_cause) = judged.outcome.recorded();
     let record = NewCouncilDecision {
         request_id: None,
@@ -1906,21 +1926,18 @@ pub(crate) fn model_judge_verdict(
         queue_ms: 0,
         ms: judged.elapsed.as_millis() as i64,
         house_rules_head: None,
-        bump_flavor: None,
+        bump_flavor: bump.as_ref().map(|b| b.flavor.clone()),
         seat_bump: None,
         reads: Vec::new(),
         pooled: choice.map(|p| p.recorded()).unwrap_or_default(),
         control_text: Vec::new(),
     };
     let word = other_word(&judged.outcome);
-    let mut note = match (&judged.outcome, &judged.answer) {
+    let note = match (&judged.outcome, &judged.answer) {
         (Outcome::Miss(cause), _) => format!("{noun} ({name}) gave no answer: {cause}"),
         (_, Some(a)) => format!("{noun} ({name}) answered {word}: {}", a.summary()),
         (_, None) => format!("{noun} ({name}) answered {word}"),
     };
-    if let Some(cause) = &judged.tripped {
-        note.push_str(&format!("\nThe {noun} stops judging this context because {cause}; its later submissions ask."));
-    }
     let label = match (&judged.outcome, &judged.answer) {
         (Outcome::Miss(cause), _) => format!("miss: {cause}"),
         (_, Some(Answer::Assessment(a))) => {
@@ -1958,7 +1975,7 @@ pub(crate) fn model_judge_verdict(
         None => None,
     };
     let assessment = judged.assessment().cloned();
-    CouncilVerdict {
+    JudgeVerdict {
         spec: spec.to_string(),
         outcome: judged.outcome,
         p_allow: choice.map(|p| p.allow),
@@ -1968,13 +1985,14 @@ pub(crate) fn model_judge_verdict(
         note,
         skipped: Vec::new(),
         observing: Vec::new(),
-        council: guardian_council(judged.deadline_ms),
+        policy,
+        council: None,
         state: case.state,
         report,
         decide_span: None,
         programs: Vec::new(),
         rubric: Vec::new(),
-        bump: None,
+        bump,
         bump_history: Vec::new(),
         undo: None,
         escalation: None,
@@ -1982,29 +2000,6 @@ pub(crate) fn model_judge_verdict(
         assessment,
         allow_by,
         pinned,
-    }
-}
-
-/// The council settings a guardian verdict carries: gatekeeper mode, with
-/// no server, contexts, specs, bumps, escalation, or judge.
-fn guardian_council(deadline_ms: u64) -> CouncilConfig {
-    CouncilConfig {
-        server: String::new(),
-        model: None,
-        contexts: Vec::new(),
-        pool_method: CouncilPoolMethod::Linear,
-        pool_weights: CouncilPoolWeights::Uniform,
-        deadline_ms,
-        require_agree: false,
-        reviewer_contexts: false,
-        house_rules: false,
-        house_rules_tokens: 0,
-        mode: CouncilMode::Gatekeeper,
-        bump_limit: None,
-        escalate: None,
-        specs: Vec::new(),
-        thresholds: Vec::new(),
-        judge: None,
     }
 }
 
@@ -2084,8 +2079,9 @@ async fn consult_model_judge(
     performer: Option<&crate::kj::gate_policy::GatePerformer>,
     cwd: Option<&str>,
     guardian: &crate::kj::gate_policy::GuardianConfig,
+    policy: crate::kj::gate_policy::JudgePolicy,
     bound: &crate::model_resolution::BoundSlot,
-) -> CouncilVerdict {
+) -> JudgeVerdict {
     let resolve_cwd = cwd.map(str::to_owned).unwrap_or_else(|| crate::runtime::shell_state::no_cwd_dir().to_string_lossy().into_owned());
     let facts = super::shell_case::gather(kernel, caller, context_id, command, planned, &resolve_cwd).await;
     let submission = Submission { command, planned, character: performer.map(|p| p.name.as_str()), cwd, facts: &facts };
@@ -2097,7 +2093,7 @@ async fn consult_model_judge(
         Ok(programs) => programs,
         Err(cause) => {
             let judged = super::guardian::Judged::begin(kind, bound, guardian).missed(Instant::now(), cause);
-            return model_judge_verdict(caller, case, judged, Vec::new());
+            return model_judge_verdict(caller, case, judged, policy, Vec::new());
         }
     };
     let pinned: Vec<super::programs::JudgedFile> = programs.iter().filter_map(|p| p.file.clone()).collect();
@@ -2119,7 +2115,7 @@ async fn consult_model_judge(
         context_id = %context_id,
         "model judge consulted on a submission"
     );
-    model_judge_verdict(caller, case, judged, pinned)
+    model_judge_verdict(caller, case, judged, policy, pinned)
 }
 
 /// Consult the council for one gate ask, or return `None` and leave the gate
@@ -2130,7 +2126,7 @@ pub(crate) async fn consult(
     caller: &KjCaller,
     spec: &GateSpec,
     config: &GateConfigLoad,
-) -> Result<Option<CouncilVerdict>, String> {
+) -> Result<Option<JudgeVerdict>, String> {
     if !eligible(spec) {
         return Ok(None);
     }
@@ -2164,7 +2160,7 @@ pub(crate) async fn consult(
             // Boxed so the model judge's state does not grow every gate
             // caller's future.
             let verdict = Box::pin(consult_model_judge(
-                kernel, kind, caller, context_id, command, &spec.planned, performer.as_ref(), cwd.as_deref(), &guardian, &bound,
+                kernel, kind, caller, context_id, command, &spec.planned, performer.as_ref(), cwd.as_deref(), &guardian, config.model_judge_policy(), &bound,
             ))
             .await;
             return Ok(Some(verdict));
@@ -2397,7 +2393,7 @@ mod tests {
             reviewer_contexts: false,
             house_rules: false,
             house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
-            mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
+            mode: crate::kj::gate_policy::JudgeMode::Gatekeeper,
             bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
             escalate: None,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }],
@@ -2825,7 +2821,7 @@ mod tests {
 
     fn bumper(allow_at: f64, mass_floor: f64, require_agree: bool) -> CouncilConfig {
         let mut c = council(allow_at, mass_floor, require_agree);
-        c.mode = crate::kj::gate_policy::CouncilMode::Bumper;
+        c.mode = crate::kj::gate_policy::JudgeMode::Bumper;
         c
     }
 
@@ -2977,7 +2973,7 @@ mod tests {
         use super::test_support::program_answer;
         let req = request();
         let mut council = program_council();
-        council.mode = crate::kj::gate_policy::CouncilMode::Bumper;
+        council.mode = crate::kj::gate_policy::JudgeMode::Bumper;
         let lean = |o: [f64; 3], n: [f64; 3], v: [f64; 3]| {
             classify_case(&req, &decode(program_answer(&req, o, n, v)), &council, "program-gate", CouncilCase::Program)
         };

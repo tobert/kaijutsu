@@ -1285,7 +1285,7 @@ mod tests {
             reviewer_contexts: false,
             house_rules: false,
             house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
-            mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
+            mode: crate::kj::gate_policy::JudgeMode::Gatekeeper,
             bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
             escalate: None,
             specs: vec![spec.clone()],
