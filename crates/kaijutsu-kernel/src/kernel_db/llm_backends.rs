@@ -32,6 +32,10 @@ pub struct BackendModelRow {
     pub extra: Option<String>,
     /// This model's own tunables on this backend.
     pub tunables: ModelTunablesRow,
+    /// The prompt profile the semantic index uses with this model, as an
+    /// [`kaijutsu_index::EmbeddingProfile`] token. `None` for a model the
+    /// index has not been told how to prompt.
+    pub embedding_profile: Option<String>,
 }
 
 /// A model's tunables on its backend. A binding copies each into a slot whose
@@ -54,19 +58,36 @@ pub struct ModelAliasRow {
     pub model: String,
 }
 
-/// The singleton `embedding_config` row. `backend` names a `backends` row of
-/// kind `openai`, which owns the base URL and the key.
+/// The singleton `embedding_config` row: the `backend_models` row the
+/// semantic index embeds with, which holds the model's prompt profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingConfigRow {
     pub enabled: bool,
-    pub backend: String,
+    pub backend_id: BackendId,
     pub model: String,
     pub dimensions: i64,
-    /// An [`kaijutsu_index::EmbeddingProfile`] token.
-    pub profile: String,
     pub timeout_ms: i64,
     pub max_in_flight: i64,
     pub max_context_bytes: i64,
+}
+
+/// Why a backend of `kind` whose model has `profile` cannot serve the
+/// semantic index, or `None` when it can. Embeddings need an `openai` kind
+/// backend (an `/embeddings` route) or a `council` one; a council server
+/// renders its own task prompts, so its model takes the `plain` profile.
+pub fn embedding_refusal(kind: &str, profile: &str) -> Option<String> {
+    match kind {
+        "openai" => None,
+        "council" if profile == "plain" => None,
+        "council" => Some(format!(
+            "a council server renders its own task prompts, so its model takes the plain \
+             embedding profile, not `{profile}` (`--embedding-profile plain`)"
+        )),
+        other => Some(format!(
+            "embeddings need a backend of kind `openai` (with an /embeddings route) or `council`, \
+             and this one is `{other}`"
+        )),
+    }
 }
 
 pub(super) const BACKEND_COLS: &str = "backend_id, name, kind, base_url, api_key_env, api_key_file, \
@@ -110,6 +131,16 @@ impl KernelDb {
         crate::llm::config::BackendKind::parse(&row.kind).map_err(KernelDbError::Validation)?;
         let existing = self.get_backend_by_name(&row.name)?;
         let backend_id = existing.as_ref().map(|b| b.backend_id).unwrap_or(row.backend_id);
+        if let Some(config) = self.get_embedding_config()?.filter(|c| c.backend_id == backend_id) {
+            let profile = self.embedding_profile(backend_id, &config.model)?.unwrap_or_default();
+            if let Some(why) = embedding_refusal(&row.kind, &profile) {
+                return Err(KernelDbError::Validation(format!(
+                    "backend '{}' serves the embedding model {}/{}: {why}; \
+                     change the embedding model with `kj embedding set` first",
+                    row.name, row.name, config.model
+                )));
+            }
+        }
         let created_at = existing.as_ref().map(|b| b.created_at).unwrap_or(row.created_at);
         self.conn.execute(
             "INSERT INTO backends (backend_id, name, kind, base_url, api_key_env, api_key_file,
@@ -223,8 +254,15 @@ impl KernelDb {
             stmt.query_map(params![id], |r| r.get::<_, String>(0))?
                 .collect::<SqliteResult<Vec<_>>>()?
         };
-        if !slots.is_empty() || !models.is_empty() || !aliases.is_empty() || !bindings.is_empty() {
+        let embedding: Option<String> = self
+            .conn
+            .query_row("SELECT model FROM embedding_config WHERE backend_id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        if !slots.is_empty() || !models.is_empty() || !aliases.is_empty() || !bindings.is_empty() || embedding.is_some() {
             let mut parts = Vec::new();
+            if let Some(model) = &embedding {
+                parts.push(format!("the embedding model {name}/{model} (`kj embedding`)"));
+            }
             if !slots.is_empty() {
                 parts.push(format!("character slots [{}]", slots.join(", ")));
             }
@@ -264,10 +302,33 @@ impl KernelDb {
         }
         let t = &row.tunables;
         validate_tunables(t.max_tokens, t.temperature, t.top_p, t.thinking_budget, t.thinking_style.as_deref())?;
+        match &row.embedding_profile {
+            Some(profile) => {
+                profile.parse::<kaijutsu_index::EmbeddingProfile>().map_err(KernelDbError::Validation)?;
+                if self.is_embedding_model(row.backend_id, &row.model_id)? {
+                    let kind = self.get_backend(row.backend_id)?.map(|b| b.kind).unwrap_or_default();
+                    if let Some(why) = embedding_refusal(&kind, profile) {
+                        return Err(KernelDbError::Validation(format!(
+                            "model '{}' is the embedding model: {why}; \
+                             change the embedding model with `kj embedding set` first",
+                            row.model_id
+                        )));
+                    }
+                }
+            }
+            None if self.is_embedding_model(row.backend_id, &row.model_id)? => {
+                return Err(KernelDbError::Validation(format!(
+                    "model '{}' is the embedding model, so it keeps its embedding profile; \
+                     change the embedding model with `kj embedding set` first",
+                    row.model_id
+                )));
+            }
+            None => {}
+        }
         self.conn.execute(
             "INSERT INTO backend_models (backend_id, model_id, context_window, extra,
-                 max_tokens, temperature, top_p, effort, thinking_budget, thinking_style)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 max_tokens, temperature, top_p, effort, thinking_budget, thinking_style, embedding_profile)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(backend_id, model_id) DO UPDATE SET
                  context_window = excluded.context_window,
                  extra = excluded.extra,
@@ -276,7 +337,8 @@ impl KernelDb {
                  top_p = excluded.top_p,
                  effort = excluded.effort,
                  thinking_budget = excluded.thinking_budget,
-                 thinking_style = excluded.thinking_style",
+                 thinking_style = excluded.thinking_style,
+                 embedding_profile = excluded.embedding_profile",
             params![
                 blob_param(row.backend_id.as_bytes()),
                 row.model_id,
@@ -288,17 +350,41 @@ impl KernelDb {
                 t.effort,
                 t.thinking_budget,
                 t.thinking_style,
+                row.embedding_profile,
             ],
         )?;
         Ok(())
     }
 
+    /// The embedding profile of one model row, `None` when the row is absent
+    /// or has none.
+    fn embedding_profile(&self, backend_id: BackendId, model_id: &str) -> KernelDbResult<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT embedding_profile FROM backend_models WHERE backend_id = ?1 AND model_id = ?2",
+            params![blob_param(backend_id.as_bytes()), model_id], |r| r.get::<_, Option<String>>(0),
+        ).optional()?.flatten())
+    }
+
+    /// Whether `(backend_id, model_id)` is the model `embedding_config` names.
+    fn is_embedding_model(&self, backend_id: BackendId, model_id: &str) -> KernelDbResult<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM embedding_config WHERE backend_id = ?1 AND model = ?2)",
+            params![blob_param(backend_id.as_bytes()), model_id], |r| r.get(0),
+        )?)
+    }
+
     /// Remove one backend's per-model metadata row. Returns whether a row went.
+    /// Refused while the row is the embedding model.
     pub fn delete_backend_model(
         &self,
         backend_id: BackendId,
         model_id: &str,
     ) -> KernelDbResult<bool> {
+        if self.is_embedding_model(backend_id, model_id)? {
+            return Err(KernelDbError::Validation(format!(
+                "model '{model_id}' is the embedding model; change it with `kj embedding set` first"
+            )));
+        }
         let n = self.conn.execute(
             "DELETE FROM backend_models WHERE backend_id = ?1 AND model_id = ?2",
             params![blob_param(backend_id.as_bytes()), model_id],
@@ -313,7 +399,7 @@ impl KernelDb {
     ) -> KernelDbResult<Vec<BackendModelRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT model_id, context_window, extra, max_tokens, temperature, top_p,
-                    effort, thinking_budget, thinking_style
+                    effort, thinking_budget, thinking_style, embedding_profile
              FROM backend_models WHERE backend_id = ?1 ORDER BY model_id",
         )?;
         let rows = stmt.query_map(params![blob_param(backend_id.as_bytes())], |row| {
@@ -330,6 +416,7 @@ impl KernelDb {
                     thinking_budget: row.get(7)?,
                     thinking_style: row.get(8)?,
                 },
+                embedding_profile: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -380,36 +467,48 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// The singleton embedding row, or `None` when never seeded.
+    /// The singleton embedding row, or `None` when never set.
     pub fn get_embedding_config(&self) -> KernelDbResult<Option<EmbeddingConfigRow>> {
         Ok(self.conn.query_row(
-            "SELECT enabled, backend, model, dimensions, profile, timeout_ms, max_in_flight, max_context_bytes
+            "SELECT enabled, backend_id, model, dimensions, timeout_ms, max_in_flight, max_context_bytes
              FROM embedding_config WHERE id = 1",
             [], |row| Ok(EmbeddingConfigRow {
-                enabled: row.get::<_, i64>(0)? != 0, backend: row.get(1)?, model: row.get(2)?,
-                dimensions: row.get(3)?, profile: row.get(4)?,
-                timeout_ms: row.get(5)?, max_in_flight: row.get(6)?, max_context_bytes: row.get(7)?,
+                enabled: row.get::<_, i64>(0)? != 0, backend_id: read_backend_id(row, 1)?, model: row.get(2)?,
+                dimensions: row.get(3)?,
+                timeout_ms: row.get(4)?, max_in_flight: row.get(5)?, max_context_bytes: row.get(6)?,
             }),
         ).optional()?)
     }
 
-    /// Replace the singleton embedding service configuration.
+    /// Replace the singleton embedding service configuration. The model must
+    /// be a `backend_models` row with an embedding profile.
     pub fn set_embedding_config(&self, row: &EmbeddingConfigRow) -> KernelDbResult<()> {
-        if row.backend.trim().is_empty() || row.model.trim().is_empty() {
-            return Err(KernelDbError::Validation("embedding backend and model must be nonempty".into()));
+        if row.model.trim().is_empty() {
+            return Err(KernelDbError::Validation("the embedding model must be nonempty".into()));
         }
         if row.dimensions <= 0 || row.timeout_ms <= 0 || row.max_in_flight <= 0 || row.max_context_bytes <= 0 {
             return Err(KernelDbError::Validation("embedding dimensions, timeout_ms, max_in_flight and max_context_bytes must be positive".into()));
         }
-        row.profile.parse::<kaijutsu_index::EmbeddingProfile>().map_err(KernelDbError::Validation)?;
+        let backend = self.get_backend(row.backend_id)?
+            .ok_or_else(|| KernelDbError::NotFound("the embedding backend".into()))?;
+        let Some(profile) = self.embedding_profile(row.backend_id, &row.model)? else {
+            return Err(KernelDbError::Validation(format!(
+                "{}/{} has no embedding profile, so the index cannot prompt it; record one with \
+                 `kj backend model set {} {} --embedding-profile <plain|qwen3|embeddinggemma>`",
+                backend.name, row.model, backend.name, row.model
+            )));
+        };
+        if let Some(why) = embedding_refusal(&backend.kind, &profile) {
+            return Err(KernelDbError::Validation(format!("{}/{}: {why}", backend.name, row.model)));
+        }
         self.conn.execute(
-            "INSERT INTO embedding_config (id, enabled, backend, model, dimensions, profile, timeout_ms, max_in_flight, max_context_bytes)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, backend = excluded.backend,
-                 model = excluded.model, dimensions = excluded.dimensions, profile = excluded.profile,
+            "INSERT INTO embedding_config (id, enabled, backend_id, model, dimensions, timeout_ms, max_in_flight, max_context_bytes)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, backend_id = excluded.backend_id,
+                 model = excluded.model, dimensions = excluded.dimensions,
                  timeout_ms = excluded.timeout_ms, max_in_flight = excluded.max_in_flight,
                  max_context_bytes = excluded.max_context_bytes",
-            params![row.enabled as i64, row.backend, row.model, row.dimensions, row.profile,
+            params![row.enabled as i64, blob_param(row.backend_id.as_bytes()), row.model, row.dimensions,
                 row.timeout_ms, row.max_in_flight, row.max_context_bytes],
         )?;
         Ok(())

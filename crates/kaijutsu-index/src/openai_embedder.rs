@@ -120,6 +120,13 @@ pub struct OpenAiEmbedder {
     permits: tokio::sync::Semaphore,
 }
 
+/// The revision an [`OpenAiEmbedder`] reports for `profile` at `base_url`.
+/// The endpoint is part of the vector space: the same model id at another
+/// provider is not the same weights.
+pub fn openai_revision(profile: EmbeddingProfile, base_url: &str) -> String {
+    format!("{}-{}", profile.as_str(), endpoint_tag(base_url))
+}
+
 /// A short, stable tag of the endpoint a vector came from.
 fn endpoint_tag(base_url: &str) -> String {
     let digest = Sha256::digest(base_url.trim_end_matches('/').as_bytes());
@@ -159,9 +166,7 @@ impl OpenAiEmbedder {
             client,
             url: format!("{}/embeddings", config.base_url.trim_end_matches('/')),
             api_key: config.api_key.map(|key| key.trim().to_owned()),
-            // The endpoint is part of the vector space: the same model id at
-            // another provider is not the same weights.
-            revision: format!("{}-{}", config.profile.as_str(), endpoint_tag(&config.base_url)),
+            revision: openai_revision(config.profile, &config.base_url),
             model: config.model,
             dimensions: config.dimensions,
             profile: config.profile,

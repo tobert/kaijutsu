@@ -35,7 +35,8 @@ impl KernelDb {
     /// Column backfills and guarded configuration migrations for existing DBs.
     /// An `embedding_config` in an older shape (a builtin model or a service
     /// endpoint) is replaced by an empty table: the kernel ships no backend
-    /// to put in its place.
+    /// to put in its place. One that names its backend by name moves to
+    /// `backend_id` ([`Self::migrate_embedding_backend_id`]).
     /// The project's stance is "schema is truth, bump = wipe", but a single
     /// `ADD COLUMN ... DEFAULT 0` is cheap and spares a live kernel a wipe.
     /// Each ALTER is guarded: a "duplicate column" error on a fresh DB (the
@@ -45,7 +46,8 @@ impl KernelDb {
     pub(super) fn apply_additive_migrations(conn: &Connection) -> KernelDbResult<()> {
         let legacy_embedding: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config'))
-                AND NOT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config') WHERE name = 'backend')",
+                AND NOT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config')
+                               WHERE name IN ('backend', 'backend_id'))",
             [], |row| row.get(0),
         )?;
         if legacy_embedding {
@@ -66,21 +68,10 @@ impl KernelDb {
                 None => None,
             };
             let tx = conn.unchecked_transaction()?;
-            tx.execute_batch("DROP TABLE embedding_config;
-                CREATE TABLE embedding_config (
-                    id INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    backend TEXT NOT NULL CHECK (backend != ''),
-                    model TEXT NOT NULL CHECK (model != ''),
-                    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
-                    profile TEXT NOT NULL DEFAULT 'plain',
-                    timeout_ms INTEGER NOT NULL CHECK (timeout_ms > 0),
-                    max_in_flight INTEGER NOT NULL CHECK (max_in_flight > 0),
-                    max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
-                );")?;
+            tx.execute_batch(&format!("DROP TABLE embedding_config; {EMBEDDING_CONFIG_TABLE}"))?;
             tx.commit()?;
             tracing::warn!(held = held.as_deref().unwrap_or("nothing"), "dropped the old embedding configuration; \
-                the semantic index is off until embedding_config names a backend and model (docs/synthesis.md)");
+                the semantic index is off until `kj embedding set` names a model");
         }
         // A database written before context characters still has the columns
         // they replaced; `contexts.provider` is in every such database and in
@@ -123,6 +114,7 @@ impl KernelDb {
             "ALTER TABLE backend_models ADD COLUMN thinking_style TEXT",
             "ALTER TABLE character_models ADD COLUMN decide TEXT CHECK (decide IS NULL OR decide != '')",
             "ALTER TABLE context_slots ADD COLUMN decide TEXT CHECK (decide IS NULL OR decide != '')",
+            "ALTER TABLE backend_models ADD COLUMN embedding_profile TEXT",
         ];
         for sql in alters {
             match conn.execute(sql, []) {
@@ -131,6 +123,7 @@ impl KernelDb {
                 Err(e) => return Err(e.into()),
             }
         }
+        Self::migrate_embedding_backend_id(conn)?;
         // A database with `contexts.context_type` is from before
         // `type-melt-v1`; the migrations below read `characters.context_type`
         // beside it, so one older than that column gains it, NULL, until
@@ -705,3 +698,66 @@ impl KernelDb {
 mod tests;
 #[cfg(test)]
 mod shape_tests;
+
+/// `embedding_config` in its current shape, for the rebuilds below. Matches
+/// the table in `SCHEMA`.
+const EMBEDDING_CONFIG_TABLE: &str = "CREATE TABLE embedding_config (
+    id INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    backend_id BLOB NOT NULL,
+    model TEXT NOT NULL CHECK (model != ''),
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    timeout_ms INTEGER NOT NULL CHECK (timeout_ms > 0),
+    max_in_flight INTEGER NOT NULL CHECK (max_in_flight > 0),
+    max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0),
+    FOREIGN KEY (backend_id, model) REFERENCES backend_models(backend_id, model_id)
+);";
+
+impl KernelDb {
+    /// Move an `embedding_config` that names its backend by name to
+    /// `backend_id`, and its profile onto the model's `backend_models` row.
+    /// A row whose backend no longer exists could not have run; it is
+    /// dropped with a warning naming what it held. Runs after the
+    /// `backend_models.embedding_profile` column exists.
+    pub(super) fn migrate_embedding_backend_id(conn: &Connection) -> KernelDbResult<()> {
+        if !Self::has_column(conn, "embedding_config", "backend")? {
+            return Ok(());
+        }
+        type OldRow = (i64, String, String, i64, String, i64, i64, i64);
+        let old: Option<OldRow> = conn.query_row(
+            "SELECT enabled, backend, model, dimensions, profile, timeout_ms, max_in_flight, max_context_bytes
+             FROM embedding_config WHERE id = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        ).optional()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(&format!("DROP TABLE embedding_config; {EMBEDDING_CONFIG_TABLE}"))?;
+        if let Some((enabled, backend, model, dimensions, profile, timeout_ms, max_in_flight, max_context_bytes)) = old {
+            let backend_id: Option<Vec<u8>> = tx
+                // The old reader matched the name without case.
+                .query_row("SELECT backend_id FROM backends WHERE name = ?1 COLLATE NOCASE
+                            ORDER BY name = ?1 DESC LIMIT 1", params![backend], |r| r.get(0))
+                .optional()?;
+            match backend_id {
+                Some(backend_id) => {
+                    tx.execute(
+                        "INSERT INTO backend_models (backend_id, model_id, embedding_profile) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(backend_id, model_id) DO UPDATE SET embedding_profile = excluded.embedding_profile",
+                        params![backend_id, model, profile],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO embedding_config (id, enabled, backend_id, model, dimensions, timeout_ms,
+                             max_in_flight, max_context_bytes)
+                         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![enabled, backend_id, model, dimensions, timeout_ms, max_in_flight, max_context_bytes],
+                    )?;
+                    tracing::info!(%backend, %model, %profile, "embedding_config now names its backend by id; \
+                        the profile is on the model row");
+                }
+                None => tracing::warn!(%backend, %model, "dropped the embedding setting: its backend does not exist; \
+                    the semantic index is off until `kj embedding set` names a model"),
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}

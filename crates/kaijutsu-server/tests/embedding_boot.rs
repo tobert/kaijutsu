@@ -1,5 +1,6 @@
 //! Embedding backend configuration and semantic index initialization at boot.
-use kaijutsu_kernel::{KernelDb, kernel_db::{BackendRow, EmbeddingConfigRow}};
+use kaijutsu_kernel::{KernelDb, kernel_db::{BackendModelRow, BackendRow, EmbeddingConfigRow}};
+use kaijutsu_types::BackendId;
 use kaijutsu_server::{config_mounts::ConfigMounts, rpc::create_shared_kernel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -8,16 +9,17 @@ fn vector_reply(dimensions: usize) -> String {
     format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}")
 }
 
-/// A backend row of kind `openai` at `base_url`, its key in a file, and the
-/// `embedding_config` row that names it.
-fn configure(db: &KernelDb, dir: &std::path::Path, base_url: Option<String>, key: Option<&str>, row: EmbeddingConfigRow) {
+/// A backend row of kind `openai` at `base_url`, its key in a file, its
+/// `boot-test` model with the `plain` profile, and the `embedding_config` row
+/// `row` makes from the backend's id.
+fn configure(db: &KernelDb, dir: &std::path::Path, base_url: Option<String>, key: Option<&str>, row: impl FnOnce(BackendId) -> EmbeddingConfigRow) {
     let key_file = key.map(|key| {
         let path = dir.join("embedding-key");
         std::fs::write(&path, format!("{key}\n")).unwrap();
         path.to_string_lossy().into_owned()
     });
-    db.upsert_backend(&BackendRow {
-        backend_id: kaijutsu_types::BackendId::new(),
+    let backend = db.upsert_backend(&BackendRow {
+        backend_id: BackendId::new(),
         name: "openrouter".into(), kind: "openai".into(), base_url,
         // An explicitly named variable does not fall back to the standard one,
         // so a missing key stays missing whatever the host exports.
@@ -26,13 +28,22 @@ fn configure(db: &KernelDb, dir: &std::path::Path, base_url: Option<String>, key
         request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None,
         created_at: 0, created_by: kaijutsu_types::PrincipalId::system(),
     }).unwrap();
-    db.set_embedding_config(&row).unwrap();
+    embedding_model(db, backend.backend_id, "boot-test", "plain");
+    db.set_embedding_config(&row(backend.backend_id)).unwrap();
 }
 
-fn row(dimensions: i64, timeout_ms: i64) -> EmbeddingConfigRow {
-    EmbeddingConfigRow {
-        enabled: true, backend: "openrouter".into(), model: "boot-test".into(),
-        dimensions, profile: "plain".into(), timeout_ms, max_in_flight: 2, max_context_bytes: 2048,
+/// A model on `backend` that the semantic index may use, with its prompt profile.
+fn embedding_model(db: &KernelDb, backend_id: BackendId, model: &str, profile: &str) {
+    db.set_backend_model(&BackendModelRow {
+        backend_id, model_id: model.into(), context_window: None, extra: None,
+        tunables: Default::default(), embedding_profile: Some(profile.into()),
+    }).unwrap();
+}
+
+fn row(dimensions: i64, timeout_ms: i64) -> impl FnOnce(BackendId) -> EmbeddingConfigRow {
+    move |backend_id| EmbeddingConfigRow {
+        enabled: true, backend_id, model: "boot-test".into(),
+        dimensions, timeout_ms, max_in_flight: 2, max_context_bytes: 2048,
     }
 }
 
@@ -75,16 +86,17 @@ async fn boot_embeds_through_a_council_server() {
     config.models.push(gogi_fake::FakeModel::embedding("embed-toy-1", 7));
     let council = gogi_fake::Server::start(config).unwrap();
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
-    db.upsert_backend(&BackendRow {
-        backend_id: kaijutsu_types::BackendId::new(),
+    let backend = db.upsert_backend(&BackendRow {
+        backend_id: BackendId::new(),
         name: "spaceghost".into(), kind: "council".into(), base_url: Some(council.url()),
         api_key_env: None, api_key_file: None, key_optional: true,
         request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None,
         created_at: 0, created_by: kaijutsu_types::PrincipalId::system(),
     }).unwrap();
+    embedding_model(&db, backend.backend_id, "embed-toy-1", "plain");
     db.set_embedding_config(&EmbeddingConfigRow {
-        backend: "spaceghost".into(), model: "embed-toy-1".into(), dimensions: 32,
-        ..row(32, 2000)
+        model: "embed-toy-1".into(),
+        ..row(32, 2000)(backend.backend_id)
     }).unwrap();
     insert_root_character(&db);
     drop(db);
@@ -110,14 +122,15 @@ async fn boot_embeds_through_a_keyless_local_server() {
         request
     });
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
-    db.upsert_backend(&BackendRow {
-        backend_id: kaijutsu_types::BackendId::new(),
+    let backend = db.upsert_backend(&BackendRow {
+        backend_id: BackendId::new(),
         name: "openrouter".into(), kind: "openai".into(), base_url: Some(base_url),
         api_key_env: Some("KAIJUTSU_EMBEDDING_TEST_UNSET_KEY".into()), api_key_file: None, key_optional: true,
         request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None,
         created_at: 0, created_by: kaijutsu_types::PrincipalId::system(),
     }).unwrap();
-    db.set_embedding_config(&row(8, 2000)).unwrap();
+    embedding_model(&db, backend.backend_id, "boot-test", "plain");
+    db.set_embedding_config(&row(8, 2000)(backend.backend_id)).unwrap();
     insert_root_character(&db);
     drop(db);
     let shared = boot(dir.path()).await;
@@ -164,20 +177,16 @@ async fn a_provider_returning_other_dimensions_leaves_index_unavailable() {
     server.await.unwrap();
 }
 
-/// No key, or a row naming a backend that is not there, leaves the index off
-/// and boot standing.
+/// A backend with no key leaves the index off and boot standing.
 #[tokio::test]
-async fn a_backend_without_a_key_or_a_row_without_a_backend_leaves_index_unavailable() {
-    for (what, key, backend) in [("no key", None, "openrouter"), ("no such backend", Some("sk-boot"), "missing")] {
-        let dir = tempfile::tempdir().unwrap();
-        let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
-        configure(&db, dir.path(), Some("http://127.0.0.1:9/api/v1".into()), key,
-            EmbeddingConfigRow { backend: backend.into(), ..row(1024, 100) });
-        insert_root_character(&db);
-        drop(db);
-        let shared = boot(dir.path()).await;
-        assert!(wait_for_index(&shared).await.is_none(), "{what}");
-    }
+async fn a_backend_without_a_key_leaves_index_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+    configure(&db, dir.path(), Some("http://127.0.0.1:9/api/v1".into()), None, row(1024, 100));
+    insert_root_character(&db);
+    drop(db);
+    let shared = boot(dir.path()).await;
+    assert!(wait_for_index(&shared).await.is_none());
 }
 
 /// Boot does not wait for the provider: one that accepts and never answers

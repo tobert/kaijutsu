@@ -20,7 +20,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{BackendId, ContentType};
 
-use crate::kernel_db::{BackendModelRow, BackendRow, ModelTunablesRow};
+use crate::kernel_db::{BackendModelRow, BackendRow};
 use crate::llm::BackendKind;
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
@@ -156,8 +156,8 @@ enum BackendCommand {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
-    /// Remove a backend. Refused while a character slot, a context's slot, or an
-    /// alias still names it.
+    /// Remove a backend. Refused while a character slot, a context's slot, an
+    /// alias, or the embedding model (`kj embedding`) still names it.
     #[command(alias = "rm")]
     Remove {
         /// Backend name
@@ -174,6 +174,8 @@ enum BackendModelCommand {
     /// pass change. A character slot's own value wins; a tunable the slot leaves
     /// unset is read from here when a context's slots are
     /// written, so a change reaches contexts after `kj context rotate`.
+    ///
+    /// kj backend model set ollama embeddinggemma-2:270m-q8_0-text --embedding-profile embeddinggemma
     Set {
         /// Backend name
         backend: String,
@@ -189,7 +191,8 @@ enum BackendModelCommand {
         #[command(flatten)]
         tunables: TunableFlags,
     },
-    /// Drop one model's metadata row.
+    /// Drop one model's metadata row. Refused while it is the embedding
+    /// model (`kj embedding`).
     #[command(alias = "rm")]
     Remove {
         /// Backend name
@@ -199,7 +202,7 @@ enum BackendModelCommand {
     },
 }
 
-/// The tunables a model row carries, as flags. Only the flags you pass
+/// The tunables and embedding profile a model row carries, as flags. Only the flags you pass
 /// change; `--clear` unsets a field.
 #[derive(clap::Args, Debug)]
 struct TunableFlags {
@@ -221,19 +224,24 @@ struct TunableFlags {
     /// Extended-thinking style: budget needs --thinking-budget below max tokens
     #[arg(long = "thinking-style", value_parser = ["off", "auto", "adaptive", "budget"])]
     thinking_style: Option<String>,
-    /// Unset a tunable: max-tokens, temperature, top-p, effort,
-    /// thinking-budget, or thinking-style. Repeat for more
+    /// For an embedding model, the task prefixes the semantic index adds:
+    /// embeddinggemma and qwen3 add their model's prompts, plain adds none.
+    /// A council server's model takes plain. See `kj embedding`
+    #[arg(long = "embedding-profile", value_parser = ["plain", "qwen3", "embeddinggemma"])]
+    embedding_profile: Option<String>,
+    /// Unset a field: max-tokens, temperature, top-p, effort,
+    /// thinking-budget, thinking-style, or embedding-profile. Repeat for more
     #[arg(long = "clear", value_name = "FIELD")]
     clear: Vec<String>,
 }
 
-const TUNABLE_FIELDS: &str = "max-tokens, temperature, top-p, effort, thinking-budget, thinking-style";
+const TUNABLE_FIELDS: &str = "max-tokens, temperature, top-p, effort, thinking-budget, thinking-style, embedding-profile";
 
 impl TunableFlags {
-    /// Apply the given flags onto `t`: set what was passed, clear what
+    /// Apply the given flags onto `row`: set what was passed, clear what
     /// `--clear` names. Refuses an unknown field, an empty token, and a field
     /// both set and cleared.
-    fn apply(self, t: &mut ModelTunablesRow) -> Result<(), String> {
+    fn apply(self, row: &mut BackendModelRow) -> Result<(), String> {
         for (name, value) in [("effort", &self.effort), ("thinking-style", &self.thinking_style)] {
             if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
                 return Err(format!("--{name} must not be empty; use --clear {name} to unset it"));
@@ -246,16 +254,19 @@ impl TunableFlags {
             "effort" => self.effort.is_some(),
             "thinking-budget" => self.thinking_budget.is_some(),
             "thinking-style" => self.thinking_style.is_some(),
+            "embedding-profile" => self.embedding_profile.is_some(),
             _ => false,
         };
         for field in &self.clear {
             if !TUNABLE_FIELDS.split(", ").any(|f| f == field) {
-                return Err(format!("--clear {field}: not a tunable; choose from {TUNABLE_FIELDS}"));
+                return Err(format!("--clear {field}: not a field; choose from {TUNABLE_FIELDS}"));
             }
             if set(field) {
                 return Err(format!("--{field} and --clear {field} together; pass one"));
             }
         }
+        if self.embedding_profile.is_some() { row.embedding_profile = self.embedding_profile; }
+        let t = &mut row.tunables;
         if let Some(v) = self.max_tokens { t.max_tokens = Some(v as i64); }
         if self.temperature.is_some() { t.temperature = self.temperature; }
         if self.top_p.is_some() { t.top_p = self.top_p; }
@@ -269,7 +280,8 @@ impl TunableFlags {
                 "top-p" => t.top_p = None,
                 "effort" => t.effort = None,
                 "thinking-budget" => t.thinking_budget = None,
-                _ => t.thinking_style = None,
+                "thinking-style" => t.thinking_style = None,
+                _ => row.embedding_profile = None,
             }
         }
         Ok(())
@@ -289,6 +301,7 @@ fn model_summary(m: &BackendModelRow) -> String {
     if let Some(v) = t.top_p { parts.push(format!("top_p={v}")); }
     if let Some(v) = t.thinking_budget { parts.push(format!("thinking_budget={v}")); }
     if let Some(v) = &t.thinking_style { parts.push(format!("thinking_style={v}")); }
+    if let Some(v) = &m.embedding_profile { parts.push(format!("embedding_profile={v}")); }
     parts.join("  ")
 }
 
@@ -852,10 +865,11 @@ impl KjDispatcher {
                     context_window: None,
                     extra: None,
                     tunables: Default::default(),
+                    embedding_profile: None,
                 });
                 if let Some(w) = context_window { row.context_window = Some(w as i64); }
                 if extra.is_some() { row.extra = extra; }
-                if let Err(e) = tunables.apply(&mut row.tunables) {
+                if let Err(e) = tunables.apply(&mut row) {
                     return KjResult::Err(format!("kj backend model set: {e}"));
                 }
                 match db.set_backend_model(&row) {
@@ -1400,6 +1414,28 @@ mod tests {
         assert!(r.message().contains("context slots of"), "{}", r.message());
         assert!(d.kernel_db().lock().get_backend_by_name("deepseek").unwrap().is_some());
     }
+    /// The embedding model is a model on a backend, so the backend cannot go
+    /// while the semantic index names it; the refusal says so.
+    ///
+    /// Falsified by a removal that ignores `embedding_config`.
+    #[tokio::test]
+    async fn remove_is_refused_while_the_embedding_model_is_on_the_backend() {
+        let d = seeded().await;
+        let c = test_caller();
+        for step in [
+            &["backend", "model", "set", "ollama", "embeddinggemma-2", "--embedding-profile", "embeddinggemma"][..],
+            &["embedding", "set", "ollama/embeddinggemma-2", "--dimensions", "768"][..],
+        ] {
+            let r = d.dispatch(&argv(step), &c).await;
+            assert!(r.is_ok(), "{step:?}: {}", r.message());
+        }
+        let r = d.dispatch(&argv(&["backend", "remove", "ollama"]), &c).await;
+        assert!(!r.is_ok(), "the embedding backend must not be removed: {}", r.message());
+        assert!(r.message().contains("ollama/embeddinggemma-2") && r.message().contains("kj embedding"),
+            "names the referent: {}", r.message());
+        assert!(d.kernel_db().lock().get_backend_by_name("ollama").unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn an_unreferenced_backend_removes_cleanly() {
         let d = seeded().await;

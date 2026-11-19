@@ -107,6 +107,7 @@ impl World {
                 context_window: window,
                 extra: None,
                 tunables,
+                embedding_profile: None,
             })
             .unwrap();
     }
@@ -750,6 +751,7 @@ fn an_unknown_thinking_style_is_refused_on_character_slot_and_model_row_writes()
             context_window: None,
             extra: None,
             tunables: ModelTunablesRow { thinking_style: Some("on".into()), ..Default::default() },
+            embedding_profile: None,
         })
         .unwrap_err()
         .to_string();

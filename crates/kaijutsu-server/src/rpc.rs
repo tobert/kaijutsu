@@ -2225,9 +2225,9 @@ pub async fn create_shared_kernel_in(
         });
     } else {
         log::warn!(
-            "semantic index off: no enabled embedding_config row was loaded from kernel.db \
-             (an error above names a failed read); semantic search and `kj synth` report \
-             unavailable (docs/synthesis.md, \"Embedding service\")"
+            "semantic index off: no embedding model is set, or it is off (an error above \
+             names a setting that cannot run); semantic search and `kj synth` report \
+             unavailable until `kj embedding set` names a model"
         );
     }
 
@@ -5778,7 +5778,7 @@ impl kernel::Server for KernelImpl {
                             .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?
                     }
                     None => return Err(capnp::Error::failed(
-                        "semantic index unavailable; check embedding_config and service startup logs".into(),
+                        "semantic index unavailable; `kj embedding show` says why".into(),
                     )),
                 };
 

@@ -119,6 +119,10 @@ kj backend set anthropic --kind anthropic --api-key-env ANTHROPIC_API_KEY --api-
 # An OpenAI-compatible local server that takes no key
 kj backend set ollama --kind openai --base-url http://localhost:11434/v1 --key-optional
 
+# The semantic index's embedding model on that server; applies at the next server start
+kj backend model set ollama embeddinggemma-2:270m-q8_0-text --embedding-profile embeddinggemma
+kj embedding set ollama/embeddinggemma-2:270m-q8_0-text --dimensions 768
+
 # OpenAI models on a ChatGPT Plus or Pro plan, signed in rather than keyed
 kj backend set gpt-plan --kind chatgpt
 kj backend login gpt-plan                          # prints an address to open

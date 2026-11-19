@@ -65,7 +65,8 @@ synth           synthesize context keywords; inspect the semantic index
 kaish           print the kaish agent primer
 character       the someone a name resolves to, its model, and its media slots
 backend         LLM endpoints and the models on each
-alias           short model names that point at a backend and model
+alias           short names for a backend and model
+embedding       semantic index model
 price           what a model's tokens and a provider-billed tool call cost
 ```
 

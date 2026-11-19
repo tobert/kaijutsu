@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::kernel_db::KernelDb;
+use crate::kernel_db::{EmbeddingConfigRow, KernelDb};
 use crate::llm::endpoint::Endpoints;
 
 use kaijutsu_index::EmbeddingProfile;
@@ -174,13 +174,12 @@ pub fn build_llm_registry(
     Ok(registry)
 }
 
-/// Read the singleton embedding config, or `None` when unset/disabled.
+/// Read the singleton embedding config, or `None` when unset or off.
 ///
-/// `enabled = 0` resolves to `None` — the same shape the kernel already
-/// handles as "no semantic index configured", so the disable knob needs no
-/// second code path. An enabled row whose backend is missing or cannot embed
-/// is an error: the operator asked for an index and would otherwise get
-/// silence.
+/// `enabled = 0` resolves to `None`, the same shape as "no semantic index
+/// configured". An enabled row that cannot run is an error
+/// ([`resolve_embedding`]): the operator asked for an index and would
+/// otherwise get silence.
 pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelConfig>> {
     let Some(row) = db
         .get_embedding_config()
@@ -191,36 +190,50 @@ pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelCo
     if !row.enabled {
         return Ok(None);
     }
+    resolve_embedding(db, &row).map(Some)
+}
+
+/// The embedding service `row` describes, or why it cannot run. Startup and
+/// `kj embedding set` both run it, so a setting that would leave the index
+/// off is refused when it is written.
+///
+/// The backend is of kind `openai` (an `/embeddings` route) or `council`;
+/// the model row holds the prompt profile, and a council model takes
+/// `plain` because the server renders its own task prompts.
+pub fn resolve_embedding(db: &KernelDb, row: &EmbeddingConfigRow) -> LlmResult<EmbeddingModelConfig> {
+    let read = |e: crate::kernel_db::KernelDbError| LlmError::InvalidRequest(format!("reading the embedding model: {e}"));
+    let backend_row = db.get_backend(row.backend_id).map_err(read)?
+        .ok_or_else(|| LlmError::InvalidRequest("the embedding backend row is missing".into()))?;
     let backend = load_backends(db)?
         .into_iter()
-        .find(|backend| backend.name.eq_ignore_ascii_case(&row.backend))
+        .find(|backend| backend.name == backend_row.name)
+        .ok_or_else(|| LlmError::InvalidRequest(format!("backend `{}` did not load", backend_row.name)))?;
+    let spec = format!("{}/{}", backend.name, row.model);
+    let profile = db.list_backend_models(row.backend_id).map_err(read)?
+        .into_iter()
+        .find(|m| m.model_id == row.model)
+        .and_then(|m| m.embedding_profile)
         .ok_or_else(|| LlmError::InvalidRequest(format!(
-            "embedding_config names backend `{}`, which is not configured; add it with `kj backend set`",
-            row.backend
+            "{spec} has no embedding profile; record one with \
+             `kj backend model set {} {} --embedding-profile <plain|qwen3|embeddinggemma>`",
+            backend.name, row.model
         )))?;
-    if !matches!(backend.kind, BackendKind::OpenAi | BackendKind::Council) {
-        return Err(LlmError::InvalidRequest(format!(
-            "embedding_config names backend `{}` of kind `{}`; embeddings need an `openai` kind backend \
-             whose base_url has an /embeddings route, or an `council` kind backend serving /council/v2/embeddings",
-            backend.name, backend.kind.as_str()
-        )));
+    if let Some(why) = crate::kernel_db::embedding_refusal(backend.kind.as_str(), &profile) {
+        return Err(LlmError::InvalidRequest(format!("{spec}: {why}")));
     }
-    let profile: EmbeddingProfile = row.profile.parse().map_err(LlmError::InvalidRequest)?;
-    if backend.kind == BackendKind::Council && profile != EmbeddingProfile::Plain {
-        return Err(LlmError::InvalidRequest(format!(
-            "embedding_config names backend `{}` of kind `council` with profile `{}`; a council server renders \
-             its own task prompts, so use profile `plain`",
-            backend.name, profile.as_str()
-        )));
-    }
-    Ok(Some(EmbeddingModelConfig {
-        enabled: true, backend, model: row.model,
-        dimensions: usize::try_from(row.dimensions)
-            .map_err(|_| LlmError::InvalidRequest("embedding_config dimensions is not positive".into()))?,
+    let profile: EmbeddingProfile = profile.parse().map_err(LlmError::InvalidRequest)?;
+    let positive = |what: &str, v: i64| usize::try_from(v).ok().filter(|v| *v > 0)
+        .ok_or_else(|| LlmError::InvalidRequest(format!("embedding {what} must be positive, got {v}")));
+    Ok(EmbeddingModelConfig {
+        enabled: row.enabled,
+        backend,
+        model: row.model.clone(),
+        dimensions: positive("dimensions", row.dimensions)?,
         profile,
-        timeout_ms: row.timeout_ms as u64, max_in_flight: row.max_in_flight as usize,
-        max_context_bytes: row.max_context_bytes as usize,
-    }))
+        timeout_ms: positive("timeout_ms", row.timeout_ms)? as u64,
+        max_in_flight: positive("max_in_flight", row.max_in_flight)?,
+        max_context_bytes: positive("max_context_bytes", row.max_context_bytes)?,
+    })
 }
 
 #[cfg(test)]
@@ -411,29 +424,35 @@ mod tests {
         assert!(load_embedding_config(&db).unwrap().is_none());
     }
 
-    fn embedding_row(backend: &str) -> EmbeddingConfigRow {
+    /// The embedding setting for `model` on `backend`, after giving the model
+    /// row `profile`.
+    fn embedding_row(db: &KernelDb, backend: &str, model: &str, profile: &str) -> EmbeddingConfigRow {
+        let backend_id = db.get_backend_by_name(backend).unwrap().expect("the backend exists").backend_id;
+        db.set_backend_model(&BackendModelRow {
+            backend_id, model_id: model.into(), context_window: None, extra: None,
+            tunables: Default::default(), embedding_profile: Some(profile.into()),
+        }).unwrap();
         EmbeddingConfigRow {
-            enabled: true, backend: backend.into(), model: "qwen/qwen3-embedding-8b".into(),
-            dimensions: 1024, profile: "qwen3".into(),
-            timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
+            enabled: true, backend_id, model: model.into(),
+            dimensions: 1024, timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
         }
     }
 
     #[test]
-    fn a_configured_embedding_service_reads_back_with_its_backend() {
+    fn a_configured_embedding_service_reads_back_with_its_backend_and_profile() {
         let db = seeded_db();
         crate::test_backends::backend(
             &db, "openrouter", "openai", Some("https://openrouter.ai/api/v1"),
             Some("OPENROUTER_API_KEY"), None, false,
         );
-        db.set_embedding_config(&embedding_row("openrouter")).unwrap();
+        db.set_embedding_config(&embedding_row(&db, "openrouter", "qwen/qwen3-embedding-8b", "qwen3")).unwrap();
         let emb = load_embedding_config(&db).unwrap().expect("configured and enabled");
         assert_eq!(emb.backend.name, "openrouter");
         assert_eq!(emb.backend.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
         assert_eq!(emb.backend.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
         assert_eq!(emb.model, "qwen/qwen3-embedding-8b");
         assert_eq!(emb.dimensions, 1024);
-        assert_eq!(emb.profile, kaijutsu_index::EmbeddingProfile::Qwen3);
+        assert_eq!(emb.profile, kaijutsu_index::EmbeddingProfile::Qwen3, "the profile comes from the model row");
         assert_eq!(emb.timeout_ms, 30_000);
         assert_eq!(emb.max_in_flight, 2);
         assert_eq!(emb.max_context_bytes, 2048);
@@ -442,42 +461,40 @@ mod tests {
     #[test]
     fn disabled_embedding_reads_as_none() {
         let db = seeded_db();
-        db.set_embedding_config(&EmbeddingConfigRow { enabled: false, ..embedding_row("openrouter") }).unwrap();
-        assert!(load_embedding_config(&db).unwrap().is_none(), "a disabled row needs no backend");
+        let row = embedding_row(&db, "ollama", "embeddinggemma-2", "embeddinggemma");
+        db.set_embedding_config(&EmbeddingConfigRow { enabled: false, ..row }).unwrap();
+        assert!(load_embedding_config(&db).unwrap().is_none());
     }
 
+    /// Only an openai or council backend serves embeddings; the write that
+    /// would name another is refused, so startup never meets one.
     #[test]
-    fn an_embedding_row_naming_no_backend_is_an_error_not_silence() {
-        let db = seeded_db();
-        db.set_embedding_config(&embedding_row("openrouter")).unwrap();
-        let error = load_embedding_config(&db).unwrap_err().to_string();
-        assert!(error.contains("openrouter") && error.contains("kj backend"), "{error}");
-    }
-
-    #[test]
-    fn only_an_openai_or_mk_backend_can_embed() {
+    fn only_an_openai_or_council_backend_can_embed() {
         let db = seeded_db();
         for backend in ["anthropic", "deepseek"] {
-            db.set_embedding_config(&embedding_row(backend)).unwrap();
-            let error = load_embedding_config(&db).unwrap_err().to_string();
+            let error = db.set_embedding_config(&embedding_row(&db, backend, "embed", "plain")).unwrap_err().to_string();
             assert!(error.contains(backend) && error.contains("openai") && error.contains("council"), "{backend}: {error}");
         }
+        assert!(db.get_embedding_config().unwrap().is_none());
     }
 
     /// A council server renders each task's prompt itself, so a `council`
-    /// backend takes the `plain` profile; any other would prefix twice.
+    /// model takes the `plain` profile; any other would prefix twice.
     #[test]
-    fn an_mk_backend_embeds_with_the_plain_profile_only() {
+    fn a_council_model_embeds_with_the_plain_profile_only() {
         let db = seeded_db();
         crate::test_backends::backend(&db, "spaceghost", "council", Some("http://100.65.47.5:8091"), None, None, true);
-        db.set_embedding_config(&EmbeddingConfigRow { profile: "plain".into(), ..embedding_row("spaceghost") }).unwrap();
+        db.set_embedding_config(&embedding_row(&db, "spaceghost", "embed-1", "plain")).unwrap();
         let emb = load_embedding_config(&db).unwrap().expect("configured and enabled");
         assert_eq!(emb.backend.kind, BackendKind::Council);
         assert_eq!(emb.profile, kaijutsu_index::EmbeddingProfile::Plain);
 
-        db.set_embedding_config(&embedding_row("spaceghost")).unwrap();
-        let error = load_embedding_config(&db).unwrap_err().to_string();
-        assert!(error.contains("spaceghost") && error.contains("plain"), "{error}");
+        let row = embedding_row(&db, "spaceghost", "embed-2", "qwen3");
+        let error = db.set_embedding_config(&row).unwrap_err().to_string();
+        assert!(error.contains("spaceghost/embed-2") && error.contains("--embedding-profile plain"), "{error}");
+        let error = resolve_embedding(&db, &row).unwrap_err().to_string();
+        assert!(error.contains("spaceghost/embed-2") && error.contains("--embedding-profile plain"),
+            "the startup check says the same: {error}");
     }
 
     #[test]
@@ -512,6 +529,7 @@ mod tests {
             context_window: Some(400_000),
             extra: None,
             tunables: Default::default(),
+            embedding_profile: None,
         })
         .unwrap();
         assert_eq!(

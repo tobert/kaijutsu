@@ -52,7 +52,7 @@ pub use config::{
     BackendConfig, BackendKind, EmbeddingModelConfig, ModelAlias, ModelInfo,
     SUPPORTED_BACKEND_KINDS, SlotTunables, unknown_backend_kind_message,
 };
-pub use db_config::{build_llm_registry, load_embedding_config};
+pub use db_config::{build_llm_registry, load_embedding_config, resolve_embedding};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, CouncilUsageExtra, GeminiUsageExtra, OpenAiCompatUsageExtra,

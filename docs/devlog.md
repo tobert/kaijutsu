@@ -404,3 +404,15 @@ Model judges use the gate's durable bump history, not an in-memory breaker.
 The third would-be bump within 30 minutes asks; the judge keeps judging.
 The same policy keys apply to Council v2 when set under `[judge]`.
 Existing host council policies still load until the host is migrated.
+
+## The embedding model is a model on a backend (November 19)
+
+`embedding_config` named its backend by text and held the prompt profile
+itself, so `kj backend remove` could delete the backend under the semantic
+index and the next start turned the index off with a log line. The setting
+now points at a `backend_models` row by `(backend_id, model)`, the row holds
+the profile, and both removal paths refuse while the index uses them. It
+stays one setting for the kernel, not a character slot: every context is
+searched in one vector space. `kj embedding set` runs the startup checks
+before it writes. The kernel also builds on macOS now: `rustix` 1.x has the
+no-replace rename there.

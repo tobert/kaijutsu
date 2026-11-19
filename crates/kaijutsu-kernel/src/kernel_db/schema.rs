@@ -808,6 +808,10 @@ CREATE TABLE IF NOT EXISTS backend_models (
     effort          TEXT,
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
+    -- The prompt profile of an embedding model (plain, qwen3, embeddinggemma):
+    -- which task prefixes the semantic index adds to its inputs. NULL for a
+    -- model the index has not been told how to prompt.
+    embedding_profile TEXT,
     PRIMARY KEY (backend_id, model_id)
 );
 
@@ -898,16 +902,19 @@ CREATE TABLE IF NOT EXISTS model_aliases (
 CREATE INDEX IF NOT EXISTS idx_model_aliases_backend ON model_aliases(backend_id);
 
 -- ── Embedding service (semantic indexing) ──────────────────────
+-- The one model the semantic index embeds with, for the whole kernel. It is a
+-- `backend_models` row, which holds its prompt profile, so neither the
+-- backend nor the model row can be removed while the index uses them.
 CREATE TABLE IF NOT EXISTS embedding_config (
     id                INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     enabled           INTEGER NOT NULL DEFAULT 1,
-    backend           TEXT NOT NULL CHECK (backend != ''),
+    backend_id        BLOB NOT NULL,
     model             TEXT NOT NULL CHECK (model != ''),
     dimensions        INTEGER NOT NULL CHECK (dimensions > 0),
-    profile           TEXT NOT NULL DEFAULT 'plain',
     timeout_ms        INTEGER NOT NULL CHECK (timeout_ms > 0),
     max_in_flight     INTEGER NOT NULL CHECK (max_in_flight > 0),
-    max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
+    max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0),
+    FOREIGN KEY (backend_id, model) REFERENCES backend_models(backend_id, model_id)
 );
 
 -- ── Roster (`crates/kaijutsu-kernel/src/roster.rs`) ─────────────────────

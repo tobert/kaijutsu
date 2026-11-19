@@ -117,6 +117,20 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Archive and promote do not resync the watcher.**
 - **A draft submit in the `llm_stream` fixture never completes its turn.**
 
+## Work Mac on the Aperture gateway (2026-11-19)
+
+The Crusoe Aperture gateway (`http://ai.civet-hops.ts.net`) authenticates by Tailscale identity, so each backend takes `--key-optional`. Claude (`anthropic`, base URL without `/v1`), Gemini (`gemini`, base URL ending `/v1beta`), and the Crusoe-hosted open models (`openai`, `/v1`) work today. Open:
+
+- **GPT models refuse `max_tokens`.** The gateway's `gpt-5.x`/`gpt-6.x` answer 400 "Use 'max_completion_tokens' instead". `Dialect::HostedOpenAi` is chosen only at api.openai.com (`llm/openai/mod.rs`, `wire_dialect`), and the Responses wire exists only on the `chatgpt` kind. Options: a backend setting that selects OpenAI's rules at any URL, or the Responses wire on `openai`.
+- **`effort` is inert on generic servers.** The gateway's vLLM DeepSeek honored `reasoning_effort: low`; `Dialect::Generic` drops `effort` with a warning (`llm/openai/build.rs`, `build_request`).
+- **Gateway errors.** GLM-5.3-Flash answered `503 {"code":"capacity_unavailable",...}`, a body not in OpenAI's error shape. The limiter cools down on 503; what a player reads has not been checked.
+- **Gateway embeddings.** `/v1/models` lists `text-embedding-3-small`, but `POST /v1/embeddings` answers 405. A local Ollama serves embeddings instead (`contrib/install-ollama-embed-macos.sh`).
+- **The kernel suite on macOS.** With `RUST_MIN_STACK=16777216` (two council and context tests overflow 2 MB test threads otherwise), 11 tests fail on macOS whether or not the embedding change is applied: `kj::cc` (4), `kj::audio_capture` staging, `kj::db` backup help, `kj::reflect::every_live_leaf_classifies` (`kj audio render` needs `<SOURCES>`), `runtime::context_shell` git (2), and `runtime::python_tool` (2). Not yet sorted into macOS-only and broken-everywhere.
+
+## Embedding model: what `kj embedding` leaves open (2026-11-19)
+
+- **A change applies at restart.** `kj embedding set` and `off` write the setting; the index connects at server start (`connect_semantic_index` in `kaijutsu-server/src/rpc.rs`). Live reconnect moves that function into the kernel, stops the old index's re-index watcher, and swaps through `set_semantic_index`.
+
 ## Decisions backend (2026-11-18)
 
 `kind = decisions` (`llm/decisions.rs`) asks OpenRouter's or Gemini's Decisions API a `choice` question; the gate's model judge calls `Provider::decisions`. Open:

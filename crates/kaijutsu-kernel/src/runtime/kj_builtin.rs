@@ -231,7 +231,7 @@ impl KjBuiltin {
     /// Index and prepare synthesis for all active contexts, reusing unchanged results.
     async fn synth_all(&self, force: bool) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
-            return ExecResult::failure(1, "semantic index unavailable; check embedding_config and service startup logs");
+            return ExecResult::failure(1, "semantic index unavailable; `kj embedding show` says why");
         };
         let contexts = {
             let db = self.dispatcher.kernel_db().lock();
@@ -264,7 +264,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (check embedding_config and service startup logs)".to_string(),
+                "semantic index not configured; `kj embedding show` says why".to_string(),
             );
         };
 
@@ -286,7 +286,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (check embedding_config and service startup logs)".to_string(),
+                "semantic index not configured; `kj embedding show` says why".to_string(),
             );
         };
 
@@ -320,7 +320,7 @@ impl KjBuiltin {
     fn synth_status(&self) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::success(
-                "semantic index: not configured\n(check embedding_config and service startup logs)".to_string(),
+                "semantic index: not configured\n`kj embedding show` says why".to_string(),
             );
         };
 

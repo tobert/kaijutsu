@@ -177,6 +177,7 @@ impl Catalog {
                         thinking_budget: r.get(8)?,
                         thinking_style: r.get(9)?,
                     },
+                    embedding_profile: None,
                 })
             })? {
                 let row = row?;

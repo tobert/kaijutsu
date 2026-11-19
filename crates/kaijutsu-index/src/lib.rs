@@ -28,7 +28,7 @@ pub use embedder::{Embedder, EmbeddingPurpose};
 pub mod council_embedder;
 pub mod openai_embedder;
 pub use council_embedder::{CouncilEmbedder, CouncilEmbedderConfig};
-pub use openai_embedder::{EmbeddingProfile, OpenAiEmbedder, OpenAiEmbedderConfig};
+pub use openai_embedder::{EmbeddingProfile, OpenAiEmbedder, OpenAiEmbedderConfig, openai_revision};
 
 use std::future::Future;
 use std::pin::Pin;

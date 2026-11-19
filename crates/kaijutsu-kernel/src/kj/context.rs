@@ -8911,6 +8911,7 @@ mod tests {
                     context_window: Some(100_000),
                     extra: None,
                     tunables: Default::default(),
+                    embedding_profile: None,
                 }).unwrap();
             }
             let context = register_context(&d, Some(label), None, character);

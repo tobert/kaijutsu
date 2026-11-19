@@ -42,6 +42,7 @@ fn model(db: &KernelDb, backend: &BackendRow, model_id: &str, window: u64, tunab
         context_window: Some(window as i64),
         extra: None,
         tunables,
+        embedding_profile: None,
     })
     .expect("write a test model row");
 }

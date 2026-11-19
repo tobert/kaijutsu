@@ -100,7 +100,7 @@ pub use cache_hydration::DEFAULT_HYDRATION_WINDOW;
 pub use tracks::{PersistedTrack, PersistedAttachment};
 pub use documents::{DocumentRow, DocSnapshotRow};
 pub use lineage::ContextEdgeRow;
-pub use llm_backends::{BackendRow, BackendModelRow, ModelTunablesRow, ModelAliasRow, EmbeddingConfigRow};
+pub use llm_backends::{BackendRow, BackendModelRow, ModelTunablesRow, ModelAliasRow, EmbeddingConfigRow, embedding_refusal};
 pub use llm_characters::{CharacterRow, CharacterSlotRow, CharacterModelRow};
 pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};

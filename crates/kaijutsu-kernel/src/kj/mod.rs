@@ -52,6 +52,7 @@ pub mod play;
 pub mod policy;
 pub mod preset;
 pub mod price;
+pub mod embedding;
 pub mod vi;
 pub mod effect;
 pub(crate) mod readonly;
@@ -588,6 +589,10 @@ impl KjDispatcher {
         }
         if cmd == "alias" {
             return self.dispatch_alias(&argv[1..], caller).await;
+        }
+        // The embedding model is kernel-global, like a backend.
+        if cmd == "embedding" {
+            return self.dispatch_embedding(&argv[1..], caller).await;
         }
         // `kj character` addresses the sheet table by name, never a
         // context — same exemption rationale as `kj backend`.
