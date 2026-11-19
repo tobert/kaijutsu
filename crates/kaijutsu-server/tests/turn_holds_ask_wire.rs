@@ -101,7 +101,7 @@ impl Held {
         let mut config = SshServerConfig::ephemeral(addr.port());
         // Setup runs as non-root principals, whose uncovered statements ask;
         // only the model's own calls should reach a reviewer here.
-        common::allow_in_shipped_gate(&config, &["kj context create", "kj drive", "kj binding allow", "cd"]);
+        common::allow_in_shipped_gate(&config, &["kj context create", "kj drive", "kj binding allow", "cd", "pwd"]);
         config.auth_db_path = Some(auth_db_path);
         common::bootstrap_mock(&config, "mock-model").await;
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
@@ -167,12 +167,17 @@ impl Held {
         });
     }
 
-    /// Script the model, subscribe to turn events, and start one drive.
-    async fn drive(&self, script: Vec<Vec<StreamEvent>>) -> (Arc<parking_lot::Mutex<Vec<Vec<Message>>>>, Receiver<ServerEvent>) {
+    async fn script_model(&self, script: Vec<Vec<StreamEvent>>) -> (Arc<parking_lot::Mutex<Vec<Vec<Message>>>>, Receiver<ServerEvent>) {
         let (mock, sent) = MockClient::new("").with_scripted_stream(script).recording_sent_messages();
         self.server.kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(mock)));
         let (callback, events) = turn_events_channel(32);
         self.performer_kj.subscribe_turn_events(callback).await.unwrap();
+        (sent, events)
+    }
+
+    /// Script the model, subscribe to turn events, and start one drive.
+    async fn drive(&self, script: Vec<Vec<StreamEvent>>) -> (Arc<parking_lot::Mutex<Vec<Vec<Message>>>>, Receiver<ServerEvent>) {
+        let (sent, events) = self.script_model(script).await;
         let admitted = self.performer_kj.execute_kj_quiet(self.context,
             &["drive".into(), "--prompt".into(), "run it".into()]).await.unwrap();
         assert_eq!(admitted.exit_code, 0, "{}", admitted.stderr);
@@ -254,6 +259,42 @@ impl Held {
     async fn close(self) {
         self.server.kernel.shutdown_runtime_worker().await.unwrap();
     }
+}
+
+#[test]
+fn a_removed_cwd_returns_a_tool_error_without_opening_an_ask() {
+    run_local(async {
+        use kaijutsu_kernel::runtime::prompt::{PromptSource, submit};
+        let h = Held::new("held-missing-cwd").await;
+        let removed = h.marker("removed");
+        std::fs::create_dir(&removed).unwrap();
+        let setup = common::shell_exec_wait(&h.performer_kj, &format!("cd {}", removed.display()), h.context).await;
+        assert_eq!(setup.2, Status::Done, "cd: {}", setup.1);
+        std::fs::remove_dir(&removed).unwrap();
+        let marker = h.marker("must-not-run");
+        let (sent, mut events) = h.script_model(vec![
+            vec![shell_write("missing-cwd", &format!("echo ran > {}", marker.display())), done("tool_use")],
+            vec![shell_write("recovered-cwd", "pwd"), done("tool_use")],
+            reply("understood"),
+        ]).await;
+        let principal = h.server.kernel_db.lock().get_context(h.context).unwrap().unwrap().performer.unwrap();
+        submit(&h.server.kernel, h.context, principal, kaijutsu_types::SessionId::new(),
+            PromptSource::Text { content: "Try the shell twice".into() }).await.unwrap();
+        wait_for("both shell results or an unexpected ask", || sent.lock().len() >= 3 || !h.pending().is_empty()).await;
+        let pending = h.pending();
+        assert!(pending.is_empty(), "neither shell call should raise an ask: {pending:?}");
+        assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
+        let sent = sent.lock().clone();
+        let results = tool_results(&sent[1]);
+        let refused = results.iter().find(|r| r.0 == "missing-cwd").expect("the model received the missing-cwd result");
+        assert!(refused.2 && refused.1.contains("no longer exists") && refused.1.contains("nothing was run"), "{refused:?}");
+        assert!(refused.1.contains(h.scratch.path().to_str().unwrap()), "{refused:?}");
+        let results = tool_results(&sent[2]);
+        let recovered = results.iter().find(|r| r.0 == "recovered-cwd").unwrap();
+        assert!(!recovered.2 && recovered.1.contains(h.scratch.path().to_str().unwrap()), "{recovered:?}");
+        assert!(!marker.exists(), "the refused command must not run in the recovered directory");
+        h.close().await;
+    });
 }
 
 /// The model asks, the reviewer allows, and the same turn continues with the

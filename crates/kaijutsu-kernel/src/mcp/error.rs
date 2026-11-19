@@ -141,6 +141,9 @@ pub enum McpError {
     #[error("call cancelled")]
     Cancelled,
 
+    #[error(transparent)]
+    RemovedContextCwd(#[from] crate::runtime::context_shell::RemovedContextCwd),
+
     /// A refusal about the caller's standing — the gate's three states,
     /// which are one refusal with three kinds. Branch on
     /// [`Refusal::kind`]; the three teach opposite lessons and collapsing

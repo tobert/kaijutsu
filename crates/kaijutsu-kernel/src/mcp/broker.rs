@@ -2635,7 +2635,10 @@ impl Broker {
                 if cancel.is_cancelled() {
                     return Err(McpError::Cancelled);
                 }
-                return Ok(KaishHookOutcome::Escalate(format!("kaish hook init failed: {e}")));
+                return match e.downcast::<crate::runtime::context_shell::RemovedContextCwd>() {
+                    Ok(removed) => Err(removed.into()),
+                    Err(e) => Ok(KaishHookOutcome::Escalate(format!("kaish hook init failed: {e}"))),
+                };
             }
         };
         if cancel.is_cancelled() {
@@ -3895,6 +3898,7 @@ fn error_to_hook_json(e: &McpError) -> String {
         McpError::Protocol(_) => ("Protocol", serde_json::Value::Null),
         McpError::Io(_) => ("Io", serde_json::Value::Null),
         McpError::Cancelled => ("Cancelled", serde_json::Value::Null),
+        McpError::RemovedContextCwd(_) => ("RemovedContextCwd", serde_json::Value::Null),
         McpError::Refused(r) => {
             // Every `McpError::Refused` is composed by `refused_gate`, so
             // only the gate's three kinds reach this arm today. The

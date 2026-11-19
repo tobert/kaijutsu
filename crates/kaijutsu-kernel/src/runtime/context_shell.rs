@@ -42,6 +42,12 @@ pub enum ShellPolicy {
     Rc(RcAuthority),
 }
 
+/// The context cwd disappeared. Recovery is already persisted; the call
+/// must return this error rather than run or open an ask in the new cwd.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct RemovedContextCwd(String);
+
 /// Source of the working directory, independent of output and execution policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCwd {
@@ -261,16 +267,17 @@ impl EmbeddedKaish {
                             "context cwd no longer exists; moved to its nearest ancestor below /, or cleared");
                         match used {
                             Some(used) => used,
-                            None => anyhow::bail!(
+                            None => return Err(RemovedContextCwd(format!(
                                 "context cwd '{}' no longer exists, and no directory above it except `/` does; \
                                  nothing was run. The context now has no working directory, so the next command \
                                  runs in '{}'. `cd DIR` sets a new one.",
-                                path.display(), super::shell_state::no_cwd_dir().display()),
+                                path.display(), super::shell_state::no_cwd_dir().display())).into()),
                         }
                     }
                 };
-                anyhow::bail!("context cwd '{}' no longer exists; nothing was run. The working directory is now '{}'; run the command again",
-                    path.display(), now.display());
+                return Err(RemovedContextCwd(format!(
+                    "context cwd '{}' no longer exists; nothing was run. The working directory is now '{}'; run the command again",
+                    path.display(), now.display())).into());
             }
         }
 

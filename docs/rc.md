@@ -116,4 +116,7 @@ parts:
   `shell_write`. Its hook body lives at `/config/rc/lib/hooks/shell-guard.kai`
   and is read fresh from `/config` on each call, inspecting `KJ_TOOL_PLAN` to
   refuse unnecessary `sh -c` / `bash -c` wrappers and suggest native kaish or
-  `kj` commands.
+  `kj` commands. If the context's working directory no longer exists, the
+  shell call returns an error instead of opening an ask. The kernel moves the
+  context to the nearest existing parent below `/`, or clears the working
+  directory if no such parent exists. The refused command does not run.
