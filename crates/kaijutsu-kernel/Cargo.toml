@@ -196,7 +196,7 @@ test-util = ["dep:tempfile"]
 
 # Process-group and parent-death handling for configured external MCP servers.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # "test-util" gives `#[tokio::test(start_paused = true)]` — how the MIDI

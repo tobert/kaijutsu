@@ -6938,7 +6938,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "russh-sftp",
- "rustix 0.38.44",
+ "rustix 1.1.4",
  "rustls",
  "rustls-platform-verifier",
  "rustysynth",

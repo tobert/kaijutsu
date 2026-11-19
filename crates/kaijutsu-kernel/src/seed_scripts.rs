@@ -408,7 +408,8 @@ fn move_aside(
 }
 
 /// `rename(2)` that fails with `AlreadyExists` instead of replacing `to`
-/// (`renameat2` with `RENAME_NOREPLACE`, through `rustix`). A plain rename
+/// (`renameat2` with `RENAME_NOREPLACE` on Linux, `renameatx_np` with
+/// `RENAME_EXCL` on macOS, through `rustix`). A plain rename
 /// would replace an empty directory or a file that appeared after the name
 /// was chosen.
 fn rename_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
