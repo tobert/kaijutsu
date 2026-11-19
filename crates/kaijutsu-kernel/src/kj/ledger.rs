@@ -308,8 +308,9 @@ enum LedgerCommand {
         #[arg(long)]
         signals: bool,
     },
-    /// Show one pending or decided ask, its statement, identities, decision,
-    /// execution inputs, publication abandonment, and completion delivery.
+    /// Show one pending or decided ask, its statement, identities, decision
+    /// and any denial reason, execution inputs, publication abandonment, and
+    /// completion delivery.
     /// Result reviews include captured execution and the settled result, even
     /// when the command authored no transcript pair.
     Show {
@@ -344,27 +345,26 @@ enum LedgerCommand {
         #[arg(long, requires = "remember")]
         family: bool,
     },
-    /// Deny one ask (claims it first; exactly one answerer wins).
+    /// Deny one ask. Nothing runs.
     Deny {
         /// The ask to deny. Request ids come from `kj ledger list`.
         request_id: String,
-        /// Remember this decision as a standing rule, so future identical
-        /// asks are denied without asking anyone. Always permitted, even
-        /// when a covered statement has a free variable. Off by default.
-        /// Undo with `kj ledger forget`.
+        /// Give the asking model a reason in the denial. `kj ledger show`
+        /// also shows it. Omit this option to deny without a reason.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// Save a standing rule that denies future matching asks without
+        /// asking again. Off by default. Undo with `kj ledger forget`.
         #[arg(long)]
         remember: Option<RememberScopeArg>,
-        /// With --remember: deny the command family instead of the exact
-        /// text, whatever the arguments. Refused, like a family allow, when
-        /// a command has a redirect, a background flag, a heredoc or a
-        /// non-plain argument; the decision on THIS ask still stands. Undo
-        /// with `kj ledger forget`.
+        /// With --remember, match the command family instead of the exact text.
+        /// A redirect, background flag, heredoc, or non-plain argument prevents
+        /// saving the rule but does not change this denial.
         #[arg(long, requires = "remember")]
         family: bool,
-        /// The reviewer's prompt was cancelled rather than answered. Deny
-        /// the ask and record the decided option `prompt_cancelled`. Cannot
-        /// be combined with --remember.
-        #[arg(long, conflicts_with = "remember")]
+        /// Record that the reviewer's prompt was canceled. Cannot be combined
+        /// with --remember or --reason.
+        #[arg(long, conflicts_with_all = ["remember", "reason"])]
         cancelled: bool,
     },
     /// Withdraw a pending ask you performed or requested. Nothing runs.
@@ -519,10 +519,11 @@ impl KjDispatcher {
             }
             LedgerCommand::Show { request_id, signals } => self.ledger_show(&request_id, signals),
             LedgerCommand::Allow { request_id, remember, family } => {
-                self.ledger_decide(&request_id, true, caller, remember, family, false)
+                self.ledger_decide(&request_id, AskVerdict::Allow, caller, remember, family, None)
             }
-            LedgerCommand::Deny { request_id, remember, family, cancelled } => {
-                self.ledger_decide(&request_id, false, caller, remember, family, cancelled)
+            LedgerCommand::Deny { request_id, reason, remember, family, cancelled } => {
+                let verdict = if cancelled { AskVerdict::PromptCancelled } else { AskVerdict::Deny };
+                self.ledger_decide(&request_id, verdict, caller, remember, family, reason.as_deref())
             }
             LedgerCommand::Cancel { request_id } => self.ledger_cancel(&request_id, caller),
             LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, to.as_deref(), caller).await,
@@ -702,7 +703,7 @@ impl KjDispatcher {
     }
 
     fn ledger_show(&self, request_id: &str, show_signals: bool) -> KjResult {
-        let (detail, signal_rows, completion_notification) = {
+        let (detail, signal_rows, completion_notification, denial_reason) = {
             let db = self.kernel_db.lock();
             let detail = match crate::ledger_view::get_ask(&db, request_id) {
                 Ok(Some(detail)) => detail,
@@ -722,7 +723,11 @@ impl KjDispatcher {
                 Ok(notice) => notice,
                 Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
             };
-            (detail, signal_rows, completion_notification)
+            let denial_reason = match approval_ledger::ask::denial_reason(db.conn_for_ledger(), request_id) {
+                Ok(reason) => reason,
+                Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
+            };
+            (detail, signal_rows, completion_notification, denial_reason)
         };
         let ask = &detail.summary;
         let result_review = if ask.origin == AskOrigin::HookResult {
@@ -796,6 +801,9 @@ impl KjDispatcher {
         if let Some(reason) = decision.and_then(|d| d.auto_reason.as_deref()) {
             lines.push(format!("auto:       {reason}"));
         }
+        if let Some(reason) = &denial_reason {
+            lines.push(format!("reason:     {reason}"));
+        }
         for moved in &detail.reassignments {
             let from = moved.from.as_ref().map_or("-", |p| p.name.as_str());
             lines.push(format!("reassigned: {from} -> {} by {} at {}", moved.to.name, moved.by.name, moved.at_ms));
@@ -864,6 +872,7 @@ impl KjDispatcher {
             "decided_by": decided_by,
             "decided_by_name": decided_by_name,
             "decided_option": decision.and_then(|d| d.option.clone()),
+            "decision_reason": denial_reason,
             "remember_scope": decision.and_then(|d| d.remember_scope.clone()),
             "redeemed_at": detail.redeemed_at_ms,
             "publication_abandoned": detail.publication_abandoned,
@@ -1003,20 +1012,16 @@ impl KjDispatcher {
     fn ledger_decide(
         &self,
         request_id: &str,
-        allow: bool,
+        verdict: AskVerdict,
         caller: &KjCaller,
         remember: Option<RememberScopeArg>,
         family: bool,
-        cancelled: bool,
+        reason: Option<&str>,
     ) -> KjResult {
-        let verdict = match (allow, cancelled) {
-            (true, _) => AskVerdict::Allow,
-            (false, true) => AskVerdict::PromptCancelled,
-            (false, false) => AskVerdict::Deny,
-        };
+        let allow = verdict == AskVerdict::Allow;
         let remember = remember.map(|scope| Remember { scope: scope.to_scope(), family });
         let verb = if allow { "allow" } else { "deny" };
-        match decide_ask(self.kernel(), caller.actor_id, caller.context_id, request_id, verdict, remember) {
+        match decide_ask_with_reason(self.kernel(), caller.actor_id, caller.context_id, request_id, verdict, remember, reason) {
             Ok(answered) => {
                 let decided = if allow { "allowed" } else { "denied" };
                 let mut message = format!("{decided} ask {request_id} ({})", answered.summary.description);
@@ -1656,6 +1661,18 @@ pub fn decide_ask(
     verdict: AskVerdict,
     remember: Option<Remember>,
 ) -> Result<AskAnswered, AskAnswerFailure> {
+    decide_ask_with_reason(kernel, answerer, answerer_context, request_id, verdict, remember, None)
+}
+
+fn decide_ask_with_reason(
+    kernel: &crate::Kernel,
+    answerer: PrincipalId,
+    answerer_context: Option<ContextId>,
+    request_id: &str,
+    verdict: AskVerdict,
+    remember: Option<Remember>,
+    reason: Option<&str>,
+) -> Result<AskAnswered, AskAnswerFailure> {
     let allow = verdict == AskVerdict::Allow;
     let span = tracing::info_span!(
         "approval.decision",
@@ -1715,7 +1732,7 @@ pub fn decide_ask(
         // reviewer snapshot and moves the row in one write transaction, so
         // exactly one answer wins and a refused answerer leaves nothing
         // claimed behind it.
-        let decided = approval_ledger::decide::decide(conn, request_id, approval_ledger::decide::DecideInput {
+        let decided = approval_ledger::decide::decide_with_denial_reason(conn, request_id, approval_ledger::decide::DecideInput {
             allow,
             decided_by: Some(answerer),
             decided_option: Some(match verdict {
@@ -1725,7 +1742,7 @@ pub fn decide_ask(
             }),
             remember_scope: remember.map(|r| remember_scope_str(r.scope)),
             auto_reason: None,
-        });
+        }, reason);
         match decided {
             Ok(row) => {
                 tracing::info!(decision.status = %row.status, "approval ask decided");

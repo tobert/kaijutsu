@@ -115,6 +115,13 @@ pub fn ensure_not_self_approval(
 /// caller must roll back on error, and a refusal or late answer made inside
 /// it commits its audit row only if that caller commits.
 pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result<ApprovalRow> {
+    decide_with_denial_reason(conn, request_id, input, None)
+}
+
+/// Decide an ask, recording the reviewer's reason on the decision event if denied.
+pub fn decide_with_denial_reason(
+    conn: &Connection, request_id: &str, input: DecideInput, denial_reason: Option<&str>,
+) -> Result<ApprovalRow> {
     let tx = if conn.is_autocommit() {
         Some(Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?)
     } else { None };
@@ -186,7 +193,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
             input.decided_option,
             input.remember_scope,
             input.auto_reason,
-            None,
+            if input.allow { None } else { denial_reason },
         )?;
         // A row whose reviewer snapshot is its own actor was answered by
         // the one person who could: mark it, so an audit can tell a

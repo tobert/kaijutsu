@@ -1007,12 +1007,29 @@ fn a_denied_turn_pair_tells_the_model_it_did_not_run() {
         let ask = s.raise(&code).await;
         let (_command, output) = s.link_waiting_pair(&ask, &code, PairOwner::Turn);
 
-        s.answer(&ask, false).await;
+        let reason = "Use the generated report instead.\nThe source file stays unchanged.";
+        let kj = &s.approver_kj;
+        let help = kj.execute_kj_quiet(s.approver,
+            &["ledger".into(), "deny".into(), "--help".into()]).await.unwrap();
+        println!("Published ledger deny help:\n{}", help.stdout);
+        let answer = kj.execute_kj_quiet(s.approver,
+            &["ledger".into(), "deny".into(), ask.clone(), "--reason".into(), reason.into()]).await.unwrap();
+        assert_eq!(answer.exit_code, 0, "{}{}", answer.stdout, answer.stderr);
         wait_for("the denied turn pair to settle", || s.block(&output).status == Status::Error).await;
+        let stderr = s.block(&output).stderr.unwrap_or_default();
+        assert!(stderr.contains("nothing was run") && stderr.contains(reason), "{stderr:?}");
+        let late = kj.execute_kj_quiet(s.approver,
+            &["ledger".into(), "deny".into(), ask.clone(), "--reason".into(), "A different reason".into()]).await.unwrap();
+        assert_ne!(late.exit_code, 0, "a late denial must not replace the decision");
+        let shown = kj.execute_kj_quiet(s.approver,
+            &["ledger".into(), "show".into(), ask.clone()]).await.unwrap();
+        assert!(shown.stdout.contains(reason), "{}", shown.stdout);
+        assert_eq!(shown.data.unwrap()["decision_reason"], reason);
         wait_for("the no-run denial seed", || {
             s.worker_blocks().iter().any(|block| {
                 block.kind == BlockKind::Text
                     && block.content.contains("denied the action")
+                    && block.content.contains(reason)
                     && block.content.contains("It did NOT run.")
                     && block.content.contains(&output.to_key())
             })
@@ -1543,7 +1560,14 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
         // to the first review's ask and never opens its own.
         assert!(ask.description.contains("Second result review"), "{}", ask.description);
     }
-    s.answer(&ask.request_id, allow).await;
+    let reason = "Keep the captured output private.";
+    if allow {
+        s.answer(&ask.request_id, true).await;
+    } else {
+        let answer = s.approver_kj.execute_kj_quiet(s.approver,
+            &["ledger".into(), "deny".into(), ask.request_id.clone(), "--reason".into(), reason.into()]).await.unwrap();
+        assert_eq!(answer.exit_code, 0, "{}{}", answer.stdout, answer.stderr);
+    }
     wait_for("reviewed operation completion", || {
         s.kernel.kernel.shell_operations().get(&submission.operation_id, s.worker).unwrap().unwrap().completed_at.is_some()
     }).await;
@@ -1555,6 +1579,7 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
     } else {
         assert_eq!(envelope.status, ShellStatus::Error);
         assert_ne!(envelope.stdout, "reviewed result", "denial stops remaining hooks");
+        assert!(envelope.error.as_deref().is_some_and(|error| error.contains(reason)), "{envelope:?}");
     }
     let captured = s.kernel.kernel.shell_operations().outcome(&submission.operation_id, s.worker).unwrap().unwrap();
     let first_review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask.request_id, s.worker).unwrap().unwrap();

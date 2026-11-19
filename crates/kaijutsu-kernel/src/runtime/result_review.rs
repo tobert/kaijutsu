@@ -136,6 +136,11 @@ impl CommandResultReview {
             if !matches!(row.status, ApprovalStatus::Pending | ApprovalStatus::Claimed) {
                 let redeemable = matches!(row.status, ApprovalStatus::Allowed | ApprovalStatus::Denied)
                     || (row.status == ApprovalStatus::Abandoned && row.decided_option.as_deref() == Some("cancel"));
+                let reason = if row.status == ApprovalStatus::Denied {
+                    let db = self.kernel.kernel_db().lock();
+                    approval_ledger::ask::denial_reason(db.conn_for_ledger(), &ask.request_id)
+                        .map_err(|e| McpError::Protocol(e.to_string()))?
+                } else { None };
                 if redeemable && !self.kernel.kernel_db().lock().redeem_ask(&ask.request_id)
                     .map_err(|e| McpError::Protocol(e.to_string()))?
                 {
@@ -152,7 +157,9 @@ impl CommandResultReview {
                 }
                 return Err(McpError::refused_gate(kaijutsu_types::RefusalKind::Denied, "result review",
                     Some(crate::kj::gate::ask_ref(ask.request_id.clone(), row.status)),
-                    "Result review did not approve publication; source was not run again."));
+                    &super::approval_resume::with_denial_reason(
+                        "Result review did not approve publication; source was not run again.".into(), reason.as_deref(),
+                    )));
             }
             tokio::select! {
                 _ = changes.recv() => {}
