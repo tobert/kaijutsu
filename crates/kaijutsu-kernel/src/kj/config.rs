@@ -52,7 +52,7 @@ enum ConfigCommand {
     /// Print one config file's content.
     #[command(alias = "cat")]
     Show {
-        /// Config file name (e.g. theme.toml) or full /config/kernel or /config/client path
+        /// Config file name (e.g. theme.toml or council/guardian.md) or full /config/kernel or /config/client path
         path: String,
         /// Emit exactly the stored content — no path/length header, no code
         /// fence. Round-trips byte-identical through the file tools.
@@ -69,14 +69,15 @@ enum ConfigCommand {
     /// Restore a config file to its embedded default. Errors if the path ships
     /// no built-in seed — there is nothing to reset it to.
     Reset {
-        /// Config file name (e.g. theme.toml) or full /config/kernel or /config/client path
+        /// Config file name (e.g. theme.toml or council/guardian.md) or full /config/kernel or /config/client path
         path: String,
     },
 }
 
 /// Canonicalize a user-supplied config arg to its `/config/kernel/<name>` path.
-/// Accepts a bare name (`theme.toml`) or an already-full path. Rejects nested
-/// paths and parent escapes — config is a flat namespace.
+/// Accepts a bare name (`theme.toml`), a nested one (`council/guardian.md`),
+/// or an already-full path. Rejects empty segments, `.`, and `..`, so a
+/// name never leaves `/config/kernel`.
 fn config_canonical(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
     // Per-client config namespace: hierarchical, always exactly two segments —
@@ -104,7 +105,8 @@ fn config_canonical(path: &str) -> Result<String, String> {
         }
         return Ok(format!("{CLIENT_ROOT}/{rest}"));
     }
-    // Kernel-global config: a flat namespace under /config/kernel.
+    // Kernel-global config: names under /config/kernel, nested ones included
+    // (the council's specs and the guardian policy live in `council/`).
     let name = trimmed
         .strip_prefix(&format!("{CONFIG_ROOT}/"))
         .unwrap_or(trimmed)
@@ -112,9 +114,9 @@ fn config_canonical(path: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("missing config file name (e.g. theme.toml)".to_string());
     }
-    if name.contains('/') || name == ".." || name == "." {
+    if name.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
         return Err(format!(
-            "invalid config path '{path}': config is a flat namespace under {CONFIG_ROOT}"
+            "invalid config path '{path}': each segment of a name under {CONFIG_ROOT} is a plain name, never empty, `.` or `..`"
         ));
     }
     Ok(format!("{CONFIG_ROOT}/{name}"))
@@ -352,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_accepts_bare_and_full_rejects_nesting() {
+    fn canonical_accepts_bare_full_and_nested_names_and_rejects_escapes() {
         assert_eq!(
             config_canonical("theme.toml").unwrap(),
             "/config/kernel/theme.toml"
@@ -361,8 +363,11 @@ mod tests {
             config_canonical("/config/kernel/mcp.toml").unwrap(),
             "/config/kernel/mcp.toml"
         );
-        assert!(config_canonical("sub/dir.toml").is_err());
-        assert!(config_canonical("/config/kernel/a/b.toml").is_err());
+        assert_eq!(config_canonical("council/guardian.md").unwrap(), "/config/kernel/council/guardian.md");
+        assert_eq!(config_canonical("/config/kernel/a/b.toml").unwrap(), "/config/kernel/a/b.toml");
+        for bad in ["../secret", "council/../gate.toml", "a//b.toml", "./theme.toml", "council/"] {
+            assert!(config_canonical(bad).is_err(), "{bad}");
+        }
         assert!(config_canonical("").is_err());
     }
 
@@ -601,6 +606,23 @@ mod tests {
         d.kernel().editor_close(id, c.actor_id).await.unwrap();
         let again = d.dispatch(&[s("config"), s("reset"), s("theme.toml")], &c).await;
         assert!(matches!(again, KjResult::Ok { .. }), "after the session closes: {again:?}");
+    }
+
+    /// `kj config reset council/guardian.md` restores the guardian policy,
+    /// which the guardian's miss names when the file is gone.
+    ///
+    /// Falsified by a flat-only config namespace, which refuses the name.
+    #[tokio::test]
+    async fn reset_restores_a_nested_seed_file() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        d.write_config_content("/config/kernel/council/guardian.md", "# clobbered").await.expect("clobber the policy");
+        let reset = d.dispatch(&[s("config"), s("reset"), s("council/guardian.md")], &c).await;
+        assert!(matches!(reset, KjResult::Ok { .. }), "reset failed: {reset:?}");
+        match d.dispatch(&[s("config"), s("show"), s("council/guardian.md"), s("--raw")], &c).await {
+            KjResult::Ok { message, .. } => assert_eq!(message, crate::config_seed::DEFAULT_GUARDIAN_POLICY),
+            other => panic!("expected Ok, got {other:?}"),
+        }
     }
 
     /// `kj config reset` on an unknown file errors instead of silently no-oping.
