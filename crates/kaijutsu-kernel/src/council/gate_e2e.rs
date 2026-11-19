@@ -4058,7 +4058,7 @@ async fn a_guardian_allow_runs_the_submission_with_a_row_naming_the_guardian() {
         assert!(system.starts_with("You judge one planned shell submission"), "the attribution comment is removed: {system}");
         assert!(system.ends_with(super::guardian::ANSWER_FORMAT), "{system}");
         let prompt = sent.last_prompt();
-        for want in ["echo guardian-ran", "[user] please print a greeting", "[assistant] I will echo it", "council-seat-performer"] {
+        for want in ["echo guardian-ran", "please print a greeting", "I will echo it", "council-seat-performer"] {
             assert!(prompt.contains(want), "{via:?}: the prompt lacks {want}: {prompt}");
         }
         assert!(rig.mock.decisions().is_empty(), "the council server is not asked");
@@ -4233,7 +4233,12 @@ async fn a_decisions_allow_runs_the_submission_and_records_the_probabilities() {
         let body: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
         assert_eq!(body["model"], "typesafe/jev-1.13");
         let state = body["state"].as_str().expect("the state is the prompt text");
-        for want in ["echo decisions-ran", "[user] please print a greeting", "[assistant] I will echo it", "council-seat-performer"] {
+        for want in [
+            "echo decisions-ran",
+            r#""trusted":true,"text":"please print a greeting"}"#,
+            r#"{"kind":"assistant""#,
+            "council-seat-performer",
+        ] {
             assert!(state.contains(want), "{via:?}: the state lacks {want}: {state}");
         }
         let question = &body["questions"]["verdict"];
@@ -4331,5 +4336,55 @@ async fn three_decisions_denials_stop_it_judging_the_context() {
     assert_eq!(latest.decision.outcome, CouncilOutcome::Miss);
     let cause = latest.decision.miss_cause.unwrap();
     assert!(cause.contains("stopped judging") && cause.contains("3 submissions in a row"), "{cause}");
+    rig.finish().await;
+}
+
+/// A program the judge cannot be shown is a miss, and the model is not
+/// asked: the guardian never judges a submission by part of what it runs.
+///
+/// Falsified by dropping the unread program from the prompt and asking the
+/// model about the rest.
+#[tokio::test]
+async fn an_unread_program_is_a_guardian_miss_and_calls_no_model() {
+    let (rig, sent) = guardian_rig(Via::Tool, GUARDIAN_ALLOW).await;
+    assert_pending(Via::Tool, rig.submit("python3 /work/missing.py").await);
+    let decision = the_decision(&rig, &rig.only_ask());
+    assert_eq!(decision.decision.outcome, CouncilOutcome::Miss);
+    let cause = decision.decision.miss_cause.unwrap();
+    assert!(cause.contains("/work/missing.py") && cause.contains("could not be read"), "{cause}");
+    assert_eq!(sent.calls(), 0);
+    rig.finish().await;
+}
+
+/// The script a model judge read is the script that runs: one changed while
+/// the judge decided is refused at execution and nothing runs.
+///
+/// Falsified by a model judge's verdict that pins no file: the changed
+/// script runs.
+#[tokio::test]
+async fn a_script_changed_after_a_model_judge_read_it_does_not_run() {
+    let slow = kaijutsu_council::test_server::Reply { delay: Duration::from_millis(400), ..verdict_reply(0.99, 0.01, 0.0) };
+    let (rig, seen) = decisions_rig(Via::Tool, vec![slow]).await;
+    rig.write("/work/fix.py", "print('judged')\n").await;
+    let params = KernelCallParams {
+        instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+        tool: ShellServer::TOOL_WRITE.to_string(),
+        arguments: serde_json::json!({ "command": "python3 /work/fix.py" }),
+    };
+    let call = rig.broker.call_tool(params, &rig.ctx, CancellationToken::new());
+    let change = async {
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        rig.write("/work/fix.py", "print('swapped')\n").await;
+    };
+    let (result, ()) = tokio::join!(call, change);
+    let result = result.expect("the gate allowed the call");
+    assert!(result.is_error, "{result:?}");
+    let text = serde_json::to_string(&result).unwrap();
+    assert!(text.contains("the script changed after"), "{text}");
+    let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+    assert!(body["state"].as_str().unwrap().contains("print('judged')"), "the judge read the first text");
+    assert_eq!(rig.only_ask().status, ApprovalStatus::Allowed);
     rig.finish().await;
 }

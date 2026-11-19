@@ -759,6 +759,8 @@ pub(crate) struct CouncilVerdict {
     judge: Option<super::shadow::JudgeRead>,
     /// A guardian decision's parsed answer, recorded beside the decision.
     assessment: Option<super::guardian::Assessment>,
+    /// The files a model judge read, by the hash of the bytes it was shown.
+    pinned: Vec<super::programs::JudgedFile>,
     /// A guardian allow's key: the guardian and the risk it named.
     allow_by: Option<String>,
 }
@@ -1039,10 +1041,11 @@ impl CouncilVerdict {
         format!("bumped {} times ({})", self.bump_history.len(), self.bump_history.join("; "))
     }
 
-    /// The files the program decisions read, by the hash of the bytes they
-    /// judged. The submission runs only while each still holds them.
+    /// The files the program decisions or a model judge read, by the hash
+    /// of the bytes judged. The submission runs only while each still holds
+    /// them.
     pub(crate) fn judged(&self) -> Vec<super::programs::JudgedFile> {
-        self.programs.iter().filter_map(|p| p.file.clone()).collect()
+        self.programs.iter().filter_map(|p| p.file.clone()).chain(self.pinned.iter().cloned()).collect()
     }
 
     /// The key an allowed statement's decision names.
@@ -1413,6 +1416,7 @@ fn build_verdict(
         judge: None,
         assessment: None,
         allow_by: None,
+        pinned: Vec::new(),
     }
 }
 
@@ -1861,7 +1865,14 @@ pub(crate) fn decided_without_council(
 /// model as the server model, its backend as the engine, and the digest of
 /// the instructions it read as the spec id. A decisions judge's
 /// probabilities are recorded as the pooled `verdict`.
-pub(crate) fn model_judge_verdict(caller: &KjCaller, case: CaseInput, judged: super::guardian::Judged) -> CouncilVerdict {
+/// `pinned` are the files the judge read, which the submission must still
+/// hold when it runs.
+pub(crate) fn model_judge_verdict(
+    caller: &KjCaller,
+    case: CaseInput,
+    judged: super::guardian::Judged,
+    pinned: Vec<super::programs::JudgedFile>,
+) -> CouncilVerdict {
     use super::guardian::Answer;
     let spec = judged.kind.spec();
     let noun = judged.kind.noun();
@@ -1970,6 +1981,7 @@ pub(crate) fn model_judge_verdict(caller: &KjCaller, case: CaseInput, judged: su
         judge: None,
         assessment,
         allow_by,
+        pinned,
     }
 }
 
@@ -2079,26 +2091,23 @@ async fn consult_model_judge(
     let submission = Submission { command, planned, character: performer.map(|p| p.name.as_str()), cwd, facts: &facts };
     let runs = super::programs::programs_in(planned, &resolve_cwd);
     let read = super::programs::read_programs(kernel.vfs().as_ref(), &resolve_cwd, runs).await;
-    let programs: Vec<super::guardian::ShownProgram> = read
-        .into_iter()
-        .take(MAX_PROGRAMS)
-        .filter_map(|p| {
-            let text = p.text.ok()?;
-            let name = match (&text.file, &text.written) {
-                (Some(file), _) => file.path.clone(),
-                (None, Some(path)) => path.clone(),
-                (None, None) => format!("`{}`", p.run.command),
-            };
-            Some(super::guardian::ShownProgram { name, text: text.text })
-        })
-        .collect();
     let state = case_state(&submission, &[], &[]);
+    let case = CaseInput { state, text: command.to_string() };
+    let programs = match super::guardian::shown_programs(read) {
+        Ok(programs) => programs,
+        Err(cause) => {
+            let judged = super::guardian::Judged::begin(kind, bound, guardian).missed(Instant::now(), cause);
+            return model_judge_verdict(caller, case, judged, Vec::new());
+        }
+    };
+    let pinned: Vec<super::programs::JudgedFile> = programs.iter().filter_map(|p| p.file.clone()).collect();
+    let state = &case.state;
     let judged = match kind {
         super::guardian::JudgeKind::Guardian => {
-            super::guardian::judge(kernel, bound, guardian, context_id, &state, &programs).await
+            super::guardian::judge(kernel, bound, guardian, context_id, state, &programs).await
         }
         super::guardian::JudgeKind::Decisions => {
-            super::decisions_judge::judge(kernel, bound, guardian, context_id, &state, &programs).await
+            super::decisions_judge::judge(kernel, bound, guardian, context_id, state, &programs).await
         }
     };
     tracing::info!(
@@ -2110,7 +2119,7 @@ async fn consult_model_judge(
         context_id = %context_id,
         "model judge consulted on a submission"
     );
-    model_judge_verdict(caller, CaseInput { state, text: command.to_string() }, judged)
+    model_judge_verdict(caller, case, judged, pinned)
 }
 
 /// Consult the council for one gate ask, or return `None` and leave the gate
@@ -2245,7 +2254,7 @@ pub(crate) async fn consult(
 
 /// The most program decisions one submission gets. A program past it is
 /// not judged, so the submission is not council-allowed.
-const MAX_PROGRAMS: usize = 8;
+pub(crate) const MAX_PROGRAMS: usize = 8;
 
 #[cfg(test)]
 pub(crate) mod test_support {

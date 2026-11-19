@@ -171,6 +171,14 @@ A chat model (the guardian) or a Decisions API (the decisions judge) on a contex
 - **Not live-tested.** Every check runs on the mock provider or a loopback Decisions server; no chatgpt, anthropic, or Decisions judge has judged a real submission yet.
 - **The decisions judge's threshold is not on its row.** `council_decisions.allow_at` needs a `mass_floor` beside it, which a Decisions answer has none of, so the row leaves the threshold empty; the ask note carries it. A comparison across judges reads `allow_at` from `gate.toml`.
 - **The decisions judge reads a policy written for the guardian.** `guardian.md` asks for `risk_level`, `user_authorization`, and a rationale the `verdict` question has no field for; a line maps its outcome onto the options. A policy written for a choice question may read better.
+- **Model-writable trusted input.** The judges trust `AGENTS.md` and read their policy from `/config/kernel`, and a context with `file:write` can change both. `gate.toml` rules are command prefixes, so it cannot statically deny writes to `/config/kernel`; that needs a path rule in the gate.
+- **`kj stage exclude` hides blocks from the judges.** An excluded block leaves the transcript tail, so an agent can drop the refusal or the user's "no" before it submits again.
+- **No secret redaction.** The transcript tail goes to the `gate` slot's backend as written; a key printed in a tool result goes with it.
+- **The breaker.** Its map is unbounded (one entry per context judged since restart), and `tripped` and `record` take the lock separately, so concurrent submissions from one context can all pass a check before any records.
+- **The ledger does not show what a judge read.** `kj ledger show` surfaces neither `house_rules_head` nor the `council_assessments` row.
+- **The tail loads the whole log.** `evidence` reads every block of the context to keep the last few kilobytes.
+- **Trust names no requester.** A `user` block is trusted when the performer did not write it; a stricter rule would trust only a person's blocks, or the context's requester's.
+- **A policy added to an existing host.** `/config/kernel` is seeded only when its host directory is empty, so a host made before the guardian has no `council/guardian.md`; each judge misses until `kj config reset council/guardian.md`.
 - **`[guardian]` names both model judges.** Its keys and switch configure the decisions judge too. A rename to `[model_judge]` would read better; nothing depends on the name yet.
 
 ## Sol's first task: friction from a GPT model driving kaijutsu (2026-11-18)
