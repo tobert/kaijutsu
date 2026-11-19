@@ -58,7 +58,7 @@ impl Probabilities {
     /// The probabilities as the ask and the log show them.
     pub(crate) fn summary(&self, allow_at: f64) -> String {
         format!(
-            "p(allow) {:.3}, p(ask) {:.3}, p(report) {:.3}; it allows at p(allow) >= {allow_at}",
+            "p(allow) {:.3}, p(ask) {:.3}, p(report) {:.3}; allowing requires a choice of allow and p(allow) >= {allow_at}",
             self.allow, self.ask, self.report
         )
     }
@@ -76,14 +76,13 @@ impl Probabilities {
     }
 }
 
-/// What the gate does with `p`: report when `report` is the most likely
-/// verdict, ties included; otherwise allow when p(allow) reaches `allow_at`;
-/// otherwise ask. Report is checked first, so a low `allow_at` never
-/// allows what the judge most likely reports.
-pub(crate) fn classify(p: Probabilities, allow_at: f64) -> Outcome {
+/// Report when `report` is the most likely verdict, ties included.
+/// Otherwise allow only when the judge chose `allow` and p(allow) meets
+/// the threshold. Ask in all other cases.
+fn classify(choice: &str, p: Probabilities, allow_at: f64) -> Outcome {
     if p.report >= p.allow && p.report >= p.ask {
         Outcome::Report
-    } else if p.allow >= allow_at {
+    } else if choice == "allow" && p.allow >= allow_at {
         Outcome::Allow
     } else {
         Outcome::Ask
@@ -138,14 +137,18 @@ pub(crate) async fn judge(
     ) {
         tracing::error!(target: "kaijutsu::council", error = %e, "the decisions judge's spend could not be recorded");
     }
-    let p = match response.answers.get(QUESTION).ok_or_else(|| "the reply has no verdict".to_string()).and_then(Probabilities::of) {
+    let Some(answer) = response.answers.get(QUESTION) else {
+        let cause = format!("{} failed: the reply has no verdict", judged.name());
+        return judged.missed(started, cause);
+    };
+    let p = match Probabilities::of(answer) {
         Ok(p) => p,
         Err(cause) => {
             let cause = format!("{} failed: {cause}", judged.name());
             return judged.missed(started, cause);
         }
     };
-    judged.outcome = classify(p, config.allow_at);
+    judged.outcome = classify(&answer.choice, p, config.allow_at);
     let verdict = match judged.outcome {
         Outcome::Allow => super::guardian::Verdict::Allow,
         _ => super::guardian::Verdict::Deny,
@@ -166,22 +169,24 @@ mod tests {
 
     #[test]
     fn allow_at_the_threshold_allows_and_under_it_asks() {
-        assert_eq!(classify(p(0.9, 0.08, 0.02), 0.9), Outcome::Allow);
-        assert_eq!(classify(p(0.97, 0.02, 0.01), 0.9), Outcome::Allow);
-        assert_eq!(classify(p(0.89, 0.1, 0.01), 0.9), Outcome::Ask, "the most likely verdict, under the threshold");
-        assert_eq!(classify(p(0.95, 0.04, 0.01), 0.98), Outcome::Ask);
+        assert_eq!(classify("allow", p(0.9, 0.08, 0.02), 0.9), Outcome::Allow);
+        assert_eq!(classify("allow", p(0.97, 0.02, 0.01), 0.9), Outcome::Allow);
+        assert_eq!(classify("allow", p(0.89, 0.1, 0.01), 0.9), Outcome::Ask, "the most likely verdict, under the threshold");
+        assert_eq!(classify("allow", p(0.95, 0.04, 0.01), 0.98), Outcome::Ask);
     }
 
     #[test]
     fn a_report_argmax_reports_whatever_the_threshold() {
-        assert_eq!(classify(p(0.1, 0.3, 0.6), 0.9), Outcome::Report);
-        assert_eq!(classify(p(0.35, 0.25, 0.4), 0.3), Outcome::Report, "report wins over a low allow_at");
-        assert_eq!(classify(p(0.4, 0.2, 0.4), 0.3), Outcome::Report, "a tie with report reports");
+        assert_eq!(classify("report", p(0.1, 0.3, 0.6), 0.9), Outcome::Report);
+        assert_eq!(classify("report", p(0.35, 0.25, 0.4), 0.3), Outcome::Report, "report wins over a low allow_at");
+        assert_eq!(classify("allow", p(0.4, 0.2, 0.4), 0.3), Outcome::Report, "a tie with report reports");
     }
 
     #[test]
-    fn an_ask_argmax_asks() {
-        assert_eq!(classify(p(0.2, 0.7, 0.1), 0.9), Outcome::Ask);
+    fn an_ask_argmax_asks_even_above_the_allow_threshold() {
+        assert_eq!(classify("ask", p(0.4, 0.55, 0.05), 0.3), Outcome::Ask);
+        assert_eq!(classify("ask", p(0.48, 0.48, 0.04), 0.3), Outcome::Ask);
+        assert_eq!(classify("allow", p(0.48, 0.48, 0.04), 0.3), Outcome::Allow);
     }
 
     #[test]
