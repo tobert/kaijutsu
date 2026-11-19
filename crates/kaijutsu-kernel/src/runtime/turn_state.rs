@@ -59,6 +59,7 @@ impl Wake {
 /// conversation lock opens it and closes it before releasing the lock.
 struct Ingress {
     turn: TurnId,
+    opening: Option<BlockId>,
     interrupt: Arc<ContextInterruptState>,
     /// Undelivered input, oldest first. Each keeps its own wake.
     pending: Vec<LiveInput>,
@@ -211,12 +212,22 @@ impl TurnState {
     }
 
     /// Open `context`'s ingress for the turn that holds its conversation lock.
+    #[cfg(test)]
     pub(crate) fn open_ingress(&self, context: ContextId, turn: TurnId, interrupt: Arc<ContextInterruptState>) {
+        self.open_ingress_at(context, turn, interrupt, None);
+    }
+
+    pub(crate) fn open_ingress_at(&self, context: ContextId, turn: TurnId, interrupt: Arc<ContextInterruptState>, opening: Option<BlockId>) {
         let mut ingress = self.ingress.lock();
         assert!(!ingress.open.contains_key(&context), "one turn at a time holds a context's conversation lock");
         // This turn's hydration folds whatever the last turn answered.
         ingress.answered.remove(&context);
-        ingress.open.insert(context, Ingress { turn, interrupt, pending: Vec::new(), delivered: Default::default() });
+        ingress.open.insert(context, Ingress { turn, opening, interrupt, pending: Vec::new(), delivered: Default::default() });
+    }
+
+    /// The running turn's original anchor, before hydration advances it.
+    pub(crate) fn opening_block(&self, context: ContextId) -> Option<BlockId> {
+        self.ingress.lock().open.get(&context)?.opening
     }
 
     /// Hand input to the context's running turn. Refused when no turn is

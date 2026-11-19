@@ -4005,7 +4005,7 @@ impl GuardianSent {
 /// and the council not. The guardian answers `reply` to every call.
 async fn guardian_rig(via: Via, reply: &str) -> (Rig, GuardianSent) {
     let gate = SlotSpec { model: "guardian-model", backend: "guardian", kind: "mock", base: Base::None };
-    let rig = rig(via, Setup { enabled: false, gate_slot: Some(gate), guardian: Some(5_000), ..Setup::default() }).await;
+    let rig = rig(via, Setup { enabled: false, gate_slot: Some(gate), guardian: Some(5_000), chat: true, ..Setup::default() }).await;
     use crate::vfs::VfsOps;
     rig.d
         .kernel()
@@ -4064,6 +4064,47 @@ async fn a_guardian_allow_runs_the_submission_with_a_row_naming_the_guardian() {
         assert!(rig.mock.decisions().is_empty(), "the council server is not asked");
         rig.finish().await;
     }
+}
+
+#[tokio::test]
+async fn the_guardian_reads_the_opening_prompt_and_senpai_instruction_before_the_tail() {
+    use kaijutsu_types::{BlockKind, ContentType, Role, Status};
+    let (rig, sent) = guardian_rig(Via::Tool, GUARDIAN_ALLOW).await;
+    let kernel = rig.d.kernel();
+    let context = rig.ctx.context_id;
+    let senpai = rig.ctx.reviewer_id.expect("the seat has a senpai reviewer");
+    let requester = character(kernel, "brief-writer", false);
+    let append = |role, text: &str, author| kernel.blocks().insert_block_as(
+        context, None, kernel.blocks().last_block_id(context).as_ref(), role,
+        BlockKind::Text, text, Status::Done, ContentType::Plain, Some(author),
+    ).unwrap();
+    append(Role::User, "A superseded instruction", senpai);
+    let opening = append(Role::User, "Opening brief: read the generated report", requester);
+    append(Role::User, "Senpai instruction: leave the source alone", senpai);
+    for _ in 0..20 {
+        append(Role::Model, &"filler ".repeat(300), rig.ctx.actor_id);
+    }
+    append(Role::User, "Another player's recent note", requester);
+    let mock = crate::llm::MockClient::new("").with_scripted_stream(vec![
+        shell_write_call("long-transcript", "echo guardian-ran", false), text_reply("done"),
+    ]);
+    kernel.llm().write().await.register("mock", Arc::new(crate::llm::Provider::Mock(mock)));
+    kernel.request_turn(crate::runtime::turn_request::TurnRequest {
+        context_id: context, after_block_id: opening, content: String::new(), principal_id: requester,
+        continuation_epoch: None, score: None,
+    }).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while sent.calls() == 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.expect("the guardian received the submission");
+    let prompt = sent.last_prompt();
+    let opening = prompt.find("Opening brief:").expect("the guardian must read the opening brief");
+    let instruction = prompt.find("Senpai instruction:").expect("the guardian must read the senpai instruction");
+    let tail = prompt.find("Another player's recent note").expect("the guardian still reads recent blocks");
+    assert!(opening < instruction && instruction < tail, "{prompt}");
+    assert!(!prompt.contains("A superseded instruction"));
+    assert_eq!(prompt.matches("Opening brief:").count(), 1);
+    assert_eq!(prompt.matches("Senpai instruction:").count(), 1);
+    rig.finish().await;
 }
 
 /// A guardian deny asks, and the ask carries the guardian's rationale so the

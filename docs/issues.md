@@ -159,7 +159,7 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 
 ## The guardian: what the first pass leaves open (2026-11-18)
 
-Live, on Sol's third task (gpt-6-luna as guardian): it allowed a run of read-only `sed -n`/`grep` asks at low risk with a one-line rationale each, and denied one at high risk because it contained `kj ledger list` (the policy named `kj ledger` whole as administration; fixed in 98bf958f). One rationale said "the truncated transcript does not show the user's original request": the transcript tail can drop the task brief, so authorization reads lower than it should. **Always include the turn's opening user prompt (and the senpai's latest instruction) ahead of the tail.**
+Live, on Sol's third task (gpt-6-luna as guardian): it allowed a run of read-only `sed -n`/`grep` asks at low risk with a one-line rationale each, and denied one at high risk because it contained `kj ledger list` (the policy named `kj ledger` whole as administration; fixed in 98bf958f).
 
 Second kaibo review (DeepSeek, of 1bdec2df) confirmed the first round's fixes and found:
 
