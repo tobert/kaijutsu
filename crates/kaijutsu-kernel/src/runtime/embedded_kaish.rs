@@ -171,9 +171,9 @@ const OUTPUT_CEILING_BYTES: usize = 4 * 1024 * 1024;
 /// a source read or a test summary arrives whole, and a full test run is cut.
 pub(crate) const PREVIEW_LIMIT_BYTES: usize = 40 * 1024;
 /// The preview keeps this much of the start.
-const PREVIEW_HEAD_BYTES: usize = 12 * 1024;
+pub(crate) const PREVIEW_HEAD_BYTES: usize = 12 * 1024;
 /// And this much of the end, where test summaries and errors land.
-const PREVIEW_TAIL_BYTES: usize = 24 * 1024;
+pub(crate) const PREVIEW_TAIL_BYTES: usize = 24 * 1024;
 
 impl OutputProfile {
     /// Build the kaish config for this profile.
@@ -190,8 +190,7 @@ impl OutputProfile {
 }
 
 /// Cut a model-facing result to a preview, storing each oversized stream in
-/// CAS and naming its `/v/cas` path on the preview's last line. A cut stdout
-/// also drops the result's structured data.
+/// CAS (`cut_preview`). A cut stdout also drops the result's structured data.
 ///
 /// The exit code stays the command's own. `did_spill` reports the cut.
 async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::FileStore>) {
@@ -206,12 +205,18 @@ async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::File
         }
     };
     if let Some((bytes, mime)) = stdout {
-        let note = stored_note(cas, &bytes, mime, "output", kept_by_kaish).await;
+        let stored = store_in_cas(cas, &bytes, mime, "output").await;
         let preview = if mime == "text/plain" {
             let text = String::from_utf8(bytes).expect("checked as UTF-8 above");
-            format!("{}\n...\n{}\n{note}", preview_head(&text), preview_tail(&text))
+            cut_preview(&text, "output", &stored, kept_by_kaish)
         } else {
-            note
+            match &stored {
+                Ok(path) => format!(
+                    "[output truncated: {} bytes of binary output, over the {PREVIEW_LIMIT_BYTES}-byte limit; the full output is at {path}]",
+                    bytes.len()
+                ),
+                Err(e) => format!("[output truncated: {} bytes of binary output; storing it failed: {e}]", bytes.len()),
+            }
         };
         result.set_out(preview);
         // The structured copy would carry every line the preview cut.
@@ -224,58 +229,92 @@ async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::File
     }
     if result.err.len() > PREVIEW_LIMIT_BYTES {
         let err = std::mem::take(&mut result.err);
-        let note = stored_note(cas, err.as_bytes(), "text/plain", "stderr", false).await;
-        result.err = format!("{}\n...\n{}\n{note}", preview_head(&err), preview_tail(&err));
+        let stored = store_in_cas(cas, err.as_bytes(), "text/plain", "stderr").await;
+        result.err = cut_preview(&err, "stderr", &stored, false);
         result.did_spill = true;
     }
 }
 
-/// Store `bytes` and say where they are, or say that storing failed.
-async fn stored_note(
+/// Store `bytes`, returning their `/v/cas` path or why storing failed.
+async fn store_in_cas(
     cas: &Arc<kaijutsu_cas::FileStore>,
     bytes: &[u8],
     mime: &'static str,
     stream: &str,
-    kept_by_kaish: bool,
-) -> String {
+) -> Result<String, String> {
     use kaijutsu_cas::ContentStore;
-    let len = bytes.len();
     let store = cas.clone();
     let owned = bytes.to_vec();
     let stored = tokio::task::spawn_blocking(move || store.store(&owned, mime))
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r.map_err(|e| e.to_string()));
-    match stored {
-        Ok(hash) => {
-            let path = format!("{}/{}/{hash}", kaijutsu_types::paths::CAS_ROOT, hash.prefix());
-            if kept_by_kaish {
-                format!("[{stream} truncated: past the {OUTPUT_CEILING_BYTES}-byte ceiling; the {len} bytes kept are at {path}]")
-            } else {
-                format!("[{stream} truncated: {len} bytes; the full {stream} is at {path}]")
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, len, "storing a model-facing {stream} in CAS failed");
-            format!("[{stream} truncated: {len} bytes; storing the full {stream} failed: {e}]")
-        }
-    }
+    stored
+        .map(|hash| format!("{}/{}/{hash}", kaijutsu_types::paths::CAS_ROOT, hash.prefix()))
+        .inspect_err(|e| tracing::error!(error = %e, len = bytes.len(), "storing a model-facing {stream} in CAS failed"))
 }
 
-fn preview_head(s: &str) -> &str {
-    let mut end = PREVIEW_HEAD_BYTES.min(s.len());
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+/// The preview a model reads for `text`, which is over the limit: the first
+/// `PREVIEW_HEAD_BYTES` and the last `PREVIEW_TAIL_BYTES`, each cut at a
+/// line end when there is one, a `[cut: …]` line where the middle was, and
+/// a last `[{stream} truncated: …]` line. When the cut falls on line ends,
+/// the marker names the lines left out and a `sed -n` command that prints
+/// them from `stored`.
+fn cut_preview(text: &str, stream: &str, stored: &Result<String, String>, kept_by_kaish: bool) -> String {
+    let len = text.len();
+    let lines = match count_lines(text) {
+        1 => "1 line".to_string(),
+        n => format!("{n} lines"),
+    };
+    let floor = |mut i: usize| {
+        while !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let ceil = |mut i: usize| {
+        while !text.is_char_boundary(i) {
+            i += 1;
+        }
+        i
+    };
+    let head_limit = floor(PREVIEW_HEAD_BYTES.min(len));
+    let head_end = text[..head_limit].rfind('\n').map_or(head_limit, |i| i + 1);
+    let tail_limit = ceil(len.saturating_sub(PREVIEW_TAIL_BYTES).max(head_end));
+    let tail_start = text[tail_limit..].find('\n').map(|i| tail_limit + i + 1).filter(|&i| i < len).unwrap_or(tail_limit);
+    let on_lines = head_end > 0 && text.as_bytes()[head_end - 1] == b'\n' && text.as_bytes()[tail_start - 1] == b'\n';
+    let cut = tail_start - head_end;
+    let marker = if on_lines {
+        let first = text[..head_end].matches('\n').count() + 1;
+        let last = text[..tail_start].matches('\n').count();
+        match stored {
+            Ok(path) => format!("[cut: lines {first}-{last}, {cut} bytes; sed -n '{first},{last}p' {path}]"),
+            Err(_) => format!("[cut: lines {first}-{last}, {cut} bytes]"),
+        }
+    } else {
+        format!("[cut: bytes {}-{}, {cut} bytes]", head_end + 1, tail_start)
+    };
+    let fact = match stored {
+        Ok(path) if kept_by_kaish => format!(
+            "[{stream} truncated: past the {OUTPUT_CEILING_BYTES}-byte ceiling; the {len} bytes, {lines} kept are at {path}]"
+        ),
+        Ok(path) => format!(
+            "[{stream} truncated: {len} bytes, {lines}, over the {PREVIEW_LIMIT_BYTES}-byte limit; the full {stream} is at {path}]"
+        ),
+        Err(e) => format!(
+            "[{stream} truncated: {len} bytes, {lines}, over the {PREVIEW_LIMIT_BYTES}-byte limit; storing the full {stream} failed: {e}]"
+        ),
+    };
+    let head = &text[..head_end];
+    let tail = &text[tail_start..];
+    let head_break = if head.is_empty() || head.ends_with('\n') { "" } else { "\n" };
+    let tail_break = if tail.ends_with('\n') { "" } else { "\n" };
+    format!("{head}{head_break}{marker}\n{tail}{tail_break}{fact}")
 }
 
-fn preview_tail(s: &str) -> &str {
-    let mut start = s.len().saturating_sub(PREVIEW_TAIL_BYTES);
-    while !s.is_char_boundary(start) {
-        start += 1;
-    }
-    &s[start..]
+/// Lines in `text`, counting a last line with no newline.
+fn count_lines(text: &str) -> usize {
+    text.matches('\n').count() + usize::from(!text.is_empty() && !text.ends_with('\n'))
 }
 
 impl EmbeddedKaish {
@@ -1377,6 +1416,31 @@ mod tests {
     /// A model shell that prints a lot keeps the real `$?`, reads a head and
     /// tail preview, and can recover every byte from `/v/cas`.
     ///
+    /// A preview that cannot cut on line ends (one long line) names the
+    /// bytes it left out; a failed store leaves no command to run.
+    #[test]
+    fn a_cut_names_bytes_without_line_ends_and_no_command_without_a_store() {
+        let line = "x".repeat(PREVIEW_LIMIT_BYTES * 2);
+        let stored = Ok("/v/cas/ab/abc".to_string());
+        let preview = cut_preview(&line, "output", &stored, false);
+        let cut = line.len() - PREVIEW_HEAD_BYTES - PREVIEW_TAIL_BYTES;
+        assert!(
+            preview.contains(&format!("\n[cut: bytes {}-{}, {cut} bytes]\n", PREVIEW_HEAD_BYTES + 1, PREVIEW_HEAD_BYTES + cut)),
+            "{}",
+            &preview[PREVIEW_HEAD_BYTES..PREVIEW_HEAD_BYTES + 80]
+        );
+        assert!(preview.ends_with(&format!(
+            "\n[output truncated: {} bytes, 1 line, over the {PREVIEW_LIMIT_BYTES}-byte limit; the full output is at /v/cas/ab/abc]",
+            line.len()
+        )));
+
+        let text: String = (1..=12000).map(|n| format!("{n}\n")).collect();
+        let failed = cut_preview(&text, "stderr", &Err("disk full".into()), false);
+        let marker = failed.lines().find(|l| l.starts_with("[cut: ")).unwrap();
+        assert!(marker.starts_with("[cut: lines ") && !marker.contains("sed"), "{marker}");
+        assert!(failed.ends_with(&format!("over the {PREVIEW_LIMIT_BYTES}-byte limit; storing the full stderr failed: disk full]")), "{failed}");
+    }
+
     /// The Agent profile caps only what the model reads: kaish runs under the
     /// internal ceiling, so `$?` inside the script is the command's own exit,
     /// and the kernel stores the full output in CAS and names its path in the
@@ -1423,9 +1487,25 @@ mod tests {
         assert!(text.starts_with("1\n2\n3\n"), "the preview keeps the head: {text}");
         assert!(text.contains("status=0"), "the script's own $? is real, and the tail keeps it: {text}");
         let full = format!("{}status=0\n", (1..=12000).map(|n| format!("{n}\n")).collect::<String>());
-        let fact = format!("[output truncated: {} bytes; the full output is at {CAS_ROOT}/", full.len());
+        let fact = format!(
+            "[output truncated: {} bytes, 12001 lines, over the {PREVIEW_LIMIT_BYTES}-byte limit; the full output is at {CAS_ROOT}/",
+            full.len()
+        );
         let at = text.find(&fact).unwrap_or_else(|| panic!("the preview names its CAS path: {text}"));
         let path = text[at + fact.len() - CAS_ROOT.len() - 1..].trim_end().trim_end_matches(']').to_string();
+
+        // The cut marker's own command prints exactly the lines it left out.
+        let marker = text.lines().find(|l| l.starts_with("[cut: lines ")).unwrap_or_else(|| panic!("a cut marker: {text}"));
+        let command = marker.split_once("; ").unwrap().1.trim_end_matches(']');
+        assert!(command.ends_with(&path), "the command reads the stored output: {marker}");
+        let middle = agent.execute_with_options(command, ExecuteOptions::default()).await.unwrap();
+        let (head, rest) = text.split_once(&format!("{marker}\n")).unwrap();
+        let tail = &rest[..rest.rfind("\n[output truncated").unwrap() + 1];
+        assert_eq!(
+            format!("{head}{}{tail}", middle.text_out()),
+            full,
+            "the head, the lines `{command}` prints, and the tail make the whole output"
+        );
 
         let back = agent.execute_with_options(&format!("grep '^7000$' {path}"), ExecuteOptions::default()).await.unwrap();
         assert_eq!(back.text_out(), "7000\n", "the model can search the stored output at {path}: {}", back.err);

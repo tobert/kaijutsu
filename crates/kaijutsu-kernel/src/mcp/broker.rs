@@ -4518,17 +4518,15 @@ fn char_boundary_ceil(s: &str, idx: usize) -> usize {
     idx
 }
 
-/// Build the middle-elision marker for `n` elided bytes.
-fn elision_marker(n: usize) -> String {
-    format!(
-        "\n\n[... truncated {} bytes from the middle — output exceeded max_result_bytes ...]\n\n",
-        n
-    )
+/// The marker for `n` bytes cut from a result over its `budget`, the same
+/// `[cut: …]` form the shell preview uses.
+fn elision_marker(n: usize, budget: usize) -> String {
+    format!("\n[cut: {n} bytes, over the {budget}-byte result limit]\n")
 }
 
 /// Truncate a tool result so its serialized size fits inside `budget`,
-/// keeping a head *and* a tail with a "[... truncated N bytes from the
-/// middle ...]" marker in between (M3-D4, head+tail revision).
+/// keeping a head *and* a tail with a `[cut: N bytes, …]` marker in
+/// between (M3-D4, head+tail revision).
 ///
 /// Compiler and test output put the useful part — errors, the summary line
 /// — at the *end*. The original prefix-only strategy threw exactly that
@@ -4551,7 +4549,7 @@ fn elision_marker(n: usize) -> String {
 /// marker text itself, emit as much of the marker as fits (char-boundary
 /// safe) and nothing else — there's no room for real content either way.
 /// If `content` is only slightly over `budget`, the fixed marker overhead
-/// (~90 bytes) still applies; this mirrors the previous footer-based
+/// (~50 bytes) still applies; this mirrors the previous footer-based
 /// implementation's same fixed overhead and is inherent to any
 /// marker-based truncation scheme, not a new regression.
 pub(crate) fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize) {
@@ -4595,7 +4593,7 @@ pub(crate) fn truncate_result_to_budget(result: &mut KernelToolResult, budget: u
     // makes the reservation a safe upper bound in one pass, no reconcile
     // needed (it can leave a few bytes of budget unused; it can never
     // overflow it).
-    let placeholder_marker = elision_marker(total);
+    let placeholder_marker = elision_marker(total, budget);
     let marker_reserve = placeholder_marker.len();
     if marker_reserve >= budget {
         let cut = char_boundary_floor(&placeholder_marker, budget);
@@ -4614,7 +4612,7 @@ pub(crate) fn truncate_result_to_budget(result: &mut KernelToolResult, budget: u
     let head = &combined[..head_cut];
     let tail = &combined[tail_start..];
     let elided = tail_start - head_cut;
-    let marker = elision_marker(elided);
+    let marker = elision_marker(elided, budget);
 
     let mut out = String::with_capacity(head.len() + marker.len() + tail.len());
     out.push_str(head);
@@ -4632,7 +4630,7 @@ fn elide_middle(s: &str, budget: usize) -> String {
     if total <= budget {
         return s.to_string();
     }
-    let placeholder_marker = elision_marker(total);
+    let placeholder_marker = elision_marker(total, budget);
     let marker_reserve = placeholder_marker.len();
     if marker_reserve >= budget {
         let cut = char_boundary_floor(&placeholder_marker, budget);
@@ -4648,7 +4646,7 @@ fn elide_middle(s: &str, budget: usize) -> String {
 
     let mut out = String::new();
     out.push_str(&s[..head_cut]);
-    out.push_str(&elision_marker(tail_start - head_cut));
+    out.push_str(&elision_marker(tail_start - head_cut, budget));
     out.push_str(&s[tail_start..]);
     out
 }
@@ -4697,10 +4695,10 @@ fn shrink_json_to_budget(value: &mut serde_json::Value, budget: usize) -> bool {
         // raw string removes at least `over` from the serialization. The
         // marker is charged for here so the loop converges instead of
         // trading one overflow for another — at its SERIALIZED cost, not its
-        // raw one: the marker carries four newlines, and a newline inside a
-        // JSON string is the two bytes `\n`. Charging the raw length left a
-        // pass four bytes short of its target.
-        let marker = elision_marker(current.len());
+        // raw one: the marker carries newlines, and a newline inside a JSON
+        // string is the two bytes `\n`. Charging the raw length left a pass
+        // short of its target.
+        let marker = elision_marker(current.len(), budget);
         let marker_cost = serde_json::Value::String(marker).to_string().len();
         let target = current.len().saturating_sub(over + marker_cost);
         let shrunk = if target == 0 {
@@ -5635,7 +5633,7 @@ mod tests {
             })
             .collect();
         assert!(
-            combined.contains("truncated") && combined.contains("from the middle"),
+            combined.contains("\n[cut: ") && combined.contains(" bytes, over the 300-byte result limit]\n"),
             "middle-elision marker missing, got: {combined:?}"
         );
         assert!(
@@ -5869,7 +5867,7 @@ mod tests {
             })
             .collect();
         assert!(combined.len() <= budget);
-        assert!(combined.contains("truncated"));
+        assert!(combined.contains("[cut: "));
     }
 
     #[test]
@@ -5900,7 +5898,7 @@ mod tests {
             "tail should end with a whole multi-byte char, got: {:?}",
             &combined[combined.len().saturating_sub(30)..]
         );
-        assert!(combined.contains("from the middle"));
+        assert!(combined.contains("-byte result limit]"), "{combined}");
     }
 
     #[test]

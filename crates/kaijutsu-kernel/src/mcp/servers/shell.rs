@@ -84,47 +84,47 @@ pub(crate) fn resolve_command_timeout(
     }
 }
 
-// What the shell is and what a call returns, in one short statement every
-// request carries. Models already write good shell and JSON, so the
-// description invites the shell they know and leans on kaish to refuse what
-// is outside its language with the fix named. Language detail stays in
-// `help`, and the text describes kaish by what it is, never by another shell.
-const ABOUT_KAISH: &str = "The shell is kaish (会sh), a shell for agents with \
-     familiar syntax and a JSON data model. Write the shell you already know, \
-     and use JSON where structure helps: a variable holds a string, a number, a \
-     list, or a record, and builtins print JSON when you pass `--json`. Quote \
-     words the way you quote JSON strings. A bare word holds only letters, \
-     digits, and the marks `_ . - / @ + ^ ~`. List files with the `glob` \
-     builtin, as in `glob **/*.log`; `--json` returns a typed list. Put any other text in quotes: double quotes for text with \
-     spaces, punctuation, or a variable, as in \"/tmp/$f.csv\", and single \
-     quotes for text kaish should leave alone. A bare number follows JSON \
-     rules, so `007` is a string. kaish checks the whole program before it runs any of it. When something is \
-     outside its language, kaish refuses, nothing runs, and the message says \
-     what to write instead; make that change and send it again. Builtins such \
-     as grep, sed, awk, find, and jq run inside the shell; other programs run \
-     from PATH. Put a multi-step job in a script file and run the file. `help` \
-     lists the topics, `help syntax` covers the language, and `help <command>` \
-     explains one builtin.";
+// What the shell is, in a few sentences every request carries. Models
+// already write good shell and JSON, so the description invites the shell
+// they know and leans on kaish to refuse a program that does not parse.
+// Language detail stays in `help`, and the text describes kaish by what it
+// is, never by another shell.
+const ABOUT_KAISH: &str = "The shell is kaish (会sh): familiar shell syntax \
+     with a JSON data model. Write the shell you know. kaish parses the whole \
+     program before running any of it; when a command does not parse, it is \
+     refused without running. Quote any word holding more than letters, \
+     digits, and `_ . - / @ + ^ ~`: double quotes when it holds a variable, \
+     single quotes to keep it literal. Builtins such as grep, sed, awk, find, \
+     jq, and glob run inside the shell and print JSON with `--json`; other \
+     programs run from PATH. Put multi-step work in a script file and run the \
+     file. `help` lists topics; `help <command>` explains one. `kj help` covers \
+     contexts, drift, and forks.";
 
-// What a call returns, as a model turn reads it (`ShellEnvelope::model_text`)
-// and as an MCP caller receives it (the envelope). Both flavours share it.
-const RESULT_CONTRACT: &str = "Each call returns the command's output. If the \
-     command wrote to stderr, a `[stderr]` line comes next, then the stderr \
-     text. After that, one bracketed line reports each fact that changes your \
-     next step: `[exit N]` when the command failed; `[rejected: the program did \
-     not run]` when kaish refused it; `[running in the background: operation \
-     ID]`; `[output truncated: N bytes; the full output is at /v/cas/…]`, which \
-     you can read with `grep`, `sed -n`, or `read`; `[cwd now DIR]` when the \
-     command changed your directory; and `[warning: …]`, which you fix first. \
-     A command that printed nothing returns `[no output]`. An MCP caller \
-     receives the same facts as one JSON object; `exit_code` null is never \
-     evidence of success.";
+// What a model turn reads after a command (`ShellEnvelope::model_text`).
+static RESULT_CONTRACT: LazyLock<String> = LazyLock::new(|| {
+    use crate::runtime::embedded_kaish::{PREVIEW_HEAD_BYTES, PREVIEW_LIMIT_BYTES, PREVIEW_TAIL_BYTES};
+    let kib = |bytes: usize| bytes / 1024;
+    format!(
+        "A call returns the command's output, then `[stderr]` and the stderr \
+         text if there is any. Each bracketed line after that changes your next \
+         step:\n\
+         - `[exit N]`: the command failed.\n\
+         - `[rejected: the program did not run]`: kaish refused it.\n\
+         - `[running in the background: operation ID]`\n\
+         - `[cwd now DIR]`\n\
+         - `[warning: …]`: fix it first.\n\
+         - `[output truncated: …]`: output over {} KiB keeps its first {} KiB \
+         and last {} KiB. A `[cut: lines A-B, …]` line marks the gap and gives \
+         the `sed -n` command that prints it from the full copy in `/v/cas`.\n\
+         A command that printed nothing returns `[no output]`.",
+        kib(PREVIEW_LIMIT_BYTES),
+        kib(PREVIEW_HEAD_BYTES),
+        kib(PREVIEW_TAIL_BYTES),
+    )
+});
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "Run a command in your current kernel context. {ABOUT_KAISH} `kj` manages \
-         contexts, drift, and forks; `kj help` explains it. {RESULT_CONTRACT}"
-    )
+    format!("Run a command in your current kernel context. {ABOUT_KAISH}\n\n{}", *RESULT_CONTRACT)
 });
 
 // The model sees the policy and the writable alternative alongside kaish syntax.
@@ -135,7 +135,8 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
          mutating `kj` verbs, editor input, `curl`, and MCP calls are refused. Use \
          `shell_write` for those operations. `which` finds host programs on PATH; \
          run them with `shell_write`. Inspect with filesystem builtins (`cat`, `grep`, `find`), \
-         `/v/docs`, and read-only `kj` commands. {ABOUT_KAISH} {RESULT_CONTRACT}"
+         `/v/docs`, and read-only `kj` commands.\n\n{ABOUT_KAISH}\n\n{}",
+        *RESULT_CONTRACT
     )
 });
 
@@ -447,10 +448,12 @@ mod tests {
         assert_eq!(both.readable_output(), "out\n[stderr]\nerr");
         for text in [DESCRIPTION.as_str(), DESCRIPTION_READ_ONLY.as_str()] {
             for fact in ["`[exit N]`", "`[rejected: the program did not run]`", "`[running in the background: operation ID]`",
-                "[output truncated: N bytes; the full output is at /v/cas/", "`[stderr]`", "`[no output]`"]
+                "`[output truncated: …]`", "`[cut: lines A-B, …]`", "`[cwd now DIR]`", "`[stderr]`", "`[no output]`"]
             {
                 assert!(text.contains(fact), "missing {fact}: {text}");
             }
+            let limit = format!("over {} KiB", crate::runtime::embedded_kaish::PREVIEW_LIMIT_BYTES / 1024);
+            assert!(text.contains(&limit), "the description states the preview limit: {text}");
         }
     }
 
@@ -458,16 +461,15 @@ mod tests {
     #[test]
     fn descriptions_stay_short_and_carry_the_kaijutsu_facts() {
         let text = DESCRIPTION.as_str();
-        assert!(text.len() < 2000, "{} chars: {text}", text.len());
-        assert!(text.contains("current kernel context") && text.contains("`kj` manages"), "{text}");
-        assert!(text.contains("familiar syntax and a JSON data model"), "{text}");
-        // Models write the shell they know; kaish refuses what is outside its
-        // language and names the fix. The details live in `help`.
-        assert!(text.contains("Write the shell you already know"), "{text}");
-        assert!(text.contains("says what to write instead"), "{text}");
-        assert!(text.contains("`help syntax`") && text.contains("script file"), "{text}");
-        // File lists come from the glob builtin: `**` recursion and a typed list.
-        assert!(text.contains("`glob **/*.log`") && text.contains("`--json`"), "{text}");
+        assert!(text.len() < 1800, "{} chars: {text}", text.len());
+        assert!(text.contains("current kernel context") && text.contains("`kj help`"), "{text}");
+        assert!(text.contains("familiar shell syntax with a JSON data model"), "{text}");
+        // Models write the shell they know; kaish refuses a program that does
+        // not parse, before any of it runs. The details live in `help`.
+        assert!(text.contains("Write the shell you know"), "{text}");
+        assert!(text.contains("refused without running"), "{text}");
+        assert!(text.contains("`help <command>`") && text.contains("script file"), "{text}");
+        assert!(text.contains("glob") && text.contains("`--json`"), "{text}");
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
         // kaish is described by what it is, never by comparison to another shell.
         for description in [text, ro_text] {
@@ -476,7 +478,7 @@ mod tests {
                 assert!(!lower.contains(other), "names {other}: {description}");
             }
         }
-        assert!(ro_text.len() < 2500, "{} chars: {ro_text}", ro_text.len());
+        assert!(ro_text.len() < 2300, "{} chars: {ro_text}", ro_text.len());
         assert!(ro_text.contains("cannot mutate shared state") && ro_text.contains("/v/docs"), "{ro_text}");
         assert!(ro_text.contains("`shell_write`") && ro_text.contains("`which` finds host programs on PATH"), "{ro_text}");
     }
