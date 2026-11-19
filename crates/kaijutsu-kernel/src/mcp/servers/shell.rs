@@ -2300,7 +2300,7 @@ mod tests {
     /// output block, the operation envelope and the job agree.
     #[tokio::test]
     async fn spilled_output_keeps_the_real_exit_and_block_and_job_agree() {
-        for (command, real_exit) in [("seq 1 5000", 0)] {
+        for (command, real_exit) in [("seq 1 12000", 0)] {
             // Foreground `call`.
             let (broker, d) = wired().await;
             let principal = PrincipalId::new();
@@ -2317,7 +2317,7 @@ mod tests {
             assert_eq!(result.is_error, real_exit != 0, "`{command}`: {body}");
             assert_eq!(body["status"], serde_json::json!(if real_exit == 0 { "done" } else { "error" }));
             let stdout = body["stdout"].as_str().unwrap();
-            assert!(stdout.len() < 5000 * 5, "spilled stdout must be capped, got {} bytes", stdout.len());
+            assert!(stdout.len() < 12000 * 5, "spilled stdout must be capped, got {} bytes", stdout.len());
             assert!(stdout.starts_with("1\n"), "the head is kept: {:?}", &stdout[..stdout.len().min(40)]);
             d.kernel().shutdown_runtime_worker().await.unwrap();
 
@@ -2372,7 +2372,7 @@ mod tests {
         binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
-        let result = broker.call_tool(call("seq 1 5000; false"), &cc, CancellationToken::new()).await.unwrap();
+        let result = broker.call_tool(call("seq 1 12000; false"), &cc, CancellationToken::new()).await.unwrap();
         let body = body_of(&result);
         assert_eq!(body["did_spill"], serde_json::json!(true));
         assert_eq!(body["exit_code"], serde_json::json!(1), "the last statement failed: {body}");

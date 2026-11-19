@@ -167,12 +167,13 @@ pub enum OutputProfile {
 const OUTPUT_CEILING_BYTES: usize = 4 * 1024 * 1024;
 
 /// A model-facing result past this many bytes, stdout or stderr, is cut to a
-/// preview.
-pub(crate) const PREVIEW_LIMIT_BYTES: usize = 8 * 1024;
+/// preview. About 10,000 tokens, the limit Codex gives the GPT plan models:
+/// a source read or a test summary arrives whole, and a full test run is cut.
+pub(crate) const PREVIEW_LIMIT_BYTES: usize = 40 * 1024;
 /// The preview keeps this much of the start.
-const PREVIEW_HEAD_BYTES: usize = 2 * 1024;
+const PREVIEW_HEAD_BYTES: usize = 12 * 1024;
 /// And this much of the end, where test summaries and errors land.
-const PREVIEW_TAIL_BYTES: usize = 4 * 1024;
+const PREVIEW_TAIL_BYTES: usize = 24 * 1024;
 
 impl OutputProfile {
     /// Build the kaish config for this profile.
@@ -189,7 +190,8 @@ impl OutputProfile {
 }
 
 /// Cut a model-facing result to a preview, storing each oversized stream in
-/// CAS and naming its `/v/cas` path on the preview's last line.
+/// CAS and naming its `/v/cas` path on the preview's last line. A cut stdout
+/// also drops the result's structured data.
 ///
 /// The exit code stays the command's own. `did_spill` reports the cut.
 async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::FileStore>) {
@@ -212,6 +214,9 @@ async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::File
             note
         };
         result.set_out(preview);
+        // The structured copy would carry every line the preview cut.
+        result.data = None;
+        result.set_output(None);
         if let Some(code) = result.original_code.take() {
             result.code = code;
         }
@@ -1399,15 +1404,16 @@ mod tests {
             .unwrap()
         };
 
-        // ~23 KB from a kaish builtin — no host exec, so this is the shell's
-        // own captured-output path and nothing else.
-        const BIG: &str = "seq 1 5000; echo \"status=$?\"";
-        const SMALL: &str = "seq 1 100; echo \"status=$?\"";
+        // Output from a kaish builtin, so this is the shell's own
+        // captured-output path and nothing else. ~23 KB is a typical source
+        // read or test summary and reaches the model whole; ~65 KB is cut.
+        const BIG: &str = "seq 1 12000; echo \"status=$?\"";
+        const READ: &str = "seq 1 5000; echo \"status=$?\"";
 
         let agent = mk("test-outlimit-agent", OutputProfile::Agent);
-        let r = agent.execute_with_options(SMALL, ExecuteOptions::default()).await.unwrap();
-        assert!(!r.did_spill, "control: under the preview limit nothing is cut");
-        assert!(r.text_out().ends_with("status=0\n"), "control got: {}", r.text_out());
+        let r = agent.execute_with_options(READ, ExecuteOptions::default()).await.unwrap();
+        assert!(!r.did_spill, "control: a {}-byte read is under the preview limit", r.text_out().len());
+        assert!(r.text_out().starts_with("1\n") && r.text_out().ends_with("4999\n5000\nstatus=0\n"), "the read is whole");
 
         let r = agent.execute_with_options(BIG, ExecuteOptions::default()).await.unwrap();
         let text = r.text_out().into_owned();
@@ -1416,17 +1422,25 @@ mod tests {
         assert!(text.len() < PREVIEW_LIMIT_BYTES, "the model reads a preview, not {} bytes", text.len());
         assert!(text.starts_with("1\n2\n3\n"), "the preview keeps the head: {text}");
         assert!(text.contains("status=0"), "the script's own $? is real, and the tail keeps it: {text}");
-        let full = format!("{}status=0\n", (1..=5000).map(|n| format!("{n}\n")).collect::<String>());
+        let full = format!("{}status=0\n", (1..=12000).map(|n| format!("{n}\n")).collect::<String>());
         let fact = format!("[output truncated: {} bytes; the full output is at {CAS_ROOT}/", full.len());
         let at = text.find(&fact).unwrap_or_else(|| panic!("the preview names its CAS path: {text}"));
         let path = text[at + fact.len() - CAS_ROOT.len() - 1..].trim_end().trim_end_matches(']').to_string();
 
-        let back = agent.execute_with_options(&format!("grep '^4999$' {path}"), ExecuteOptions::default()).await.unwrap();
-        assert_eq!(back.text_out(), "4999\n", "the model can search the stored output at {path}: {}", back.err);
+        let back = agent.execute_with_options(&format!("grep '^7000$' {path}"), ExecuteOptions::default()).await.unwrap();
+        assert_eq!(back.text_out(), "7000\n", "the model can search the stored output at {path}: {}", back.err);
         let hash = path.rsplit('/').next().unwrap();
         use kaijutsu_cas::ContentStore;
         let stored = kernel.cas().retrieve(&hash.parse().unwrap()).unwrap().expect("stored in CAS");
         assert_eq!(stored, full.as_bytes(), "CAS holds every byte the command printed");
+
+        // `seq` last: its structured data would carry every line past the cut.
+        let r = agent.execute_with_options("seq 1 12000", ExecuteOptions::default()).await.unwrap();
+        assert!(r.did_spill);
+        assert!(
+            r.data.is_none() && r.output().is_none(),
+            "a preview carries no structured copy of the output it cut; CAS holds the whole"
+        );
 
         let internal = mk("test-outlimit-internal", OutputProfile::Internal);
         let r = internal.execute_with_options(BIG, ExecuteOptions::default()).await.unwrap();

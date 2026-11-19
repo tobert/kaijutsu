@@ -2645,11 +2645,11 @@ mod house_verb_tests {
         out
     }
 
-    /// `kj help` stays at half the model-facing preview limit or less, so a
-    /// model reads the whole map, with room for a verb's `--help` in the
-    /// same shell call. Past the limit, a model reads only the first 2 KiB
-    /// and the last 4 KiB.
-    const HELP_BUDGET_BYTES: usize = crate::runtime::embedded_kaish::PREVIEW_LIMIT_BYTES / 2;
+    /// `kj help` stays within 4 KiB, so a model reads the whole map cheaply,
+    /// with room for several verbs' `--help` under the model-facing preview
+    /// limit in the same shell call.
+    const HELP_BUDGET_BYTES: usize = 4 * 1024;
+    const _: () = assert!(HELP_BUDGET_BYTES <= crate::runtime::embedded_kaish::PREVIEW_LIMIT_BYTES / 2);
 
     #[tokio::test]
     async fn help_fits_the_model_preview_for_every_seat() {
