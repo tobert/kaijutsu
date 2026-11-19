@@ -159,6 +159,8 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 
 ## The guardian: what the first pass leaves open (2026-11-18)
 
+Live, on Sol's third task (gpt-6-luna as guardian): it allowed a run of read-only `sed -n`/`grep` asks at low risk with a one-line rationale each, and denied one at high risk because it contained `kj ledger list` (the policy named `kj ledger` whole as administration; fixed in 98bf958f). One rationale said "the truncated transcript does not show the user's original request": the transcript tail can drop the task brief, so authorization reads lower than it should. **Always include the turn's opening user prompt (and the senpai's latest instruction) ahead of the tail.**
+
 Second kaibo review (DeepSeek, of 1bdec2df) confirmed the first round's fixes and found:
 
 - **An oversized shebang script is dropped, not a miss.** `programs.rs` `read_programs` skips a `File { shebang: true }` on any read error, including the 16 KiB cap, so `./big.sh` reaches a model judge as a command with no program; the shared path affects the council too. Separate "binary or missing" (skip) from "too large" or "read failed on a regular file" (miss). The test covers only `python3 missing.py`.
