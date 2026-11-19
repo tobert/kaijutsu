@@ -390,3 +390,10 @@ A reviewer's denial reason belongs to the accepted decision. The ledger writes
 it on the decision event in the same transaction. The asking model reads it
 in the tool result, so a reviewer does not have to send a second block that
 may arrive after the turn ends.
+
+## Working directories during a tool turn (November 19)
+
+A removed working directory is a tool error, not an ask. The failed call
+runs nothing even if the kernel found a parent to use for the next call.
+Model tool batches read the saved directory once so dispatch and file write
+ordering agree after a shell `cd`.

@@ -204,7 +204,6 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
 - **`${var#prefix}` fails indirectly.** The gate reported that it could not restore an invalid environment name rather than naming the unsupported expansion.
 - **No git identity in the container.** HOME is a tmpfs, so git has no `user.name`; Sol supplied its own identity per command and the reviewer denied it. Container env does not help: kaish clears the environment for host commands. It does pass `HOME`, so spaceghost's quadlet now mounts an identity-only gitconfig (`~/kj-dev/kaijutsu/gitconfig`, `[user]` and `[init]`) read-only at `~/.gitconfig`. Next: the writable kaish-extras `git` (`commit` feature, `WritableGitConfig::with_identity`) with the author from the lineage root's sheet and the committer from the performer.
 - **Reading a background run's output is awkward.** Sol ran cargo with `run_in_background` and then grepped `kj wait --operation <id>` for `FAILED` and `test result:` lines; it took several asks to find which tests failed. A way to page or tail an operation's stdout would help.
-- **File tools keep the old cwd after a shell `cd`.** After Sol ran `cd` in `shell_write`, the file tools still resolved relative paths against the previous worktree, so its edits needed absolute paths.
 - **A reviewer's piped read asks too.** `kj character show sol | grep …` from the senpai console waited on Amy, while the same command without the pipe ran.
 
 ## Council house rules, objects, and verbs (2026-11-08)

@@ -69,6 +69,12 @@ Three distinct edges connect contexts:
   `MAX_DRIFT_RETRIES` (5), then move to the durable dead-letter log and drain
   into the well-known `lost+found` context (`ensure_lost_found_context`).
 
+## Working directory
+
+A shell `cd` changes the context's working directory. The kernel reads the
+saved directory once at the start of each model tool batch. Call `cd` in a
+separate batch before using relative paths in that directory.
+
 ## Rotation, handoffs, and archive
 
 - **Rotation (`kj context rotate [<ctx>]`).** Creates a successor context

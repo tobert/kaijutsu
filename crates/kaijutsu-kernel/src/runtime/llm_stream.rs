@@ -40,6 +40,8 @@ enum StreamFailure {
     LiveInput(String),
     #[error("Could not write the turn record: {0}")]
     TurnRecord(String),
+    #[error("Could not read the context's working directory; no tools in this batch ran: {0}")]
+    ToolCwd(String),
 }
 
 #[derive(Clone, Copy)]
@@ -3691,6 +3693,11 @@ async fn run_llm_stream(
                 signature: pending.signature.clone(),
             })
             .collect();
+
+        // A completed shell call can change the durable cwd during a turn.
+        // Use one snapshot for both file ordering and dispatch in this batch.
+        let mut tool_ctx = tool_ctx.clone();
+        tool_ctx.cwd = super::shell_state::context_cwd(&kernel, context_id).map_err(StreamFailure::ToolCwd)?;
 
         // Every Running result lands, in call order, after the last block the
         // inference streamed, before any call runs (`place_running_result`).

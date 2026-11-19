@@ -297,6 +297,49 @@ fn a_removed_cwd_returns_a_tool_error_without_opening_an_ask() {
     });
 }
 
+#[test]
+fn file_tools_follow_the_cwd_persisted_by_shell_write() {
+    run_local(Box::pin(async {
+        let h = Held::new("held-file-cwd").await;
+        let new = h.marker("new");
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(h.marker("target.txt"), "old cwd\n").unwrap();
+        std::fs::write(new.join("target.txt"), "new cwd\n").unwrap();
+        let initial = common::shell_exec_wait(&h.performer_kj, &format!("cd {}", h.scratch.path().display()), h.context).await;
+        assert_eq!(initial.2, Status::Done, "cd: {}", initial.1);
+        h.reviewer_kj.join_context(h.reviewer_context, "file-cwd-review").await.unwrap();
+        let granted = h.reviewer_kj.execute_kj_quiet(h.reviewer_context,
+            &["binding".into(), "allow".into(), "builtin.file".into(), h.context.to_string()]).await.unwrap();
+        assert_eq!(granted.exit_code, 0, "{}", granted.stderr);
+        let tool = |id: &str, name: &str, input| StreamEvent::ToolUse {
+            id: id.into(), name: name.into(), input, signature: None,
+        };
+        let (sent, mut events) = h.drive(vec![
+            vec![shell_write("cd", "cd new"), done("tool_use")],
+            vec![
+                tool("read", "builtin_file__read", serde_json::json!({"path": "target.txt"})),
+                tool("write", "write", serde_json::json!({"path": "created.txt", "content": "created"})),
+                done("tool_use"),
+            ],
+            vec![tool("edit", "edit", serde_json::json!({"path": "target.txt", "old_string": "new cwd", "new_string": "edited"})), done("tool_use")],
+            reply("done"),
+        ]).await;
+        assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
+        let sent = sent.lock().clone();
+        let results = tool_results(sent.last().unwrap());
+        for id in ["cd", "read", "write", "edit"] {
+            let result = results.iter().find(|r| r.0 == id).unwrap();
+            assert!(!result.2, "{result:?}");
+            if id == "read" { assert!(result.1.contains("new cwd"), "{result:?}"); }
+        }
+        assert_eq!(std::fs::read_to_string(new.join("target.txt")).unwrap(), "edited\n");
+        assert_eq!(std::fs::read_to_string(new.join("created.txt")).unwrap(), "created");
+        assert_eq!(std::fs::read_to_string(h.marker("target.txt")).unwrap(), "old cwd\n");
+        assert!(!h.marker("created.txt").exists());
+        h.close().await;
+    }));
+}
+
 /// The model asks, the reviewer allows, and the same turn continues with the
 /// command's real output as its tool result.
 ///
