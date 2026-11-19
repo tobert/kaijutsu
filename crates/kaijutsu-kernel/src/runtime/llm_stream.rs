@@ -2580,7 +2580,7 @@ async fn process_llm_stream(
     // input it accepted.
     let mut undelivered = Vec::new();
     let outcome = if let Some(mailbox) = mailbox.as_mut() {
-        kernel.turns().open_ingress(context_id, turn_id, turn_lease.interrupt());
+        kernel.turns().open_ingress_at(context_id, turn_id, turn_lease.interrupt(), Some(after_block_id));
         // Boxed so the turn's state lives on the heap: an unoptimized build
         // sizes this frame by every local, and a 2 MB thread has little to
         // spare. `a_turn_future_stays_small` pins the size.

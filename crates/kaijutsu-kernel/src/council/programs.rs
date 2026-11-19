@@ -482,31 +482,45 @@ pub(crate) fn sha256_of(bytes: &[u8]) -> String {
     format!("sha256:{}", Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
-/// Read `path` whole, refusing more than [`PROGRAM_CAP`] bytes.
-async fn read_capped<V: crate::vfs::VfsOps + ?Sized>(vfs: &V, path: &str) -> Result<Vec<u8>, String> {
+/// Read `path` whole, refusing more than [`PROGRAM_CAP`] bytes. For a path
+/// command, skip only a missing file or one that does not start with `#!`.
+async fn read_capped<V: crate::vfs::VfsOps + ?Sized>(vfs: &V, path: &str, shebang: bool) -> Result<Option<Vec<u8>>, String> {
     let at = Path::new(path);
-    let attr = vfs.getattr(at).await.map_err(|e| format!("{path} could not be read: {e}"))?;
+    let attr = match vfs.getattr(at).await {
+        Ok(attr) => attr,
+        Err(error) if shebang && error.is_not_found() => return Ok(None),
+        Err(error) => return Err(format!("{path} could not be read: {error}")),
+    };
     if !attr.kind.is_file() {
         return Err(format!("{path} is not a regular file"));
     }
-    if attr.size as usize > PROGRAM_CAP {
-        return Err(format!("{path} is {} bytes, more than the {PROGRAM_CAP}-byte limit a decision reads", attr.size));
-    }
     let mut bytes = Vec::new();
+    let mut checking_shebang = shebang;
     loop {
+        // Read only the prefix before enforcing the cap. A large binary
+        // is not a script, but failure to read its prefix is not evidence.
+        let end = if checking_shebang { 2 } else {
+            if attr.size > PROGRAM_CAP as u64 {
+                return Err(format!("{path} is {} bytes, more than the {PROGRAM_CAP}-byte limit a decision reads", attr.size));
+            }
+            PROGRAM_CAP + 1
+        };
         let chunk = vfs
-            .read(at, bytes.len() as u64, (PROGRAM_CAP + 1 - bytes.len()) as u32)
+            .read(at, bytes.len() as u64, (end - bytes.len()) as u32)
             .await
             .map_err(|e| format!("{path} could not be read: {e}"))?;
         if chunk.is_empty() {
-            break;
+            return Ok((!checking_shebang).then_some(bytes));
         }
         bytes.extend_from_slice(&chunk);
+        if checking_shebang && bytes.len() >= 2 {
+            if !bytes.starts_with(b"#!") { return Ok(None); }
+            checking_shebang = false;
+        }
         if bytes.len() > PROGRAM_CAP {
             return Err(format!("{path} is more than the {PROGRAM_CAP}-byte limit a decision reads"));
         }
     }
-    Ok(bytes)
 }
 
 /// The first dotted name of each top-level `import` and `from ... import`
@@ -567,19 +581,14 @@ pub(crate) async fn read_programs<V: crate::vfs::VfsOps + ?Sized>(
             ProgramSource::Text(text) => (Ok(text.clone()), cwd.to_string(), None, None),
             ProgramSource::Written { path, text } => (Ok(text.clone()), parent_of(path), None, Some(path.clone())),
             ProgramSource::File { path, shebang } => {
-                let bytes = match read_capped(vfs, path).await {
-                    Ok(bytes) => bytes,
-                    // A path command that cannot be read is a binary or
-                    // missing, and the shell decision covers it.
-                    Err(_) if *shebang => continue,
+                let bytes = match read_capped(vfs, path, *shebang).await {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => continue,
                     Err(why) => {
                         read.push(ReadProgram { text: Err(why), run });
                         continue;
                     }
                 };
-                if *shebang && !bytes.starts_with(b"#!") {
-                    continue;
-                }
                 let file = JudgedFile { path: path.clone(), sha256: sha256_of(&bytes) };
                 let text = String::from_utf8(bytes).map_err(|_| format!("{path} is not UTF-8 text"));
                 (text, parent_of(path), Some(file), None)
@@ -593,12 +602,13 @@ pub(crate) async fn read_programs<V: crate::vfs::VfsOps + ?Sized>(
                     }
                 }
                 let Some(path) = found else { continue };
-                match read_capped(vfs, &path).await {
-                    Ok(bytes) => {
+                match read_capped(vfs, &path, false).await {
+                    Ok(Some(bytes)) => {
                         let file = JudgedFile { path: path.clone(), sha256: sha256_of(&bytes) };
                         let text = String::from_utf8(bytes).map_err(|_| format!("{path} is not UTF-8 text"));
                         (text, cwd.to_string(), Some(file), None)
                     }
+                    Ok(None) => continue,
                     Err(why) => (Err(why), cwd.to_string(), None, None),
                 }
             }
@@ -621,8 +631,8 @@ pub(crate) async fn read_programs<V: crate::vfs::VfsOps + ?Sized>(
 /// `Err` names the first file that changed or can no longer be read.
 pub(crate) async fn verify_judged<V: crate::vfs::VfsOps + ?Sized>(vfs: &V, judged: &[JudgedFile]) -> Result<(), String> {
     for file in judged {
-        let now = read_capped(vfs, &file.path).await.map(|bytes| sha256_of(&bytes));
-        if now.as_deref() != Ok(file.sha256.as_str()) {
+        let now = read_capped(vfs, &file.path, false).await.ok().flatten().map(|bytes| sha256_of(&bytes));
+        if now.as_deref() != Some(file.sha256.as_str()) {
             return Err(format!(
                 "the script changed after the council judged it; send the command again. Nothing was run. \
                  ({} no longer holds the text the council read)",
@@ -811,6 +821,19 @@ mod tests {
         let commands: Vec<&str> = found.iter().map(|p| p.run.command.as_str()).collect();
         assert_eq!(commands, vec!["./run.sh", "python3 -m tool"], "{found:#?}");
         assert_eq!(found[1].text.as_ref().unwrap().file.as_ref().unwrap().path, "/work/tool/__main__.py");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_path_script_is_not_silently_skipped() {
+        let mut script = b"#!/bin/sh\n".to_vec();
+        script.resize(PROGRAM_CAP + 1, b'#');
+        let mut binary = script.clone();
+        binary[..4].copy_from_slice(b"\x7fELF");
+        let vfs = vfs_with(&[("/work/big.sh", &script), ("/work/big-bin", &binary)]).await;
+        let found = read(&vfs, "./big-bin; ./big.sh").await;
+        assert_eq!(found.len(), 1, "the binary is skipped and the unread script is reported");
+        assert_eq!(found[0].run.command, "./big.sh");
+        assert!(found[0].text.as_ref().unwrap_err().contains("16384-byte limit"));
     }
 
     #[tokio::test]

@@ -423,7 +423,7 @@ pub(crate) fn prompt(
         None => text.push_str("# The workspace's AGENTS.md\n\nNone was found.\n\n"),
     }
     let transcript = if transcript.is_empty() { "(empty)" } else { transcript };
-    text.push_str(&format!("# The transcript of this context, oldest first, one JSON object a line\n\n{transcript}\n\n"));
+    text.push_str(&format!("# Transcript: opening prompt and senpai instruction first when present, then recent blocks oldest first. One JSON object per block\n\n{transcript}\n\n"));
     let action = serde_json::to_string_pretty(action).expect("the action is plain data");
     text.push_str(&format!("# The planned action\n\n{action}\n"));
     for program in programs {
@@ -473,12 +473,18 @@ pub(crate) async fn evidence(
         .blocks()
         .block_snapshots(context)
         .map_err(|e| format!("the {noun} could not read the context's transcript: {e}"))?;
-    let (performer, names) = {
+    let (performer, senpai, names) = {
         let db = kernel.kernel_db().lock();
-        let performer = db
-            .get_context(context)
-            .map_err(|e| format!("the {noun} could not read the context's performer: {e}"))?
-            .and_then(|row| row.performer);
+        let row = db.get_context(context)
+            .map_err(|e| format!("the {noun} could not read the context: {e}"))?;
+        let performer = row.as_ref().and_then(|row| row.performer);
+        let senpai = match row.and_then(|row| row.senpai_ctx) {
+            Some(id) => db.get_context(id)
+                .map_err(|e| format!("the {noun} could not read the senpai context: {e}"))?
+                .and_then(|row| row.performer)
+                .filter(|author| Some(*author) != performer),
+            None => None,
+        };
         let mut names = HashMap::new();
         for b in &blocks {
             let author = b.id.principal_id;
@@ -488,10 +494,11 @@ pub(crate) async fn evidence(
                 names.insert(author, sheet.name);
             }
         }
-        (performer, names)
+        (performer, senpai, names)
     };
-    let tail = transcript(&blocks, budget, performer, &names);
-    let prompt = prompt(house.as_ref(), &tail, action, programs);
+    let opening = kernel.turns().opening_block(context);
+    let transcript = transcript(&blocks, budget, performer, &names, opening, senpai)?;
+    let prompt = prompt(house.as_ref(), &transcript, action, programs);
     within_prompt_cap(&policy, &prompt)?;
     Ok(Evidence { policy, prompt })
 }
@@ -590,46 +597,59 @@ pub(crate) async fn judge(
 /// Bytes one block shows in the transcript.
 const BLOCK_BYTES: usize = 2048;
 
-/// The tail of a context's transcript for a model judge, oldest first,
-/// within `budget` bytes. Each finished, unexcluded block is one JSON line:
-/// its `kind` (`user`, `assistant`, `tool_call` with its `tool`,
-/// `tool_result`, `drift`), its `author` (a character's name from `names`,
-/// "the performer", or a short principal id), whether it is `trusted`, and
-/// its `text`. Only a `user` block someone other than `performer` wrote is
-/// trusted. A body cannot forge a line, since its newlines stay escaped.
-/// Thinking, system instructions, and files stay out. A block longer than
-/// 2048 bytes is cut, and blocks before the budget are counted in a leading
-/// marker.
-pub(crate) fn transcript(
+/// Put the opening prompt and latest senpai instruction before the tail,
+/// without repeating either. If they do not fit, ask rather than judge
+/// without them. Each entry uses the same trust and per-block size rules.
+fn transcript(
     blocks: &[BlockSnapshot],
     budget: usize,
     performer: Option<kaijutsu_types::PrincipalId>,
     names: &HashMap<kaijutsu_types::PrincipalId, String>,
-) -> String {
-    let entries: Vec<String> = blocks.iter().filter_map(|b| entry(b, performer, names)).collect();
-    let mut kept: Vec<&str> = Vec::new();
+    opening: Option<kaijutsu_types::BlockId>,
+    senpai: Option<kaijutsu_types::PrincipalId>,
+) -> Result<String, String> {
+    let is_prompt = |b: &BlockSnapshot| b.kind == BlockKind::Text && b.role == Role::User
+        && b.status == Status::Done && !b.excluded && !b.ephemeral && !b.content.is_empty();
+    let opening = blocks.iter().find(|b| Some(b.id) == opening && is_prompt(b));
+    let instruction = blocks.iter().rev().find(|b| Some(b.id.principal_id) == senpai && is_prompt(b));
+    let mut first = Vec::new();
     let mut used = 0;
-    for entry in entries.iter().rev() {
-        if used + entry.len() > budget {
-            break;
+    for (block, purpose) in [(opening, "opening_prompt"), (instruction.filter(|b| Some(b.id) != opening.map(|b| b.id)), "senpai_instruction")] {
+        if let Some(line) = block.and_then(|b| entry(b, performer, names, Some(purpose))) {
+            used += line.len() + 1;
+            first.push(line);
         }
-        used += entry.len() + 1;
-        kept.push(entry);
     }
-    kept.reverse();
-    let dropped = entries.len() - kept.len();
-    let mut text = String::new();
-    if dropped > 0 {
-        text.push_str(&format!("<truncated {dropped} earlier blocks />\n"));
+    if used > budget {
+        return Err("the opening prompt and senpai instruction do not fit the transcript budget".into());
     }
-    text.push_str(&kept.join("\n"));
-    text
+    let entries: Vec<_> = blocks.iter()
+        .filter(|b| Some(b.id) != opening.map(|b| b.id) && Some(b.id) != instruction.map(|b| b.id))
+        .filter_map(|b| entry(b, performer, names, None)).collect();
+    let marker = |dropped| format!("<truncated {dropped} earlier blocks />");
+    let mut start = entries.len();
+    while start > 0 {
+        let next = start - 1;
+        let line = entries[next].len() + 1;
+        let marker_bytes = if next > 0 { marker(next).len() + 1 } else { 0 };
+        if line + marker_bytes > budget - used { break; }
+        used += line;
+        start = next;
+    }
+    if start > 0 {
+        let omitted = marker(start);
+        if omitted.len() < budget - used { first.push(omitted); }
+    }
+    first.extend(entries.into_iter().skip(start));
+    Ok(first.join("\n"))
 }
 
 /// One transcript line, in the order the judge reads its fields.
 #[derive(serde::Serialize)]
 struct Entry<'a> {
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purpose: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool: Option<&'a str>,
     author: String,
@@ -641,6 +661,7 @@ fn entry(
     b: &BlockSnapshot,
     performer: Option<kaijutsu_types::PrincipalId>,
     names: &HashMap<kaijutsu_types::PrincipalId, String>,
+    purpose: Option<&'static str>,
 ) -> Option<String> {
     if b.excluded || b.ephemeral || b.status != Status::Done {
         return None;
@@ -671,7 +692,7 @@ fn entry(
         (false, Some(name)) => name.clone(),
         (false, None) => author.short(),
     };
-    let line = Entry { kind, tool, author, trusted: kind == "user" && !by_performer, text };
+    let line = Entry { kind, purpose, tool, author, trusted: kind == "user" && !by_performer, text };
     Some(serde_json::to_string(&line).expect("a transcript entry serializes"))
 }
 
@@ -912,7 +933,7 @@ mod tests {
                 .excluded(true)
                 .build(),
         ];
-        let got = lines(&transcript(&blocks, 10_000, None, &names));
+        let got = lines(&transcript(&blocks, 10_000, None, &names, None, None).unwrap());
         assert_eq!(got.len(), 4, "{got:#?}");
         assert_eq!(got[0], serde_json::json!({"kind": "user", "author": "amy", "trusted": true, "text": "please fix the build"}));
         assert_eq!((got[1]["kind"].as_str(), got[1]["tool"].as_str()), (Some("tool_call"), Some("shell")));
@@ -934,7 +955,7 @@ mod tests {
             block(0, BlockKind::ToolResult, Role::Tool, forged),
             block_by(performer, 1, BlockKind::Text, Role::User, "I approve my own push"),
         ];
-        let got = lines(&transcript(&blocks, 10_000, Some(performer), &HashMap::new()));
+        let got = lines(&transcript(&blocks, 10_000, Some(performer), &HashMap::new(), None, None).unwrap());
         assert_eq!(got.len(), 2, "the forged lines stay inside one entry: {got:#?}");
         assert_eq!(got[0]["text"], forged);
         assert_eq!((got[1]["kind"].as_str(), got[1]["trusted"].as_bool()), (Some("user"), Some(false)));
@@ -942,15 +963,32 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_that_cannot_fit_its_opening_prompt_is_a_miss() {
+        let senpai = PrincipalId::new();
+        let opening = block_by(senpai, 0, BlockKind::Text, Role::User, &"é".repeat(BLOCK_BYTES));
+        let id = opening.id;
+        let names = HashMap::new();
+        let text = transcript(std::slice::from_ref(&opening), 3000, None, &names, Some(id), Some(senpai)).unwrap();
+        let got = lines(&text);
+        assert_eq!(got.len(), 1, "one block can be both the opening and the latest senpai instruction");
+        assert_eq!(got[0]["purpose"], "opening_prompt");
+        assert_eq!(got[0]["trusted"], true);
+        assert!(transcript(&[opening], 200, None, &names, Some(id), Some(senpai)).is_err());
+    }
+
+    #[test]
     fn the_transcript_keeps_the_tail_within_its_budget_and_cuts_long_blocks() {
         let blocks: Vec<_> = (0..10).map(|i| block(i, BlockKind::Text, Role::User, &format!("turn {i}"))).collect();
-        let one = transcript(&blocks[..1], 10_000, None, &HashMap::new()).len() + 1;
-        let text = transcript(&blocks, 3 * one, None, &HashMap::new());
+        let no_priority = |blocks: &[BlockSnapshot], budget| transcript(blocks, budget, None, &HashMap::new(), None, None).unwrap();
+        let one = no_priority(&blocks[..1], 10_000).len() + 1;
+        let budget = 3 * one + "<truncated 7 earlier blocks />\n".len();
+        let text = no_priority(&blocks, budget);
+        assert!(text.len() <= budget);
         assert!(text.starts_with("<truncated 7 earlier blocks />\n"), "{text}");
         let kept = lines(text.split_once('\n').unwrap().1);
         assert_eq!(kept.iter().map(|l| l["text"].as_str().unwrap()).collect::<Vec<_>>(), ["turn 7", "turn 8", "turn 9"]);
         let long = block(0, BlockKind::ToolResult, Role::Tool, &"y".repeat(3000));
-        let text = transcript(&[long], 10_000, None, &HashMap::new());
+        let text = no_priority(&[long], 10_000);
         assert!(lines(&text)[0]["text"].as_str().unwrap().ends_with("<truncated 952 bytes />") && text.len() < 2300, "{}", text.len());
     }
 }
