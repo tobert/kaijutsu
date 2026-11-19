@@ -74,6 +74,13 @@ Both model judges read the same evidence and share `[guardian]`, the breaker, an
 - **The decisions judge.** One Decisions call on the slot, under the same deadline. Its state is the guardian's user message; its `verdict` question's instructions are the policy and a line mapping the policy's outcome to the options. It allows when p(allow) reaches `[guardian] allow_at` (default 0.9), reports when `report` is the most likely verdict (ties included), and otherwise asks with the three probabilities in the ask. A provider error, a timeout, a transport error, or a reply that does not match the question is a miss. An ask or a report counts as a denial on the breaker.
 - **Record.** Each decision is a `council_decisions` row with the spec name in the table. The guardian's answer is a `council_assessments` row beside it; the decisions judge's probabilities are the decision's pooled `verdict` rows.
 
+## Denying an ask
+
+`kj ledger deny <id> --reason "Use the generated report instead."` denies the
+ask and includes the reason in the denial the model reads. `kj ledger show <id>`
+shows the recorded reason. Omit `--reason` to deny without one. With `--remember`,
+the reason belongs to this decision, not to future denials by the rule.
+
 ## Standing rules for a character
 
 `kj ledger allow <request-id> --remember character [--family]` binds a rule to the character performing the ask. Scope `session` covers the context and requester; scope `always` covers everyone.

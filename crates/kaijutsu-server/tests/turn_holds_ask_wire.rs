@@ -207,6 +207,12 @@ impl Held {
         )).await;
     }
 
+    async fn deny_with_reason(&self, request_id: &str, reason: &str) {
+        let answer = self.reviewer_kj.execute_kj_quiet(self.reviewer_context,
+            &["ledger".into(), "deny".into(), request_id.into(), "--reason".into(), reason.into()]).await.unwrap();
+        assert_eq!(answer.exit_code, 0, "{}{}", answer.stdout, answer.stderr);
+    }
+
     fn approval(&self, request_id: &str) -> approval_ledger::types::ApprovalRow {
         self.server.kernel_db.lock().get_approval(request_id).unwrap().expect("the ask row")
     }
@@ -305,14 +311,18 @@ fn a_denied_ask_returns_the_denial_in_the_same_turn() {
         ]).await;
 
         let asks = h.wait_for_asks(1).await;
-        h.answer(&asks[0], false).await;
+        let reason = "Use the generated report instead.\nThe source file stays unchanged.";
+        h.deny_with_reason(&asks[0], reason).await;
         assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
 
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
         let results = tool_results(&sent[1]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "held-2");
         assert!(results[0].2, "a denial is an error result: {results:?}");
-        assert!(results[0].1.contains("denied"), "the model reads the denial: {results:?}");
+        assert!(results[0].1.contains("denied") && results[0].1.contains(reason),
+            "the model reads the reason in the denial: {results:?}");
         assert!(!marker.exists());
         assert_eq!(h.result_block("held-2").status, Status::Error);
         h.assert_no_seed();
@@ -556,10 +566,11 @@ fn a_denied_hook_ask_on_another_tool_returns_the_denial() {
             reply("fine"),
         ]).await;
         let asks = h.wait_for_asks(1).await;
-        h.answer(&asks[0], false).await;
+        let reason = "The file list is already in the report.";
+        h.deny_with_reason(&asks[0], reason).await;
         assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
         let results = tool_results(&sent.lock()[1]);
-        assert!(results[0].2 && results[0].1.contains("denied"), "{results:?}");
+        assert!(results[0].2 && results[0].1.contains("denied") && results[0].1.contains(reason), "{results:?}");
         assert!(!h.server.kernel_db.lock().undelivered_answers().unwrap().iter().any(|a| a.request_id == asks[0]),
             "delivering the denial spent it");
         h.assert_no_seed();

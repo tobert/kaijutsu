@@ -727,6 +727,14 @@ pub fn list_events(conn: &Connection, request_id: &str) -> Result<Vec<EventRow>>
     Ok(rows)
 }
 
+/// The reviewer's reason on the accepted decision, if supplied.
+pub fn denial_reason(conn: &Connection, request_id: &str) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT note FROM approval_events WHERE request_id = ?1 AND kind = 'decided' ORDER BY seq LIMIT 1",
+        params![request_id], |row| row.get(0),
+    ).optional()?.flatten())
+}
+
 /// Every refused answer attempt on one ask, oldest first. The measurement
 /// side of the no-self-approval invariant: without this, a low escalation
 /// rate is indistinguishable from a gate everyone answered themselves.

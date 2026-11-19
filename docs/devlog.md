@@ -383,3 +383,10 @@ annotations the builder never writes. Anything else sends in full, and a
 failed upgrade or a lost connection falls back to a full request, so the
 rule can be strict without losing a turn. HTTP stays as the fallback and as
 the off switch.
+
+## Give the reason with the denial (November 19)
+
+A reviewer's denial reason belongs to the accepted decision. The ledger writes
+it on the decision event in the same transaction. The asking model reads it
+in the tool result, so a reviewer does not have to send a second block that
+may arrive after the turn ends.

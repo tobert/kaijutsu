@@ -967,8 +967,11 @@ async fn run_gate_once(
                 let Some((request_id, status)) = found else { return Ok(None); };
                 let row = db.get_approval(&request_id)?
                     .ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request_id.clone()))?;
-                if answer_is_held(db, &request_id, &row, status)? { return Ok(Some((request_id, status, row, true))); }
-                Ok(db.redeem_ask(&request_id)?.then_some((request_id, status, row, false)))
+                if answer_is_held(db, &request_id, &row, status)? { return Ok(Some((request_id, status, row, true, None))); }
+                let reason = if status == ApprovalStatus::Denied {
+                    approval_ledger::ask::denial_reason(db.conn_for_ledger(), &request_id)?
+                } else { None };
+                Ok(db.redeem_ask(&request_id)?.then_some((request_id, status, row, false, reason)))
             };
             match caller.context_id {
                 Some(context_id) => {
@@ -981,7 +984,7 @@ async fn run_gate_once(
             }
         };
         match answered {
-            Ok(Some((request_id, _, row, true))) => {
+            Ok(Some((request_id, _, row, true, _))) => {
                 return GateOutcome::unavailable_without_row(if row.exec_source.is_some() {
                     format!("Approval {request_id} runs its command once, in the approval worker. \
                              No new command ran. Read its status with kj wait --ask {request_id}.")
@@ -990,7 +993,7 @@ async fn run_gate_once(
                              Read its status with kj wait --ask {request_id}.")
                 });
             }
-            Ok(Some((request_id, status, row, false))) => {
+            Ok(Some((request_id, status, row, false, reason))) => {
                 approval_span.record("ask.id", request_id.as_str());
                 {
                     if let Some(id) = PrincipalId::try_from_slice(&row.principal_id) {
@@ -1023,8 +1026,9 @@ async fn run_gate_once(
                          it is now spent"
                             .to_string()
                     } else {
-                        "this exact request was already denied by its assigned reviewer"
-                            .to_string()
+                        crate::runtime::approval_resume::with_denial_reason(
+                            "this exact request was already denied by its assigned reviewer".into(), reason.as_deref(),
+                        )
                     },
                     judged: Vec::new(),
                 };
@@ -1360,7 +1364,7 @@ mod tests {
         let db = d.kernel_db.lock();
         approval_ledger::claim::claim(db.conn_for_ledger(), request_id, answerer.as_bytes())
             .unwrap();
-        approval_ledger::decide::decide(
+        approval_ledger::decide::decide_with_denial_reason(
             db.conn_for_ledger(),
             request_id,
             approval_ledger::decide::DecideInput {
@@ -1373,6 +1377,7 @@ mod tests {
                 remember_scope: None,
                 auto_reason: None,
             },
+            (!allow).then_some("Use the generated report instead."),
         )
         .unwrap();
     }
@@ -1983,6 +1988,7 @@ mod tests {
         );
         assert_eq!(second.ask.as_ref().unwrap().status, AskStatus::Denied);
         assert_eq!(second.ask.as_ref().unwrap().request_id, request_id);
+        assert!(second.reason.contains("Use the generated report instead."), "{}", second.reason);
 
         let third =
             run_gate(d.kernel(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
