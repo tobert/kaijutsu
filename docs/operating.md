@@ -20,6 +20,18 @@ Environment variables need a service restart, while `kj backend set` and config 
 
 Reseed rc trees with `kaijutsu-server rc reseed` while stopped (`--force` overwrites defaults or moves retired trees aside).
 
+## The macOS LaunchAgent
+
+On macOS, `contrib/install-launchd.sh` builds a release binary, copies it to `~/bin/kaijutsu-server`, and runs it as the LaunchAgent `local.kaijutsu-server`, logging to `~/Library/Logs/kaijutsu-server.log`. Re-running it deploys a new build. Bootstrap the kernel first, with the agent stopped:
+
+```bash
+launchctl bootout gui/$(id -u)/local.kaijutsu-server            # stop
+kaijutsu-server kj -- embedding show                            # any kj verb, offline
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.kaijutsu-server.plist
+```
+
+The agent's environment holds only `PATH`, `RUST_LOG`, and any `XDG_DATA_HOME` or `XDG_CONFIG_HOME` from the installing shell, so backend keys come from files. launchd restarts a failing server every 5 seconds without limit.
+
 ## Rootless Podman and container setup
 
 The Kaijutsu container image (`localhost/kaijutsu:dev`) runs as the non-root `kaijutsu` user (UID/GID 10001).
