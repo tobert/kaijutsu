@@ -25,19 +25,21 @@
 
 cap=6000
 
-cwd="$(kj context info --json | jq -r '.cwd // empty')"
+info="$(kj context info --json)"
+ctx="$(echo "$info" | jq -r '.label // .context_id[0:8] // "<context>"')"
+cwd="$(echo "$info" | jq -r '.cwd // empty')"
 if test -z "$cwd"; then
-  kj block create --role system --kind notification --content "This context has no working directory, so the shell starts in the kernel's own working directory, which may not be your project. Give it one with `cd DIR` in shell_write; the change persists. From outside this context, `kj context set . --cwd DIR` sets it."
-  echo "orient: context has no cwd; said so"
+  kj block create --role system --kind notification --content "This context has no working directory, so the shell starts in the kernel's own working directory, which may not be your project. Give it one with `cd DIR` in shell_write; the change persists. From an operator context, `kj context set $ctx --cwd DIR` sets it."
+  kj rc skip "no working directory"
   exit 0
 fi
 if test "$cwd" = "/"; then
-  kj block create --role system --kind notification --content "This context's working directory is /, which is almost always a mistake: relative paths and searches start at the top of the host, not in your project. Move to your project with `cd DIR` in shell_write; the change persists. From outside this context, `kj context set . --cwd DIR` sets it."
-  echo "orient: context cwd is /; said so"
+  kj block create --role system --kind notification --content "This context's working directory is /, which is almost always a mistake: relative paths and searches start at the top of the host, not in your project. Move to your project with `cd DIR` in shell_write; the change persists. From an operator context, `kj context set $ctx --cwd DIR` sets it."
+  kj rc skip "cwd is /"
   exit 0
 fi
 if test ! -d "$cwd"; then
-  echo "orient: cwd $cwd is not a directory; skipped"
+  kj rc skip "cwd $cwd is not a directory"
   exit 0
 fi
 cd "$cwd"

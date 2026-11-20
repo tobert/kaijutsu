@@ -420,10 +420,20 @@ async fn run_lifecycle(
             rc_runs::begin_run_script(db.conn_for_ledger(), run_id, &script.path, &script.content, script_started_at)
                 .map_err(|error| format!("rc lifecycle {verb}: could not record {} before execution: {error}", script.path))?
         };
-        let result = run_kai_script(dispatcher, invocation, rc_dir, &character, script, caller, owner).await;
+        let ctx_id = invocation.admission.context();
+        let settlements = dispatcher.kernel().rc_settlements();
+        settlements.clear_active_skip(ctx_id);
+        let mut result = run_kai_script(dispatcher, invocation, rc_dir, &character, script, caller, owner).await;
+        if let Some(_reason) = settlements.take_active_skip(ctx_id)
+            && !result.failed()
+            && let settlement::ScriptExecution::Completed { result: exec, .. } = &mut result
+        {
+            exec.code = settlement::RC_EXIT_SKIP;
+            exec.original_code = None;
+        }
         let cancelled = result.cancelled();
         any_script_failed |= result.failed();
-        dispatcher.kernel().rc_settlements().retain_and_project(run_id, seq, result)?;
+        settlements.retain_and_project(run_id, seq, result)?;
         if cancelled {
             return Err(format!("rc lifecycle {verb} cancelled while running {}", script.path));
         }

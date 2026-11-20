@@ -76,6 +76,13 @@ enum RcCommand {
         /// Canonical rc path, or a hook body path, to show
         path: String,
     },
+    /// Mark the active rc script as conditionally skipped (`[ skip ]`).
+    /// Only valid inside an rc lifecycle script (`rc_depth > 0`); exiting
+    /// with code 77 also marks a script skipped.
+    Skip {
+        /// Optional reason why the script skipped its work
+        reason: Option<String>,
+    },
 }
 
 /// Staleness classification for `kj rc list`'s per-entry seed comparison
@@ -252,6 +259,7 @@ impl KjDispatcher {
             }
             RcCommand::Rm { path } => self.rc_rm(&path).await,
             RcCommand::Show { path } => self.rc_show(&path).await,
+            RcCommand::Skip { reason } => self.rc_skip(reason.as_deref(), caller),
         };
         if let Some(path) = write_path
             && let KjResult::Ok { message, .. } = &result
@@ -673,7 +681,24 @@ impl Classify for RcCommand {
     fn effect(&self) -> Effect {
         match self {
             RcCommand::List { .. } | RcCommand::Show { .. } => Effect::Read,
-            RcCommand::Add { .. } | RcCommand::Rm { .. } => Effect::Write,
+            RcCommand::Add { .. } | RcCommand::Rm { .. } | RcCommand::Skip { .. } => Effect::Write,
+        }
+    }
+}
+
+impl super::KjDispatcher {
+    fn rc_skip(&self, reason: Option<&str>, caller: &KjCaller) -> KjResult {
+        if caller.rc_depth == 0 {
+            return KjResult::Err("kj rc skip: only valid inside an rc lifecycle script".to_string());
+        }
+        let Some(ctx) = caller.context_id else {
+            return KjResult::Err("kj rc skip: caller has no context".to_string());
+        };
+        let reason = reason.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        self.kernel().rc_settlements().mark_active_skip(ctx, reason.clone());
+        match reason {
+            Some(r) => KjResult::ok(format!("skipped: {r}")),
+            None => KjResult::ok("skipped"),
         }
     }
 }

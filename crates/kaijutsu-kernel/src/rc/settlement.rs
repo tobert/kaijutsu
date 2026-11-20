@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use crate::block_store::{RecordedBlockInsert, ShellResultFields, SharedBlockStore};
 use crate::kernel_db::KernelDb;
 
+/// Exit code an rc script (or `kj rc skip`) uses to mark a conditional skip.
+pub(crate) const RC_EXIT_SKIP: i64 = 77;
+
 /// The exact outcome captured from one attempted rc script.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum ScriptExecution {
@@ -52,9 +55,13 @@ impl ScriptExecution {
         }
     }
 
+    pub(crate) fn skipped(&self) -> bool {
+        !self.cancelled() && self.exit_code() == Some(RC_EXIT_SKIP)
+    }
+
     pub(crate) fn failed(&self) -> bool {
         self.cancelled() || matches!(self, Self::NotRun { .. } | Self::Fault { .. } | Self::LegacyRecorded { .. })
-            || self.exit_code().is_some_and(|code| code != 0)
+            || self.exit_code().is_some_and(|code| code != 0 && code != RC_EXIT_SKIP)
     }
 
     pub(crate) fn cancelled(&self) -> bool {
@@ -93,6 +100,7 @@ pub(crate) struct RcSettlements {
     blocks: SharedBlockStore,
     pending_results: parking_lot::Mutex<HashMap<ScriptKey, PendingResult>>,
     pending_finishes: parking_lot::Mutex<HashMap<String, PendingFinish>>,
+    active_skips: parking_lot::Mutex<HashMap<ContextId, Option<String>>>,
     projection: parking_lot::Mutex<()>,
 }
 
@@ -106,8 +114,21 @@ impl RcSettlements {
             blocks,
             pending_results: parking_lot::Mutex::new(HashMap::new()),
             pending_finishes: parking_lot::Mutex::new(HashMap::new()),
+            active_skips: parking_lot::Mutex::new(HashMap::new()),
             projection: parking_lot::Mutex::new(()),
         }
+    }
+
+    pub(crate) fn clear_active_skip(&self, context: ContextId) {
+        self.active_skips.lock().remove(&context);
+    }
+
+    pub(crate) fn mark_active_skip(&self, context: ContextId, reason: Option<String>) {
+        self.active_skips.lock().insert(context, reason);
+    }
+
+    pub(crate) fn take_active_skip(&self, context: ContextId) -> Option<Option<String>> {
+        self.active_skips.lock().remove(&context)
     }
 
     /// Retain the captured result, then publish its context-log projection.
@@ -430,17 +451,28 @@ fn projection(path: &str, execution: &ScriptExecution) -> Option<Projection> {
     if !failed && stdout.is_empty() && stderr.is_empty() && output.is_none() {
         return None;
     }
-    let header = if failed {
+    let display_path = path.strip_prefix("/config/rc/").unwrap_or(path);
+    let header = if execution.cancelled() {
+        format!(
+            " \x1b[33m*\x1b[0m \x1b[1m{sort_key}\x1b[0m \x1b[2m{display_path}\x1b[0m  \x1b[1;33m[ error ]\x1b[0m\n"
+        )
+    } else if failed {
         match exit {
             Some(code) => format!(
-                "rc {sort_key} exit {code}: {path}\nrc_path: {path}\nsort_key: {sort_key}\nexit_code: {code}\n\n"
+                " \x1b[31m*\x1b[0m \x1b[1m{sort_key}\x1b[0m \x1b[2m{display_path}\x1b[0m \x1b[2m(exit {code})\x1b[0m  \x1b[1;31m[ error ]\x1b[0m\n"
             ),
             None => format!(
-                "rc {sort_key} failed: {path}\nrc_path: {path}\nsort_key: {sort_key}\nexit_code: n/a\n\n"
+                " \x1b[31m*\x1b[0m \x1b[1m{sort_key}\x1b[0m \x1b[2m{display_path}\x1b[0m  \x1b[1;31m[ error ]\x1b[0m\n"
             ),
         }
+    } else if execution.skipped() {
+        format!(
+            " \x1b[33m*\x1b[0m \x1b[1m{sort_key}\x1b[0m \x1b[2m{display_path}\x1b[0m  \x1b[1;33m[ skip ]\x1b[0m\n"
+        )
     } else {
-        format!("rc {sort_key} trace: {path}\nrc_path: {path}\nsort_key: {sort_key}\n\n")
+        format!(
+            " \x1b[32m*\x1b[0m \x1b[1m{sort_key}\x1b[0m \x1b[2m{display_path}\x1b[0m  \x1b[1;32m[ ok ]\x1b[0m\n"
+        )
     };
     let stdout_len = stdout.len();
     let mut raw = header.into_bytes();
@@ -449,6 +481,11 @@ fn projection(path: &str, execution: &ScriptExecution) -> Option<Projection> {
     }
     if !stdout.is_empty() {
         raw.extend_from_slice(b"--- stdout ---\n");
+        if std::str::from_utf8(&stdout).is_err() {
+            raw.extend_from_slice(format!(
+                "[binary rc output displayed with replacement characters; exact {stdout_len} bytes retained in the run ledger]\n"
+            ).as_bytes());
+        }
         raw.extend_from_slice(&stdout);
         raw.push(b'\n');
     }
@@ -544,9 +581,45 @@ mod tests {
             &ScriptExecution::Completed { result, cancelled: false },
         ).unwrap();
         assert_eq!(projected.content_type, ContentType::Plain);
-        assert!(projected.content.contains("rc S00 trace"));
+        assert!(projected.content.contains("* S00"));
+        assert!(projected.content.contains("[ ok ]"));
         assert!(projected.content.contains("exact 3 bytes"));
         assert!(projected.content.contains("warning from rc"));
+    }
+
+    #[test]
+    fn openrc_projection_emits_ansi_status_spans_for_trace_and_error() {
+        let ok = projection(
+            "/config/rc/coder/create/S10-binding.kai",
+            &completed("bound coder\n"),
+        ).unwrap();
+        assert_eq!(ok.kind, BlockKind::Trace);
+        assert!(ok.content.contains("* S10"));
+        assert!(ok.content.contains("[ ok ]"));
+        assert!(ok.content.contains("bound coder"));
+        assert!(ok.ansi.as_ref().is_some_and(|(spans, _)| !spans.is_empty()));
+
+        let mut fail_result = kaish_kernel::interpreter::ExecResult::success("");
+        fail_result.code = 2;
+        let fail = projection(
+            "/config/rc/coder/create/S35-orient.kai",
+            &ScriptExecution::Completed { result: fail_result, cancelled: false },
+        ).unwrap();
+        assert_eq!(fail.kind, BlockKind::Error);
+        assert!(fail.content.contains("* S35"));
+        assert!(fail.content.contains("[ error ]"));
+        assert!(fail.content.contains("exit 2"));
+        assert!(fail.ansi.as_ref().is_some_and(|(spans, _)| !spans.is_empty()));
+
+        let mut skip_result = kaish_kernel::interpreter::ExecResult::success("no working directory\n");
+        skip_result.code = RC_EXIT_SKIP;
+        let skip_exec = ScriptExecution::Completed { result: skip_result, cancelled: false };
+        assert!(!skip_exec.failed());
+        assert!(skip_exec.skipped());
+        let skipped = projection("/config/rc/coder/create/S36-house-rules.kai", &skip_exec).unwrap();
+        assert_eq!(skipped.kind, BlockKind::Trace);
+        assert!(skipped.content.contains("* S36"));
+        assert!(skipped.content.contains("[ skip ]"));
     }
 
     #[tokio::test]
