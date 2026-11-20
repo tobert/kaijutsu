@@ -566,18 +566,26 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             "trace block must reference the script path or sort key, got: {body}"
         );
 
-        // The fast path, asserted on the very block most likely to regress it:
-        // an rc script with no escape bytes must leave the block exactly as it
-        // was before ANSI ingest existed — no spans, no tag, no row.
-        assert!(trace_blocks[0].style_spans.is_empty(), "escape-free rc output must have no spans");
-        assert!(trace_blocks[0].provenance.is_none(), "escape-free rc output must stay untagged");
+        // OpenRC settlement headers intentionally style the status badge (`*`,
+        // sort key, path, `[ ok ]`), so every rc trace block carries ANSI
+        // spans and a provenance row for the raw pre-strip output.
+        assert!(body.contains("[ ok ]"), "trace block must carry OpenRC [ ok ] badge, got: {body}");
+        assert!(!body.contains('\u{1b}'), "no escape byte may survive into block content: {body:?}");
+        assert!(!trace_blocks[0].style_spans.is_empty(), "OpenRC settlement header must produce style spans");
+        let tag = trace_blocks[0].provenance.as_ref().expect("styled OpenRC trace block must carry a provenance tag");
+        assert_eq!(tag.transform, kaijutsu_ansi::TRANSFORM_NAME);
+        assert_eq!(tag.version, kaijutsu_ansi::PARSER_VERSION);
+        let (version, original) = d
+            .kernel_db()
+            .lock()
+            .get_block_provenance(&trace_blocks[0].id, kaijutsu_ansi::TRANSFORM_NAME)
+            .expect("provenance query")
+            .expect("OpenRC trace block must write a provenance row");
+        assert_eq!(version, kaijutsu_ansi::PARSER_VERSION);
         assert_eq!(
-            d.kernel_db()
-                .lock()
-                .get_block_provenance(&trace_blocks[0].id, kaijutsu_ansi::TRANSFORM_NAME)
-                .expect("provenance query"),
-            None,
-            "escape-free rc output must not write a provenance row"
+            kaijutsu_ansi::strip(&original),
+            (trace_blocks[0].content.clone(), trace_blocks[0].style_spans.clone()),
+            "strip(original) must reproduce (content, style_spans) exactly"
         );
     }
 
@@ -1658,7 +1666,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         assert!(
             contents
                 .iter()
-                .any(|c| c.contains("/config/rc/test/create/S00-fail.kai")),
+                .any(|c| c.contains("test/create/S00-fail.kai")),
             "error block should reference rc path, got: {contents:?}"
         );
     }
@@ -2401,7 +2409,7 @@ esac
     /// The marker every rc-seeded datetime notification's content starts
     /// with — kept in one place so a wording tweak in the seed scripts
     /// doesn't scatter edits across every test.
-    const DATETIME_MARKER: &str = "Current date/time: ";
+    const DATETIME_MARKER: &str = "Our context begins ";
 
     fn notification_blocks_with_marker(
         dispatcher: &KjDispatcher,
@@ -3418,8 +3426,9 @@ esac
             .filter(|b| b.kind == kaijutsu_types::BlockKind::Error)
             .map(|b| b.content)
             .collect();
+        let display_link = link.strip_prefix("/config/rc/").unwrap_or(link);
         assert!(
-            errors.iter().any(|c| c.contains(link)),
+            errors.iter().any(|c| c.contains(display_link)),
             "Error block must name the link path: {errors:?}"
         );
         assert!(
@@ -3878,7 +3887,11 @@ esac
                     assert_eq!(notes.len(), 1, "expected one notification, got: {own:#?}");
                     let text = &notes[0].content;
                     assert!(text.starts_with(NO_CWD_MARKER), "{text}");
-                    assert!(text.contains("`cd DIR`") && text.contains("kj context set . --cwd DIR"), "{text}");
+                    assert!(
+                        text.contains("`cd DIR`")
+                            && text.contains("From an operator context, `kj context set orient --cwd DIR`"),
+                        "{text}"
+                    );
                     assert_eq!(notes[0].role, kaijutsu_types::Role::System, "{text}");
                 });
         })
@@ -3899,8 +3912,12 @@ esac
                     assert_eq!(notes.len(), 1, "expected one notification, got: {own:#?}");
                     let text = &notes[0].content;
                     assert!(text.starts_with(ROOT_CWD_MARKER), "{text}");
-                    assert!(text.contains("almost always a mistake") && text.contains("`cd DIR`")
-                        && text.contains("kj context set . --cwd DIR"), "{text}");
+                    assert!(
+                        text.contains("almost always a mistake")
+                            && text.contains("`cd DIR`")
+                            && text.contains("From an operator context, `kj context set orient --cwd DIR`"),
+                        "{text}"
+                    );
                     assert_eq!(notes[0].role, kaijutsu_types::Role::System, "{text}");
                 });
         })

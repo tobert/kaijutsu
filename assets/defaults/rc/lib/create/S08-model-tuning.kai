@@ -16,7 +16,7 @@ case "$model" in
     tuning="Answer directly without restating the request or padding with framing."
     ;;
   *)
-    echo "model-tuning: none for $model"
+    kj rc skip "no tuning for ${model:-unset}"
     exit 0
     ;;
 esac
