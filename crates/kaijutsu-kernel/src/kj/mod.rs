@@ -2654,7 +2654,7 @@ mod house_verb_tests {
     /// with room for several verbs' `--help` under the model-facing preview
     /// limit in the same shell call.
     const HELP_BUDGET_BYTES: usize = 4 * 1024;
-    const _: () = assert!(HELP_BUDGET_BYTES <= crate::runtime::embedded_kaish::PREVIEW_LIMIT_BYTES / 2);
+    const _: () = assert!(HELP_BUDGET_BYTES <= crate::runtime::embedded_kaish::PreviewLimit::DEFAULT.bytes() / 2);
 
     #[tokio::test]
     async fn help_fits_the_model_preview_for_every_seat() {

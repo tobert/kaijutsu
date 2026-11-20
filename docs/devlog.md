@@ -416,3 +416,18 @@ stays one setting for the kernel, not a character slot: every context is
 searched in one vector space. `kj embedding set` runs the startup checks
 before it writes. The kernel also builds on macOS now: `rustix` 1.x has the
 no-replace rename there.
+## A model reads its output once (November 19)
+
+A shell result's `[data]` line repeated the output for every `--json` call
+and for `seq`, `find`, and `glob`, so the model read a list twice. The line
+now comes only when stdout does not already show the data; a `kj` verb whose
+table abbreviates still sends its handles. The decision is by content, not
+by who produced the data, because the same builtin prints either way. The
+`[latch]` line is gone: stderr already names the confirming command.
+
+The preview limit moved from constants to the character's model
+(`kj character model set --preview-kib`), copied into a context's `model`
+slot like `max_tokens`, so a small model can take less than Codex's 40 KiB.
+The shell and its tool description read the same value. It stops at 48 KiB,
+below the broker's 64 KiB shell budget, which would otherwise cut the
+envelope with no `/v/cas` copy.

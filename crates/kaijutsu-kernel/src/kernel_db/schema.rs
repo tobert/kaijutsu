@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS context_slots (
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
     decide          TEXT CHECK (decide IS NULL OR decide != ''),
+    preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0),
     PRIMARY KEY (context_id, role)
 );
 
@@ -840,7 +841,7 @@ CREATE INDEX IF NOT EXISTS idx_character_slots_backend ON character_slots(backen
 -- The one model a character runs. A context copies it under role `model`,
 -- and under `distill` when the character has no `distill` slot and the model
 -- is no council server. A NULL tunable takes the model's `backend_models`
--- value at that copy (docs/senpai-kohai.md, "Where a model comes from").
+-- value at that copy.
 CREATE TABLE IF NOT EXISTS character_models (
     principal_id    BLOB NOT NULL PRIMARY KEY REFERENCES characters(principal_id),
     backend_id      BLOB NOT NULL REFERENCES backends(backend_id),
@@ -851,7 +852,9 @@ CREATE TABLE IF NOT EXISTS character_models (
     effort          TEXT,
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
-    decide          TEXT CHECK (decide IS NULL OR decide != '')
+    decide          TEXT CHECK (decide IS NULL OR decide != ''),
+    -- The shell output a model reads whole, in KiB; NULL is the kernel default.
+    preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0)
 );
 CREATE INDEX IF NOT EXISTS idx_character_models_backend ON character_models(backend_id);
 

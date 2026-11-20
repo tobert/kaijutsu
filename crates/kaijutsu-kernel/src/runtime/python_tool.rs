@@ -331,7 +331,7 @@ mod tests {
                 context: ContextId::new(), session: SessionId::new() },
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Allow { path: Some(path.to_string()) },
-            OutputProfile::Agent,
+            OutputProfile::AGENT,
             |_, _, _| {},
         )
         .expect("build an exec shell")

@@ -85,6 +85,9 @@ pub struct CharacterModelRow {
     /// assembles its reply from council decisions. Only a character's model
     /// has one; a backend's model row and the character's other slots do not.
     pub decide: Option<String>,
+    /// The shell output this model reads whole, in KiB, before the kernel
+    /// cuts it to a preview. `None` takes the kernel default.
+    pub preview_kib: Option<i64>,
 }
 
 pub(super) const CHARACTER_SLOT_COLS: &str = "principal_id, role, backend_id, model, max_tokens, temperature, \
@@ -106,7 +109,7 @@ pub(super) fn row_to_character_slot(row: &rusqlite::Row<'_>) -> SqliteResult<Cha
 }
 
 pub(super) const CHARACTER_MODEL_COLS: &str = "principal_id, backend_id, model, max_tokens, temperature, \
-                                    top_p, effort, thinking_budget, thinking_style, decide";
+                                    top_p, effort, thinking_budget, thinking_style, decide, preview_kib";
 
 pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterModelRow> {
     Ok(CharacterModelRow {
@@ -120,6 +123,7 @@ pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<Ch
         thinking_budget: row.get(7)?,
         thinking_style: row.get(8)?,
         decide: row.get(9)?,
+        preview_kib: row.get(10)?,
     })
 }
 
@@ -245,10 +249,17 @@ impl KernelDb {
             row.thinking_style.as_deref(),
         )?;
         validate_decide(row.decide.as_deref())?;
+        if let Some(kib) = row.preview_kib {
+            use crate::runtime::embedded_kaish::PreviewLimit;
+            let (min, max) = (PreviewLimit::MIN_KIB as i64, PreviewLimit::MAX_KIB as i64);
+            if !(min..=max).contains(&kib) {
+                return Err(KernelDbError::Validation(format!("preview_kib must be from {min} to {max} (got {kib})")));
+            }
+        }
         self.conn.execute(
             &format!(
                 "INSERT INTO character_models ({CHARACTER_MODEL_COLS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(principal_id) DO UPDATE SET
                      backend_id = excluded.backend_id,
                      model = excluded.model,
@@ -258,7 +269,8 @@ impl KernelDb {
                      effort = excluded.effort,
                      thinking_budget = excluded.thinking_budget,
                      thinking_style = excluded.thinking_style,
-                     decide = excluded.decide"
+                     decide = excluded.decide,
+                     preview_kib = excluded.preview_kib"
             ),
             params![
                 blob_param(row.principal_id.as_bytes()),
@@ -271,6 +283,7 @@ impl KernelDb {
                 row.thinking_budget,
                 row.thinking_style,
                 row.decide,
+                row.preview_kib,
             ],
         )?;
         Ok(())

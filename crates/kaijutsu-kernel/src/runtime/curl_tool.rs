@@ -117,7 +117,7 @@ mod tests {
             crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
             session_context_map(),
             ExternalExec::Deny,
-            OutputProfile::Agent,
+            OutputProfile::AGENT,
             configure_tools,
         )
         .expect("EmbeddedKaish init")

@@ -160,7 +160,7 @@ pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            decide: None,
+            decide: None, preview_kib: None,
         })
         .expect("give the performer the mock model");
     }

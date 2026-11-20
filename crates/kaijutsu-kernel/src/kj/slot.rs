@@ -87,6 +87,12 @@ pub(super) enum CharacterSlotCommand {
     },
 }
 
+/// The values `--preview-kib` takes (`PreviewLimit::MIN_KIB..=MAX_KIB`).
+const PREVIEW_KIB_RANGE: std::ops::RangeInclusive<i64> = {
+    use crate::runtime::embedded_kaish::PreviewLimit;
+    PreviewLimit::MIN_KIB as i64..=PreviewLimit::MAX_KIB as i64
+};
+
 #[derive(Subcommand, Debug)]
 pub(super) enum CharacterModelCommand {
     /// Set the character's model, replacing the one it has. A context copies
@@ -129,6 +135,13 @@ pub(super) enum CharacterModelCommand {
         /// `--decide` clears the program
         #[arg(long)]
         decide: Option<String>,
+        /// Shell output, in KiB from 4 to 48, that the model reads whole.
+        /// Longer output reaches it as its first 30% and last 60% with the gap
+        /// marked, and the full output stays readable in `/v/cas`. Setting
+        /// the model without `--preview-kib` restores 40 KiB. A context
+        /// copies this when it is made or rotated
+        #[arg(long = "preview-kib", value_parser = clap::value_parser!(u32).range(PREVIEW_KIB_RANGE))]
+        preview_kib: Option<u32>,
     },
     /// Remove the character's model. Role slots stay. Contexts keep the
     /// slots they copied until they are rotated.
@@ -175,6 +188,7 @@ pub(super) fn model_data(
         "thinking_budget": m.thinking_budget,
         "thinking_style": m.thinking_style,
         "decide": m.decide,
+        "preview_kib": m.preview_kib,
     })
 }
 
@@ -187,6 +201,9 @@ pub(super) fn model_summary(
     let mut knobs = knob_list(m.max_tokens, m.temperature, m.top_p, m.effort.as_deref(), m.thinking_budget, m.thinking_style.as_deref());
     if let Some(path) = &m.decide {
         knobs.push(format!("decide={path}"));
+    }
+    if let Some(kib) = m.preview_kib {
+        knobs.push(format!("preview_kib={kib}"));
     }
     if knobs.is_empty() {
         format!("{backend}/{} (no parameters set)", m.model)
@@ -239,6 +256,7 @@ impl KjDispatcher {
                 thinking_budget,
                 thinking_style,
                 decide,
+                preview_kib,
             } => {
                 let (backend, model) = match split_backend_model(&model) {
                     Ok(pair) => pair,
@@ -281,6 +299,7 @@ impl KjDispatcher {
                     thinking_budget: thinking_budget.map(|v| v as i64),
                     thinking_style,
                     decide,
+                    preview_kib: preview_kib.map(i64::from),
                 }) {
                     return KjResult::Err(format!("kj character model set: {e}"));
                 }

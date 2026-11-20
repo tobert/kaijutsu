@@ -358,6 +358,13 @@ fn non_negative(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
 
+/// The shell output context `context_id`'s model reads whole, in KiB: its
+/// [`MODEL`] slot's `preview_kib`. `None` when the context has no model slot
+/// or the slot sets none, and the kernel default applies.
+pub fn preview_kib(db: &KernelDb, context_id: ContextId) -> KernelDbResult<Option<u64>> {
+    Ok(db.context_slot(context_id, MODEL)?.and_then(|slot| non_negative(slot.preview_kib)))
+}
+
 /// The model context `context_id` runs, from its [`MODEL`] slot. A slot on a
 /// council server with no `max_tokens` runs no chat turn. `Err` is a fault
 /// reading the slot or a missing `max_tokens` on a backend that requires it.

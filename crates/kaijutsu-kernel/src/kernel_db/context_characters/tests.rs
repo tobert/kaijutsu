@@ -216,7 +216,7 @@ impl World {
                     effort: slot.effort.clone(),
                     thinking_budget: slot.thinking_budget,
                     thinking_style: slot.thinking_style.clone(),
-                    decide: None,
+                    decide: None, preview_kib: None,
                 })
                 .unwrap();
         }
@@ -438,7 +438,7 @@ impl World {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            decide: None,
+            decide: None, preview_kib: None,
         };
         self.db.set_character_model(&row).unwrap();
         row
@@ -667,7 +667,7 @@ fn a_root_character_refuses_a_model() {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            decide: None,
+            decide: None, preview_kib: None,
         })
         .unwrap_err()
         .to_string();
@@ -1850,7 +1850,7 @@ fn a_decisions_backend_serves_the_gate_and_never_a_chat_turn() {
     let judged = w.character("judged");
     w.db.set_character_model(&CharacterModelRow {
         principal_id: judged, backend_id: w.deepseek, model: "ds-flash".into(), max_tokens: Some(1024),
-        temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None,
+        temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None, preview_kib: None,
     }).unwrap();
     w.db.set_character_slot(&slot(judged, "gate")).unwrap();
     let error = w.db.set_character_slot(&slot(judged, "distill")).unwrap_err().to_string();
@@ -1863,7 +1863,7 @@ fn a_decisions_backend_serves_the_gate_and_never_a_chat_turn() {
     let chat = w.character("chat");
     w.db.set_character_model(&CharacterModelRow {
         principal_id: chat, backend_id: jev, model: "typesafe/jev-1.13".into(), max_tokens: None,
-        temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None,
+        temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None, preview_kib: None,
     }).unwrap();
     let conv = w.ctx("conv2", "coder", None, None);
     let error = w.db.write_context_character(conv.context_id, chat, None, None).unwrap_err().to_string();

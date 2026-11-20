@@ -682,7 +682,7 @@ mod fill_tests {
             let kaish = EmbeddedKaish::with_identity("panic-settlement", documents.clone(), kernel.clone(), None,
                 crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: ctx, session: kaijutsu_types::SessionId::new() },
                 crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
-                super::super::embedded_kaish::OutputProfile::Agent,
+                super::super::embedded_kaish::OutputProfile::AGENT,
                 |_, _, tools| { tools.register(PanicBuiltin); }).unwrap();
             if during_hook {
                 kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {

@@ -67,12 +67,15 @@ impl InstancePolicy {
         policy.shell_command_max + Duration::from_secs(60)
     }
 
+    /// The result budget of `builtin.shell` and `builtin.shell_write`.
+    pub const SHELL_RESULT_BYTES: usize = 64 * 1024;
+
     /// Production constructor for `builtin.shell` and `builtin.shell_write`.
     pub fn for_shell(kernel: &crate::Kernel) -> Self {
         Self {
             call_timeout: Self::shell_call_timeout(kernel.timeouts()),
             // See the matching comment on `Default` above — 64 KiB, not 64 MiB.
-            max_result_bytes: 64 * 1024,
+            max_result_bytes: Self::SHELL_RESULT_BYTES,
             max_concurrency: 16,
         }
     }

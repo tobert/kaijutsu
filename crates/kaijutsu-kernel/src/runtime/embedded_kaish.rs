@@ -71,9 +71,10 @@ pub struct EmbeddedKaish {
     /// Snapshot of the kaijutsu kernel's `TimeoutPolicy` at construction.
     /// Callers use `timeouts()` when supplying per-invocation `ExecuteOptions`.
     timeouts: kaijutsu_types::TimeoutPolicy,
-    /// The store a model-facing (Agent profile) shell keeps cut output in;
-    /// `None` for an Internal shell, whose results are never cut.
-    preview_store: Option<Arc<kaijutsu_cas::FileStore>>,
+    /// The store a model-facing (Agent profile) shell keeps cut output in,
+    /// and the limit it cuts at; `None` for an Internal shell, whose results
+    /// are never cut.
+    preview_store: Option<(Arc<kaijutsu_cas::FileStore>, PreviewLimit)>,
 }
 
 /// Refuse tools whose effects cannot be limited to observation. Register these
@@ -152,13 +153,12 @@ pub enum ExternalExec {
 /// a head and tail, sets exit code 3, and retains the command's code in
 /// `original_code`; that remap also reaches script `$?`. Callers must reject
 /// spilled output when a preview would corrupt the result.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputProfile {
-    /// Model-facing output: the kernel cuts a final result past
-    /// `PREVIEW_LIMIT_BYTES` to a head and tail and stores the whole of it in
-    /// CAS, named by its `/v/cas` path (`preview_for_model`).
-    #[default]
-    Agent,
+    /// Model-facing output: the kernel cuts a final result past the limit to
+    /// a head and tail and stores the whole of it in CAS, named by its
+    /// `/v/cas` path (`preview_for_model`).
+    Agent(PreviewLimit),
     /// Rc, hook, and editor output: the full text, up to the ceiling.
     Internal,
 }
@@ -166,21 +166,62 @@ pub enum OutputProfile {
 /// Memory ceiling for every embedded shell's captured output.
 const OUTPUT_CEILING_BYTES: usize = 4 * 1024 * 1024;
 
-/// A model-facing result past this many bytes, stdout or stderr, is cut to a
-/// preview. About 10,000 tokens, the limit Codex gives the GPT plan models:
-/// a source read or a test summary arrives whole, and a full test run is cut.
-pub(crate) const PREVIEW_LIMIT_BYTES: usize = 40 * 1024;
-/// The preview keeps this much of the start.
-pub(crate) const PREVIEW_HEAD_BYTES: usize = 12 * 1024;
-/// And this much of the end, where test summaries and errors land.
-pub(crate) const PREVIEW_TAIL_BYTES: usize = 24 * 1024;
+/// The model-facing output a shell sends whole. A result past `bytes`,
+/// stdout or stderr, is cut to its first 30% and last 60%. A context takes
+/// its model slot's `preview_kib` (`PreviewLimit::for_context`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewLimit {
+    bytes: usize,
+}
+
+impl PreviewLimit {
+    /// About 10,000 tokens, the limit Codex gives the GPT plan models: a
+    /// source read or a test summary arrives whole, and a full test run is cut.
+    pub const DEFAULT: Self = Self::from_kib(40);
+    /// Below this, a preview's markers outweigh the output they replace.
+    pub const MIN_KIB: u32 = 4;
+    /// Above this, a preview and its envelope pass the broker's shell result
+    /// budget, which cuts the envelope with no `/v/cas` copy.
+    pub const MAX_KIB: u32 = 48;
+
+    pub const fn from_kib(kib: usize) -> Self {
+        Self { bytes: kib * 1024 }
+    }
+
+    /// The limit of context `context_id`: its model slot's `preview_kib`, or
+    /// [`Self::DEFAULT`] when the context has no model slot or the slot sets none.
+    pub(crate) fn for_context(db: &crate::kernel_db::KernelDb, context_id: ContextId) -> crate::kernel_db::KernelDbResult<Self> {
+        let kib = crate::model_resolution::preview_kib(db, context_id)?;
+        Ok(kib.and_then(|kib| usize::try_from(kib).ok()).map_or(Self::DEFAULT, Self::from_kib))
+    }
+
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+
+    /// The preview keeps this much of the start.
+    pub const fn head(self) -> usize {
+        self.bytes * 3 / 10
+    }
+
+    /// And this much of the end, where test summaries and errors land.
+    pub const fn tail(self) -> usize {
+        self.bytes * 6 / 10
+    }
+}
+
+const _: () = assert!((PreviewLimit::MAX_KIB as usize) * 1024 < crate::mcp::InstancePolicy::SHELL_RESULT_BYTES);
 
 impl OutputProfile {
+    /// The model-facing profile at the default limit, for a shell that serves
+    /// no context's model.
+    pub const AGENT: Self = Self::Agent(PreviewLimit::DEFAULT);
+
     /// Build the kaish config for this profile.
     fn to_config(self) -> OutputLimitConfig {
         let mut cfg = OutputLimitConfig::agent();
         cfg.set_limit(Some(OUTPUT_CEILING_BYTES));
-        if self == Self::Agent {
+        if matches!(self, Self::Agent(_)) {
             // Past the ceiling, CAS keeps what kaish kept.
             cfg.set_head_bytes(OUTPUT_CEILING_BYTES / 4 * 3);
             cfg.set_tail_bytes(OUTPUT_CEILING_BYTES / 4);
@@ -193,27 +234,27 @@ impl OutputProfile {
 /// CAS (`cut_preview`). A cut stdout also drops the result's structured data.
 ///
 /// The exit code stays the command's own. `did_spill` reports the cut.
-async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::FileStore>) {
+async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::FileStore>, limit: PreviewLimit) {
     let kept_by_kaish = result.did_spill;
     let stdout = match result.out_bytes() {
         Some(bytes) if std::str::from_utf8(bytes).is_err() => {
-            (bytes.len() > PREVIEW_LIMIT_BYTES).then(|| (bytes.to_vec(), "application/octet-stream"))
+            (bytes.len() > limit.bytes()).then(|| (bytes.to_vec(), "application/octet-stream"))
         }
         _ => {
             let text = result.text_out();
-            (text.len() > PREVIEW_LIMIT_BYTES).then(|| (text.into_owned().into_bytes(), "text/plain"))
+            (text.len() > limit.bytes()).then(|| (text.into_owned().into_bytes(), "text/plain"))
         }
     };
     if let Some((bytes, mime)) = stdout {
         let stored = store_in_cas(cas, &bytes, mime, "output").await;
         let preview = if mime == "text/plain" {
             let text = String::from_utf8(bytes).expect("checked as UTF-8 above");
-            cut_preview(&text, "output", &stored, kept_by_kaish)
+            cut_preview(&text, "output", &stored, kept_by_kaish, limit)
         } else {
             match &stored {
                 Ok(path) => format!(
-                    "[output truncated: {} bytes of binary output, over the {PREVIEW_LIMIT_BYTES}-byte limit; the full output is at {path}]",
-                    bytes.len()
+                    "[output truncated: {} bytes of binary output, over the {}-byte limit; the full output is at {path}]",
+                    bytes.len(), limit.bytes()
                 ),
                 Err(e) => format!("[output truncated: {} bytes of binary output; storing it failed: {e}]", bytes.len()),
             }
@@ -227,10 +268,10 @@ async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::File
         }
         result.did_spill = true;
     }
-    if result.err.len() > PREVIEW_LIMIT_BYTES {
+    if result.err.len() > limit.bytes() {
         let err = std::mem::take(&mut result.err);
         let stored = store_in_cas(cas, err.as_bytes(), "text/plain", "stderr").await;
-        result.err = cut_preview(&err, "stderr", &stored, false);
+        result.err = cut_preview(&err, "stderr", &stored, false, limit);
         result.did_spill = true;
     }
 }
@@ -254,14 +295,15 @@ async fn store_in_cas(
         .inspect_err(|e| tracing::error!(error = %e, len = bytes.len(), "storing a model-facing {stream} in CAS failed"))
 }
 
-/// The preview a model reads for `text`, which is over the limit: the first
-/// `PREVIEW_HEAD_BYTES` and the last `PREVIEW_TAIL_BYTES`, each cut at a
+/// The preview a model reads for `text`, which is over `limit`: its first
+/// `limit.head()` and last `limit.tail()` bytes, each cut at a
 /// line end when there is one, a `[cut: …]` line where the middle was, and
 /// a last `[{stream} truncated: …]` line. When the cut falls on line ends,
 /// the marker names the lines left out and a `sed -n` command that prints
 /// them from `stored`.
-fn cut_preview(text: &str, stream: &str, stored: &Result<String, String>, kept_by_kaish: bool) -> String {
+fn cut_preview(text: &str, stream: &str, stored: &Result<String, String>, kept_by_kaish: bool, limit: PreviewLimit) -> String {
     let len = text.len();
+    let bytes = limit.bytes();
     let lines = match count_lines(text) {
         1 => "1 line".to_string(),
         n => format!("{n} lines"),
@@ -278,9 +320,9 @@ fn cut_preview(text: &str, stream: &str, stored: &Result<String, String>, kept_b
         }
         i
     };
-    let head_limit = floor(PREVIEW_HEAD_BYTES.min(len));
+    let head_limit = floor(limit.head().min(len));
     let head_end = text[..head_limit].rfind('\n').map_or(head_limit, |i| i + 1);
-    let tail_limit = ceil(len.saturating_sub(PREVIEW_TAIL_BYTES).max(head_end));
+    let tail_limit = ceil(len.saturating_sub(limit.tail()).max(head_end));
     let tail_start = text[tail_limit..].find('\n').map(|i| tail_limit + i + 1).filter(|&i| i < len).unwrap_or(tail_limit);
     let on_lines = head_end > 0 && text.as_bytes()[head_end - 1] == b'\n' && text.as_bytes()[tail_start - 1] == b'\n';
     let cut = tail_start - head_end;
@@ -299,10 +341,10 @@ fn cut_preview(text: &str, stream: &str, stored: &Result<String, String>, kept_b
             "[{stream} truncated: past the {OUTPUT_CEILING_BYTES}-byte ceiling; the {len} bytes, {lines} kept are at {path}]"
         ),
         Ok(path) => format!(
-            "[{stream} truncated: {len} bytes, {lines}, over the {PREVIEW_LIMIT_BYTES}-byte limit; the full {stream} is at {path}]"
+            "[{stream} truncated: {len} bytes, {lines}, over the {bytes}-byte limit; the full {stream} is at {path}]"
         ),
         Err(e) => format!(
-            "[{stream} truncated: {len} bytes, {lines}, over the {PREVIEW_LIMIT_BYTES}-byte limit; storing the full {stream} failed: {e}]"
+            "[{stream} truncated: {len} bytes, {lines}, over the {bytes}-byte limit; storing the full {stream} failed: {e}]"
         ),
     };
     let head = &text[..head_end];
@@ -337,7 +379,7 @@ impl EmbeddedKaish {
                 reviewer: None, context: ContextId::new(), session: SessionId::new() },
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Deny,
-            OutputProfile::Agent,
+            OutputProfile::AGENT,
             |_, _, _| {},
         )
     }
@@ -384,6 +426,7 @@ impl EmbeddedKaish {
         project_root: Option<PathBuf>,
         identity: ShellIdentity,
         session_contexts: SessionContextMap,
+        preview: PreviewLimit,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         let path = kernel.host_path().map(str::to_string);
@@ -399,8 +442,8 @@ impl EmbeddedKaish {
             // lever, held off by construction (no caller choice to get wrong).
             // Lookups still see the writable shell's PATH.
             ExternalExec::LookupOnly { path },
-            // The read-only model shell uses the agent output limit.
-            OutputProfile::Agent,
+            // The read-only shell is always model-facing.
+            OutputProfile::Agent(preview),
             configure_tools,
         )
     }
@@ -526,7 +569,10 @@ impl EmbeddedKaish {
             docs_fs
         };
 
-        let preview_store = (output == OutputProfile::Agent).then(|| kernel.cas().clone());
+        let preview_store = match output {
+            OutputProfile::Agent(limit) => Some((kernel.cas().clone(), limit)),
+            OutputProfile::Internal => None,
+        };
         let ctx_for_tools = session_contexts.clone();
         let sid_for_tools = session_id;
         let timeouts = kernel.timeouts().clone();
@@ -606,8 +652,8 @@ impl EmbeddedKaish {
         let context_id = self.context_id().map(|cid| cid.to_string());
         let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
         let mut result = self.kernel.execute_with_options(code, opts).await?;
-        if let Some(cas) = &self.preview_store {
-            preview_for_model(&mut result, cas).await;
+        if let Some((cas, limit)) = &self.preview_store {
+            preview_for_model(&mut result, cas, *limit).await;
         }
         Ok(result)
     }
@@ -622,8 +668,8 @@ impl EmbeddedKaish {
         let context_id = self.context_id().map(|cid| cid.to_string());
         let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
         let mut result = self.kernel.execute_with_options_streaming(code, opts, on_output).await?;
-        if let Some(cas) = &self.preview_store {
-            preview_for_model(&mut result, cas).await;
+        if let Some((cas, limit)) = &self.preview_store {
+            preview_for_model(&mut result, cas, *limit).await;
         }
         Ok(result)
     }
@@ -868,6 +914,10 @@ fn merge_trace_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PREVIEW_LIMIT_BYTES: usize = PreviewLimit::DEFAULT.bytes();
+    const PREVIEW_HEAD_BYTES: usize = PreviewLimit::DEFAULT.head();
+    const PREVIEW_TAIL_BYTES: usize = PreviewLimit::DEFAULT.tail();
     use crate::block_store::shared_block_store;
     use kaijutsu_types::paths::{CAS_ROOT, RC_ROOT};
 
@@ -1377,7 +1427,7 @@ mod tests {
                 crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
                 crate::runtime::context_engine::session_context_map(),
                 exec,
-                OutputProfile::Agent,
+                OutputProfile::AGENT,
                 |_, _, _| {},
             )
             .unwrap()
@@ -1422,7 +1472,7 @@ mod tests {
     fn a_cut_names_bytes_without_line_ends_and_no_command_without_a_store() {
         let line = "x".repeat(PREVIEW_LIMIT_BYTES * 2);
         let stored = Ok("/v/cas/ab/abc".to_string());
-        let preview = cut_preview(&line, "output", &stored, false);
+        let preview = cut_preview(&line, "output", &stored, false, PreviewLimit::DEFAULT);
         let cut = line.len() - PREVIEW_HEAD_BYTES - PREVIEW_TAIL_BYTES;
         assert!(
             preview.contains(&format!("\n[cut: bytes {}-{}, {cut} bytes]\n", PREVIEW_HEAD_BYTES + 1, PREVIEW_HEAD_BYTES + cut)),
@@ -1435,7 +1485,7 @@ mod tests {
         )));
 
         let text: String = (1..=12000).map(|n| format!("{n}\n")).collect();
-        let failed = cut_preview(&text, "stderr", &Err("disk full".into()), false);
+        let failed = cut_preview(&text, "stderr", &Err("disk full".into()), false, PreviewLimit::DEFAULT);
         let marker = failed.lines().find(|l| l.starts_with("[cut: ")).unwrap();
         assert!(marker.starts_with("[cut: lines ") && !marker.contains("sed"), "{marker}");
         assert!(failed.ends_with(&format!("over the {PREVIEW_LIMIT_BYTES}-byte limit; storing the full stderr failed: disk full]")), "{failed}");
@@ -1474,7 +1524,7 @@ mod tests {
         const BIG: &str = "seq 1 12000; echo \"status=$?\"";
         const READ: &str = "seq 1 5000; echo \"status=$?\"";
 
-        let agent = mk("test-outlimit-agent", OutputProfile::Agent);
+        let agent = mk("test-outlimit-agent", OutputProfile::AGENT);
         let r = agent.execute_with_options(READ, ExecuteOptions::default()).await.unwrap();
         assert!(!r.did_spill, "control: a {}-byte read is under the preview limit", r.text_out().len());
         assert!(r.text_out().starts_with("1\n") && r.text_out().ends_with("4999\n5000\nstatus=0\n"), "the read is whole");
@@ -1803,7 +1853,7 @@ mod tests {
             crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Deny,
-            OutputProfile::Agent,
+            OutputProfile::AGENT,
             |_, _, _| {},
         )
         .unwrap();
@@ -1864,7 +1914,7 @@ mod tests {
             crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Deny,
-            OutputProfile::Agent,
+            OutputProfile::AGENT,
             |_, _, _| {},
         )
         .unwrap();
@@ -1929,7 +1979,7 @@ mod tests {
             crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Deny,
-            OutputProfile::Agent,
+            OutputProfile::AGENT,
             |_, _, _| {},
         )
         .unwrap();
@@ -1984,7 +2034,7 @@ mod tests {
             crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Deny,
-            OutputProfile::Agent,
+            OutputProfile::AGENT,
             |_, _, _| {},
         )
         .unwrap();

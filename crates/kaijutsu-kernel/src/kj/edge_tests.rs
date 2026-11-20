@@ -155,7 +155,7 @@ fn give_judge_a_council_model(d: &KjDispatcher) -> PrincipalId {
     db.set_character_model(&crate::kernel_db::CharacterModelRow {
         principal_id: judge, backend_id: nagaya.backend_id, model: s("gemma"), max_tokens: None,
         temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
-        decide: None,
+        decide: None, preview_kib: None,
     }).unwrap();
     judge
 }

@@ -4069,7 +4069,7 @@ esac
             }).unwrap();
             db.set_character_model(&crate::kernel_db::CharacterModelRow {
                 principal_id: judge_character, backend_id: nagaya.backend_id, model: "gemma".into(), max_tokens: None,
-                temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None,
+                temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None, preview_kib: None,
             }).unwrap();
         }
         let judge = archivable_by(&d, "judge-coder-seat", Some(seat), "judge-shadow-type-unread", judge_character);

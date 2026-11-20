@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use super::context_characters::{SlotValues, insert_slot, over};
+use super::context_characters::{ModelOnly, SlotValues, insert_slot, over};
 
 /// `max_tokens` the old model path sent when the slot, the model row and
 /// `llm_defaults` all left it unset (`LlmRegistry::max_output_tokens`).
@@ -241,7 +241,7 @@ impl Catalog {
                 Some(UNSET_MAX_TOKENS)
             }
         };
-        SlotValues::new(backend_id, model, tunables, None, max_tokens, row.and_then(|m| m.context_window))
+        SlotValues::new(backend_id, model, tunables, ModelOnly::default(), max_tokens, row.and_then(|m| m.context_window))
     }
 }
 

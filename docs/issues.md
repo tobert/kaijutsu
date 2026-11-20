@@ -6,6 +6,16 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Shell output a model reads: what the preview-limit change leaves open (2026-11-19)
+
+- **kaish `--json` prints the output tree, not `.data`.** `seq 1 3 --json` prints `["1","2","3"]` while its `.data` is `[1,2,3]` (`apply_output_format` in kaish-types prefers `.output` over `.data`). A kaish change, under its compatibility promises.
+- **`[data]` is chosen by content.** `ShellEnvelope::prints_data` leaves it out when stdout is `data` as JSON or prints its scalars one per line; anything else still sends it. A `kj` verb whose printed text carries what the model needs (`kj vi`, `kj block append` keep the buffer and length only in `data`) could print it and drop the line.
+- **The MCP shell tool still sends the whole envelope** (stdout and `data` both) to MCP clients such as Claude Code (`kaijutsu-mcp`).
+- **`kj help` is budgeted against the default limit** (`HELP_BUDGET_BYTES` in `kj/mod.rs`), so a model with `--preview-kib` under 8 has its `kj help` cut.
+- **stdout and stderr together can pass the broker's 64 KiB shell budget** even at 40 KiB, and the broker then cuts the envelope with no `/v/cas` copy. `--preview-kib` stops at 48 for the same reason.
+- **Three tests fail on main before this change**, likely since the `[cut: …]` marker (82fa74a9): `rc_role_bindings::the_toolie_reads_run_in_its_read_only_shell` (the stance's `cat -n FILE`), `e2e_kj_workflow::test_shell_truncation_does_not_corrupt_exit_code`, `gate_executes_wire::streaming_output_limit_preserves_the_command_exit`.
+- **No doc owns the shell result contract** since the consolidation removed `docs/shell-envelope.md`; it lives in `ShellEnvelope::model_text` and the shell tool description. About 2,000 code comments still point at docs the consolidation (44a0a8cc, 46e12db4) removed or folded; only the shell output path was fixed.
+
 ## rc bindings: the person-input facades are copied per directory (2026-11-15)
 
 - Every rc directory a person talks to grants `edit_input`, `submit_input`, and `commit_capture` in its own `S10-binding.kai`. When the toolie became an assistant Amy talks to, her tui hit one missing facade, then the next (`submit_input`, then `edit_input`). A shared lib script for the person input set, sourced by each person-facing directory, would keep the set in one place.

@@ -66,6 +66,8 @@ pub(crate) struct ContextShellInputs {
     /// `curl_tool` so the shell's `curl` reaches only what this context's
     /// list names.
     pub egress_hosts: Vec<String>,
+    /// The model-facing output the context's model reads whole.
+    pub preview: super::embedded_kaish::PreviewLimit,
 }
 
 impl ContextShellInputs {
@@ -78,7 +80,7 @@ impl ContextShellInputs {
         } else {
             super::embedded_kaish::ExternalExec::Deny
         };
-        let (cwd, exports, egress_hosts) = {
+        let (cwd, exports, egress_hosts, preview) = {
             let db = kernel.kernel_db().lock();
             let cwd = match cwd {
                 ShellCwd::Context => super::shell_state::read_context_cwd(&db, context)
@@ -90,9 +92,11 @@ impl ContextShellInputs {
                 .map_err(|error| anyhow::anyhow!("read context_env for {context}: {error}"))?;
             let egress_hosts = db.list_context_egress(context)
                 .map_err(|error| anyhow::anyhow!("read context_egress for {context}: {error}"))?;
-            (cwd, exports, egress_hosts)
+            let preview = super::embedded_kaish::PreviewLimit::for_context(&db, context)
+                .map_err(|error| anyhow::anyhow!("read the preview limit of {context}: {error}"))?;
+            (cwd, exports, egress_hosts, preview)
         };
-        Ok(Self { cwd, exports, external_exec, egress_hosts })
+        Ok(Self { cwd, exports, external_exec, egress_hosts, preview })
     }
 
     pub fn environment(&self) -> std::collections::HashMap<String, String> {
@@ -148,11 +152,12 @@ impl EmbeddedKaish {
             ShellPolicy::Approved(planned) => Some(planned.clone()),
             _ => None,
         };
-        let (privileged, read_only, output) = match policy {
-            ShellPolicy::Agent | ShellPolicy::Approved(_) => (false, false, OutputProfile::Agent),
-            ShellPolicy::Internal => (false, false, OutputProfile::Internal),
-            ShellPolicy::ReadOnly => (false, true, OutputProfile::Agent),
-            ShellPolicy::Rc(_) => (true, false, OutputProfile::Internal),
+        // A model-facing shell cuts output at the context's preview limit.
+        let (privileged, read_only, model_facing) = match policy {
+            ShellPolicy::Agent | ShellPolicy::Approved(_) => (false, false, true),
+            ShellPolicy::Internal => (false, false, false),
+            ShellPolicy::ReadOnly => (false, true, true),
+            ShellPolicy::Rc(_) => (true, false, false),
         };
         // Fresh, isolated session map: this kaish lives for one invocation and
         // tracks exactly one session→context mapping. No cross-invocation
@@ -165,10 +170,10 @@ impl EmbeddedKaish {
             anyhow::anyhow!("context shell requires a registered kj dispatcher")
         })?;
         // Loaded before `configure_tools` so the closure can move the
-        // context's egress rows straight into `curl_tool` — the shell reads
-        // them once, when it is built (`docs/egress.md`, "Who changes the
-        // list").
+        // context's egress rows straight into `curl_tool`. The shell reads
+        // them once, when it is built.
         let inputs = ContextShellInputs::load(dispatcher.kernel(), context_id, read_only, cwd.clone()).await?;
+        let output = if model_facing { OutputProfile::Agent(inputs.preview) } else { OutputProfile::Internal };
         let egress_hosts = inputs.egress_hosts.clone();
         let configure_tools =
             move |scm: SessionContextMap,
@@ -217,6 +222,7 @@ impl EmbeddedKaish {
                 inputs.cwd.clone(),
                 identity,
                 session_contexts,
+                inputs.preview,
                 configure_tools,
             )?
         } else {

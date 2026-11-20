@@ -115,6 +115,8 @@ impl KernelDb {
             "ALTER TABLE character_models ADD COLUMN decide TEXT CHECK (decide IS NULL OR decide != '')",
             "ALTER TABLE context_slots ADD COLUMN decide TEXT CHECK (decide IS NULL OR decide != '')",
             "ALTER TABLE backend_models ADD COLUMN embedding_profile TEXT",
+            "ALTER TABLE character_models ADD COLUMN preview_kib INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0)",
+            "ALTER TABLE context_slots ADD COLUMN preview_kib INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0)",
         ];
         for sql in alters {
             match conn.execute(sql, []) {

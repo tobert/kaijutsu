@@ -13,8 +13,8 @@
 use crate::runtime::command_result::shell_result_to_envelope;
 use crate::runtime::command_result::shell_envelope_to_tool_result as envelope_result;
 use crate::runtime::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
-use crate::runtime::embedded_kaish::EmbeddedKaish;
-use std::sync::{Arc, LazyLock, Weak};
+use crate::runtime::embedded_kaish::{EmbeddedKaish, PreviewLimit};
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -100,10 +100,13 @@ const ABOUT_KAISH: &str = "The shell is kaish (会sh): familiar shell syntax \
      file. `help` lists topics; `help <command>` explains one. `kj help` covers \
      contexts, drift, and forks.";
 
-// What a model turn reads after a command (`ShellEnvelope::model_text`).
-static RESULT_CONTRACT: LazyLock<String> = LazyLock::new(|| {
-    use crate::runtime::embedded_kaish::{PREVIEW_HEAD_BYTES, PREVIEW_LIMIT_BYTES, PREVIEW_TAIL_BYTES};
-    let kib = |bytes: usize| bytes / 1024;
+// What a model turn reads after a command (`ShellEnvelope::model_text`),
+// with the preview limit of the context that lists the tool.
+fn result_contract(limit: PreviewLimit) -> String {
+    let kib = |bytes: usize| match bytes % 1024 {
+        0 => format!("{}", bytes / 1024),
+        _ => format!("{:.1}", bytes as f64 / 1024.0),
+    };
     format!(
         "A call returns the command's output, then `[stderr]` and the stderr \
          text if there is any. Each bracketed line after that changes your next \
@@ -117,18 +120,19 @@ static RESULT_CONTRACT: LazyLock<String> = LazyLock::new(|| {
          and last {} KiB. A `[cut: lines A-B, …]` line marks the gap and gives \
          the `sed -n` command that prints it from the full copy in `/v/cas`.\n\
          A command that printed nothing returns `[no output]`.",
-        kib(PREVIEW_LIMIT_BYTES),
-        kib(PREVIEW_HEAD_BYTES),
-        kib(PREVIEW_TAIL_BYTES),
+        kib(limit.bytes()),
+        kib(limit.head()),
+        kib(limit.tail()),
     )
-});
+}
 
-static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!("Run a command in your current kernel context. {ABOUT_KAISH}\n\n{}", *RESULT_CONTRACT)
-});
-
-// The model sees the policy and the writable alternative alongside kaish syntax.
-static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
+/// The tool description of `shell_write`, or of `shell` when `read_only`, for
+/// a context whose preview limit is `limit`.
+fn description(read_only: bool, limit: PreviewLimit) -> String {
+    if !read_only {
+        return format!("Run a command in your current kernel context. {ABOUT_KAISH}\n\n{}", result_contract(limit));
+    }
+    // The model sees the policy and the writable alternative alongside kaish syntax.
     format!(
         "Run a READ-ONLY command in your current kernel context. Submitted \
          commands cannot mutate shared state. File writes, external commands, \
@@ -136,14 +140,14 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
          `shell_write` for those operations. `which` finds host programs on PATH; \
          run them with `shell_write`. Inspect with filesystem builtins (`cat`, `grep`, `find`), \
          `/v/docs`, and read-only `kj` commands.\n\n{ABOUT_KAISH}\n\n{}",
-        *RESULT_CONTRACT
+        result_contract(limit)
     )
-});
+}
 
 /// The writable shell's description, for the primer duplication guard.
 #[cfg(test)]
-pub(crate) fn tool_description() -> &'static str {
-    &DESCRIPTION
+pub(crate) fn tool_description() -> String {
+    description(false, PreviewLimit::DEFAULT)
 }
 
 /// Broker server for `shell` or `shell_write`, selected at construction.
@@ -191,14 +195,6 @@ impl ShellServer {
         }
     }
 
-    fn description(&self) -> &'static str {
-        if self.read_only {
-            &DESCRIPTION_READ_ONLY
-        } else {
-            &DESCRIPTION
-        }
-    }
-
     fn broker(&self) -> McpResult<Arc<Broker>> {
         self.broker.upgrade().ok_or_else(|| McpError::InstanceDown {
             instance: self.instance_id.clone(),
@@ -218,11 +214,22 @@ impl McpServerLike for ShellServer {
         &self.instance_id
     }
 
-    async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
+    async fn list_tools(&self, ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
+        // Listing never fails: the broker snapshots tools before the
+        // dispatcher is wired, and a call that cannot read the limit fails
+        // when it builds its shell.
+        let limit = match self.broker()?.kj_dispatcher().await {
+            Some(dispatcher) => PreviewLimit::for_context(&dispatcher.kernel_db().lock(), ctx.context_id)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(context = %ctx.context_id, %error, "reading the preview limit failed; describing the default");
+                    PreviewLimit::DEFAULT
+                }),
+            None => PreviewLimit::DEFAULT,
+        };
         Ok(vec![KernelTool {
             instance: self.instance_id.clone(),
             name: self.tool.to_string(),
-            description: Some(self.description().to_string()),
+            description: Some(description(self.read_only, limit)),
             input_schema: tool_input_schema::<ShellParams>(),
         }])
     }
@@ -416,7 +423,8 @@ mod tests {
             PrincipalId::new(), ContextId::new(), SessionId::new(),
             kaijutsu_types::KernelId::new(),
         );
-        for server in [ShellServer::new(Weak::new()), ShellServer::new_read_only(Weak::new())] {
+        let (broker, _d) = wired().await;
+        for server in [ShellServer::new(Arc::downgrade(&broker)), ShellServer::new_read_only(Arc::downgrade(&broker))] {
             let tools = server.list_tools(&ctx).await.unwrap();
             assert_eq!(tools.len(), 1);
             let tool = &tools[0];
@@ -446,13 +454,13 @@ mod tests {
         both.stdout = "out".into();
         both.stderr = "err".into();
         assert_eq!(both.readable_output(), "out\n[stderr]\nerr");
-        for text in [DESCRIPTION.as_str(), DESCRIPTION_READ_ONLY.as_str()] {
+        for text in [description(false, PreviewLimit::DEFAULT), description(true, PreviewLimit::DEFAULT)] {
             for fact in ["`[exit N]`", "`[rejected: the program did not run]`", "`[running in the background: operation ID]`",
                 "`[output truncated: …]`", "`[cut: lines A-B, …]`", "`[cwd now DIR]`", "`[stderr]`", "`[no output]`"]
             {
                 assert!(text.contains(fact), "missing {fact}: {text}");
             }
-            let limit = format!("over {} KiB", crate::runtime::embedded_kaish::PREVIEW_LIMIT_BYTES / 1024);
+            let limit = format!("over {} KiB", PreviewLimit::DEFAULT.bytes() / 1024);
             assert!(text.contains(&limit), "the description states the preview limit: {text}");
         }
     }
@@ -460,7 +468,7 @@ mod tests {
     /// One short statement per flavour: every request carries it.
     #[test]
     fn descriptions_stay_short_and_carry_the_kaijutsu_facts() {
-        let text = DESCRIPTION.as_str();
+        let text = &description(false, PreviewLimit::DEFAULT);
         assert!(text.len() < 1800, "{} chars: {text}", text.len());
         assert!(text.contains("current kernel context") && text.contains("`kj help`"), "{text}");
         assert!(text.contains("familiar shell syntax with a JSON data model"), "{text}");
@@ -470,7 +478,7 @@ mod tests {
         assert!(text.contains("refused without running"), "{text}");
         assert!(text.contains("`help <command>`") && text.contains("script file"), "{text}");
         assert!(text.contains("glob") && text.contains("`--json`"), "{text}");
-        let ro_text = DESCRIPTION_READ_ONLY.as_str();
+        let ro_text = &description(true, PreviewLimit::DEFAULT);
         // kaish is described by what it is, never by comparison to another shell.
         for description in [text, ro_text] {
             let lower = description.to_lowercase();
@@ -489,7 +497,7 @@ mod tests {
     /// this shows the whole thing.
     #[test]
     fn read_only_description_as_the_model_reads_it() {
-        println!("\n--- shell (read-only) description ---\n{}\n--- end ---", DESCRIPTION_READ_ONLY.as_str());
+        println!("\n--- shell (read-only) description ---\n{}\n--- end ---", description(true, PreviewLimit::DEFAULT));
     }
 
     /// An `Arc<KjDispatcher>` wired into a fresh broker with BOTH the writable
@@ -1242,6 +1250,66 @@ mod tests {
             !visible2.iter().any(|(name, _)| name == "shell"),
             "no-facade context must not see the shell tool: {visible2:?}"
         );
+    }
+
+    /// A character's model sets the preview limit of the contexts it plays
+    /// (`kj character model set --preview-kib`). The shell cuts that
+    /// context's output at the limit, and its tool description states it. A
+    /// context whose model sets none keeps the kernel default.
+    ///
+    /// Falsified by a shell that reads the kernel constant, a description
+    /// that does not follow the context, or a context slot that drops the
+    /// value when it is copied.
+    #[tokio::test]
+    async fn a_models_preview_limit_cuts_its_contexts_output() {
+        use crate::kj::KjResult;
+        let (broker, d) = wired().await;
+        crate::test_backends::example_backends(&d.kernel_db().lock());
+        d.reload_llm_registry().await.unwrap();
+        let caller = test_caller();
+        for argv in [
+            &["character", "create", "terse", "--rc", "coder"][..],
+            &["character", "model", "set", "terse", "deepseek/deepseek-flash", "--preview-kib", "4"],
+            &["character", "create", "roomy", "--rc", "coder"],
+            &["character", "model", "set", "roomy", "deepseek/deepseek-flash"],
+        ] {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let r = d.dispatch(&argv, &caller).await;
+            assert!(matches!(r, KjResult::Ok { .. }), "{argv:?}: {}", r.message());
+        }
+        // Past 48 KiB the broker's result budget would cut the preview.
+        let argv: Vec<String> = ["character", "model", "set", "terse", "deepseek/deepseek-flash", "--preview-kib", "64"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(matches!(d.dispatch(&argv, &caller).await, KjResult::Err(m) if m.contains("4..=48")),
+            "a limit past the broker budget is refused");
+        let principal = PrincipalId::new();
+        let server = ShellServer::new(Arc::downgrade(&broker));
+        // `seq 1 3000` prints 13,893 bytes: over 4 KiB, under the default.
+        for (name, limit) in [("terse", 4096), ("roomy", PreviewLimit::DEFAULT.bytes())] {
+            let context = register_context(&d, Some(name), None, principal);
+            {
+                let db = d.kernel_db().lock();
+                let performer = db.get_character_by_name(name).unwrap().unwrap().principal_id;
+                db.write_context_character(context, performer, None, None).unwrap();
+                let slot = db.context_slot(context, crate::model_resolution::MODEL).unwrap().expect("a model slot");
+                assert_eq!(slot.preview_kib, (name == "terse").then_some(4), "{name}: the context copies its model's limit");
+            }
+            let mut binding = ContextToolBinding::new();
+            binding.grant(Capability::Facade("shell".into()));
+            broker.set_binding(context, binding).await.unwrap();
+            let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+
+            let result = broker.call_tool(call("seq 1 3000"), &cc, CancellationToken::new()).await.unwrap();
+            let stdout = body_of(&result)["stdout"].as_str().unwrap().to_string();
+            let cut = stdout.contains(&format!("over the {limit}-byte limit"));
+            assert_eq!(cut, limit < 13_893, "{name}: {} bytes read: {}", stdout.len(), &stdout[stdout.len().saturating_sub(200)..]);
+            assert!(!cut || stdout.len() < limit, "{name}: a {}-byte preview is over the limit", stdout.len());
+
+            let tools = server.list_tools(&cc).await.unwrap();
+            let description = tools[0].description.as_deref().unwrap();
+            assert!(description.contains(&format!("over {} KiB", limit / 1024)), "{name}: {description}");
+        }
+        d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
     /// Helper: the envelope a completed `ExecResult` produces.
