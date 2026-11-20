@@ -132,14 +132,16 @@ fn description(read_only: bool, limit: PreviewLimit) -> String {
     if !read_only {
         return format!("Run a command in your current kernel context. {ABOUT_KAISH}\n\n{}", result_contract(limit));
     }
-    // The model sees the policy and the writable alternative alongside kaish syntax.
+    // The model sees the policy alongside kaish syntax, without pointing it at
+    // `shell_write` (read-only seats do not hold `shell_write`).
     format!(
         "Run a READ-ONLY command in your current kernel context. Submitted \
          commands cannot mutate shared state. File writes, external commands, \
-         mutating `kj` verbs, editor input, `curl`, and MCP calls are refused. Use \
-         `shell_write` for those operations. `which` finds host programs on PATH; \
-         run them with `shell_write`. Inspect with filesystem builtins (`cat`, `grep`, `find`), \
-         `/v/docs`, and read-only `kj` commands.\n\n{ABOUT_KAISH}\n\n{}",
+         mutating `kj` verbs, editor input, `curl`, and MCP calls are refused \
+         in this read-only shell. `which` finds host programs on PATH \
+         (read-only cannot run them). Inspect with filesystem builtins \
+         (`cat`, `grep`, `find`), `/v/docs`, and read-only `kj` \
+         commands.\n\n{ABOUT_KAISH}\n\n{}",
         result_contract(limit)
     )
 }
@@ -488,16 +490,7 @@ mod tests {
         }
         assert!(ro_text.len() < 2300, "{} chars: {ro_text}", ro_text.len());
         assert!(ro_text.contains("cannot mutate shared state") && ro_text.contains("/v/docs"), "{ro_text}");
-        assert!(ro_text.contains("`shell_write`") && ro_text.contains("`which` finds host programs on PATH"), "{ro_text}");
-    }
-
-    /// Prints the read-only tool description as the model receives it —
-    /// `cargo test -p kaijutsu-kernel read_only_description -- --nocapture`.
-    /// Published text is read, not grepped: the asserts above pin phrases,
-    /// this shows the whole thing.
-    #[test]
-    fn read_only_description_as_the_model_reads_it() {
-        println!("\n--- shell (read-only) description ---\n{}\n--- end ---", description(true, PreviewLimit::DEFAULT));
+        assert!(!ro_text.contains("`shell_write`") && ro_text.contains("`which` finds host programs on PATH"), "{ro_text}");
     }
 
     /// An `Arc<KjDispatcher>` wired into a fresh broker with BOTH the writable

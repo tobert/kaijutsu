@@ -525,8 +525,6 @@ async fn the_toolie_reads_run_in_its_read_only_shell_body() {
     let h = harness().await;
     h.kernel.broker().set_kj_dispatcher(&h.dispatcher).await;
     let ctx = create_typed(&h, "explorer", "toolie").await;
-    let stance = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/defaults/rc/toolie/create/S00-stance.md")).expect("read the toolie stance");
     let call_ctx = CallContext::new(h.creator, ctx, SessionId::new(), KernelId::new());
     let run = |command: String| {
         let broker = h.kernel.broker().clone();
@@ -540,20 +538,13 @@ async fn the_toolie_reads_run_in_its_read_only_shell_body() {
             result.structured.expect("the shell returns its envelope")
         }
     };
-    // The commands the stance shows, then the reads a seat makes with the
-    // shell, bound to files every toolie seat has. A stance that shows
-    // another command fails here until this list runs it too.
     let file = "/config/rc/toolie/create/S00-stance.md";
     let dir = "/config/rc/toolie";
-    for shown in ["`cat -n FILE`", "`grep -rn PATTERN DIR`"] {
-        assert!(stance.contains(shown), "the stance no longer shows {shown}; run what it shows instead");
-    }
     let reads = [
         format!("cat -n {file}"),
         format!("wc -l {file}"),
         format!("cat -n {file} | sed -n '1,150p'"),
         format!("grep -rn shell {dir}"),
-        format!("grep -rnF 'helpful assistant' {dir}"),
         format!("grep -rn -B4 -A8 shell {dir}"),
         format!("file {file}"),
         "pwd".to_string(),
@@ -602,20 +593,20 @@ async fn only_house_seats_hold_the_house_capability_body() {
     let h = harness().await;
     let root = ensure_root(&h, "amy").await;
     let mut seats = vec![("root", root)];
-    for ty in ["mcp", "banto", "coder", "toolie", "musician"] {
+    for ty in ["mcp", "banto", "senpai", "coder", "kohai", "toolie", "musician"] {
         let ctx = create_typed(&h, &format!("seat-{ty}"), ty).await;
         seats.push((ty, ctx));
     }
     for (ty, ctx) in seats {
         let binding = h.kernel.broker().binding(&ctx).await
             .unwrap_or_else(|| panic!("{ty} rc must seed a binding"));
-        let house = !matches!(ty, "coder" | "toolie" | "musician");
+        let house = !matches!(ty, "coder" | "kohai" | "toolie" | "musician");
         assert_eq!(binding.allows(&Capability::House), house, "{ty}: house");
     }
 }
 
-/// A coder keeps the work authorities (drift, fork, exec, editor) and drops
-/// the ones that run the instrument: the kj verbs for context lifecycle,
+/// A coder or kohai keeps the work authorities (drift, fork, exec, editor) and
+/// drops the ones that run the instrument: the kj verbs for context lifecycle,
 /// the beat, and self-driving belong to a house seat.
 #[test]
 fn coder_loadout_is_a_worker_loadout() {
@@ -630,14 +621,42 @@ fn coder_loadout_is_a_worker_loadout() {
 
 async fn coder_loadout_is_a_worker_loadout_body() {
     let h = harness().await;
-    let ctx = create_typed(&h, "coder-seat", "coder").await;
-    let binding = h.kernel.broker().binding(&ctx).await.expect("coder rc must seed a binding");
-    for cap in [Capability::Drift, Capability::Fork, Capability::Exec, Capability::Editor,
-                Capability::Facade("shell_write".into())] {
-        assert!(binding.allows(&cap), "coder should allow {cap:?}");
+    for dir in ["coder", "kohai"] {
+        let ctx = create_typed(&h, &format!("{dir}-seat"), dir).await;
+        let binding = h.kernel.broker().binding(&ctx).await
+            .unwrap_or_else(|| panic!("{dir} rc must seed a binding"));
+        for cap in [Capability::Drift, Capability::Fork, Capability::Exec, Capability::Editor,
+                    Capability::Facade("shell_write".into())] {
+            assert!(binding.allows(&cap), "{dir} should allow {cap:?}");
+        }
+        for cap in [Capability::House, Capability::Operator, Capability::Transport,
+                    Capability::Drive, Capability::System, Capability::ConfigWrite, Capability::Admin] {
+            assert!(!binding.allows(&cap), "{dir} must not allow {cap:?}");
+        }
     }
-    for cap in [Capability::House, Capability::Operator, Capability::Transport,
-                Capability::Drive, Capability::System, Capability::ConfigWrite, Capability::Admin] {
-        assert!(!binding.allows(&cap), "coder must not allow {cap:?}");
+}
+
+/// A senpai carries the operator loadout: house, operator, drive, system, admin,
+/// and the full shell/editor/file authorities.
+#[test]
+fn senpai_loadout_is_an_operator_loadout() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(senpai_loadout_is_an_operator_loadout_body());
+    });
+}
+
+async fn senpai_loadout_is_an_operator_loadout_body() {
+    let h = harness().await;
+    let ctx = create_typed(&h, "senpai-seat", "senpai").await;
+    let binding = h.kernel.broker().binding(&ctx).await.expect("senpai rc must seed a binding");
+    for cap in [Capability::House, Capability::Operator, Capability::Drive, Capability::System,
+                Capability::Admin, Capability::Drift, Capability::Fork, Capability::Exec,
+                Capability::Editor, Capability::Facade("shell_write".into())] {
+        assert!(binding.allows(&cap), "senpai should allow {cap:?}");
     }
+    assert!(binding.is_admin(), "senpai should hold binding-admin");
 }

@@ -267,7 +267,9 @@ fn set_ephemeral_host_exec(rc_root: &Path, enabled: bool) {
             canonical.as_str(),
             "/config/rc/person/create/S10-binding.kai"
                 | "/config/rc/banto/create/S10-binding.kai"
+                | "/config/rc/senpai/create/S10-binding.kai"
                 | "/config/rc/coder/create/S10-binding.kai"
+                | "/config/rc/kohai/create/S10-binding.kai"
                 | "/config/rc/lib/create/S10-binding.kai"
         ) {
             continue;

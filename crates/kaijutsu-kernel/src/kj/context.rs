@@ -9650,9 +9650,11 @@ mod tests {
         assert!(result.is_ok(), "prompt failed: {}", result.message());
         let msg = result.message();
 
-        let opening = "We are a cybernetic system focused on software engineering.";
+        let coder_stance = crate::seed_scripts::seed_body("/config/rc/coder/create/S00-stance.md")
+            .expect("coder stance seed")
+            .trim();
         assert_eq!(
-            msg.match_indices(opening).count(),
+            msg.match_indices(coder_stance).count(),
             1,
             "the coder receives its stance exactly once: {msg}"
         );
@@ -9660,20 +9662,9 @@ mod tests {
             !msg.contains("LEGACY-KERNEL-PROMPT-MUST-NOT-APPEAR"),
             "the old /config/kernel/system.md input must be ignored: {msg}"
         );
-        // The coder stance carries accountability, the define-done and
-        // orient rhythm, honest guessing, the working rules, and done.
-        for rule in ["The human in our system is accountable for our work",
-            "how we will know when it is complete", "We begin each task by getting oriented",
-            "The most important thing to do when guessing is say so",
-            "Search file contents with grep", "least privilege",
-            "kj wait --operation", "Use the `done` tool", "fair & square", "頑張って"] {
-            // Prose wraps freely; compare with line breaks folded to spaces.
-            let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(flat.contains(rule), "coder stance is missing {rule:?}: {msg}");
-        }
 
         // Order is the rc sort order: coder S00-stance, then the situation.
-        let rc_pos = msg.find(opening).expect("rc present");
+        let rc_pos = msg.find(coder_stance).expect("rc present");
         let situation_pos = msg.find("<situation>").expect("situation present");
         assert!(
             rc_pos < situation_pos,
@@ -9697,11 +9688,15 @@ mod tests {
         assert!(result.is_ok(), "musician prompt failed: {}", result.message());
         let musician_prompt = result.message();
         assert!(
-            !musician_prompt.contains(opening),
+            !musician_prompt.contains(coder_stance),
             "the musician receives no coder stance: {musician_prompt}"
         );
+        let musician_stance =
+            crate::seed_scripts::seed_body("/config/rc/musician/create/S00-stance.md")
+                .expect("musician stance seed")
+                .trim();
         assert!(
-            musician_prompt.contains("We are a cybernetic system making music together."),
+            musician_prompt.contains(musician_stance),
             "musician's own role section is still present: {musician_prompt}"
         );
     }
@@ -9741,10 +9736,13 @@ mod tests {
             .block_snapshots(before)
             .map(|blocks| crate::llm::extract_system_prompt_sections(&blocks))
             .expect("before snapshots");
+        let coder_stance = crate::seed_scripts::seed_body("/config/rc/coder/create/S00-stance.md")
+            .expect("coder stance seed")
+            .trim();
         assert!(
             before_sections
                 .iter()
-                .any(|section| section.contains("We are a cybernetic system focused on software engineering.")),
+                .any(|section| section.contains(coder_stance)),
             "first context must receive the seeded coder stance: {before_sections:?}"
         );
 

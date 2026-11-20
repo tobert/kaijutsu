@@ -441,7 +441,7 @@ fn bootstrap_leaves_a_console_label_it_does_not_accept_alone() {
 fn shipped() -> Vec<&'static str> {
     let names: Vec<_> =
         kaijutsu_kernel::seed_scripts::shipped_characters().into_iter().filter(|name| *name != "judge").collect();
-    assert!(names.contains(&"sol") && names.contains(&"coder"), "{names:?}");
+    assert!(names.contains(&"senpai") && names.contains(&"kohai") && names.contains(&"coder"), "{names:?}");
     names
 }
 

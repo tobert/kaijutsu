@@ -37,12 +37,13 @@ character.
 
 - `person/`: root characters (persons). Grants operator and house capabilities
   without `drive`; runs no model turns.
+- `senpai/`, `kohai/`: the universal core characters — `senpai` orchestrates
+  and keeps state, `kohai` executes bounded work. Both split character
+  activation (`S00-stance.md`) from Kaijutsu mechanics (`S05-env.md`) and link
+  the shared inline model-tuning check (`S08-model-tuning.kai`).
 - `banto/`, `coder/`, `companion/`, `storyteller/`, `musician/`, `toolie/`,
-  `assistant/`, `council/`, `sol/`: model characters of the same name. Sol's
-  stance is written for GPT-6.2, and bootstrap gives it the same model as the
-  others. On any other model, sol's `S12-model-check.kai` leaves a
-  notification naming the commands that set up a `chatgpt` backend, give sol
-  `chatgpt/gpt-6.2-sol`, and rotate the context onto it.
+  `assistant/`, `council/`: other shipped model characters (`banto` and `coder`
+  remain during the transition to `senpai` and `kohai`).
 - `judge/`: council judge shadow character (runs no chat turns and binds no
   tool loadout).
 - `mcp/`: characters for external MCP bridge sessions (`kaijutsu-lead`).
@@ -89,10 +90,9 @@ parts:
    ```xml
    <situation>
      <context id="019abc..." label="lead" state="live"/>
-     <performer id="019def..." name="banto"/>
-     <senpai id="019000..." label="amy" character="amy"/>
-     <cwd>/home/atobey/src/kaijutsu</cwd>
-     <model provider="deepseek" id="deepseek-chat"/>
+     <model provider="deepseek" name="deepseek-chat"/>
+     <performer id="019def..." name="senpai"/>
+     <senpai id="019000..." context="amy" character="amy"/>
    </situation>
    ```
 2. **Stored system instruction blocks:** Every non-excluded, non-ephemeral,
@@ -100,9 +100,11 @@ parts:
    joined with `\n\n` in document order.
 
 ### Stance register and live edits
-- Shipped stances (`S00-stance.md`) are written in plain ASCII STE using
-  inclusive `we`, naming accountability to the person we work with, and closing
-  with `頑張って` (for `coder`, `assistant`, and `companion`).
+- Shipped stances (`S00-stance.md`) use direct second-person (`you`) focused on
+  activating the character's voice and judgment rather than crystallizing domain
+  rules. Kaijutsu-specific runtime contracts live in a separate delimited block
+  (`S05-env.md`) when needed, and `lib/create/S08-model-tuning.kai` provides an
+  optional inline model-specific nudge at context creation.
 - `kj context instruction list|show|add|edit` and `kj stage exclude <id>`
   modify the stored instruction blocks of a live context and take effect on its
   next turn.

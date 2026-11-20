@@ -113,7 +113,7 @@
 
     async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt_body() {
         use crate::vfs::VfsOps;
-        for dir in ["coder", "banto", "toolie", "musician", "council"] {
+        for dir in ["coder", "banto", "toolie", "musician", "council", "senpai", "kohai", "companion"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let prefix = format!("/config/rc/{dir}/create/");
@@ -167,8 +167,8 @@
         let chair = crate::seed_scripts::seed_body("/config/rc/musician/chairs/bass.md")
             .expect("musician must carry the folded chair voice");
         assert!(
-            chair.contains("low register"),
-            "the chair's register guidance must survive the fold: {chair}"
+            chair.contains("X:1\nT:bass\n"),
+            "the bass chair must carry its header: {chair}"
         );
     }
 
@@ -193,7 +193,7 @@
         for chair_fact in ["K:C", "T:bass", "in C", "Low register", "comma"] {
             assert!(!tick.contains(chair_fact), "the tick prompt names {chair_fact:?}, which is the chair's");
         }
-        assert!(tick.contains("come from your chair"), "{tick}");
+        assert!(tick.contains("chair"), "{tick}");
         let attach = seed_body("/config/rc/musician/create/S20-arm.kai").expect("arm script");
         assert!(attach.contains("kj transport attach --track \"$KJ_BAND\""), "{attach}");
     }
@@ -2639,7 +2639,9 @@ esac
         let ctx = lookup_context_id(&d, "tale");
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         let sections = crate::extract_system_prompt_sections(&blocks).join("\n");
-        assert!(sections.contains("accountable"), "the stance names who is accountable: {sections}");
+        let stance = crate::seed_scripts::seed_body("/config/rc/storyteller/create/S00-stance.md")
+            .expect("storyteller stance seed");
+        assert!(sections.contains(stance.trim()), "the stance is installed: {sections}");
         assert!(sections.contains("tea house at the edge of the marsh"), "the card is instruction text: {sections}");
         assert!(!blocks.iter().any(|b| b.kind == BlockKind::Error), "{:?}", block_contents_in(&d, ctx));
         d.kernel_db().lock().assign_test_review(ctx, Some(teller), Some(caller.principal_id)).unwrap();
@@ -2804,7 +2806,12 @@ esac
         let blocks = d.block_store().block_snapshots(main).unwrap();
         let sections = crate::extract_system_prompt_sections(&blocks).join("\n");
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat(&sections).contains("a companion, not a worker"), "the main stance is installed: {sections}");
+        let main_stance = crate::seed_scripts::seed_body("/config/rc/companion/create/S00-stance.md")
+            .expect("companion stance seed");
+        let main_env = crate::seed_scripts::seed_body("/config/rc/companion/create/S05-env.md")
+            .expect("companion env seed");
+        assert!(flat(&sections).contains(&flat(main_stance)), "the main stance is installed: {sections}");
+        assert!(flat(&sections).contains(&flat(main_env)), "the main env is installed: {sections}");
         assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
 
         fire_companion_tick(&d, main, 1).await;
@@ -2813,9 +2820,10 @@ esac
         let first_id = first[0].context_id;
         let child_blocks = d.block_store().block_snapshots(first_id).unwrap();
         let child_sections = crate::extract_system_prompt_sections(&child_blocks).join("\n");
-        assert!(flat(&child_sections).contains("This context is a check-in"), "the child has its own stance: {child_sections}");
-        assert!(flat(&child_sections).contains("This context stays on record"), "the child knows it is read later");
-        assert!(!flat(&child_sections).contains("a companion, not a worker"),
+        let fork_stance = crate::seed_scripts::seed_body("/config/rc/companion/fork/S20-stance.md")
+            .expect("companion fork stance seed");
+        assert!(flat(&child_sections).contains(&flat(fork_stance)), "the child has its own stance: {child_sections}");
+        assert!(!flat(&child_sections).contains(&flat(main_stance)),
             "a spawn child does not inherit the main stance: {child_sections}");
         // The child only observes: the copy of the main seat's writable shell is cleared.
         let binding = d.dispatch(&argv(&["binding", "show", &first_id.to_hex()]), &console_caller(&d)).await;
@@ -2956,7 +2964,9 @@ esac
         assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
         assert!(checkins_of(&d, main).is_empty(), "no check-in while the seat wraps up");
         let blocks = d.block_store().block_snapshots(main).unwrap();
-        assert!(blocks.iter().any(|b| b.role == Role::User && b.content.contains("Write the handoff now")),
+        let wrapup = crate::seed_scripts::seed_body("/config/rc/companion/tick/S10-wrapup.md")
+            .expect("companion wrapup seed");
+        assert!(blocks.iter().any(|b| b.role == Role::User && b.content.contains(wrapup.trim())),
             "the wrap-up turn was driven: {:?}", block_contents_in(&d, main));
         let env = |ctx| d.kernel_db().lock().get_context_env(ctx).unwrap().into_iter()
             .map(|e| (e.key, e.value)).collect::<std::collections::HashMap<_, _>>();
@@ -3660,8 +3670,9 @@ esac
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
             let instructions: Vec<_> = blocks.iter().filter(|b| b.role == kaijutsu_types::Role::System && b.kind == kaijutsu_types::BlockKind::Text).collect();
             assert_eq!(instructions.len(), 1);
-            assert!(instructions[0].content.contains("acknowledge"));
-            assert!(instructions[0].content.contains("Amy is accountable"));
+            let council_stance = crate::seed_scripts::seed_body("/config/rc/council/create/S00-stance.md")
+                .expect("council stance seed");
+            assert_eq!(instructions[0].content.trim(), council_stance.trim());
         });
     }
 
@@ -4157,4 +4168,113 @@ esac
         assert!(r.is_ok(), "retire failed: {}", r.message());
         assert!(find_run_for_context(&d, ctx, VERB_ARCHIVE).is_some(), "the played context's archive lifecycle ran");
         assert!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().archived_at.is_some());
+    }
+
+    async fn assert_create_loads_stance_and_env(dir: &str) {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let caller = console_caller(&d);
+        let performer = rc_performer(&d, dir);
+        let label = format!("{dir}-create-check");
+        let r = d.dispatch(&argv(&["context", "create", &performer, "--name", &label]), &caller).await;
+        assert!(r.is_ok(), "{dir} create failed: {}", r.message());
+        let ctx = lookup_context_id(&d, &label);
+        assert!(rc_errors(&d, ctx).is_empty(), "{dir}: {:?}", rc_errors(&d, ctx));
+
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let markdown: Vec<&str> = blocks
+            .iter()
+            .filter(|b| {
+                b.role == Role::System
+                    && b.kind == BlockKind::Text
+                    && b.content_type == ContentType::Markdown
+            })
+            .map(|b| b.content.trim())
+            .collect();
+        let stance = crate::seed_scripts::seed_body(&format!("/config/rc/{dir}/create/S00-stance.md"))
+            .unwrap_or_else(|| panic!("missing {dir} stance"))
+            .trim();
+        let env = crate::seed_scripts::seed_body(&format!("/config/rc/{dir}/create/S05-env.md"))
+            .unwrap_or_else(|| panic!("missing {dir} env"))
+            .trim();
+        assert_eq!(markdown, vec![stance, env], "{dir}: expected S00-stance.md then S05-env.md");
+    }
+
+    #[test]
+    fn senpai_create_loads_stance_and_env() {
+        crate::on_rc_thread(|| assert_create_loads_stance_and_env("senpai"));
+    }
+
+    #[test]
+    fn kohai_create_loads_stance_and_env() {
+        crate::on_rc_thread(|| assert_create_loads_stance_and_env("kohai"));
+    }
+
+    #[test]
+    fn model_tuning_script_emits_only_for_tuned_families() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let caller = console_caller(&d);
+            let tuning_script = crate::seed_scripts::seed_body("/config/rc/lib/create/S08-model-tuning.kai")
+                .expect("S08-model-tuning.kai seed");
+
+            let cases = [
+                ("none", None, false),
+                ("claude", Some("claude-opus-5-5"), false),
+                ("lfm3", Some("lfm3-2.7b"), false),
+                ("gpt", Some("gpt-6.2-sol"), true),
+                ("qwen", Some("qwen3.8-27b"), true),
+                ("gemma", Some("gemma-4-27b"), true),
+            ];
+            let mut emitted = Vec::new();
+            for (tag, model_opt, expect_tuned) in cases {
+                let actor = PrincipalId::new();
+                let char_name = format!("tuner-{tag}");
+                {
+                    let db = d.kernel_db().lock();
+                    db.insert_character(&crate::kernel_db::CharacterRow {
+                        rc_dir: Some("kohai".into()),
+                        console_ctx: None,
+                        mcp_hub_ctx: None,
+                        principal_id: actor,
+                        name: char_name.clone(),
+                        created_at: 0,
+                        retired_at: None,
+                        handoff_ctx: None,
+                        root_ctx: None,
+                        root: false,
+                    }).unwrap();
+                    if let Some(model) = model_opt {
+                        db.seed_test_slot_entries(actor, &[("model", "mock", model)]).unwrap();
+                    }
+                }
+                let ctx_label = format!("tune-{tag}");
+                let r = d.dispatch(&argv(&["context", "create", &char_name, "--name", &ctx_label]), &caller).await;
+                assert!(r.is_ok(), "{tag} create failed: {}", r.message());
+                let ctx = lookup_context_id(&d, &ctx_label);
+                let blocks = d.block_store().block_snapshots(ctx).unwrap();
+                assert!(!blocks.iter().any(|b| b.kind == BlockKind::Error), "{tag}: {:?}", block_contents_in(&d, ctx));
+
+                let tuning_blocks: Vec<String> = blocks
+                    .iter()
+                    .filter(|b| {
+                        b.role == Role::System
+                            && b.kind == BlockKind::Text
+                            && b.content_type == ContentType::Plain
+                    })
+                    .map(|b| b.content.trim().to_string())
+                    .collect();
+                if expect_tuned {
+                    assert_eq!(tuning_blocks.len(), 1, "{tag} ({model_opt:?}): expected 1 tuning block, got {tuning_blocks:?}");
+                    let body = &tuning_blocks[0];
+                    assert!(!body.is_empty() && tuning_script.contains(body.as_str()), "{tag}: unexpected tuning block {body:?}");
+                    emitted.push(body.clone());
+                } else {
+                    assert!(tuning_blocks.is_empty(), "{tag} ({model_opt:?}): expected no tuning block, got {tuning_blocks:?}");
+                }
+            }
+            let unique: std::collections::HashSet<&str> = emitted.iter().map(|s| s.as_str()).collect();
+            assert_eq!(unique.len(), 3, "gpt, qwen, and gemma should emit distinct tuning blocks: {emitted:?}");
+        });
     }

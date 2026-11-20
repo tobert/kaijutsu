@@ -1,4 +1,4 @@
-# coder: what a coding seat uses, and nothing else. Every tool schema rides
+# kohai: what a worker seat uses, and nothing else. Every tool schema rides
 # on every request, so the roster is the seat's largest cost.
 set -e
 # One shell: the writable one. Its facade also projects the shell-operation
@@ -15,7 +15,7 @@ kj binding allow "builtin.turn"
 kj binding allow "facade:edit_input"
 kj binding allow "facade:submit_input"
 kj binding allow "facade:commit_capture"
-# kj verb authorities a coder works with: fork a context, push and merge
+# kj verb authorities a kohai works with: fork a context, push and merge
 # drift, run host commands, and save through the editor.
 kj binding allow "fork"
 kj binding allow "drift"
@@ -23,5 +23,5 @@ kj binding allow "exec"
 kj binding allow "editor"
 # Deliberately NOT granted: house (the kj administration verbs: ledger, rc,
 # binding, config, and the rest), operator, transport, drive, system.
-# A coder works on the task; the kernel's own running is not its work, and
+# A kohai works on the task; the kernel's own running is not its work, and
 # every verb it can see costs a turn it may spend studying instead.

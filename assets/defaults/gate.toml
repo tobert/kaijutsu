@@ -110,7 +110,7 @@
 #   transcript_tokens = 8000                # the transcript tail it reads, at four bytes a token
 #   house_rules_tokens = 2000               # the workspace's AGENTS.md it reads
 #
-#   [rc.sol.guardian]
+#   [rc.kohai.guardian]
 #   enabled = true
 
 [global]
@@ -150,6 +150,15 @@ allow = [
   "kj context create",     # banto creates its lanes, `kj context create coder --name <lane>`
   "kj fork",             # a fork copies this context's own performer
   "kj drive",            # runs a turn on a lane banto directs
+  "kj price set",        # appends a price row; a correction is a later row
+  "kj price set-tool",   # appends a tool price row; a correction is a later row
+]
+
+[rc.senpai]
+allow = [
+  "kj context create",     # senpai creates its lanes, `kj context create kohai --name <lane>`
+  "kj fork",             # a fork copies this context's own performer
+  "kj drive",            # runs a turn on a lane senpai directs
   "kj price set",        # appends a price row; a correction is a later row
   "kj price set-tool",   # appends a tool price row; a correction is a later row
 ]

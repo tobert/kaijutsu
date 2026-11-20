@@ -1,0 +1,26 @@
+# S08-model-tuning.kai — inject short model-specific execution tuning at
+# context create. Runs silently (writes no block) when no model or an untuned
+# model is configured, and never exits nonzero so a failure never inserts an
+# Error block into the conversation.
+model="$(kj context info --json | jq -r '.resolved_model // empty' || true)"
+
+tuning=""
+case "$model" in
+  gpt-5*|gpt-6*|GPT-5*|GPT-6*)
+    tuning="Carry authorized work through to verification without pausing for confirmation on routine, reversible steps."
+    ;;
+  qwen*|Qwen*)
+    tuning="Keep internal reasoning brief and move directly to tool calls or answers instead of re-checking decided steps."
+    ;;
+  gemma*|Gemma*)
+    tuning="Answer directly without restating the request or padding with framing."
+    ;;
+  *)
+    echo "model-tuning: none for $model"
+    exit 0
+    ;;
+esac
+
+kj block create --role system --kind text --content "$tuning" || true
+echo "model-tuning: applied for $model"
+exit 0

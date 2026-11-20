@@ -696,11 +696,14 @@ fn test_rpc_created_context_runs_rc_create() {
             .expect("create_context_with_rc_dir");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
+        let coder_stance = kaijutsu_kernel::seed_scripts::seed_body("/config/rc/coder/create/S00-stance.md")
+            .expect("coder stance seed")
+            .trim();
         let blocks = get_all_blocks(&kernel, ctx).await;
         let has_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("We are a cybernetic system focused on software engineering.")
+                && b.content.contains(coder_stance)
         });
         assert!(
             has_stance,
@@ -733,11 +736,17 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
             .expect("create_context_with_rc_dir");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
+        let assistant_stance = kaijutsu_kernel::seed_scripts::seed_body("/config/rc/assistant/create/S00-stance.md")
+            .expect("assistant stance seed")
+            .trim();
+        let coder_stance = kaijutsu_kernel::seed_scripts::seed_body("/config/rc/coder/create/S00-stance.md")
+            .expect("coder stance seed")
+            .trim();
         let blocks = get_all_blocks(&kernel, ctx).await;
         let has_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("the fleet's assistant context")
+                && b.content.contains(assistant_stance)
         });
         assert!(
             has_stance,
@@ -751,7 +760,7 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
         // negative the default-context test makes, in the direction a
         // copy-pasted bucket would actually break.
         assert!(
-            !blocks.iter().any(|b| b.content.contains("We are a cybernetic system focused on software engineering.")),
+            !blocks.iter().any(|b| b.content.contains(coder_stance)),
             "assistant context must not get the coder stance"
         );
     });
@@ -769,12 +778,12 @@ fn test_rpc_plain_context_does_not_get_the_coder_stance() {
         let ctx = create_context(&kernel, "plain").await.unwrap();
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
+        let coder_stance = kaijutsu_kernel::seed_scripts::seed_body("/config/rc/coder/create/S00-stance.md")
+            .expect("coder stance seed")
+            .trim();
         let blocks = get_all_blocks(&kernel, ctx).await;
-        // Assert on the phrase the coder stance opens with today
-        // (coder/create/S00-stance.md), so a real leak trips this; a stale
-        // phrase would pass regardless.
         assert!(
-            !blocks.iter().any(|b| b.content.contains("We are a cybernetic system focused on software engineering.")),
+            !blocks.iter().any(|b| b.content.contains(coder_stance)),
             "a banto-performed context must not get the coder stance; got {} blocks: {:#?}",
             blocks.len(),
             blocks
@@ -804,9 +813,12 @@ fn test_coder_stance_is_the_same_for_every_model() {
             !blocks.iter().any(|b| b.kind == BlockKind::Trace && b.content.contains("tier")),
             "no stance tier is chosen for {model}: {blocks:#?}"
         );
+        let coder_stance = kaijutsu_kernel::seed_scripts::seed_body("/config/rc/coder/create/S00-stance.md")
+            .expect("coder stance seed")
+            .trim();
         blocks
             .into_iter()
-            .find(|b| b.role == Role::System && b.kind == BlockKind::Text && b.content.starts_with("We are a cybernetic system focused on software engineering."))
+            .find(|b| b.role == Role::System && b.kind == BlockKind::Text && b.content.contains(coder_stance))
             .unwrap_or_else(|| panic!("no coder stance for {model}"))
             .content
     };
