@@ -614,9 +614,9 @@ fn tool_failure_reaches_the_client_with_its_result_and_error_flag() {
 }
 
 /// A later hydration of a turn's log sends the bytes the turn sent. A shell
-/// result reaches the model as its JSON envelope while its block shows people
-/// the readable output, so the block must also keep what was sent
-/// (`docs/conversation-session.md`, "Tool results replay as sent").
+/// result reaches the model as its output and fact lines
+/// (`ShellEnvelope::model_text`), its block shows people the readable output,
+/// and the block keeps what was sent when the two differ.
 #[test]
 fn a_shell_result_rehydrates_as_the_model_received_it() {
     run_local(async {
@@ -644,9 +644,8 @@ fn a_shell_result_rehydrates_as_the_model_received_it() {
         assert_eq!(sent.len(), 2);
         let wire = serde_json::to_string(&sent[1]).unwrap();
         assert!(wire.contains("hello from kaish"), "the shell ran and its output reached the model: {wire}");
-        // A clean success reaches the model as its output alone
-        // (docs/shell-envelope.md, "What a model turn reads"), so the block
-        // stores that text once and keeps the envelope as its record.
+        // A clean success reaches the model as its output alone, so the
+        // block stores that text once and keeps the envelope as its record.
         let result = server.kernel.blocks().block_snapshots(context).unwrap().into_iter()
             .find(|b| b.kind == BlockKind::ToolResult && b.tool_use_id.as_deref() == Some("replay-shell"))
             .expect("the shell result block");
@@ -675,6 +674,61 @@ fn a_shell_result_rehydrates_as_the_model_received_it() {
             panic!("message {i} differs\nreplayed: {:#}\nsent: {:#}",
                 replayed.get(i).unwrap_or(&serde_json::Value::Null), expected.get(i).unwrap_or(&serde_json::Value::Null));
         }
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+/// A model reads a command's output once. `seq` keeps its numbers as
+/// structured data beside its text, and `--json` prints that data as the
+/// output; neither copy is sent a second time under the output. A `kj` verb
+/// whose text does not show its data still sends it, on a `[data]` line.
+#[test]
+fn a_model_reads_structured_output_once() {
+    run_local(async {
+        use kaijutsu_kernel::llm::{ContentBlock, MessageContent, MockClient, Provider, stream::StreamEvent};
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "data-once").await.unwrap();
+        assign_turn_identity(&server, context, PrincipalId::new());
+        kj.join_context(context, "data-once").await.unwrap();
+        let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
+        let shell = |id: &str, command: &str| StreamEvent::ToolUse { id: id.into(), name: "shell".into(),
+            input: serde_json::json!({"command": command}), signature: None };
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![shell("seq-text", "seq 1 3"), shell("seq-json", "seq 1 3 --json"),
+                shell("kj-list", "kj context list"), done("tool_use")],
+            vec![StreamEvent::TextStart, StreamEvent::TextDelta("ack".into()), StreamEvent::TextEnd, done("end_turn")],
+        ]).recording_sent_messages();
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        let (callback, mut events) = turn_events_channel(32);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let admitted = kj.execute_kj_quiet(context, &["drive".into(), "--prompt".into(), "count".into()]).await.unwrap();
+        assert_eq!(admitted.exit_code, 0, "{}", admitted.stderr);
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let read = |id: &str| sent[1].iter().find_map(|m| match &m.content {
+            MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == id => Some(content.clone()),
+                _ => None,
+            }),
+            _ => None,
+        }).unwrap_or_else(|| panic!("the request carries the {id} result"));
+        assert_eq!(read("seq-text"), "1\n2\n3\n");
+        // kaish's `--json` renders seq's output tree, whose rows are strings.
+        assert_eq!(read("seq-json"), r#"["1","2","3"]"#);
+        let listed = read("kj-list");
+        assert!(listed.contains("\n[data] ["), "the handles the table abbreviates reach the model: {listed}");
+        // The record behind what was sent keeps the structured copy.
+        let blocks = server.kernel.blocks().block_snapshots(context).unwrap();
+        let record = blocks.iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_use_id.as_deref() == Some("seq-text"))
+            .and_then(|b| b.shell_envelope.as_deref())
+            .expect("the seq result keeps its envelope");
+        let record: serde_json::Value = serde_json::from_str(record).unwrap();
+        assert_eq!(record["data"], serde_json::json!([1, 2, 3]));
         server.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }

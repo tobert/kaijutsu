@@ -1762,7 +1762,7 @@ fn map_tool_dispatch_result(
         Ok(r) => {
             // A tool that wrote a body already said what went wrong, and that
             // body is passed through untouched — prefixing "Error: " onto a
-            // structured body (the shell envelope, `docs/shell-envelope.md`)
+            // structured body (the shell envelope, `ShellEnvelope`)
             // makes it unparseable and reports the failure twice. The prefix
             // is for a tool that failed with nothing but stderr to show.
             let content = if r.stdout.is_empty() {
@@ -9032,8 +9032,8 @@ mod lifetime_tests {
         let named = kernel.blocks().get_block_snapshot(context, &named).unwrap().unwrap();
         assert_eq!((named.kind, named.tool_name.as_deref()), (kaijutsu_types::BlockKind::ToolCall, Some("envelope")));
         assert!(!result.is_error);
-        // The model reads the clean output with the facts rendered below
-        // it (docs/shell-envelope.md, "What a model turn reads").
+        // The model reads the clean output with the facts rendered below it;
+        // `data` the output does not show is one (`ShellEnvelope::model_text`).
         assert_eq!(result.content, "red\n[data] {\"phase\":3}");
         let block = kernel.blocks().get_block_snapshot(context, &anchor).unwrap().unwrap();
         assert_eq!(block.content, "red");

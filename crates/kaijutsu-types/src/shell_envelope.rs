@@ -3,7 +3,7 @@
 //! Every field is always present. An unavailable value is `null`, which is
 //! distinct from zero, false, and an empty string. `is_error` follows `status`;
 //! command exits, interpreter rejection, hook replacements, and incomplete
-//! operations retain their distinct meanings. See `docs/shell-envelope.md`.
+//! operations retain their distinct meanings.
 
 use serde::{Deserialize, Serialize};
 
@@ -67,11 +67,13 @@ pub struct ShellEnvelope {
     /// Whether output was capped and the tail dropped. `null` when the
     /// serving path cannot tell.
     pub did_spill: Option<bool>,
-    /// A `kj` verb's structured payload — arrays for list verbs, objects for
-    /// inspect. `null` when the command set none.
+    /// The command's output as structured data, for programs: a `kj` verb's
+    /// handles or record, a kaish builtin's values (`seq`, `find`, `jq`), or
+    /// the value `--json` printed. `null` when the command set none.
     pub data: Option<serde_json::Value>,
-    /// A `kj` confirmation gate's re-run hint (`command`, `target`, `hint`).
-    /// `null` when the command did not latch.
+    /// A `kj` confirmation gate's re-run hint (`command`, `target`, `hint`),
+    /// for programs; stderr tells a reader the same. `null` when the command
+    /// did not latch.
     pub latch: Option<serde_json::Value>,
     /// The block the command's output landed in. `null` when the serving
     /// path has no block to name.
@@ -104,7 +106,7 @@ pub struct ShellEnvelope {
 ///
 /// kaish accepts `/` as a working directory. A kaijutsu seat at `/` is almost
 /// always a mistake, so every surface that leaves a shell there says so and
-/// none refuses it. See `docs/shell-envelope.md`, "A cwd of `/`".
+/// none refuses it.
 pub fn is_root_cwd(cwd: &std::path::Path) -> bool {
     cwd.has_root() && cwd.parent().is_none()
 }
@@ -234,10 +236,15 @@ impl ShellEnvelope {
 
     /// What a model reads for this result in a kernel turn: `clean` (the
     /// readable output, as the durable block stores it), then one bracketed
-    /// line for each fact that changes what the model should do next. A clean
-    /// success is its output alone. Always text, never JSON, and never empty:
-    /// a command that printed nothing reads `[no output]`, so every result has
-    /// one shape. See `docs/shell-envelope.md`, "What a model turn reads".
+    /// fact line for each fact that changes what the model should do next. A
+    /// clean success is its output alone. Always text, never JSON, and never
+    /// empty: a command that printed nothing reads `[no output]`, so every
+    /// result has one shape.
+    ///
+    /// `data` takes a `[data]` line only when stdout does not already show it
+    /// (`prints_data`): `--json` prints it, and `seq`, `find`, and `glob`
+    /// print its items one per line. `latch` is never read; the command's
+    /// stderr says the same.
     pub fn model_text(&self, clean: &str) -> String {
         let operation = |label: &str| match (&self.operation_id, &self.ask_id) {
             (Some(op), Some(ask)) => format!("[{label}: operation {op}, ask {ask}]"),
@@ -262,11 +269,8 @@ impl ShellEnvelope {
             ShellStatus::Timeout => facts.push(operation("timed out waiting; the command may still be running")),
             ShellStatus::StreamClosed => facts.push(operation("the outcome never arrived")),
         }
-        if let Some(data) = &self.data {
+        if let Some(data) = self.data.as_ref().filter(|data| !self.prints_data(data)) {
             facts.push(format!("[data] {data}"));
-        }
-        if let Some(latch) = &self.latch {
-            facts.push(format!("[latch] {latch}"));
         }
         if let Some(cwd) = &self.cwd {
             facts.push(format!("[cwd now {cwd}]"));
@@ -282,6 +286,25 @@ impl ShellEnvelope {
             text.push_str(&fact);
         }
         text
+    }
+
+    /// Whether stdout already shows `data`: stdout is `data` as JSON, or
+    /// `data` is a list of strings, numbers, or booleans that stdout prints
+    /// one per line.
+    fn prints_data(&self, data: &serde_json::Value) -> bool {
+        use serde_json::Value;
+        let out = self.stdout.strip_suffix('\n').unwrap_or(&self.stdout);
+        if serde_json::from_str::<Value>(out).is_ok_and(|printed| &printed == data) {
+            return true;
+        }
+        let Value::Array(items) = data else { return false };
+        let lines: Vec<&str> = if out.is_empty() { Vec::new() } else { out.split('\n').collect() };
+        lines.len() == items.len()
+            && items.iter().zip(&lines).all(|(item, line)| match item {
+                Value::String(s) => s == line,
+                Value::Number(_) | Value::Bool(_) => item.to_string() == *line,
+                _ => false,
+            })
     }
 
     /// The keys this envelope always serializes, in declaration order. The
@@ -392,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_and_structured_facts_ride_below_the_output() {
+    fn handles_ride_below_the_output_and_structured_copies_stay_out() {
         let mut env = ShellEnvelope::new(ShellStatus::Running);
         env.operation_id = Some("op-1".into());
         assert_eq!(env.model_text(""), "[running in the background: operation op-1]");
@@ -405,8 +428,13 @@ mod tests {
         env.did_spill = Some(true);
         env.data = Some(serde_json::json!(["a", "b"]));
         env.latch = Some(serde_json::json!({"command": "kj context archive x --confirm"}));
-        assert_eq!(env.model_text("listed\n"),
-            "listed\n[data] [\"a\",\"b\"]\n[latch] {\"command\":\"kj context archive x --confirm\"}");
+        env.stdout = "a\nb\n".into();
+        assert_eq!(env.model_text("a\nb\n"), "a\nb\n", "data printed one per line is read once");
+        env.stdout = r#"["a","b"]"#.into();
+        assert_eq!(env.model_text(r#"["a","b"]"#), r#"["a","b"]"#, "data printed as JSON is read once");
+        env.stdout = "listed 2 contexts\n".into();
+        assert_eq!(env.model_text("listed 2 contexts\n"), "listed 2 contexts\n[data] [\"a\",\"b\"]",
+            "data the output does not show is read below it");
         assert_eq!(ShellEnvelope::new(ShellStatus::Rejected).model_text("parse error at 1:4"),
             "parse error at 1:4\n[rejected: the program did not run]");
     }

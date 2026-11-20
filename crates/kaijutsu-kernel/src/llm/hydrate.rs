@@ -1579,7 +1579,7 @@ mod estimate_tokens_tests {
     }
 }
 
-/// Hydration is blind to styling, by construction (docs/ansi-and-beyond.md).
+/// Hydration is blind to styling, by construction.
 ///
 /// `style_spans` and `provenance` describe how a block LOOKS and where its
 /// content came from; the model reads the stripped content and nothing else.

@@ -6,7 +6,6 @@
 //! transaction leaves the prior result intact and reports the storage error.
 //!
 //! General text edits and model token streams are not ANSI ingest sites.
-//! See `docs/ansi-and-beyond.md`.
 
 use std::borrow::Cow;
 
