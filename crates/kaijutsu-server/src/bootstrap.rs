@@ -24,13 +24,10 @@ const CONSOLE_RC_DIR: &str = "banto";
 /// The response budget bootstrap gives each model it sets.
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 
-/// The chat characters bootstrap creates when they are missing, each running
-/// the rc directory of its name and given bootstrap's model
-/// (`docs/character.md`, "Shipped characters").
-pub const SHIPPED_CHARACTERS: &[&str] =
-    &["banto", "coder", "companion", "musician", "storyteller", "toolie", "assistant", "council"];
 /// The shipped character created with no model: its model is a council
-/// server, set by hand before the council is enabled.
+/// server, set by hand before the council is enabled. Every other shipped
+/// character ([`kaijutsu_kernel::seed_scripts::shipped_characters`]) is a
+/// chat character given bootstrap's model.
 pub const SHIPPED_JUDGE: &str = "judge";
 
 
@@ -455,7 +452,7 @@ async fn create_shipped_characters(
 ) -> Result<(), String> {
     let mut existing = Vec::new();
     let mut without_model = Vec::new();
-    for &name in SHIPPED_CHARACTERS.iter().chain(&[SHIPPED_JUDGE]) {
+    for name in kaijutsu_kernel::seed_scripts::shipped_characters() {
         if name == opts.root {
             existing.push(format!("{name} (the root character)"));
             continue;

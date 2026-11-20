@@ -436,8 +436,14 @@ fn bootstrap_leaves_a_console_label_it_does_not_accept_alone() {
     });
 }
 
-/// The chat characters bootstrap ships, each with the rc directory of its name.
-const SHIPPED: [&str; 8] = ["banto", "coder", "companion", "musician", "storyteller", "toolie", "assistant", "council"];
+/// The chat characters bootstrap ships, each with the rc directory of its
+/// name: every shipped character but judge.
+fn shipped() -> Vec<&'static str> {
+    let names: Vec<_> =
+        kaijutsu_kernel::seed_scripts::shipped_characters().into_iter().filter(|name| *name != "judge").collect();
+    assert!(names.contains(&"sol") && names.contains(&"coder"), "{names:?}");
+    names
+}
 
 /// A fresh bootstrap creates every shipped character with its directory and
 /// the model it was given, and judge with its directory and no model. A
@@ -448,14 +454,14 @@ fn a_fresh_bootstrap_creates_the_shipped_characters() {
         let config = SshServerConfig::ephemeral_with_root(0, "amy");
         let opts = options(&config, Some(BackendChoice::mock("mock-model")));
         let first = bootstrap(&config, &opts).await.expect("bootstrap");
-        for name in SHIPPED {
+        for name in shipped() {
             let line = format!("kj character create {name} --rc {name} --model mock/mock-model --max-tokens 16384");
             assert!(first.ran.contains(&line), "missing {line:?}: {first:?}");
         }
         assert!(first.ran.iter().any(|l| l == "kj character create judge --rc judge"), "{first:?}");
         {
             let db = kernel_db(&config);
-            for name in SHIPPED {
+            for name in shipped() {
                 let sheet = db.get_character_by_name(name).unwrap().unwrap_or_else(|| panic!("{name} exists"));
                 assert_eq!(sheet.rc_dir.as_deref(), Some(name));
                 assert!(!sheet.root, "{name} is no root");
@@ -469,7 +475,7 @@ fn a_fresh_bootstrap_creates_the_shipped_characters() {
         let again = bootstrap(&config, &opts).await.expect("bootstrap again");
         assert!(again.ran.is_empty(), "{again:?}");
         let note = again.notes.iter().find(|n| n.contains("already exist")).unwrap_or_else(|| panic!("{again:?}"));
-        for name in SHIPPED.iter().chain(&["judge"]) {
+        for name in shipped().iter().chain(&["judge"]) {
             assert!(note.contains(name), "{name} is named: {note}");
         }
     });
@@ -483,7 +489,7 @@ fn without_a_model_the_report_names_each_model_set() {
         let config = SshServerConfig::ephemeral_with_root(0, "amy");
         let report = bootstrap(&config, &options(&config, None)).await.expect("bootstrap");
         assert!(report.ran.iter().any(|l| l == "kj character create coder --rc coder"), "{report:?}");
-        for name in SHIPPED {
+        for name in shipped() {
             let verb = format!("kj character model set {name} <backend>/<model>");
             assert!(report.notes.iter().any(|n| n.contains(&verb)), "missing {verb:?}: {report:?}");
         }

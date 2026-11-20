@@ -30,10 +30,17 @@ A context has no type; it runs the lifecycle scripts in its performer's
 rc.
 
 ### Shipped directories (`assets/defaults/rc/`)
+Each top-level directory except `lib/`, `mcp/`, and `person/` ships a
+character of the same name, which `kaijutsu-server bootstrap` creates when it
+is missing (`seed_scripts::shipped_characters`). Adding a directory ships a
+character.
+
 - `person/`: root characters (persons). Grants operator and house capabilities
   without `drive`; runs no model turns.
 - `banto/`, `coder/`, `companion/`, `storyteller/`, `musician/`, `toolie/`,
-  `assistant/`, `council/`: model characters of the same name.
+  `assistant/`, `council/`, `sol/`: model characters of the same name. Sol's
+  stance is written for GPT-6.2, and bootstrap gives it the same model as the
+  others.
 - `judge/`: council judge shadow character (runs no chat turns and binds no
   tool loadout).
 - `mcp/`: characters for external MCP bridge sessions (`kaijutsu-lead`).

@@ -107,6 +107,25 @@ pub fn seed_files() -> Vec<(String, &'static str)> {
     out
 }
 
+/// The embedded rc directories that no shipped character is named for:
+/// `lib/` holds shared bodies, root characters (persons) run `person/`, and
+/// MCP bridge sessions run `mcp/`.
+pub const NON_CHARACTER_RC_DIRS: &[&str] = &["lib", "mcp", "person"];
+
+/// The characters a kernel ships, sorted: one for each top-level directory
+/// of the embedded rc seed except [`NON_CHARACTER_RC_DIRS`], named for its
+/// directory. A directory added under `assets/defaults/rc/` ships a
+/// character without a Rust edit.
+pub fn shipped_characters() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = RC_SEED_DIR
+        .dirs()
+        .filter_map(|dir| dir.path().to_str())
+        .filter(|name| !NON_CHARACTER_RC_DIRS.contains(name))
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 /// The embedded seed body for one canonical rc path, or `None` if no seed
 /// ships for it. Powers `kaijutsu-server rc reseed`: restore-from-default
 /// without the repo checked out, and the seed half of `kj rc list`'s
@@ -579,6 +598,24 @@ mod tests {
 
     fn read(root: &std::path::Path, rel: &str) -> Option<String> {
         std::fs::read_to_string(root.join(rel)).ok()
+    }
+
+    /// Every seed directory but the non-character ones ships a character,
+    /// each with a `create/` bundle, and each non-character name still names
+    /// a seed directory.
+    #[test]
+    fn each_character_directory_ships_a_character() {
+        let shipped = shipped_characters();
+        for name in ["coder", "judge", "sol", "toolie"] {
+            assert!(shipped.contains(&name), "{name} ships: {shipped:?}");
+        }
+        for name in NON_CHARACTER_RC_DIRS {
+            assert!(RC_SEED_DIR.get_dir(name).is_some(), "{name}/ is a seed directory");
+            assert!(!shipped.contains(name), "{name} is no character: {shipped:?}");
+        }
+        for name in &shipped {
+            assert!(RC_SEED_DIR.get_dir(format!("{name}/create")).is_some(), "{name}/ has a create bundle");
+        }
     }
 
     #[test]
