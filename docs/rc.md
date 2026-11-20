@@ -40,7 +40,9 @@ character.
 - `banto/`, `coder/`, `companion/`, `storyteller/`, `musician/`, `toolie/`,
   `assistant/`, `council/`, `sol/`: model characters of the same name. Sol's
   stance is written for GPT-6.2, and bootstrap gives it the same model as the
-  others.
+  others. On any other model, sol's `S12-model-check.kai` leaves a
+  notification naming the commands that set up a `chatgpt` backend, give sol
+  `chatgpt/gpt-6.2-sol`, and rotate the context onto it.
 - `judge/`: council judge shadow character (runs no chat turns and binds no
   tool loadout).
 - `mcp/`: characters for external MCP bridge sessions (`kaijutsu-lead`).
