@@ -20,9 +20,10 @@ use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, Status};
 pub const TOOL_RESULT_FOLD_LINES: usize = 12;
 
 /// Whether a block of this kind renders folded the first time it is seen,
-/// before anything follows it. Only `Error`.
+/// before anything follows it. `Error` and `Trace` (RC boot diagnostics) fold
+/// by default so they stay one line until expanded.
 pub fn collapses_by_default(kind: BlockKind) -> bool {
-    matches!(kind, BlockKind::Error)
+    matches!(kind, BlockKind::Error | BlockKind::Trace)
 }
 
 /// Whether `block` folds on its own once a later block follows it: settled
@@ -299,5 +300,13 @@ mod tests {
             "3 lines · test result: ok. 478 passed"
         );
         assert_eq!(tool_result_stub(" \n"), "no output");
+    }
+
+    #[test]
+    fn trace_and_error_collapse_by_default() {
+        assert!(collapses_by_default(BlockKind::Error));
+        assert!(collapses_by_default(BlockKind::Trace));
+        assert!(!collapses_by_default(BlockKind::Text));
+        assert!(!collapses_by_default(BlockKind::ToolResult));
     }
 }

@@ -107,6 +107,13 @@ pub async fn run(
     // completion offers nothing until a later poll fills it in, never a
     // failure to start.
     app.kj_catalog = bridge.kj_command_catalog(start.id).await.unwrap_or_default();
+    match bridge.actor().get_config("theme.toml".to_string()).await {
+        Ok(theme_toml) => match crate::present::Palette::try_from_theme_toml(&theme_toml) {
+            Ok(palette) => app.palette = palette,
+            Err(err) => tracing::warn!(%err, "unparseable theme.toml from kernel; using default palette"),
+        },
+        Err(err) => tracing::debug!(%err, "theme.toml unavailable on startup; using default palette"),
+    }
 
     // Subscribed before the first hydrate, not inside the loop: the actor's
     // kernel-wide event bus drops an event it has no receiver for, and the

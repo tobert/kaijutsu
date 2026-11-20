@@ -317,7 +317,7 @@ impl App {
             drafts: DraftOutbox::default(),
             editor_keys: EditorOutbox::default(),
             register_puts: RegisterOutbox::default(),
-            palette: Palette::builtin(),
+            palette: Palette::tokyo_midnight(),
             screen_rows: 24,
             wrap: WrapCache::new(),
             quit: false,
@@ -583,7 +583,12 @@ impl App {
                 .map(|c| model_leaf(&c.model).to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "model".to_string()),
-            Role::System => "system".to_string(),
+            Role::System => match block.kind {
+                BlockKind::Text => "prompt".to_string(),
+                BlockKind::Trace => "local".to_string(),
+                BlockKind::Error => "diag".to_string(),
+                _ => "system".to_string(),
+            },
             Role::Tool => block.tool_name.clone().unwrap_or_else(|| "tool".to_string()),
             Role::Asset => "asset".to_string(),
         }

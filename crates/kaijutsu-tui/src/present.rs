@@ -33,30 +33,194 @@ pub const ERROR_MARK: &str = "✗";
 
 /// A tone's terminal style.
 ///
-/// A `theme.toml` → ratatui loader is a later lane; [`Palette::builtin`] is
-/// the shipped default. Both resolvers are total functions with no default
-/// arm, so a tone added to `kaijutsu-present` fails this match rather than
-/// silently painting a placeholder nobody notices.
+/// [`Palette::tokyo_midnight`] is the shipped runtime default, overridable via
+/// kernel-owned `theme.toml` (`Palette::from_theme_toml`); [`Palette::builtin`]
+/// is the 16-color ANSI baseline. Both resolvers are total functions with no
+/// default arm, so a tone added to `kaijutsu-present` fails this match rather
+/// than silently painting a placeholder nobody notices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    /// Set when the terminal is known to render on a light ground. Only the
-    /// dim role differs today; kept so a theme loader has somewhere to put
-    /// the distinction.
+    /// Set when the terminal is known to render on a light ground.
     pub light_ground: bool,
+    fg_dim: Color,
+    accent: Color,
+    success: Color,
+    warning: Color,
+    error: Color,
+    user: Color,
+    thinking: Color,
+    tool_call: Color,
+    tool_result: Color,
+    tool_error: Color,
+    drift_push: Color,
+    drift_pull: Color,
+    drift_merge: Color,
+    notification: Color,
+    resource: Color,
+    heading: Color,
+    code: Color,
+    selection_bg: Color,
+    ansi: Option<[Color; 16]>,
 }
 
 impl Default for Palette {
     fn default() -> Self {
-        Self::builtin()
+        Self::tokyo_midnight()
     }
 }
 
 impl Palette {
-    /// The built-in default palette: 16-color ANSI, so it inherits whatever
-    /// the terminal's own scheme is instead of fighting it.
+    /// The 16-color ANSI baseline palette: inherits whatever the terminal's own
+    /// scheme is instead of overriding with RGB values.
     pub const fn builtin() -> Self {
         Self {
             light_ground: false,
+            fg_dim: Color::DarkGray,
+            accent: Color::Blue,
+            success: Color::Green,
+            warning: Color::Yellow,
+            error: Color::Red,
+            user: Color::Cyan,
+            thinking: Color::DarkGray,
+            tool_call: Color::Yellow,
+            tool_result: Color::Gray,
+            tool_error: Color::LightRed,
+            drift_push: Color::Magenta,
+            drift_pull: Color::LightMagenta,
+            drift_merge: Color::Blue,
+            notification: Color::LightBlue,
+            resource: Color::LightGreen,
+            heading: Color::LightYellow,
+            code: Color::LightCyan,
+            selection_bg: Color::DarkGray,
+            ansi: None,
+        }
+    }
+
+    /// Tokyo Midnight default palette: deep cool-indigo semantics and matching
+    /// ANSI-16 mapping for RC boot traces and tool output.
+    pub const fn tokyo_midnight() -> Self {
+        Self {
+            light_ground: false,
+            fg_dim: Color::Rgb(86, 95, 137),          // #565f89
+            accent: Color::Rgb(122, 162, 247),        // #7aa2f7
+            success: Color::Rgb(158, 206, 106),       // #9ece6a
+            warning: Color::Rgb(224, 175, 104),       // #e0af68
+            error: Color::Rgb(247, 118, 142),         // #f7768e
+            user: Color::Rgb(125, 207, 255),          // #7dcfff
+            thinking: Color::Rgb(86, 95, 137),        // #565f89
+            tool_call: Color::Rgb(224, 175, 104),     // #e0af68
+            tool_result: Color::Rgb(169, 177, 214),   // #a9b1d6
+            tool_error: Color::Rgb(247, 118, 142),    // #f7768e
+            drift_push: Color::Rgb(187, 154, 247),    // #bb9af7
+            drift_pull: Color::Rgb(187, 154, 247),    // #bb9af7
+            drift_merge: Color::Rgb(122, 162, 247),   // #7aa2f7
+            notification: Color::Rgb(125, 207, 255),  // #7dcfff
+            resource: Color::Rgb(115, 218, 202),      // #73daca
+            heading: Color::Rgb(224, 175, 104),       // #e0af68
+            code: Color::Rgb(125, 207, 255),          // #7dcfff
+            selection_bg: Color::Rgb(51, 70, 124),    // #33467c
+            ansi: Some([
+                Color::Rgb(21, 22, 30),    // 0 black
+                Color::Rgb(247, 118, 142), // 1 red
+                Color::Rgb(158, 206, 106), // 2 green
+                Color::Rgb(224, 175, 104), // 3 yellow
+                Color::Rgb(122, 162, 247), // 4 blue
+                Color::Rgb(187, 154, 247), // 5 magenta
+                Color::Rgb(125, 207, 255), // 6 cyan
+                Color::Rgb(169, 177, 214), // 7 white
+                Color::Rgb(65, 72, 104),   // 8 bright_black
+                Color::Rgb(247, 118, 142), // 9 bright_red
+                Color::Rgb(158, 206, 106), // 10 bright_green
+                Color::Rgb(224, 175, 104), // 11 bright_yellow
+                Color::Rgb(122, 162, 247), // 12 bright_blue
+                Color::Rgb(187, 154, 247), // 13 bright_magenta
+                Color::Rgb(125, 207, 255), // 14 bright_cyan
+                Color::Rgb(192, 202, 245), // 15 bright_white
+            ]),
+        }
+    }
+
+    /// Overlay `theme.toml` keys onto [`Palette::tokyo_midnight`]. Returns an
+    /// error if `toml_str` is invalid TOML.
+    pub fn try_from_theme_toml(toml_str: &str) -> Result<Self, toml::de::Error> {
+        let mut p = Self::tokyo_midnight();
+        let doc = toml::from_str::<toml::Table>(toml_str)?;
+        let bg = doc
+            .get("bg")
+            .and_then(|v| v.as_str())
+            .and_then(|s| parse_hex_color(s, None))
+            .unwrap_or(Color::Rgb(26, 27, 38));
+        let get_hex = |key: &str| -> Option<Color> {
+            doc.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_hex_color(s, Some(bg)))
+        };
+        if let Some(c) = get_hex("fg_dim") {
+            p.fg_dim = c;
+            p.thinking = c;
+        }
+        if let Some(c) = get_hex("accent") {
+            p.accent = c;
+            p.drift_merge = c;
+        }
+        if let Some(c) = get_hex("accent2") {
+            p.heading = c;
+        }
+        if let Some(c) = get_hex("success") {
+            p.success = c;
+            p.resource = c;
+        }
+        if let Some(c) = get_hex("warning") {
+            p.warning = c;
+        }
+        if let Some(c) = get_hex("error") {
+            p.error = c;
+            p.tool_error = c;
+        }
+        if let Some(c) = get_hex("row_tool") {
+            p.tool_call = c;
+        }
+        if let Some(c) = get_hex("row_result") {
+            p.tool_result = c;
+        }
+        if let Some(c) = get_hex("selection_bg") {
+            p.selection_bg = c;
+        }
+        if let Some(ansi_tbl) = doc.get("ansi").and_then(|v| v.as_table()) {
+            let mut table = p.ansi.unwrap_or([Color::Reset; 16]);
+            const KEYS: [&str; 16] = [
+                "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+                "bright_black", "bright_red", "bright_green", "bright_yellow",
+                "bright_blue", "bright_magenta", "bright_cyan", "bright_white",
+            ];
+            for (idx, key) in KEYS.iter().enumerate() {
+                if let Some(c) = ansi_tbl
+                    .get(*key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| parse_hex_color(s, Some(bg)))
+                {
+                    table[idx] = c;
+                }
+            }
+            p.ansi = Some(table);
+        }
+        Ok(p)
+    }
+
+    /// Overlay `theme.toml` keys onto [`Palette::tokyo_midnight`]. Unparseable
+    /// TOML or missing keys fall back to the Tokyo Midnight default.
+    pub fn from_theme_toml(toml_str: &str) -> Self {
+        Self::try_from_theme_toml(toml_str).unwrap_or_else(|_| Self::tokyo_midnight())
+    }
+
+    /// Resolve a kernel-side [`StyleColor`] to a ratatui color, mapping ANSI
+    /// indices `0..=15` through the active `[ansi]` theme table when set.
+    pub fn ansi_color(&self, color: StyleColor) -> Color {
+        match color {
+            StyleColor::Indexed(n) if n < 16 => self.ansi.map_or(Color::Indexed(n), |t| t[n as usize]),
+            StyleColor::Indexed(n) => Color::Indexed(n),
+            StyleColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
         }
     }
 
@@ -64,20 +228,20 @@ impl Palette {
     pub fn block(&self, tone: BlockTone) -> Style {
         let s = Style::new();
         match tone {
-            BlockTone::User => s.fg(Color::Cyan),
+            BlockTone::User => s.fg(self.user),
             BlockTone::Assistant => s.fg(Color::Reset),
-            BlockTone::Thinking => s.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-            BlockTone::ToolCall => s.fg(Color::Yellow),
-            BlockTone::ToolResult => s.fg(Color::Gray),
-            BlockTone::ToolError => s.fg(Color::LightRed),
-            BlockTone::ErrorWarning => s.fg(Color::Yellow),
-            BlockTone::ErrorSeverity => s.fg(Color::Red),
-            BlockTone::ErrorFatal => s.fg(Color::Red).add_modifier(Modifier::BOLD),
-            BlockTone::DriftPush => s.fg(Color::Magenta),
-            BlockTone::DriftPull => s.fg(Color::LightMagenta),
-            BlockTone::DriftMerge => s.fg(Color::Blue),
-            BlockTone::Notification => s.fg(Color::LightBlue),
-            BlockTone::Resource => s.fg(Color::LightGreen),
+            BlockTone::Thinking => s.fg(self.thinking).add_modifier(Modifier::ITALIC),
+            BlockTone::ToolCall => s.fg(self.tool_call),
+            BlockTone::ToolResult => s.fg(self.tool_result),
+            BlockTone::ToolError => s.fg(self.tool_error),
+            BlockTone::ErrorWarning => s.fg(self.warning),
+            BlockTone::ErrorSeverity => s.fg(self.error),
+            BlockTone::ErrorFatal => s.fg(self.error).add_modifier(Modifier::BOLD),
+            BlockTone::DriftPush => s.fg(self.drift_push),
+            BlockTone::DriftPull => s.fg(self.drift_pull),
+            BlockTone::DriftMerge => s.fg(self.drift_merge),
+            BlockTone::Notification => s.fg(self.notification),
+            BlockTone::Resource => s.fg(self.resource),
             BlockTone::Foreground => s.fg(Color::Reset),
             BlockTone::Dim => self.dim(),
         }
@@ -88,9 +252,9 @@ impl Palette {
     pub fn span(&self, tone: SpanTone) -> Style {
         let s = Style::new();
         match tone {
-            SpanTone::Heading => s.add_modifier(Modifier::BOLD).fg(Color::LightYellow),
-            SpanTone::CodeBlock => s.fg(Color::LightCyan),
-            SpanTone::Code => s.fg(Color::LightCyan),
+            SpanTone::Heading => s.add_modifier(Modifier::BOLD).fg(self.heading),
+            SpanTone::CodeBlock => s.fg(self.code),
+            SpanTone::Code => s.fg(self.code),
             SpanTone::Strong => s.add_modifier(Modifier::BOLD),
             SpanTone::Plain => s,
         }
@@ -103,18 +267,18 @@ impl Palette {
 
     /// The status line.
     pub fn status(&self) -> Style {
-        Style::new().fg(Color::Blue)
+        Style::new().fg(self.accent)
     }
 
     /// A status-line figure that needs attention (a cache past 80% of its
     /// TTL, a pending ask, a disconnected kernel).
     pub fn warning(&self) -> Style {
-        Style::new().fg(Color::Yellow)
+        Style::new().fg(self.warning)
     }
 
     /// A status-line figure that is past its limit.
     pub fn alarm(&self) -> Style {
-        Style::new().fg(Color::Red)
+        Style::new().fg(self.error)
     }
 
     /// The compose line's own text.
@@ -126,7 +290,7 @@ impl Palette {
         if self.light_ground {
             Style::new().fg(Color::Gray)
         } else {
-            Style::new().fg(Color::DarkGray)
+            Style::new().fg(self.fg_dim)
         }
     }
 
@@ -255,8 +419,30 @@ impl Palette {
 
     /// The scrolled transcript's `v` linewise mark, before `y` copies it.
     pub fn copy_selection(&self) -> Style {
-        Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        Style::new().bg(self.selection_bg).add_modifier(Modifier::BOLD)
     }
+}
+
+/// Parse `#rrggbb` or `#rrggbbaa` into a ratatui RGB color, blending alpha
+/// over `blend_bg` when present.
+fn parse_hex_color(s: &str, blend_bg: Option<Color>) -> Option<Color> {
+    let hex = s.trim().strip_prefix('#')?;
+    if !hex.is_ascii() || (hex.len() != 6 && hex.len() != 8) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    if hex.len() == 8
+        && let Ok(a) = u8::from_str_radix(&hex[6..8], 16)
+        && let Some(Color::Rgb(br, bg_g, bb)) = blend_bg
+    {
+        let alpha = u16::from(a);
+        let inv = 255 - alpha;
+        let mix = |fg: u8, bg: u8| -> u8 { ((u16::from(fg) * alpha + u16::from(bg) * inv) / 255) as u8 };
+        return Some(Color::Rgb(mix(r, br), mix(g, bg_g), mix(b, bb)));
+    }
+    Some(Color::Rgb(r, g, b))
 }
 
 /// What a block needs from outside itself to render.
@@ -318,12 +504,16 @@ pub fn block_version(block: &BlockSnapshot, collapsed: bool) -> u64 {
 /// argument was clipped to fit or the block has none — the call body then
 /// prints, so nothing is lost to the header.
 pub fn divider_text(view: &BlockView<'_>, width: u16) -> (String, bool) {
+    divider_text_with_rule(view, width, '─')
+}
+
+fn divider_text_with_rule(view: &BlockView<'_>, width: u16, rule_ch: char) -> (String, bool) {
     let width = usize::from(width.max(1));
     let tail = format!(" {}", view.stamp);
     let tail_w = display_width(&tail);
     let (head, whole) = match (view.tool, view.arg.as_deref()) {
         (Some(tool), Some(arg)) => {
-            let lead = format!("─ {} · {} ─ ", view.speaker, tool);
+            let lead = format!("{rule_ch} {} · {} {rule_ch} ", view.speaker, tool);
             // Leave a rule of at least two cells before the stamp.
             let room = width.saturating_sub(display_width(&lead) + tail_w + 3);
             if display_width(arg) <= room {
@@ -333,8 +523,8 @@ pub fn divider_text(view: &BlockView<'_>, width: u16) -> (String, bool) {
                 (format!("{lead}{clipped}… "), false)
             }
         }
-        (Some(tool), None) => (format!("─ {} · {} ", view.speaker, tool), false),
-        (None, _) => (format!("─ {} · {} ", view.speaker, view.performer), false),
+        (Some(tool), None) => (format!("{rule_ch} {} · {} ", view.speaker, tool), false),
+        (None, _) => (format!("{rule_ch} {} · {} ", view.speaker, view.performer), false),
     };
     let head_w = display_width(&head);
     let rule = width.saturating_sub(head_w + tail_w);
@@ -342,7 +532,11 @@ pub fn divider_text(view: &BlockView<'_>, width: u16) -> (String, bool) {
         // Too narrow for the stamp — the identity is what must survive.
         (truncate(&head, width), false)
     } else {
-        (format!("{head}{}{tail}", "─".repeat(rule)), whole)
+        let mut fill = String::with_capacity(rule * rule_ch.len_utf8());
+        for _ in 0..rule {
+            fill.push(rule_ch);
+        }
+        (format!("{head}{fill}{tail}"), whole)
     }
 }
 
@@ -385,7 +579,8 @@ pub fn render_block(
 
     let mut lines = Vec::new();
     if view.show_divider {
-        let (header, whole_arg) = divider_text(view, width);
+        let rule_ch = if block.kind == BlockKind::Trace { '┄' } else { '─' };
+        let (header, whole_arg) = divider_text_with_rule(view, width, rule_ch);
         lines.push(Line::from(Span::styled(header, palette.divider())));
         // A call whose whole one-line argument sits in its header has
         // nothing left to say: the body would repeat the header as JSON. A
@@ -400,11 +595,15 @@ pub fn render_block(
 
     if view.collapsed {
         let stub = match block.kind {
+            BlockKind::Error if !block.style_spans.is_empty() => {
+                trace_stub_line(ERROR_MARK, block, &block.content, width, base, palette)
+            }
             BlockKind::Error => stub_line(ERROR_MARK, &text, width, base),
             BlockKind::Thinking => {
                 marked_line(&thinking_stub(block.summary.as_deref(), &text), width, base)
             }
             BlockKind::ToolResult => marked_line(&tool_result_stub(&text), width, base),
+            BlockKind::Trace => trace_stub_line(COLLAPSED_MARK, block, &text, width, base, palette),
             _ => stub_line(COLLAPSED_MARK, &text, width, base),
         };
         lines.push(stub);
@@ -455,24 +654,20 @@ pub fn render_block(
                 (style, span.text)
             })
             .collect()
-    } else if let Some(segments) = ansi_segments(block, base) {
+    } else if let Some(segments) = ansi_segments(block, base, palette) {
         segments
     } else {
         vec![(base, text)]
     };
 
-    lines.extend(wrap_styled(&styled, width));
-    lines
-}
-
-/// A kernel-side [`StyleColor`] as a ratatui color. Indexed stays semantic —
-/// the terminal's own palette slot, themeable by the terminal, not us —
-/// truecolor rides verbatim.
-fn ansi_color(color: StyleColor) -> Color {
-    match color {
-        StyleColor::Indexed(n) => Color::Indexed(n),
-        StyleColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    let mut body = wrap_styled(&styled, width);
+    if matches!(block.kind, BlockKind::Trace | BlockKind::Error) {
+        for line in &mut body {
+            right_align_openrc_badge(line, width);
+        }
     }
+    lines.extend(body);
+    lines
 }
 
 /// One [`StyleSpan`]'s style, layered over the block's own tone. Every
@@ -481,13 +676,13 @@ fn ansi_color(color: StyleColor) -> Color {
 /// and blink, which ratatui's own doc notes most terminals render as bold or
 /// not at all — carried anyway so a terminal that does support them shows
 /// them, and dropped by no terminal's fault of ours if it doesn't.
-fn ansi_span_style(span: &StyleSpan, base: Style) -> Style {
+fn ansi_span_style(span: &StyleSpan, base: Style, palette: &Palette) -> Style {
     let mut style = base;
     if let Some(fg) = span.fg {
-        style = style.fg(ansi_color(fg));
+        style = style.fg(palette.ansi_color(fg));
     }
     if let Some(bg) = span.bg {
-        style = style.bg(ansi_color(bg));
+        style = style.bg(palette.ansi_color(bg));
     }
     if span.attrs.contains(StyleAttrs::BOLD) {
         style = style.add_modifier(Modifier::BOLD);
@@ -526,8 +721,8 @@ fn ansi_span_style(span: &StyleSpan, base: Style) -> Style {
 /// structured `output` renders from that instead
 /// (`kaijutsu_present::format::format_block_inner`), and a span's offset
 /// means nothing against a different string.
-fn ansi_segments(block: &BlockSnapshot, base: Style) -> Option<Vec<(Style, String)>> {
-    if block.style_spans.is_empty() || block.output.is_some() {
+fn ansi_segments(block: &BlockSnapshot, base: Style, palette: &Palette) -> Option<Vec<(Style, String)>> {
+    if block.style_spans.is_empty() || (block.kind == BlockKind::ToolResult && block.output.is_some()) {
         return None;
     }
     // Matches `format_single_block`'s own trailing trim (the leading edge is
@@ -545,7 +740,7 @@ fn ansi_segments(block: &BlockSnapshot, base: Style) -> Option<Vec<(Style, Strin
         if start > cursor {
             segments.push((base, content[cursor..start].to_string()));
         }
-        segments.push((ansi_span_style(span, base), content[start..end].to_string()));
+        segments.push((ansi_span_style(span, base, palette), content[start..end].to_string()));
         cursor = end;
     }
     if cursor < content.len() {
@@ -572,6 +767,124 @@ fn stub_line(mark: &str, text: &str, width: u16, style: Style) -> Line<'static> 
         usize::from(width),
     );
     Line::from(Span::styled(body, style))
+}
+
+/// A collapsed `Trace` (or ANSI-spanned `Error`) block's one-line stub: keeps
+/// its ANSI spans on the first line (`▸  * S10 coder/create/S10-binding.kai  [ ok ]`)
+/// and right-aligns any trailing `[ ok ]` / `[ !! ]` badge to `width`,
+/// truncating the middle if the terminal is narrower than the line.
+fn trace_stub_line(
+    mark: &str,
+    block: &BlockSnapshot,
+    text: &str,
+    width: u16,
+    base: Style,
+    palette: &Palette,
+) -> Line<'static> {
+    let first_line_end = text.find('\n').unwrap_or(text.len());
+    let mut spans = vec![Span::styled(format!("{mark} "), base)];
+    if let Some(segments) = ansi_segments(block, base, palette) {
+        let mut remaining = first_line_end;
+        for (style, seg) in segments {
+            if remaining == 0 {
+                break;
+            }
+            if seg.len() <= remaining {
+                remaining -= seg.len();
+                spans.push(Span::styled(seg, style));
+            } else {
+                let cut = seg
+                    .char_indices()
+                    .take_while(|(i, _)| *i < remaining)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                if cut > 0 {
+                    spans.push(Span::styled(seg[..cut].to_string(), style));
+                }
+                break;
+            }
+        }
+    } else {
+        let first = text[..first_line_end].trim_end();
+        spans.push(Span::styled(first.to_string(), base));
+    }
+    let mut line = Line::from(spans);
+    fit_or_align_openrc_line(&mut line, width);
+    line
+}
+
+/// Truncate an OpenRC line if it exceeds `width`, preserving its trailing
+/// `[ ok ]` / `[ !! ]` badge when present; otherwise right-align the badge.
+fn fit_or_align_openrc_line(line: &mut Line<'static>, width: u16) {
+    let target_w = usize::from(width);
+    let total_w: usize = line.spans.iter().map(|s| display_width(s.content.as_ref())).sum();
+    if total_w <= target_w {
+        right_align_openrc_badge(line, width);
+        return;
+    }
+    if line.spans.len() > 1 && is_openrc_badge(line.spans.last().unwrap().content.as_ref()) {
+        let badge = line.spans.pop().unwrap();
+        let badge_w = display_width(badge.content.as_ref());
+        let room = target_w.saturating_sub(badge_w + 1);
+        let mut kept = Vec::new();
+        let mut used = 0usize;
+        for span in line.spans.drain(..) {
+            if used >= room {
+                break;
+            }
+            let sw = display_width(span.content.as_ref());
+            if used + sw <= room {
+                used += sw;
+                kept.push(span);
+            } else {
+                let clipped = truncate(span.content.as_ref(), room - used);
+                used += display_width(&clipped);
+                kept.push(Span::styled(clipped, span.style));
+                break;
+            }
+        }
+        if used < target_w.saturating_sub(badge_w) {
+            kept.push(Span::raw(" ".repeat(target_w - badge_w - used)));
+        }
+        kept.push(badge);
+        line.spans = kept;
+    } else {
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+        line.spans = vec![Span::styled(truncate(&joined, target_w), style)];
+    }
+}
+
+fn is_openrc_badge(s: &str) -> bool {
+    let tail = s.trim_end();
+    tail.ends_with("[ ok ]")
+        || tail.ends_with("[ skip ]")
+        || tail.ends_with("[ error ]")
+        || tail.ends_with("[ !! ]")
+}
+
+/// If `line` ends with an OpenRC `[ ok ]` or `[ !! ]` badge, pad between the
+/// preceding text and the badge so the badge sits flush against `width`.
+fn right_align_openrc_badge(line: &mut Line<'static>, width: u16) {
+    let total_w: usize = line
+        .spans
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
+    let target_w = usize::from(width);
+    if total_w >= target_w {
+        return;
+    }
+    let Some(last) = line.spans.last() else {
+        return;
+    };
+    if !is_openrc_badge(last.content.as_ref()) {
+        return;
+    }
+    let pad = target_w - total_w;
+    let idx = line.spans.len() - 1;
+    line.spans.insert(idx, Span::raw(" ".repeat(pad)));
 }
 
 /// A fold's one line: the `▸` mark, then what the shared fold rule says
@@ -1679,5 +1992,110 @@ mod tests {
         let _ = cache.lines(&b, &view(), 20, &palette);
         cache.forget(&b.id);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn tokyo_midnight_palette_sets_truecolor_roles_and_ansi_table() {
+        let palette = Palette::tokyo_midnight();
+        assert_eq!(palette.block(BlockTone::User).fg, Some(Color::Rgb(125, 207, 255)));
+        assert_eq!(palette.block(BlockTone::ErrorSeverity).fg, Some(Color::Rgb(247, 118, 142)));
+        assert_eq!(palette.span(SpanTone::Heading).fg, Some(Color::Rgb(224, 175, 104)));
+        assert_eq!(palette.ansi_color(StyleColor::Indexed(2)), Color::Rgb(158, 206, 106));
+        assert_eq!(palette.ansi_color(StyleColor::Indexed(200)), Color::Indexed(200));
+    }
+
+    #[test]
+    fn theme_toml_overrides_tokyo_midnight_and_ansi_palette() {
+        let toml = r##"
+fg_dim = "#9a90bd"
+accent = "#a487ff"
+error = "#ff5c8a"
+warning = "#ffb45e"
+success = "#4ce0b3"
+
+[ansi]
+green = "#4ce0b3"
+red = "#ff5c8a"
+"##;
+        let palette = Palette::from_theme_toml(toml);
+        assert_eq!(palette.status().fg, Some(Color::Rgb(164, 135, 255)));
+        assert_eq!(palette.alarm().fg, Some(Color::Rgb(255, 92, 138)));
+        assert_eq!(palette.warning().fg, Some(Color::Rgb(255, 180, 94)));
+        assert_eq!(palette.divider().fg, Some(Color::Rgb(154, 144, 189)));
+        assert_eq!(palette.ansi_color(StyleColor::Indexed(2)), Color::Rgb(76, 224, 179));
+        assert_eq!(palette.ansi_color(StyleColor::Indexed(1)), Color::Rgb(255, 92, 138));
+    }
+
+    #[test]
+    fn openrc_trace_right_aligns_badge_and_keeps_ansi_when_collapsed_or_open() {
+        let palette = Palette::tokyo_midnight();
+        let line = " * S10 coder/create/S10-binding.kai  [ ok ]";
+        let full = format!("{line}\n--- stdout ---\nbound");
+        let badge_start = line.rfind("[ ok ]").unwrap() as u32;
+        let mut b = block(BlockKind::Trace, Role::System, &full);
+        b.style_spans = vec![StyleSpan {
+            start: badge_start,
+            end: badge_start + 6,
+            fg: Some(StyleColor::Indexed(2)),
+            bg: None,
+            attrs: StyleAttrs::BOLD,
+        }];
+
+        let mut v = view();
+        v.collapsed = true;
+        v.show_divider = true;
+        v.speaker = "local";
+        let collapsed = render_block(&b, &v, 60, &palette);
+        assert_eq!(collapsed.len(), 2);
+        let divider: String = collapsed[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(divider.starts_with("┄ local · "));
+        let collapsed_text: String = collapsed[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(collapsed_text.starts_with("▸ "));
+        assert!(collapsed_text.ends_with("[ ok ]"));
+        assert_eq!(display_width(&collapsed_text), 60);
+        assert_eq!(collapsed[1].spans.last().unwrap().style.fg, Some(Color::Rgb(158, 206, 106)));
+
+        v.collapsed = false;
+        v.show_divider = false;
+        let open = render_block(&b, &v, 60, &palette);
+        assert!(open.len() > 1);
+        let first_open: String = open[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_open.ends_with("[ ok ]"));
+        assert_eq!(display_width(&first_open), 60);
+    }
+
+    #[test]
+    fn parse_hex_color_handles_non_ascii_and_alpha_and_shipped_theme() {
+        assert_eq!(parse_hex_color("#aébcd", None), None);
+        assert!(Palette::try_from_theme_toml("not valid toml = [").is_err());
+        let shipped = include_str!("../../../assets/defaults/theme.toml");
+        let palette = Palette::try_from_theme_toml(shipped).unwrap();
+        assert_eq!(palette.status().fg, Some(Color::Rgb(164, 135, 255)));
+        // #a487ff4d blended over #131020 must not be opaque #a487ff
+        assert_ne!(palette.copy_selection().bg, Some(Color::Rgb(164, 135, 255)));
+    }
+
+    #[test]
+    fn failed_openrc_error_and_narrow_stub_align_and_keep_badge() {
+        let palette = Palette::tokyo_midnight();
+        let line = " * S35 coder/create/S35-very-long-script-name.kai (exit 2)  [ !! ]";
+        let badge_start = line.rfind("[ !! ]").unwrap() as u32;
+        let mut b = block(BlockKind::Error, Role::System, line);
+        b.output = Some(kaijutsu_types::OutputData::text("ignored"));
+        b.style_spans = vec![StyleSpan {
+            start: badge_start,
+            end: badge_start + 6,
+            fg: Some(StyleColor::Indexed(1)),
+            bg: None,
+            attrs: StyleAttrs::BOLD,
+        }];
+        let mut v = view();
+        v.collapsed = true;
+        let narrow = render_block(&b, &v, 36, &palette);
+        let text: String = narrow[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("✗ "));
+        assert!(text.ends_with("[ !! ]"));
+        assert_eq!(display_width(&text), 36);
+        assert_eq!(narrow[0].spans.last().unwrap().style.fg, Some(Color::Rgb(247, 118, 142)));
     }
 }
