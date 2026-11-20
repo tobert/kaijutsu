@@ -358,7 +358,7 @@ fn harden_child_command(cmd: &mut Command) {
                     .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
                 #[cfg(target_os = "linux")]
                 rustix::process::set_parent_process_death_signal(Some(
-                    rustix::process::Signal::Kill,
+                    rustix::process::Signal::KILL,
                 ))
                 .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
                 Ok(())
