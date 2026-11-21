@@ -82,7 +82,7 @@ pub fn poll_heroic_live_data(
 
     if now - cache.last_work_poll >= LIVE_POLL_INTERVAL_SECS {
         cache.last_work_poll = now;
-        for track in &tracks.tracks {
+        for track in tracks.tracks.iter().filter(|t| t.playing) {
             if cache.in_flight_tracks.contains_key(&track.id) {
                 continue;
             }
@@ -160,7 +160,11 @@ pub fn ingest_heroic_cues(
                 continue;
             }
             if let Some(track_id) = tracks.track_of.get(context_id)
-                && let Some(li) = tracks.tracks.iter().position(|t| &t.id == track_id)
+                && let Some(li) = tracks
+                    .tracks
+                    .iter()
+                    .filter(|t| t.playing)
+                    .position(|t| &t.id == track_id)
             {
                 let band = (li * 4).min(15);
                 state.band_energies[band] = (state.band_energies[band] + 0.9).min(1.5);
@@ -182,8 +186,9 @@ pub fn ingest_heroic_cues(
     }
 }
 
-/// Populate [`HeroicState`] from live kernel tracks when live mode is active.
-/// Fake-driver simulation runs exclusively in `advance_heroic_driver`.
+/// Populate [`HeroicState`] from currently playing kernel tracks when live mode is active.
+/// Dormant tracks (`playing == false`) are excluded by default. Fake-driver simulation
+/// runs exclusively in `advance_heroic_driver`.
 pub fn sync_heroic_state(
     time: Res<Time>,
     palette: Res<HeroicPalette>,
@@ -194,7 +199,14 @@ pub fn sync_heroic_state(
     mut cache: ResMut<HeroicLiveCache>,
     mut state: ResMut<HeroicState>,
 ) {
-    if state.using_fake || tracks.tracks.is_empty() {
+    if state.using_fake {
+        return;
+    }
+
+    let playing_tracks: Vec<&kaijutsu_client::TrackInfo> =
+        tracks.tracks.iter().filter(|t| t.playing).collect();
+    if playing_tracks.is_empty() {
+        state.lanes.clear();
         return;
     }
 
@@ -210,8 +222,7 @@ pub fn sync_heroic_state(
             .unwrap_or(now_inst)
     };
 
-    let primary_bps = tracks
-        .tracks
+    let primary_bps = playing_tracks
         .first()
         .map(|t| (1_000_000.0 / t.period_us.max(1) as f32).max(0.25))
         .unwrap_or(2.0);
@@ -220,8 +231,8 @@ pub fn sync_heroic_state(
     let ctx_map: HashMap<ContextId, &kaijutsu_client::ContextInfo> =
         drift.contexts.iter().map(|c| (c.id, c)).collect();
 
-    let mut lanes = Vec::with_capacity(tracks.tracks.len());
-    for (li, track) in tracks.tracks.iter().enumerate() {
+    let mut lanes = Vec::with_capacity(playing_tracks.len());
+    for (li, track) in playing_tracks.into_iter().enumerate() {
         let period_secs = (track.period_us.max(1) as f32) / 1_000_000.0;
         let playhead_beats = if track.playing {
             beats
@@ -359,4 +370,50 @@ pub fn sync_heroic_state(
         .collect();
 
     state.lanes = lanes;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaijutsu_client::TrackInfo;
+
+    fn make_track(id: &str, playing: bool) -> TrackInfo {
+        TrackInfo {
+            id: id.into(),
+            score_context_id: ContextId::new(),
+            playing,
+            playhead_tick: 0,
+            period_us: 500_000,
+            beats_per_phrase: 8,
+            beat_count: 0,
+            last_epoch_ns: 0,
+            clock_kind: "system".into(),
+            attached: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dormant_tracks_are_filtered_out_of_live_lanes() {
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        world.insert_resource(HeroicPalette::default());
+        let mut wt = WellTracks::default();
+        wt.tracks = vec![make_track("dormant-smoke", false), make_track("live-bass", true)];
+        world.insert_resource(wt);
+        world.insert_resource(WellBeatsRes::default());
+        world.insert_resource(DriftState::default());
+        world.insert_resource(ContextTails::default());
+        world.insert_resource(HeroicLiveCache::default());
+        let mut st = HeroicState::default();
+        st.using_fake = false;
+        world.insert_resource(st);
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_heroic_state);
+        schedule.run(&mut world);
+
+        let state = world.resource::<HeroicState>();
+        assert_eq!(state.lanes.len(), 1);
+        assert_eq!(state.lanes[0].track_id, "live-bass");
+    }
 }

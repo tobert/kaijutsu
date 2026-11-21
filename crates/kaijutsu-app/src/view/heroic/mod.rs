@@ -315,10 +315,11 @@ fn advance_heroic_driver(
         return;
     }
 
+    let has_playing_tracks = tracks.tracks.iter().any(|t| t.playing);
     let use_fake = match state.driver_mode {
         state::DriverMode::Fake => true,
         state::DriverMode::Live => false,
-        state::DriverMode::Auto => tracks.tracks.is_empty(),
+        state::DriverMode::Auto => !has_playing_tracks,
     };
     state.using_fake = use_fake;
     if use_fake {
