@@ -6,7 +6,6 @@
 //! workspace screen entered via `Ctrl+A k` (`Action::GoToHeroic`).
 
 pub mod environment;
-pub mod fake;
 pub mod framing;
 pub mod live;
 pub mod notes;
@@ -55,7 +54,6 @@ impl Plugin for HeroicPlugin {
             .init_resource::<HeroicPalette>()
             .register_type::<HeroicPalette>()
             .init_resource::<state::HeroicState>()
-            .init_resource::<fake::FakeDriver>()
             .init_resource::<live::HeroicLiveCache>()
             .init_resource::<notes::HeroicNotesRuntime>()
             .init_resource::<performers::HeroicPerformerPool>()
@@ -75,7 +73,6 @@ impl Plugin for HeroicPlugin {
                     live::poll_heroic_live_data,
                     live::apply_heroic_work_results,
                     live::ingest_heroic_cues,
-                    advance_heroic_driver,
                     live::sync_heroic_state,
                     sync_heroic_live_tuning,
                     environment::sync_environment,
@@ -163,13 +160,11 @@ struct HeroicEntryRuntimes<'w> {
 #[allow(clippy::too_many_arguments)]
 fn enter_heroic(
     mut commands: Commands,
-    time: Res<Time>,
     palette: Res<HeroicPalette>,
     mut state: ResMut<HeroicState>,
     actor: Option<Res<RpcActor>>,
     tracks: Res<crate::view::time_well::rays::WellTracks>,
     result_channel: Res<RpcResultChannel>,
-    mut live_cache: ResMut<live::HeroicLiveCache>,
     mut saved: ResMut<HeroicSavedCamera>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform, &mut Projection), With<Camera3d>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -182,7 +177,6 @@ fn enter_heroic(
     }
 
     state.clear_driver_state();
-    live_cache.entered_at_secs = time.elapsed_secs_f64();
     if tracks.tracks.is_empty() && actor.is_some() {
         live::request_initial_tracks(actor.as_deref(), &result_channel);
     }
@@ -295,35 +289,6 @@ fn exit_heroic(
             *tf = Transform::IDENTITY;
             *proj = Projection::default();
         }
-    }
-}
-
-fn advance_heroic_driver(
-    time: Res<Time>,
-    palette: Res<HeroicPalette>,
-    actor: Option<Res<RpcActor>>,
-    live_cache: Res<live::HeroicLiveCache>,
-    tracks: Res<crate::view::time_well::rays::WellTracks>,
-    mut fake: ResMut<fake::FakeDriver>,
-    mut state: ResMut<HeroicState>,
-) {
-    let awaiting_initial_live = actor.is_some()
-        && tracks.tracks.is_empty()
-        && (time.elapsed_secs_f64() - live_cache.entered_at_secs) < 0.45;
-    if awaiting_initial_live {
-        state.using_fake = false;
-        return;
-    }
-
-    let has_playing_tracks = tracks.tracks.iter().any(|t| t.playing);
-    let use_fake = match state.driver_mode {
-        state::DriverMode::Fake => true,
-        state::DriverMode::Live => false,
-        state::DriverMode::Auto => !has_playing_tracks,
-    };
-    state.using_fake = use_fake;
-    if use_fake {
-        fake.advance(time.delta_secs(), &palette, &mut state);
     }
 }
 
@@ -450,17 +415,11 @@ mod tests {
     }
 
     #[test]
-    fn fake_driver_schedule_advances_once_per_frame_and_preserves_flashes() {
+    fn idle_schedule_keeps_lanes_empty_and_decays_energy() {
         let mut world = World::new();
-        let pal = HeroicPalette::default();
-        let mut fake = fake::FakeDriver::with_seed(7);
+        world.insert_resource(HeroicPalette::default());
         let mut state = HeroicState::default();
-        fake.advance(0.0, &pal, &mut state);
-        let start_beats = state.lanes[0].playhead_beats;
-        let expected_bps = 1.0 / state.lanes[0].period_secs as f64;
-
-        world.insert_resource(pal);
-        world.insert_resource(fake);
+        state.band_energies[0] = 1.0;
         world.insert_resource(state);
         world.insert_resource(live::HeroicLiveCache::default());
         world.insert_resource(crate::view::time_well::rays::WellTracks::default());
@@ -472,26 +431,14 @@ mod tests {
 
         let mut time = Time::<()>::default();
         let mut schedule = Schedule::default();
-        schedule.add_systems(
-            (
-                advance_heroic_driver,
-                live::sync_heroic_state,
-                notes::sync_notes_and_pads,
-            )
-                .chain(),
-        );
-        for step in 1..=10u64 {
+        schedule.add_systems((live::sync_heroic_state, notes::sync_notes_and_pads).chain());
+        for _ in 0..10 {
             time.advance_by(std::time::Duration::from_millis(25));
             world.insert_resource(time.clone());
             schedule.run(&mut world);
-            let _ = step;
         }
-        let end_beats = world.resource::<HeroicState>().lanes[0].playhead_beats;
-        let elapsed_secs = 0.25_f64;
-        let expected_beats = start_beats + elapsed_secs * expected_bps;
-        assert!(
-            (end_beats - expected_beats).abs() < 0.05,
-            "expected ~{expected_beats} beats after 0.25s (1x speed), got {end_beats}"
-        );
+        let st = world.resource::<HeroicState>();
+        assert!(st.lanes.is_empty());
+        assert!(st.band_energies[0] < 0.9, "expected energy to decay when idle");
     }
 }

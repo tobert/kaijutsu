@@ -32,7 +32,6 @@ const LIVE_POLL_INTERVAL_SECS: f64 = 1.0;
 pub struct HeroicLiveCache {
     pub work_by_track: HashMap<String, Vec<WorkStatus>>,
     in_flight_tracks: HashMap<String, f64>,
-    pub entered_at_secs: f64,
     last_track_poll: f64,
     last_work_poll: f64,
     last_beat_by_track: HashMap<String, i64>,
@@ -151,9 +150,6 @@ pub fn ingest_heroic_cues(
     palette: Res<HeroicPalette>,
     mut state: ResMut<HeroicState>,
 ) {
-    if state.using_fake {
-        return;
-    }
     for ServerEventMessage(ev) in events.read() {
         if let ServerEvent::RenderCue { context_id, cue } = ev {
             if cue.mime == RENDER_FLUSH_MIME {
@@ -186,9 +182,10 @@ pub fn ingest_heroic_cues(
     }
 }
 
-/// Populate [`HeroicState`] from currently playing kernel tracks when live mode is active.
-/// Dormant tracks (`playing == false`) are excluded by default. Fake-driver simulation
-/// runs exclusively in `advance_heroic_driver`.
+/// Populate [`HeroicState`] from currently playing kernel tracks.
+///
+/// Dormant tracks (`playing == false`) are excluded by default. When no tracks
+/// are playing, the road idles cleanly with no lanes while energy/history decay.
 pub fn sync_heroic_state(
     time: Res<Time>,
     palette: Res<HeroicPalette>,
@@ -199,18 +196,19 @@ pub fn sync_heroic_state(
     mut cache: ResMut<HeroicLiveCache>,
     mut state: ResMut<HeroicState>,
 ) {
-    if state.using_fake {
-        return;
-    }
-
     let playing_tracks: Vec<&kaijutsu_client::TrackInfo> =
         tracks.tracks.iter().filter(|t| t.playing).collect();
+    let dt = time.delta_secs();
+    let primary_bps = playing_tracks
+        .first()
+        .map(|t| (1_000_000.0 / t.period_us.max(1) as f32).max(0.25))
+        .unwrap_or(2.0);
+    state.tick_energy(dt, primary_bps);
+
     if playing_tracks.is_empty() {
         state.lanes.clear();
         return;
     }
-
-    let dt = time.delta_secs();
 
     // Apply signed display offset to the visual clock (`docs/newui.md`, "Clock and latency").
     let now_inst = Instant::now();
@@ -221,12 +219,6 @@ pub fn sync_heroic_state(
             .checked_sub(Duration::from_millis((-palette.display_offset_ms) as u64))
             .unwrap_or(now_inst)
     };
-
-    let primary_bps = playing_tracks
-        .first()
-        .map(|t| (1_000_000.0 / t.period_us.max(1) as f32).max(0.25))
-        .unwrap_or(2.0);
-    state.tick_energy(dt, primary_bps);
 
     let ctx_map: HashMap<ContextId, &kaijutsu_client::ContextInfo> =
         drift.contexts.iter().map(|c| (c.id, c)).collect();
@@ -404,9 +396,7 @@ mod tests {
         world.insert_resource(DriftState::default());
         world.insert_resource(ContextTails::default());
         world.insert_resource(HeroicLiveCache::default());
-        let mut st = HeroicState::default();
-        st.using_fake = false;
-        world.insert_resource(st);
+        world.insert_resource(HeroicState::default());
 
         let mut schedule = Schedule::default();
         schedule.add_systems(sync_heroic_state);
@@ -415,5 +405,29 @@ mod tests {
         let state = world.resource::<HeroicState>();
         assert_eq!(state.lanes.len(), 1);
         assert_eq!(state.lanes[0].track_id, "live-bass");
+    }
+
+    #[test]
+    fn idle_kernel_leaves_lanes_empty() {
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        world.insert_resource(HeroicPalette::default());
+        let mut wt = WellTracks::default();
+        wt.tracks = vec![make_track("dormant-only", false)];
+        world.insert_resource(wt);
+        world.insert_resource(WellBeatsRes::default());
+        world.insert_resource(DriftState::default());
+        world.insert_resource(ContextTails::default());
+        world.insert_resource(HeroicLiveCache::default());
+        let mut st = HeroicState::default();
+        st.band_energies[0] = 1.0;
+        world.insert_resource(st);
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_heroic_state);
+        schedule.run(&mut world);
+
+        let state = world.resource::<HeroicState>();
+        assert!(state.lanes.is_empty());
     }
 }

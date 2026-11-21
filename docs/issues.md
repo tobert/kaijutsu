@@ -18,6 +18,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - Audio spectrum hills currently derive 16-band energy from beat crossings and `RenderCue` onsets rather than FFT of mixed audio frames.
 - Adjacent performers aligned at the same Z/lead can still partially overlap their streaming text ribbons (`view/heroic/text.rs`); a 2D/screen-space overlap solver or alternating depth offset would separate crowded clusters.
 - Sun stripes in `assets/shaders/heroic/sun.wesl` sit mostly below `y = 0` when the disc is centered at `y = 0`; shifting the stripe band up into `[0.38, 0.72]` of UV or raising the disc slightly would show the striped bottom bands above the horizon.
+- Heroic demo/test scenarios should be driven via a kernel/fixture script that creates and plays real tracks over RPC rather than a client-side fake driver (`view/heroic/fake.rs` removed).
 
 ## Shell output a model reads: what the preview-limit change leaves open (2026-11-19)
 

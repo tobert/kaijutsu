@@ -1,4 +1,4 @@
-//! Scene-state layer (`HeroicState`) decoupling data drivers (`fake`, `live`)
+//! Scene-state layer (`HeroicState`) decoupling kernel track state (`live`)
 //! from the visual systems (`road`, `notes`, `performers`, `environment`, `text`,
 //! `selection`).
 
@@ -8,20 +8,6 @@ use bevy::prelude::*;
 use kaijutsu_hyoushigi::WorkStatus;
 use kaijutsu_present::work::{PerformerSlack, SlackState};
 use kaijutsu_types::ContextId;
-
-/// Active data source for [`HeroicState`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(dead_code)]
-pub enum DriverMode {
-    /// Use live kernel data whenever tracks exist; otherwise run the deterministic
-    /// fake driver so the scene is never blank on entry before tracks start.
-    #[default]
-    Auto,
-    /// Force the deterministic fake driver.
-    Fake,
-    /// Force live kernel data only.
-    Live,
-}
 
 /// One candidate probability bar for a decision-player performer.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,8 +116,6 @@ pub struct ConstellationStar {
 /// Single shared scene state read by all heroic visual systems.
 #[derive(Resource)]
 pub struct HeroicState {
-    pub driver_mode: DriverMode,
-    pub using_fake: bool,
     pub lanes: Vec<HeroicLane>,
     /// 16-band audio/onset energy, `[0.0, 1.5]`.
     pub band_energies: [f32; 16],
@@ -161,8 +145,6 @@ impl Default for HeroicState {
             hill_history.push_back([0.0; 16]);
         }
         Self {
-            driver_mode: DriverMode::Auto,
-            using_fake: true,
             lanes: Vec::new(),
             band_energies: [0.0; 16],
             hill_history,
