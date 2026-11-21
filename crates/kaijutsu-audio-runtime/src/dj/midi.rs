@@ -427,7 +427,7 @@ fn click_bytes(note: u8, channel: u8, velocity: u8) -> (Vec<u8>, Vec<u8>) {
 /// one obvious config seam: symbolic-endpoint naming (a named-endpoint registry
 /// vs a substring list) is an open question in `docs/scenes/patchbay.md` —
 /// slice 1 deliberately keeps it a bare const, not a config surface.
-const SYNTH_PATTERNS: [&str; 2] = ["timidity", "fluidsynth"];
+const SYNTH_PATTERNS: [&str; 3] = ["timidity", "fluidsynth", "fluid synth"];
 
 /// Our own ALSA seq clients — never an auto-connect target even if a pattern
 /// somehow matched one (the render's own output, the ear, the patch-view
@@ -2138,6 +2138,15 @@ mod tests {
         assert_eq!(
             decide_autoconnect(&endpoints, &[], RENDER, &["fluidsynth"]),
             Some((140, 0))
+        );
+    }
+
+    #[test]
+    fn matches_real_fluidsynth_client_name_with_space() {
+        let endpoints = vec![sink(131, 0, "FLUID Synth (1031492)")];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &[], RENDER, &SYNTH_PATTERNS),
+            Some((131, 0))
         );
     }
 

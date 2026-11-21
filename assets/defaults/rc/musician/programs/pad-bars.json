@@ -1,0 +1,31 @@
+{
+  "instructions": "You are the pads player in a tune in E minor, 4/4. Choose the next bar of sustained chords. Follow what has been played, leave space around the bass, and resolve smoothly on the last bar of the phrase.",
+  "input_label": "The phrase so far",
+  "question": "The chordal pad bar to play next.",
+  "prefix": "X:1\n%%MIDI channel 2\n%%MIDI program 49\nM:4/4\nL:1/8\nK:Em\n",
+  "join": " | ",
+  "suffix": " |]",
+  "shuffle": 4,
+  "history_messages": 4,
+  "no_repeat": true,
+  "options": {
+    "p0": {"means": "warm E minor root triad, sustained", "text": "[EGB]8"},
+    "p1": {"means": "E minor seventh bloom, sustained", "text": "[EGBd]8"},
+    "p2": {"means": "open G over E-style suspension, sustained", "text": "[DGB]8"},
+    "p3": {"means": "B minor dominant color, sustained", "text": "[B,DF]8"},
+    "p4": {"means": "E minor drifting to D major", "text": "[EGB]4 [DFA]4"},
+    "p5": {"means": "C major sixth color, sustained", "text": "[CEG]8"},
+    "p6": {"means": "C major seventh glow, sustained", "text": "[CEGB]8"},
+    "p7": {"means": "A minor fourth-degree pad, sustained", "text": "[Ace]8"},
+    "p8": {"means": "A minor seventh lift, sustained", "text": "[Aceg]8"},
+    "p9": {"means": "D major moving into B minor", "text": "[DFA]4 [DFB]4"},
+    "p10": {"means": "E minor chord with fourth-beat breath", "text": "[EGB]6 z2"},
+    "p11": {"means": "G major resolving home to E minor", "text": "[GBd]4 [EGB]4"}
+  },
+  "slots": [
+    {"case": "Bar 1 of 4.", "options": ["p0", "p1", "p2", "p5", "p10"]},
+    {"case": "Bar 2 of 4.", "options": ["p1", "p2", "p4", "p5", "p6", "p7", "p8", "p9", "p10"]},
+    {"case": "Bar 3 of 4.", "options": ["p2", "p3", "p4", "p6", "p7", "p8", "p9", "p11"]},
+    {"case": "Bar 4 of 4, the last bar.", "options": ["p0", "p10", "p11"]}
+  ]
+}
