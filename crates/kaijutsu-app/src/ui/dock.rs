@@ -1182,7 +1182,7 @@ mod tests {
         world.insert_resource(RpcConnectionState::default());
         world.insert_resource(Theme::default());
         world.insert_resource(DockState::default());
-        world.insert_resource(AgentControl { enabled: true });
+        world.insert_resource(AgentControl::new(true));
         world.run_system_once(update_connection).unwrap();
         assert!(world
             .resource::<DockState>()
@@ -1190,7 +1190,7 @@ mod tests {
             .text
             .ends_with("AGENT CONTROL"));
 
-        world.insert_resource(AgentControl { enabled: false });
+        world.insert_resource(AgentControl::new(false));
         world.run_system_once(update_connection).unwrap();
         assert!(!world
             .resource::<DockState>()
@@ -2089,10 +2089,12 @@ pub fn update_hints(
     prefix: Res<crate::input::prefix::PrefixState>,
     ledger: Res<crate::connection::ledger::LedgerMirror>,
     notice: Res<crate::ui::ask_sheet::AskNotice>,
+    control: Res<crate::agent_control::AgentControl>,
     time: Res<Time>,
     mut dock: ResMut<DockState>,
 ) {
     if !focus_area.is_changed()
+        && !control.is_changed()
         && !screen.is_changed()
         && !room.is_changed()
         && !prefix.is_changed()
@@ -2101,7 +2103,14 @@ pub fn update_hints(
     {
         return;
     }
-    let notice = notice.current(time.elapsed_secs_f64());
+    // An agent's request for control outranks the ask notice: the keys come
+    // first so a long reason is what the clip takes.
+    let control_notice = control
+        .pending_reason()
+        .map(|reason| format!("^A g allow \u{2502} ^A G refuse \u{2502} agent asks: {reason}"));
+    let notice = control_notice
+        .as_deref()
+        .or(notice.current(time.elapsed_secs_f64()));
 
     // A pending Ctrl+A owns the footer while armed — this IS the prefix
     // legend (docs/input.md): it appears exactly when you need it and

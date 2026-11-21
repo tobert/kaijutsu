@@ -36,9 +36,18 @@ none does (the `Ctrl+A` chords and wheel scroll fire as `Global` too). While
 control is off it returns error code -23100. It refuses `ToggleAgentControl`:
 the latch belongs to the player. It has no text parameter.
 
+`kaijutsu/request_control` takes `{"reason": "<why>"}` and works with control
+off or on. It returns `on`, `pending`, or `requested`, and records the request
+without opening control. While a request waits, the hints line starts with
+`^A g allow | ^A G refuse | agent asks: <reason>` (the reason is clipped to 80
+characters). `Ctrl+A g` allows it and `Ctrl+A G` (`DenyAgentControl`) refuses
+it; an unanswered request expires after 60 seconds. `kaijutsu/act` refuses both
+actions: the answer is the player's.
+
 `kaijutsu/state` is read-only and answers while control is off. It returns the
-screen, the focus area, the active contexts, the active context id, and whether
-control is on.
+screen, the focus area, the active contexts, the active context id, whether
+control is on, and `control_request` (`pending`, `denied`, or `timed_out` with
+its reason; null when there is none or it was allowed).
 
 The latch covers only these two methods. BRP's built-in methods and
 `bevy_brp_extras` (`send_keys`, `type_text`, ECS writes) are outside it, so the

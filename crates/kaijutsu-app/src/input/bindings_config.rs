@@ -439,6 +439,7 @@ fn action_to_str(a: &Action) -> String {
         Action::PromptContextRotate => "PromptContextRotate".into(),
         Action::HoldQuickContext => "HoldQuickContext".into(),
         Action::ToggleAgentControl => "ToggleAgentControl".into(),
+        Action::DenyAgentControl => "DenyAgentControl".into(),
         Action::UnpinQuickContext => "UnpinQuickContext".into(),
         Action::AskAllowOnce => "AskAllowOnce".into(),
         Action::AskAllowAlways => "AskAllowAlways".into(),
@@ -534,6 +535,7 @@ pub(crate) fn parse_action(s: &str) -> Result<Action, String> {
         "PromptContextRotate" => Ok(Action::PromptContextRotate),
         "HoldQuickContext" => Ok(Action::HoldQuickContext),
         "ToggleAgentControl" => Ok(Action::ToggleAgentControl),
+        "DenyAgentControl" => Ok(Action::DenyAgentControl),
         "UnpinQuickContext" => Ok(Action::UnpinQuickContext),
         "AskAllowOnce" => Ok(Action::AskAllowOnce),
         "AskAllowAlways" => Ok(Action::AskAllowAlways),
@@ -790,6 +792,7 @@ mod tests {
         "PromptContextRotate",
         "HoldQuickContext",
         "ToggleAgentControl",
+        "DenyAgentControl",
         "UnpinQuickContext",
     ];
 

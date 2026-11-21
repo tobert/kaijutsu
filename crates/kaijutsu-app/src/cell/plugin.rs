@@ -75,6 +75,7 @@ impl Plugin for CellPlugin {
         let active_id = app.register_system(brp_methods::handle_active_context);
         let act_id = app.register_system(brp_methods::handle_act);
         let state_id = app.register_system(brp_methods::handle_state);
+        let request_id = app.register_system(brp_methods::handle_request_control);
         app.world_mut()
             .resource_mut::<RemoteMethods>()
             .insert(
@@ -98,6 +99,12 @@ impl Plugin for CellPlugin {
             .insert(
                 brp_methods::STATE_METHOD,
                 RemoteMethodSystemId::Instant(state_id),
+            );
+        app.world_mut()
+            .resource_mut::<RemoteMethods>()
+            .insert(
+                brp_methods::REQUEST_CONTROL_METHOD,
+                RemoteMethodSystemId::Instant(request_id),
             );
 
         // Configure SystemSet execution order

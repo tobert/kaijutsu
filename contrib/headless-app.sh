@@ -12,6 +12,7 @@
 #                                 [--kernel-port N] [--brp-port N]
 #                                 [--wayland NAME] [--agent-control] [--build]
 #   contrib/headless-app.sh act ACTION         BRP kaijutsu/act (needs --agent-control)
+#   contrib/headless-app.sh request REASON     BRP kaijutsu/request_control
 #   contrib/headless-app.sh state              BRP kaijutsu/state
 #   contrib/headless-app.sh frames             the app's frame count
 #   contrib/headless-app.sh status
@@ -345,6 +346,15 @@ cmd_act() {
   echo
 }
 
+cmd_request() {
+  load_env
+  [[ $# -eq 1 ]] || die "usage: request REASON   (asks the player for agent control)"
+  local json
+  json="$(python3 -c 'import json,sys; print(json.dumps({"reason": sys.argv[1]}))' "$1")"
+  brp kaijutsu/request_control "$json"
+  echo
+}
+
 cmd_state() {
   load_env
   brp kaijutsu/state '{}'
@@ -375,6 +385,7 @@ case "${1:-}" in
   keys) shift; cmd_keys "$@" ;;
   text) shift; cmd_text "$@" ;;
   act) shift; cmd_act "$@" ;;
+  request) shift; cmd_request "$@" ;;
   state) cmd_state ;;
   frames) load_env; frame_count ;;
   logs) echo "$STATE/logs" ;;

@@ -8,7 +8,7 @@ use bevy_remote::{error_codes, BrpError, BrpResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent_control::AgentControl;
+use crate::agent_control::{AgentControl, RequestOutcome, RequestStatus};
 use crate::connection::drift::DriftState;
 use crate::input::bindings_config::parse_action;
 use crate::input::context::ActiveInputContexts;
@@ -27,6 +27,9 @@ pub const ACTIVE_CONTEXT_METHOD: &str = "kaijutsu/active_context";
 
 /// Method name for firing an action as if its binding had been pressed.
 pub const ACT_METHOD: &str = "kaijutsu/act";
+
+/// Method name for asking the player to turn agent control on.
+pub const REQUEST_CONTROL_METHOD: &str = "kaijutsu/request_control";
 
 /// Method name for the app's input and navigation state (read-only).
 pub const STATE_METHOD: &str = "kaijutsu/state";
@@ -55,8 +58,30 @@ struct ActResponse {
     context: String,
 }
 
+#[derive(Deserialize)]
+struct RequestControlParams {
+    /// Why the agent wants control; shown to the player, clipped.
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct RequestControlResponse {
+    /// `on` (nothing to ask), `pending` (one is already waiting), or
+    /// `requested`. Poll `kaijutsu/state` for the player's answer.
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct ControlRequestView {
+    /// `pending`, `denied`, or `timed_out`.
+    status: &'static str,
+    reason: String,
+}
+
 #[derive(Serialize)]
 struct StateResponse {
+    /// The latest request for control; null when none, or once allowed.
+    control_request: Option<ControlRequestView>,
     agent_control: bool,
     screen: String,
     focus: String,
@@ -197,10 +222,13 @@ pub fn handle_act(
         message: format!("Cannot parse action: {e}"),
         data: None,
     })?;
-    if action == Action::ToggleAgentControl {
+    if matches!(
+        action,
+        Action::ToggleAgentControl | Action::DenyAgentControl
+    ) {
         return Err(BrpError {
             code: error_codes::INVALID_PARAMS,
-            message: "ToggleAgentControl is the player's latch; an agent cannot flip it".into(),
+            message: "the agent-control latch and its answer are the player's; an agent cannot fire them (use kaijutsu/request_control)".into(),
             data: None,
         });
     }
@@ -218,6 +246,32 @@ pub fn handle_act(
     .map_err(BrpError::internal)
 }
 
+/// BRP handler: `kaijutsu/request_control`
+///
+/// Params: `{ "reason": "<why>" }`. Works with control off or on. It only
+/// records the request: the dock shows it and the player's `Ctrl+A g` allows
+/// it (`crate::agent_control`). Poll `kaijutsu/state` for the answer.
+pub fn handle_request_control(
+    In(params): In<Option<Value>>,
+    time: Res<Time>,
+    mut control: ResMut<AgentControl>,
+) -> BrpResult {
+    let RequestControlParams { reason } = parse_params(params)?;
+    if reason.trim().is_empty() {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "reason must say why control is wanted".into(),
+            data: None,
+        });
+    }
+    let status = match control.request(&reason, time.elapsed_secs_f64()) {
+        RequestOutcome::On => "on",
+        RequestOutcome::Pending => "pending",
+        RequestOutcome::Requested => "requested",
+    };
+    serde_json::to_value(RequestControlResponse { status }).map_err(BrpError::internal)
+}
+
 /// BRP handler: `kaijutsu/state`
 ///
 /// No params. Read-only, answers whether or not agent control is on.
@@ -230,6 +284,14 @@ pub fn handle_state(
     doc_cache: Res<DocumentCache>,
 ) -> BrpResult {
     serde_json::to_value(StateResponse {
+        control_request: control.request.as_ref().map(|r| ControlRequestView {
+            status: match r.status {
+                RequestStatus::Pending => "pending",
+                RequestStatus::Denied => "denied",
+                RequestStatus::TimedOut => "timed_out",
+            },
+            reason: r.reason.clone(),
+        }),
         agent_control: control.enabled,
         screen: format!("{:?}", screen.get()),
         focus: format!("{:?}", *focus),
@@ -270,9 +332,7 @@ mod tests {
             .init_state::<Screen>()
             .init_resource::<FocusArea>()
             .init_resource::<DocumentCache>()
-            .insert_resource(AgentControl {
-                enabled: agent_control,
-            })
+            .insert_resource(AgentControl::new(agent_control))
             .insert_resource(ActiveInputContexts(contexts))
             .insert_resource(InputMap {
                 bindings: vec![Binding::key(
@@ -347,6 +407,68 @@ mod tests {
         let err = act(&mut app, serde_json::json!({"action": "ToggleAgentControl"})).unwrap_err();
         assert_eq!(err.code, error_codes::INVALID_PARAMS);
         assert!(fired(&mut app).is_empty());
+    }
+
+    #[test]
+    fn act_cannot_answer_the_players_request() {
+        let mut app = app(true, vec![InputContext::Global]);
+        let err = act(&mut app, serde_json::json!({"action": "DenyAgentControl"})).unwrap_err();
+        assert_eq!(err.code, error_codes::INVALID_PARAMS);
+        assert!(fired(&mut app).is_empty());
+    }
+
+    fn request(app: &mut App, params: Value) -> BrpResult {
+        app.world_mut()
+            .run_system_once_with(handle_request_control, Some(params))
+            .unwrap()
+    }
+
+    fn state(app: &mut App) -> Value {
+        app.world_mut()
+            .run_system_once_with(handle_state, None)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A request works with the latch off, records itself, and leaves the
+    /// latch alone: only the player's key turns it on.
+    #[test]
+    fn a_request_is_recorded_and_shown_in_state_without_opening_control() {
+        let mut app = app(false, vec![InputContext::Global]);
+        app.insert_resource(Time::<()>::default());
+        let ok = request(&mut app, serde_json::json!({"reason": "drive the smoke test"})).unwrap();
+        assert_eq!(ok["status"], "requested");
+        let state = state(&mut app);
+        assert_eq!(state["agent_control"], false);
+        assert_eq!(state["control_request"]["status"], "pending");
+        assert_eq!(state["control_request"]["reason"], "drive the smoke test");
+        // Still refused.
+        let err = act(&mut app, serde_json::json!({"action": "FocusNextBlock"})).unwrap_err();
+        assert_eq!(err.code, AGENT_CONTROL_OFF);
+    }
+
+    #[test]
+    fn a_repeat_request_says_pending_and_an_open_latch_says_on() {
+        let mut app = app(false, vec![InputContext::Global]);
+        app.insert_resource(Time::<()>::default());
+        request(&mut app, serde_json::json!({"reason": "one"})).unwrap();
+        let again = request(&mut app, serde_json::json!({"reason": "two"})).unwrap();
+        assert_eq!(again["status"], "pending");
+        let mut open = self::app(true, vec![InputContext::Global]);
+        open.insert_resource(Time::<()>::default());
+        let on = request(&mut open, serde_json::json!({"reason": "x"})).unwrap();
+        assert_eq!(on["status"], "on");
+    }
+
+    #[test]
+    fn a_request_without_a_reason_is_refused() {
+        let mut app = app(false, vec![InputContext::Global]);
+        app.insert_resource(Time::<()>::default());
+        for bad in [serde_json::json!({"reason": "  "}), serde_json::json!({})] {
+            let err = request(&mut app, bad).unwrap_err();
+            assert_eq!(err.code, error_codes::INVALID_PARAMS);
+        }
+        assert!(state(&mut app)["control_request"].is_null());
     }
 
     #[test]

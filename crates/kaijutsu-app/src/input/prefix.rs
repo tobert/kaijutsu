@@ -113,6 +113,7 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         KeyCode::KeyH => Some(Action::HoldQuickContext),
         // g — the agent-control gate: let an agent drive the app over BRP,
         // or block it again.
+        KeyCode::KeyG if shift => Some(Action::DenyAgentControl),
         KeyCode::KeyG => Some(Action::ToggleAgentControl),
         // l — the ledger ribbon (docs/tui.md, "The ledger"): every pending
         // ask across every context. A toggle; the surface latches.
@@ -246,6 +247,15 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::KeyG, false, false),
             Some(Action::ToggleAgentControl)
+        );
+    }
+
+    /// `G` refuses a pending agent request without turning anything on.
+    #[test]
+    fn shift_g_denies_agent_control() {
+        assert_eq!(
+            resolve_chord(KeyCode::KeyG, false, true),
+            Some(Action::DenyAgentControl)
         );
     }
 

@@ -229,6 +229,8 @@ pub enum Action {
     /// `Ctrl+A g` — the agent-control latch. While it is on, an agent may
     /// fire actions over BRP (`kaijutsu/act`); firing it again blocks them.
     ToggleAgentControl,
+    /// `Ctrl+A G` — refuse the agent's pending request for control.
+    DenyAgentControl,
     /// `Ctrl+A [` — focus the conversation, as tmux's copy-mode key does. Does
     /// nothing when the conversation already has focus, and never scrolls.
     FocusConversation,

@@ -88,9 +88,11 @@ A player's text registers are shared through the kernel's register store: compos
 - **No selection is written to PRIMARY.**
 - **The kernel's register map is never pruned.**
 
-## Agent control could be requested through the ledger
+## A kernel ledger ask for agent control
 
-Agent control (`docs/input.md`, "Agent control over BRP") is a latch that only the player flips, by flag or `Ctrl+A g`. An MCP client could instead raise an ask in the ledger and the player's approval would flip the latch. `AgentControl` is one resource, so the approval only has to write it; the ask, its identity routing, and the ledger row are the open work.
+An agent asks for control with `kaijutsu/request_control`, and only the player at that app sees the request (`docs/input.md`, "Agent control over BRP"). A ledger ask would also reach the tui and other clients, and leave a record. It needs a gated kernel verb that flips the latch on a named app peer, so it waits on the peer route and a design conversation about the identity rules in `docs/approval-identity.md`. `AgentControl` is one resource, so the approval only has to write it.
+
+The footer line grows leftward over the badge cluster when a request is pending at 1280 px, and the dock's connection text clips at the right edge at 800 and 1280 px.
 
 ## The headless app harness: input at a low frame rate
 
