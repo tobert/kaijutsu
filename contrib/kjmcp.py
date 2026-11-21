@@ -103,6 +103,14 @@ def main() -> int:
     parser.add_argument("--key-file", required=True)
     parser.add_argument("--context", default="bench-admin")
     parser.add_argument(
+        "--character",
+        help=(
+            "the live non-root character that performs the session context. "
+            "Required when --key-file belongs to a root character, which "
+            "performs only its root console."
+        ),
+    )
+    parser.add_argument(
         "--home",
         help=(
             "HOME for the kaijutsu-mcp child. A throwaway kernel mints a fresh "
@@ -138,6 +146,8 @@ def main() -> int:
     ]
     if args.insecure:
         argv.append("--insecure")
+    if args.character:
+        argv += ["--character", args.character]
 
     env = dict(os.environ)
     if args.home:

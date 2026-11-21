@@ -88,9 +88,9 @@ A player's text registers are shared through the kernel's register store: compos
 - **No selection is written to PRIMARY.**
 - **The kernel's register map is never pruned.**
 
-## The headless app harness cannot seed (2026-11-14)
+## The headless app harness: input at a low frame rate
 
-`contrib/headless-app.sh start` stops at "kernel listened but never answered". Its readiness probe and seed steps run `kj` through `contrib/kjmcp.py` with the root character's key, and `kaijutsu-mcp` now refuses to auto-register a context a person performs. The harness needs a non-root character to seed through, or a seed path that needs no MCP session. At the headless app's ~1 fps, `type_text` also drops characters after a surface switch.
+`contrib/headless-app.sh start` runs end to end on gamescope's headless backend (about 10 fps with a debug build); `--compositor labwc` keeps the old path. `type_text` and `keys` are not yet re-checked at this rate: key names are BRP key codes such as `KeyW`, and a `type_text` burst can still drop characters after a surface switch. The app's window does not fill the gamescope output (a screenshot is 800x600 at a 1920x1080 output). An agent-facing input method (one BRP message carrying an action or a whole string) and a state query would replace most key synthesis.
 
 ## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
 

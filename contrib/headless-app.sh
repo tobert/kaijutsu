@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Headless runtime harness for kaijutsu-app.
 #
-# Runs the Bevy app on a headless Wayland compositor (labwc, wlroots headless
-# backend) against a throwaway kernel, so app changes can be checked with BRP
+# Runs the Bevy app on a headless Wayland compositor (gamescope's headless
+# backend by default; labwc on the wlroots headless backend with
+# --compositor labwc) against a throwaway kernel, so app changes can be checked with BRP
 # screenshots and keys without a person at a display. Everything this script
 # starts lives under one state directory and `stop` tears down only that.
 #
 # Usage:
-#   contrib/headless-app.sh start [--size WxH] [--kernel-port N] [--brp-port N]
+#   contrib/headless-app.sh start [--compositor gamescope|labwc] [--size WxH]
+#                                 [--kernel-port N] [--brp-port N]
 #                                 [--wayland NAME] [--build]
 #   contrib/headless-app.sh status
 #   contrib/headless-app.sh shot NAME [DIR]    BRP screenshot -> DIR/NAME.png
@@ -38,6 +40,8 @@ MCP_BIN="${KJ_MCP_BIN:-$REPO_ROOT/target/debug/kaijutsu-mcp}"
 APP_BIN="${KJ_APP_BIN:-$REPO_ROOT/target/debug/kaijutsu-app}"
 RTDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 DIRECTOR="headless-director"
+# A root character performs only its root console, so MCP sessions run as this one.
+PERFORMER="headless-kohai"
 
 die() { echo "headless-app: $*" >&2; exit 1; }
 
@@ -71,6 +75,7 @@ stop_pid() { # pidfile, cmdline-substring
 kjmcp() {
   KJMCP_QUIET=1 python3 "$REPO_ROOT/contrib/kjmcp.py" \
     --binary "$MCP_BIN" --port "$KERNEL_PORT" --key-file "$STATE/keys/$DIRECTOR" \
+    --character "$PERFORMER" \
     --home "$STATE/home" --insecure --context headless-admin "$@" 2>>"$STATE/logs/seed.log"
 }
 
@@ -87,8 +92,10 @@ brp() { # method, params-json
 
 cmd_start() {
   local size="1920x1080" KERNEL_PORT=22724 BRP_PORT=15712 wayland="" build=0
+  local compositor="gamescope"
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --compositor) compositor="$2"; shift 2 ;;
       --size) size="$2"; shift 2 ;;
       --kernel-port) KERNEL_PORT="$2"; shift 2 ;;
       --brp-port) BRP_PORT="$2"; shift 2 ;;
@@ -99,9 +106,16 @@ cmd_start() {
   done
   [[ "$KERNEL_PORT" != 2222 ]] || die "refusing port 2222: that is the operator's kernel"
   [[ ! -e "$STATE/env.sh" ]] || die "already started ($STATE); run stop first"
-  for tool in ss curl python3 labwc wlr-randr ssh-keygen; do
+  case "$compositor" in
+    gamescope) tools=(ss curl python3 gamescope ssh-keygen) ;;
+    labwc) tools=(ss curl python3 labwc wlr-randr ssh-keygen) ;;
+    *) die "unknown compositor: $compositor (gamescope|labwc)" ;;
+  esac
+  for tool in "${tools[@]}"; do
     command -v "$tool" >/dev/null || die "missing tool: $tool"
   done
+  [[ "$compositor" == labwc || -z "$wayland" ]] \
+    || die "--wayland names an existing compositor; gamescope starts its own"
   port_is_listening "$KERNEL_PORT" && die "kernel port $KERNEL_PORT is busy"
   port_is_listening "$BRP_PORT" && die "BRP port $BRP_PORT is busy"
 
@@ -120,7 +134,9 @@ cmd_start() {
 
   # --- compositor: reuse a named socket, or start our own labwc -------------
   local labwc_started=0
-  if [[ -n "$wayland" ]]; then
+  if [[ "$compositor" == gamescope ]]; then
+    : # gamescope hosts the app as its child process; see the app launch below
+  elif [[ -n "$wayland" ]]; then
     [[ -S "$RTDIR/$wayland" ]] || die "no wayland socket $RTDIR/$wayland"
   else
     mkdir -p "$STATE/labwc-cfg"
@@ -140,12 +156,14 @@ cmd_start() {
     done
     [[ -n "$wayland" ]] || die "labwc made no wayland socket; see $STATE/logs/labwc.log"
   fi
-  local output
-  output="$(WAYLAND_DISPLAY="$wayland" wlr-randr | awk 'NR==1{print $1}')"
-  [[ -n "$output" ]] || die "wlr-randr lists no output on $wayland"
-  WAYLAND_DISPLAY="$wayland" wlr-randr --output "$output" --custom-mode "$size" \
-    || die "could not set $size on $output"
-  echo "== wayland $wayland, output $output at $size (labwc started by us: $labwc_started)"
+  if [[ "$compositor" == labwc ]]; then
+    local output
+    output="$(WAYLAND_DISPLAY="$wayland" wlr-randr | awk 'NR==1{print $1}')"
+    [[ -n "$output" ]] || die "wlr-randr lists no output on $wayland"
+    WAYLAND_DISPLAY="$wayland" wlr-randr --output "$output" --custom-mode "$size" \
+      || die "could not set $size on $output"
+    echo "== wayland $wayland, output $output at $size (labwc started by us: $labwc_started)"
+  fi
 
   # --- ephemeral kernel -----------------------------------------------------
   local key="$STATE/keys/$DIRECTOR"
@@ -156,6 +174,9 @@ cmd_start() {
   echo "== init root character $DIRECTOR"
   env "${kenv[@]}" "$SERVER_BIN" init --as "$DIRECTOR" --key "$key.pub" >/dev/null
   env "${kenv[@]}" "$SERVER_BIN" rc reseed --dir "$STATE/config/rc" >/dev/null
+  env "${kenv[@]}" "$SERVER_BIN" --config-root "$STATE/config" kj --as "$DIRECTOR" \
+    -- character create "$PERFORMER" --rc mcp >/dev/null \
+    || die "could not create $PERFORMER; see the output above"
   env "${kenv[@]}" RUST_LOG=info "$SERVER_BIN" --config-root "$STATE/config" \
     --port "$KERNEL_PORT" >"$STATE/logs/kernel.log" 2>&1 &
   echo $! > "$STATE/kernel.pid"
@@ -179,10 +200,9 @@ cmd_start() {
   local abc=$'X:1\nT:Headless\nM:4/4\nL:1/8\nK:C\nCDEF GABc|c2 G2 E2 C2|'
   local md=$'## Harness\n\n- **Compositor**: labwc on the wlroots headless backend.\n- **Kernel**: a throwaway kaijutsu-server on its own port.\n- **App**: kaijutsu-app with BRP enabled.\n\n```rust\nfn main() { println!("hello"); }\n```'
   kjmcp \
-    "kj character create headless-kohai --rc coder" \
-    "kj context create headless-kohai --name alpha-notes" \
-    "kj context create headless-kohai --name beta-review" \
-    "kj context create headless-kohai --name gamma-scratch" \
+    "kj context create ${PERFORMER} --name alpha-notes" \
+    "kj context create ${PERFORMER} --name beta-review" \
+    "kj context create ${PERFORMER} --name gamma-scratch" \
     "kj block create -c alpha-notes --role user --kind text --content 'Summarize the headless harness in three bullets.'" \
     "kj block create -c alpha-notes --role model --kind thinking --content 'The harness has three parts: a compositor, a kernel, and the app.'" \
     "kj block create -c alpha-notes --role model --kind text --content-type text/markdown --content '$md'" \
@@ -199,17 +219,26 @@ cmd_start() {
   echo "== raise one pending ask"
   (timeout 8 python3 "$REPO_ROOT/contrib/kjmcp.py" --binary "$MCP_BIN" \
     --port "$KERNEL_PORT" --key-file "$key" --home "$STATE/home" --insecure \
-    --context headless-admin "git push origin headless-harness" \
+    --character "$PERFORMER" --context headless-admin "git push origin headless-harness" \
     >"$STATE/logs/ask.log" 2>&1 || true)
 
   # --- app ------------------------------------------------------------------
   echo "== launch app"
-  env WAYLAND_DISPLAY="$wayland" BRP_EXTRAS_PORT="$BRP_PORT" \
-    XDG_DATA_HOME="$STATE/xdg/data" XDG_CONFIG_HOME="$STATE/xdg/config" \
-    XDG_STATE_HOME="$STATE/xdg/state" \
-    RUST_LOG="${KJ_HEADLESS_APP_LOG:-info,wgpu=warn,naga=warn,bevy_render=info}" \
-    "$APP_BIN" --host 127.0.0.1 --port "$KERNEL_PORT" --insecure --key-file "$key" \
-    --maximize >"$STATE/logs/app.log" 2>&1 &
+  local app_cmd=("$APP_BIN" --host 127.0.0.1 --port "$KERNEL_PORT" --insecure --key-file "$key")
+  local app_env=(BRP_EXTRAS_PORT="$BRP_PORT"
+    XDG_DATA_HOME="$STATE/xdg/data" XDG_CONFIG_HOME="$STATE/xdg/config"
+    XDG_STATE_HOME="$STATE/xdg/state"
+    RUST_LOG="${KJ_HEADLESS_APP_LOG:-info,wgpu=warn,naga=warn,bevy_render=info}")
+  if [[ "$compositor" == gamescope ]]; then
+    # gamescope's lifetime is the app's; its nested socket is named in the log.
+    wayland="gamescope-headless"
+    env "${app_env[@]}" gamescope --backend headless --expose-wayland \
+      -W "${size%x*}" -H "${size#*x}" -w "${size%x*}" -h "${size#*x}" \
+      -- "${app_cmd[@]}" --fullscreen >"$STATE/logs/app.log" 2>&1 &
+  else
+    env WAYLAND_DISPLAY="$wayland" "${app_env[@]}" "${app_cmd[@]}" --maximize \
+      >"$STATE/logs/app.log" 2>&1 &
+  fi
   echo $! > "$STATE/app.pid"
   for _ in $(seq 1 60); do
     kill -0 "$(cat "$STATE/app.pid")" 2>/dev/null \
@@ -222,6 +251,7 @@ cmd_start() {
   cat > "$STATE/env.sh" <<ENV
 # Written by contrib/headless-app.sh start
 WAYLAND_NAME="$wayland"
+COMPOSITOR=$compositor
 LABWC_STARTED=$labwc_started
 KERNEL_PORT=$KERNEL_PORT
 BRP_PORT=$BRP_PORT
@@ -232,7 +262,7 @@ ENV
 cmd_status() {
   load_env
   echo "state dir     $STATE"
-  echo "wayland       $WAYLAND_NAME (labwc ours: $LABWC_STARTED)"
+  echo "compositor    $COMPOSITOR (wayland $WAYLAND_NAME)"
   echo "kernel        port $KERNEL_PORT, pid $(cat "$STATE/kernel.pid" 2>/dev/null || echo '-')"
   echo "app           pid $(cat "$STATE/app.pid" 2>/dev/null || echo '-'), BRP http://127.0.0.1:$BRP_PORT"
   echo "key           $STATE/keys/$DIRECTOR"
@@ -275,7 +305,7 @@ cmd_text() {
 cmd_stop() {
   # Stop what we started; a missing state dir is not an error.
   if [[ -d "$STATE" ]]; then
-    stop_pid "$STATE/app.pid" kaijutsu-app
+    stop_pid "$STATE/app.pid" "kaijutsu-app"
     stop_pid "$STATE/kernel.pid" kaijutsu-server
     if [[ -f "$STATE/env.sh" ]] && grep -q '^LABWC_STARTED=1' "$STATE/env.sh" \
        || [[ -f "$STATE/labwc.pid" ]]; then
