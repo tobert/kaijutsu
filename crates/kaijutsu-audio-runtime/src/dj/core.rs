@@ -172,7 +172,7 @@ impl Default for MetronomeConfig {
     fn default() -> Self {
         // Must match assets/defaults/metronome.toml — verified by
         // `config_parses_the_shipped_default_and_fills_partials` below.
-        Self { enabled: true, note: 84, channel: 15, velocity: 110, gate_ms: 60 }
+        Self { enabled: false, note: 84, channel: 15, velocity: 110, gate_ms: 60 }
     }
 }
 

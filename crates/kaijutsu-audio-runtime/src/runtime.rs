@@ -239,6 +239,8 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
     let mut last_inventory_snapshot: Option<crate::patch_graph::PatchGraphSnapshot> = None;
     let mut last_inventory_render_events = 0u64;
     let mut last_inventory_input_events: BTreeMap<String, u64> = BTreeMap::new();
+    let mut last_metronome_fetch: Option<std::time::Instant> = None;
+    let mut last_metronome_config: Option<crate::dj::core::MetronomeConfig> = None;
     loop {
         tokio::select! {
             biased;
@@ -246,6 +248,8 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
             result = status.changed() => {
                 result.map_err(|e| e.to_string())?;
                 connected = false;
+                last_metronome_fetch = None;
+                last_metronome_config = None;
                 reported.clear();
                 revision = None;
                 state.clocks.clear();
@@ -281,14 +285,22 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
         let work = async {
             if !connected {
                 if midi { profiles = fetch_profiles(actor).await?; }
+                connected = true;
+            }
+            if last_metronome_fetch.map(|t| t.elapsed() >= Duration::from_secs(5)).unwrap_or(true) {
+                last_metronome_fetch = Some(std::time::Instant::now());
                 let mut loaded = false;
                 let layers = options.config_client.as_deref().map(Some).into_iter().chain(std::iter::once(None));
                 for client in layers {
                     let path = kaijutsu_types::paths::client_config_path(client, "metronome.toml");
                     match actor.get_config(path.clone()).await {
                     Ok(body) if !body.trim().is_empty() => {
-                        let config = toml::from_str(&body).map_err(|e| format!("invalid metronome config: {e}"))?;
-                        dj.ctl_tx.send(DjCtl::MetronomeConfig(config)).map_err(|e| e.to_string())?;
+                        let config: crate::dj::core::MetronomeConfig =
+                            toml::from_str(&body).map_err(|e| format!("invalid metronome config: {e}"))?;
+                        if Some(config) != last_metronome_config {
+                            dj.ctl_tx.send(DjCtl::MetronomeConfig(config)).map_err(|e| e.to_string())?;
+                            last_metronome_config = Some(config);
+                        }
                         loaded = true;
                         break;
                     }
@@ -296,8 +308,9 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
                     Err(e) => tracing::debug!("metronome config {path} unavailable: {e}"),
                     }
                 }
-                if !loaded { tracing::warn!("metronome config unavailable; keeping the current runtime settings"); }
-                connected = true;
+                if !loaded && last_metronome_config.is_none() {
+                    tracing::warn!("metronome config unavailable; keeping the current runtime settings");
+                }
             }
             if midi && revision != Some(state.topology.revision()) {
                 let matched = match_ports(&profiles, &state.topology.ports());

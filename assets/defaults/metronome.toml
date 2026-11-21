@@ -11,7 +11,7 @@
 # away. `enabled` is the master on/off on top of that.
 
 # Whether the click sounds at all.
-enabled = true
+enabled = false
 
 # MIDI note for the click. 84 = C6 — a crisp 拍子木-like tick. A pitched note on a
 # normal channel (NOT GM channel-9 percussion, which is silent under the game
