@@ -111,6 +111,9 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // on screen by the time this key is pressed: arming the prefix peeks
         // it (`ui::quick_context`), and `h` is what keeps it there.
         KeyCode::KeyH => Some(Action::HoldQuickContext),
+        // g — the agent-control gate: let an agent drive the app over BRP,
+        // or block it again.
+        KeyCode::KeyG => Some(Action::ToggleAgentControl),
         // l — the ledger ribbon (docs/tui.md, "The ledger"): every pending
         // ask across every context. A toggle; the surface latches.
         KeyCode::KeyL => Some(Action::OpenLedger),
@@ -233,6 +236,16 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::KeyH, true, false),
             Some(Action::HoldQuickContext)
+        );
+    }
+
+    /// `g` latches agent control: the gate that lets an agent fire actions
+    /// over BRP. A toggle, so the same chord blocks it again.
+    #[test]
+    fn g_toggles_agent_control() {
+        assert_eq!(
+            resolve_chord(KeyCode::KeyG, false, false),
+            Some(Action::ToggleAgentControl)
         );
     }
 

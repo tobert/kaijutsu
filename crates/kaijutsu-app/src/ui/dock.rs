@@ -1041,10 +1041,11 @@ pub(crate) fn classify_connection_error(msg: &str) -> Option<&'static str> {
 /// Update connection widget when RpcConnectionState changes.
 pub fn update_connection(
     conn_state: Res<RpcConnectionState>,
+    control: Res<crate::agent_control::AgentControl>,
     theme: Res<Theme>,
     mut dock: ResMut<DockState>,
 ) {
-    if !conn_state.is_changed() {
+    if !conn_state.is_changed() && !control.is_changed() {
         return;
     }
 
@@ -1073,8 +1074,15 @@ pub fn update_connection(
         ("\u{26a0} Disconnected".to_string(), theme.error)
     };
 
-    dock.connection.text = text;
-    dock.connection.color = color;
+    // The latch is the player's consent; say so wherever the connection is.
+    // It takes the warning color: someone else may be driving.
+    if control.enabled {
+        dock.connection.text = format!("{text} \u{b7} AGENT CONTROL");
+        dock.connection.color = theme.warning;
+    } else {
+        dock.connection.text = text;
+        dock.connection.color = color;
+    }
 }
 
 /// Render text for the global-error badge — the ambient HUD signal for
@@ -1159,6 +1167,37 @@ mod tests {
         BackgroundActivityLevel, PRESENCE_MAX_AGE,
     };
     use crate::ui::theme::Theme;
+
+    /// The dock says so while an agent may drive the app, and stops saying so
+    /// when the latch is released.
+    #[test]
+    fn the_connection_text_names_agent_control_while_it_is_on() {
+        use super::{update_connection, DockState};
+        use crate::agent_control::AgentControl;
+        use crate::connection::RpcConnectionState;
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::prelude::*;
+
+        let mut world = World::new();
+        world.insert_resource(RpcConnectionState::default());
+        world.insert_resource(Theme::default());
+        world.insert_resource(DockState::default());
+        world.insert_resource(AgentControl { enabled: true });
+        world.run_system_once(update_connection).unwrap();
+        assert!(world
+            .resource::<DockState>()
+            .connection
+            .text
+            .ends_with("AGENT CONTROL"));
+
+        world.insert_resource(AgentControl { enabled: false });
+        world.run_system_once(update_connection).unwrap();
+        assert!(!world
+            .resource::<DockState>()
+            .connection
+            .text
+            .contains("AGENT CONTROL"));
+    }
 
     /// The hints line carries the waiting-ask count on every screen: a
     /// player must see that the instrument is waiting on them without

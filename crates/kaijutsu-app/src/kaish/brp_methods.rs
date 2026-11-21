@@ -8,7 +8,13 @@ use bevy_remote::{error_codes, BrpError, BrpResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent_control::AgentControl;
 use crate::connection::drift::DriftState;
+use crate::input::bindings_config::parse_action;
+use crate::input::context::ActiveInputContexts;
+use crate::input::map::InputMap;
+use crate::input::{Action, ActionFired, FocusArea, InputContext};
+use crate::ui::screen::Screen;
 use crate::view::components::ContextSwitchRequested;
 use crate::view::document::DocumentCache;
 use kaijutsu_types::ContextId;
@@ -19,12 +25,44 @@ pub const SWITCH_CONTEXT_METHOD: &str = "kaijutsu/switch_context";
 /// Method name for querying the active context.
 pub const ACTIVE_CONTEXT_METHOD: &str = "kaijutsu/active_context";
 
+/// Method name for firing an action as if its binding had been pressed.
+pub const ACT_METHOD: &str = "kaijutsu/act";
+
+/// Method name for the app's input and navigation state (read-only).
+pub const STATE_METHOD: &str = "kaijutsu/state";
+
+/// BRP error code for a refused `kaijutsu/act`: agent control is off.
+pub const AGENT_CONTROL_OFF: i16 = -23100;
+
 // ── Request / Response types ─────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct SwitchContextParams {
     /// UUID string (hyphenated or plain hex).
     context_id: String,
+}
+
+#[derive(Deserialize)]
+struct ActParams {
+    /// An action name, or `Name:payload` — the bindings-config syntax.
+    action: String,
+}
+
+#[derive(Serialize)]
+struct ActResponse {
+    action: String,
+    /// The binding context the action was stamped with.
+    context: String,
+}
+
+#[derive(Serialize)]
+struct StateResponse {
+    agent_control: bool,
+    screen: String,
+    focus: String,
+    /// Active binding contexts, lowest priority first.
+    contexts: Vec<String>,
+    active_context_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -129,6 +167,78 @@ pub fn handle_active_context(
     .map_err(BrpError::internal)
 }
 
+/// BRP handler: `kaijutsu/act`
+///
+/// Params: `{ "action": "FocusNextBlock" }`, or `"Name:payload"` for the
+/// actions that carry a value (`"JumpSeat:3"`). Fires `ActionFired` as the
+/// dispatcher would for a key press: stamped with the active context that
+/// binds the action, else `Global` (the prefix chords and wheel scroll are
+/// stamped `Global` too). Refused unless agent control is on
+/// (`crate::agent_control`); the latch itself is the player's, so
+/// `ToggleAgentControl` is refused as well.
+pub fn handle_act(
+    In(params): In<Option<Value>>,
+    control: Res<AgentControl>,
+    map: Res<InputMap>,
+    active: Res<ActiveInputContexts>,
+    mut writer: MessageWriter<ActionFired>,
+) -> BrpResult {
+    if !control.enabled {
+        return Err(BrpError {
+            code: AGENT_CONTROL_OFF,
+            message: "agent control is off: start the app with --agent-control, or press Ctrl+A g"
+                .into(),
+            data: None,
+        });
+    }
+    let ActParams { action: raw } = parse_params(params)?;
+    let action = parse_action(&raw).map_err(|e| BrpError {
+        code: error_codes::INVALID_PARAMS,
+        message: format!("Cannot parse action: {e}"),
+        data: None,
+    })?;
+    if action == Action::ToggleAgentControl {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "ToggleAgentControl is the player's latch; an agent cannot flip it".into(),
+            data: None,
+        });
+    }
+    let context = map
+        .bindings
+        .iter()
+        .find(|b| b.action == action && active.contains(b.context))
+        .map(|b| b.context)
+        .unwrap_or(InputContext::Global);
+    writer.write(ActionFired::new(action, context));
+    serde_json::to_value(ActResponse {
+        action: raw,
+        context: format!("{context:?}"),
+    })
+    .map_err(BrpError::internal)
+}
+
+/// BRP handler: `kaijutsu/state`
+///
+/// No params. Read-only, answers whether or not agent control is on.
+pub fn handle_state(
+    In(_params): In<Option<Value>>,
+    control: Res<AgentControl>,
+    screen: Res<State<Screen>>,
+    focus: Res<FocusArea>,
+    active: Res<ActiveInputContexts>,
+    doc_cache: Res<DocumentCache>,
+) -> BrpResult {
+    serde_json::to_value(StateResponse {
+        agent_control: control.enabled,
+        screen: format!("{:?}", screen.get()),
+        focus: format!("{:?}", *focus),
+        contexts: active.0.iter().map(|c| format!("{c:?}")).collect(),
+        active_context_id: doc_cache.active_id().map(|id| id.to_string()),
+    })
+    .map_err(BrpError::internal)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<T, BrpError> {
@@ -143,5 +253,113 @@ fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<T
             message: "Params not provided".into(),
             data: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::binding::Binding;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::state::app::StatesPlugin;
+
+    fn app(agent_control: bool, contexts: Vec<InputContext>) -> App {
+        let mut app = App::new();
+        app.add_plugins(StatesPlugin)
+            .add_message::<ActionFired>()
+            .init_state::<Screen>()
+            .init_resource::<FocusArea>()
+            .init_resource::<DocumentCache>()
+            .insert_resource(AgentControl {
+                enabled: agent_control,
+            })
+            .insert_resource(ActiveInputContexts(contexts))
+            .insert_resource(InputMap {
+                bindings: vec![Binding::key(
+                    KeyCode::KeyJ,
+                    InputContext::Navigation,
+                    Action::FocusNextBlock,
+                    "next block",
+                )],
+            });
+        app
+    }
+
+    fn act(app: &mut App, params: Value) -> BrpResult {
+        app.world_mut()
+            .run_system_once_with(handle_act, Some(params))
+            .unwrap()
+    }
+
+    fn fired(app: &mut App) -> Vec<ActionFired> {
+        app.world_mut()
+            .resource_mut::<Messages<ActionFired>>()
+            .drain()
+            .collect()
+    }
+
+    #[test]
+    fn act_is_refused_while_agent_control_is_off() {
+        let mut app = app(false, vec![InputContext::Global, InputContext::Navigation]);
+        let err = act(&mut app, serde_json::json!({"action": "FocusNextBlock"})).unwrap_err();
+        assert_eq!(err.code, AGENT_CONTROL_OFF);
+        assert!(fired(&mut app).is_empty(), "a refused act fires nothing");
+    }
+
+    #[test]
+    fn act_fires_stamped_with_the_active_binding_context() {
+        let mut app = app(true, vec![InputContext::Global, InputContext::Navigation]);
+        let ok = act(&mut app, serde_json::json!({"action": "FocusNextBlock"})).unwrap();
+        assert_eq!(ok["context"], "Navigation");
+        let messages = fired(&mut app);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].action, Action::FocusNextBlock);
+        assert_eq!(messages[0].context, InputContext::Navigation);
+    }
+
+    /// An action bound only in a context that is not active gets `Global`,
+    /// the way the prefix chords do — it never borrows the other surface's.
+    #[test]
+    fn act_stamps_global_when_no_active_context_binds_the_action() {
+        let mut app = app(true, vec![InputContext::Global]);
+        act(&mut app, serde_json::json!({"action": "FocusNextBlock"})).unwrap();
+        assert_eq!(fired(&mut app)[0].context, InputContext::Global);
+    }
+
+    #[test]
+    fn act_carries_a_payload() {
+        let mut app = app(true, vec![InputContext::Global]);
+        act(&mut app, serde_json::json!({"action": "JumpSeat:3"})).unwrap();
+        assert_eq!(fired(&mut app)[0].action, Action::JumpSeat(3));
+    }
+
+    #[test]
+    fn act_rejects_an_unknown_action() {
+        let mut app = app(true, vec![InputContext::Global]);
+        let err = act(&mut app, serde_json::json!({"action": "NoSuchAction"})).unwrap_err();
+        assert_eq!(err.code, error_codes::INVALID_PARAMS);
+        assert!(fired(&mut app).is_empty());
+    }
+
+    #[test]
+    fn act_cannot_flip_the_players_latch() {
+        let mut app = app(true, vec![InputContext::Global]);
+        let err = act(&mut app, serde_json::json!({"action": "ToggleAgentControl"})).unwrap_err();
+        assert_eq!(err.code, error_codes::INVALID_PARAMS);
+        assert!(fired(&mut app).is_empty());
+    }
+
+    #[test]
+    fn state_answers_with_the_latch_off() {
+        let mut app = app(false, vec![InputContext::Global, InputContext::TextInput]);
+        let state = app
+            .world_mut()
+            .run_system_once_with(handle_state, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["agent_control"], false);
+        assert_eq!(state["contexts"], serde_json::json!(["Global", "TextInput"]));
+        assert_eq!(state["focus"], "Compose");
+        assert!(state["active_context_id"].is_null());
     }
 }

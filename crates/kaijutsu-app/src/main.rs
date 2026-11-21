@@ -60,6 +60,11 @@ struct Cli {
     #[arg(long)]
     maximize: bool,
 
+    /// Start with agent control on: an agent may fire actions over BRP
+    /// (`kaijutsu/act`). Off by default; `Ctrl+A g` toggles it at runtime.
+    #[arg(long)]
+    agent_control: bool,
+
     /// Share a local directory into `/r/<client-id>/<name>` (repeatable).
     /// Format: `[name=]path[:rw]` — the name defaults to the path's
     /// basename; `:rw` labels the share read-write in the manifest (write
@@ -69,6 +74,7 @@ struct Cli {
     shares: Vec<kaijutsu_client::ShareArg>,
 }
 
+mod agent_control;
 mod cell;
 mod commands;
 mod config;
@@ -236,6 +242,9 @@ fn main() {
         .add_plugins(text::KjTextPlugin)
         // Focus-based input dispatch (Phase 1: emits alongside old handlers)
         .add_plugins(input::InputPlugin)
+        .add_plugins(agent_control::AgentControlPlugin {
+            enabled: cli.agent_control,
+        })
         // Cell editing
         .add_plugins(cell::CellPlugin)
         // The conversation renderer (docs/conversation-surface.md): draws

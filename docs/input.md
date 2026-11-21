@@ -21,3 +21,27 @@ App input flows through a central action table that maps key combinations to `Ac
 - **`dirty_file_buffers` swap table:** Unsaved work is persisted in durable file documents as swap files. On reopen, the kernel announces recovered swaps rather than serving them silently.
 - **W12 changed-on-disk guard:** `:w` refuses to overwrite a file when disk generation has advanced past the buffer's load generation, unless overridden with `:w!`.
 - **`kj swap` management:** Use `kj swap list`, `kj swap ack <path>`, and `kj swap discard <path>` to inspect and resolve recovered swaps explicitly.
+
+## Agent control over BRP
+
+An agent can fire actions in the app only while agent control is on. It is off
+at startup. `kaijutsu-app --agent-control` starts it on, and `Ctrl+A g`
+(`ToggleAgentControl`) turns it on or off while the app runs. While it is on,
+the dock's connection text ends with `AGENT CONTROL`.
+
+`kaijutsu/act` takes `{"action": "<name>"}` (or `"<name>:<payload>"`, such as
+`JumpSeat:3`) and fires that action as the dispatcher would for a key press. It
+stamps the action with the active context that binds it, and with `Global` when
+none does (the `Ctrl+A` chords and wheel scroll fire as `Global` too). While
+control is off it returns error code -23100. It refuses `ToggleAgentControl`:
+the latch belongs to the player. It has no text parameter.
+
+`kaijutsu/state` is read-only and answers while control is off. It returns the
+screen, the focus area, the active contexts, the active context id, and whether
+control is on.
+
+The latch covers only these two methods. BRP's built-in methods and
+`bevy_brp_extras` (`send_keys`, `type_text`, ECS writes) are outside it, so the
+latch is consent, not a boundary. `contrib/headless-app.sh start --agent-control`,
+`act`, and `state` drive it for tests.
+

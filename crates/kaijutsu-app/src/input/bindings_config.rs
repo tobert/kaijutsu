@@ -438,6 +438,7 @@ fn action_to_str(a: &Action) -> String {
         Action::PromptContextSwitch => "PromptContextSwitch".into(),
         Action::PromptContextRotate => "PromptContextRotate".into(),
         Action::HoldQuickContext => "HoldQuickContext".into(),
+        Action::ToggleAgentControl => "ToggleAgentControl".into(),
         Action::UnpinQuickContext => "UnpinQuickContext".into(),
         Action::AskAllowOnce => "AskAllowOnce".into(),
         Action::AskAllowAlways => "AskAllowAlways".into(),
@@ -455,7 +456,7 @@ fn action_to_str(a: &Action) -> String {
     }
 }
 
-fn parse_action(s: &str) -> Result<Action, String> {
+pub(crate) fn parse_action(s: &str) -> Result<Action, String> {
     // Payloaded actions use "Name:payload" — see `action_to_str`.
     if let Some((name, payload)) = s.split_once(':') {
         return parse_action_with_payload(name, payload);
@@ -532,6 +533,7 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "PromptContextSwitch" => Ok(Action::PromptContextSwitch),
         "PromptContextRotate" => Ok(Action::PromptContextRotate),
         "HoldQuickContext" => Ok(Action::HoldQuickContext),
+        "ToggleAgentControl" => Ok(Action::ToggleAgentControl),
         "UnpinQuickContext" => Ok(Action::UnpinQuickContext),
         "AskAllowOnce" => Ok(Action::AskAllowOnce),
         "AskAllowAlways" => Ok(Action::AskAllowAlways),
@@ -787,6 +789,7 @@ mod tests {
         "PromptContextSwitch",
         "PromptContextRotate",
         "HoldQuickContext",
+        "ToggleAgentControl",
         "UnpinQuickContext",
     ];
 

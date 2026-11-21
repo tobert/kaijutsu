@@ -73,6 +73,8 @@ impl Plugin for CellPlugin {
         use crate::kaish::brp_methods;
         let switch_id = app.register_system(brp_methods::handle_switch_context);
         let active_id = app.register_system(brp_methods::handle_active_context);
+        let act_id = app.register_system(brp_methods::handle_act);
+        let state_id = app.register_system(brp_methods::handle_state);
         app.world_mut()
             .resource_mut::<RemoteMethods>()
             .insert(
@@ -84,6 +86,18 @@ impl Plugin for CellPlugin {
             .insert(
                 brp_methods::ACTIVE_CONTEXT_METHOD,
                 RemoteMethodSystemId::Instant(active_id),
+            );
+        app.world_mut()
+            .resource_mut::<RemoteMethods>()
+            .insert(
+                brp_methods::ACT_METHOD,
+                RemoteMethodSystemId::Instant(act_id),
+            );
+        app.world_mut()
+            .resource_mut::<RemoteMethods>()
+            .insert(
+                brp_methods::STATE_METHOD,
+                RemoteMethodSystemId::Instant(state_id),
             );
 
         // Configure SystemSet execution order

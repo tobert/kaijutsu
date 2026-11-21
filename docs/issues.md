@@ -88,9 +88,13 @@ A player's text registers are shared through the kernel's register store: compos
 - **No selection is written to PRIMARY.**
 - **The kernel's register map is never pruned.**
 
+## Agent control could be requested through the ledger
+
+Agent control (`docs/input.md`, "Agent control over BRP") is a latch that only the player flips, by flag or `Ctrl+A g`. An MCP client could instead raise an ask in the ledger and the player's approval would flip the latch. `AgentControl` is one resource, so the approval only has to write it; the ask, its identity routing, and the ledger row are the open work.
+
 ## The headless app harness: input at a low frame rate
 
-`contrib/headless-app.sh start` runs end to end on gamescope's headless backend (about 10 fps with a debug build); `--compositor labwc` keeps the old path. `type_text` and `keys` are not yet re-checked at this rate: key names are BRP key codes such as `KeyW`, and a `type_text` burst can still drop characters after a surface switch. The app's window does not fill the gamescope output (a screenshot is 800x600 at a 1920x1080 output). An agent-facing input method (one BRP message carrying an action or a whole string) and a state query would replace most key synthesis.
+`contrib/headless-app.sh start` runs end to end on gamescope's headless backend (about 10 fps with a debug build); `--compositor labwc` keeps the old path. `type_text` and `keys` are not yet re-checked at this rate: key names are BRP key codes such as `KeyW`, and a `type_text` burst can still drop characters after a surface switch. The app's window does not fill the gamescope output (a screenshot is 800x600 at a 1920x1080 output), and the dock's `AGENT CONTROL` marker clips at that width. `kaijutsu/act` and `kaijutsu/state` (`docs/input.md`, "Agent control over BRP") now replace most key synthesis; move the harness's `keys` users onto `act`.
 
 ## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
 

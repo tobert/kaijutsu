@@ -10,7 +10,9 @@
 # Usage:
 #   contrib/headless-app.sh start [--compositor gamescope|labwc] [--size WxH]
 #                                 [--kernel-port N] [--brp-port N]
-#                                 [--wayland NAME] [--build]
+#                                 [--wayland NAME] [--agent-control] [--build]
+#   contrib/headless-app.sh act ACTION         BRP kaijutsu/act (needs --agent-control)
+#   contrib/headless-app.sh state              BRP kaijutsu/state
 #   contrib/headless-app.sh status
 #   contrib/headless-app.sh shot NAME [DIR]    BRP screenshot -> DIR/NAME.png
 #   contrib/headless-app.sh keys KEY...        BRP send_keys: all KEYs held at once (a chord)
@@ -92,7 +94,7 @@ brp() { # method, params-json
 
 cmd_start() {
   local size="1920x1080" KERNEL_PORT=22724 BRP_PORT=15712 wayland="" build=0
-  local compositor="gamescope"
+  local compositor="gamescope" agent_control=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --compositor) compositor="$2"; shift 2 ;;
@@ -101,6 +103,7 @@ cmd_start() {
       --brp-port) BRP_PORT="$2"; shift 2 ;;
       --wayland) wayland="$2"; shift 2 ;;
       --build) build=1; shift ;;
+      --agent-control) agent_control=1; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -225,6 +228,7 @@ cmd_start() {
   # --- app ------------------------------------------------------------------
   echo "== launch app"
   local app_cmd=("$APP_BIN" --host 127.0.0.1 --port "$KERNEL_PORT" --insecure --key-file "$key")
+  [[ $agent_control -eq 0 ]] || app_cmd+=(--agent-control)
   local app_env=(BRP_EXTRAS_PORT="$BRP_PORT"
     XDG_DATA_HOME="$STATE/xdg/data" XDG_CONFIG_HOME="$STATE/xdg/config"
     XDG_STATE_HOME="$STATE/xdg/state"
@@ -302,6 +306,21 @@ cmd_text() {
   echo
 }
 
+cmd_act() {
+  load_env
+  [[ $# -eq 1 ]] || die "usage: act ACTION   (e.g. FocusNextBlock, JumpSeat:3)"
+  local json
+  json="$(python3 -c 'import json,sys; print(json.dumps({"action": sys.argv[1]}))' "$1")"
+  brp kaijutsu/act "$json"
+  echo
+}
+
+cmd_state() {
+  load_env
+  brp kaijutsu/state '{}'
+  echo
+}
+
 cmd_stop() {
   # Stop what we started; a missing state dir is not an error.
   if [[ -d "$STATE" ]]; then
@@ -325,7 +344,9 @@ case "${1:-}" in
   shot) shift; cmd_shot "$@" ;;
   keys) shift; cmd_keys "$@" ;;
   text) shift; cmd_text "$@" ;;
+  act) shift; cmd_act "$@" ;;
+  state) cmd_state ;;
   logs) echo "$STATE/logs" ;;
   stop) cmd_stop ;;
-  *) sed -n '2,25p' "${BASH_SOURCE[0]}"; exit 2 ;;
+  *) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 2 ;;
 esac
