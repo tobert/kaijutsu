@@ -327,6 +327,8 @@ fn main() {
         .add_plugins(view::room::RoomPlugin)
         // Time-well context browser (radial 3D well; Ctrl+W to enter, Esc to leave)
         .add_plugins(view::time_well::TimeWellPlugin)
+        // Full-window 3D heroic view (Ctrl+A k to enter, Esc to leave)
+        .add_plugins(view::heroic::HeroicPlugin)
         // In-app vi editor — screen/landing foundation (open_editor signal → Screen::Editor)
         .add_plugins(view::editor::EditorPlugin)
         .add_plugins(view::diff_view::DiffViewPlugin)

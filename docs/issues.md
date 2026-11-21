@@ -6,6 +6,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Doc drift found while planning the heroic view (2026-11-21)
+
+- `docs/time.md` "Tracks and Score Contexts" says score contexts hold "open future speculations"; only committed cells become blocks (`crates/kaijutsu-hyoushigi/src/materialize.rs`). Pending and speculated work lives only in `Timeline.future`.
+- Code comments cite deleted docs: `docs/color.md` (`assets/defaults/theme.toml`, `ui/theme_loader.rs`, `connection/actor_plugin.rs`), `docs/scenes/*` (`ui/screen.rs`), `docs/timewell.md`. The color rules now live in `docs/newui.md` for the scene; the UI lane's rules have no doc.
+- `view/time_well/live.rs` comments name `metronome::ingest_beat_signals`; no metronome module exists.
+
+## Heroic view follow-ups (2026-11-21)
+
+- Live kernel work updates still poll `kj transport work --track <id>` at 1 Hz via `execute_kj_quiet` (`view/heroic/live.rs`); a dedicated work-status wire event + measured performer lead field remains future work (`docs/newui.md`, "The live driver").
+- Audio spectrum hills currently derive 16-band energy from beat crossings and `RenderCue` onsets rather than FFT of mixed audio frames.
+- Adjacent performers aligned at the same Z/lead can still partially overlap their streaming text ribbons (`view/heroic/text.rs`); a 2D/screen-space overlap solver or alternating depth offset would separate crowded clusters.
+- Sun stripes in `assets/shaders/heroic/sun.wesl` sit mostly below `y = 0` when the disc is centered at `y = 0`; shifting the stripe band up into `[0.38, 0.72]` of UV or raising the disc slightly would show the striped bottom bands above the horizon.
+
 ## Shell output a model reads: what the preview-limit change leaves open (2026-11-19)
 
 - **kaish `--json` prints the output tree, not `.data`.** `seq 1 3 --json` prints `["1","2","3"]` while its `.data` is `[1,2,3]` (`apply_output_format` in kaish-types prefers `.output` over `.data`). A kaish change, under its compatibility promises.

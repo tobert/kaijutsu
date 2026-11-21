@@ -181,6 +181,7 @@ impl Keys {
                 // table"); this lane has not built it, so the notice names
                 // what it will do rather than reading as a plain unbound key.
                 KeyCode::Char('d') => Intent::NotYet("Ctrl+A d will detach; not built yet"),
+                KeyCode::Char('k') => Intent::NotYet("Ctrl+A k opens the heroic view; not built yet"),
                 KeyCode::Esc => Intent::LegendChanged,
                 _ => Intent::Unbound(key.code),
             };
@@ -421,6 +422,11 @@ mod tests {
         assert_eq!(
             keys.interpret(press(KeyCode::Char('d'))),
             Intent::NotYet("Ctrl+A d will detach; not built yet")
+        );
+        keys.interpret(ctrl('a'));
+        assert_eq!(
+            keys.interpret(press(KeyCode::Char('k'))),
+            Intent::NotYet("Ctrl+A k opens the heroic view; not built yet")
         );
     }
 

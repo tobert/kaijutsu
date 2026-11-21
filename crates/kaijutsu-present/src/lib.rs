@@ -20,6 +20,7 @@
 //! | [`kaish`] | a kaish command to a validity verdict |
 //! | [`action`] | the user-intent vocabulary every input device maps onto |
 //! | [`beats`] | per-track beat phasors and the pulse envelope |
+//! | [`work`] | `WorkStatus` → note visual state and performer slack/alarm |
 
 pub mod action;
 pub mod beats;
@@ -28,3 +29,4 @@ pub mod format;
 pub mod kaish;
 pub mod markdown;
 pub mod reader;
+pub mod work;

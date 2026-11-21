@@ -359,6 +359,12 @@ pub enum RpcResultMessage {
     TracksReceived {
         tracks: Vec<kaijutsu_client::TrackInfo>,
     },
+    /// Per-track work statuses polled via `kj transport work --track <id>`
+    /// for the heroic view (`view::heroic::live`).
+    TrackWorkReceived {
+        track_id: String,
+        statuses: Vec<kaijutsu_hyoushigi::WorkStatus>,
+    },
     /// The `Ctrl+Z` context toggle resolved on the kernel: the context to
     /// switch to (a live shell child, a shell's root, or one just created),
     /// or why the toggle refused or failed. Drained by
@@ -949,6 +955,7 @@ fn apply_theme_from_rpc(
     mut results: MessageReader<RpcResultMessage>,
     mut theme: ResMut<crate::ui::theme::Theme>,
     mut scene_palette: ResMut<crate::view::scene_palette::ScenePalette>,
+    mut heroic_palette: ResMut<crate::view::scene_palette::HeroicPalette>,
     mut error_queue: ResMut<crate::view::components::GlobalErrorQueue>,
     time: Res<Time>,
 ) {
@@ -958,8 +965,10 @@ fn apply_theme_from_rpc(
                 Ok(data) => {
                     *scene_palette =
                         crate::view::scene_palette::ScenePalette::from_scene_data(&data.scene);
+                    *heroic_palette =
+                        crate::view::scene_palette::HeroicPalette::from_heroic_data(&data.heroic);
                     *theme = crate::ui::theme::Theme::from(data);
-                    log::info!("applied theme from kernel config (RPC): UI + scene palette");
+                    log::info!("applied theme from kernel config (RPC): UI + scene + heroic palettes");
                 }
                 Err(e) => {
                     log::error!("theme.toml from kernel is unparseable: {e}");

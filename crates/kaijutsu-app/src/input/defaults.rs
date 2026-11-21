@@ -542,6 +542,69 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
+    // Heroic (Screen::Heroic — full-window 3D road, docs/newui.md)
+    // ====================================================================
+
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::Heroic,
+        Action::PopLevel,
+        "Clear selection or leave heroic view",
+    ));
+    b.push(Binding::key(
+        KeyCode::Enter,
+        InputContext::Heroic,
+        Action::Activate,
+        "Open selected performer context",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyR,
+        InputContext::Heroic,
+        Action::ReloadTheme,
+        "Reload theme.toml over RPC",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowRight,
+        InputContext::Heroic,
+        Action::StepNext,
+        "Next performer",
+    ));
+    b.push(Binding::key(
+        KeyCode::Tab,
+        InputContext::Heroic,
+        Action::StepNext,
+        "Next performer",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowLeft,
+        InputContext::Heroic,
+        Action::StepPrev,
+        "Previous performer",
+    ));
+    for (i, key) in [
+        KeyCode::Digit0,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        b.push(Binding::key(
+            key,
+            InputContext::Heroic,
+            Action::JumpSeat(i),
+            format!("Select performer {i}"),
+        ));
+    }
+
+    // ====================================================================
     // QuickContext (the Ctrl+A overlay, HELD via `Ctrl+A h`)
     // ====================================================================
     // The one binding this context carries. `UnpinQuickContext` rather than

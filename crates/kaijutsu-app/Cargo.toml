@@ -18,6 +18,7 @@ dynamic_linking = ["bevy/dynamic_linking"]
 kaijutsu-abc.workspace = true
 kaijutsu-audio.workspace = true
 kaijutsu-cas.workspace = true
+kaijutsu-hyoushigi.workspace = true
 kaijutsu-client = { workspace = true, features = ["cli"] }
 kaijutsu-diff = { workspace = true, features = ["viewer"] }
 kaijutsu-editor.workspace = true

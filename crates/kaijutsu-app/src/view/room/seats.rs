@@ -107,29 +107,15 @@ fn nick_draw(nick: &str, salt: u32) -> f32 {
     bearing::hash01(base.wrapping_add(salt.wrapping_mul(0x9E37_79B1)))
 }
 
-/// Deterministic hue in degrees `[0, 360)` for a peer's nick — same nick,
-/// same hue, every session (mission: "Amy learns 'that teal one is
-/// mcp/toad'"). The raw draw is pushed through one more golden-ratio
-/// fractional multiply before mapping to degrees: nicks whose FNV bytes
-/// happen to land close together (e.g. "mcp/toad" vs "mcp/toat") would
-/// otherwise often hash to adjacent, hard-to-distinguish hues; multiplying
-/// by an irrational constant and re-fracting is the standard "N distinct
-/// colors" decorrelation step — small input differences become large output
-/// differences.
-pub fn nick_hue_degrees(nick: &str) -> f32 {
-    const GOLDEN_RATIO: f32 = 1.618_034;
-    let draw = nick_draw(nick, 0);
-    (draw * GOLDEN_RATIO).fract() * 360.0
-}
-
-/// The identity linear-RGB color for a nick's wisp — [`nick_hue_degrees`] at
-/// a fixed saturation/lightness ([`SEAT_SATURATION`]/[`SEAT_LIGHTNESS`]),
-/// through `Color::hsl` (CSS-HSL, sRGB-referenced) → `to_linear()`, the
-/// scene's color-space contract (`scene_palette`'s module doc: "everything
-/// in this resource is linear").
+/// The identity linear-RGB color for a nick's wisp — uses the shared
+/// [`crate::view::scene_palette::identity_hue_degrees`] rule at a fixed
+/// saturation/lightness ([`SEAT_SATURATION`]/[`SEAT_LIGHTNESS`]).
 pub fn nick_identity_color(nick: &str) -> Vec3 {
-    let hue = nick_hue_degrees(nick);
-    let c = Color::hsl(hue, SEAT_SATURATION, SEAT_LIGHTNESS).to_linear();
+    let c = crate::view::scene_palette::identity_color_linear(
+        nick,
+        SEAT_SATURATION,
+        SEAT_LIGHTNESS,
+    );
     Vec3::new(c.red, c.green, c.blue)
 }
 
@@ -418,17 +404,21 @@ pub(crate) fn sync_seats(
 mod tests {
     use super::*;
 
-    // ── nick_hue_degrees ──
+    // ── identity hue (via scene_palette) ──
 
     #[test]
     fn hue_is_deterministic_for_the_same_nick() {
-        assert_eq!(nick_hue_degrees("mcp/toad"), nick_hue_degrees("mcp/toad"));
+        assert_eq!(
+            crate::view::scene_palette::identity_hue_degrees("mcp/toad"),
+            crate::view::scene_palette::identity_hue_degrees("mcp/toad")
+        );
+        assert_eq!(nick_identity_color("mcp/toad"), nick_identity_color("mcp/toad"));
     }
 
     #[test]
     fn hue_stays_in_degree_range() {
         for nick in ["mcp/toad", "kaijutsu-app", "mcp/toat", "acp/claude", ""] {
-            let hue = nick_hue_degrees(nick);
+            let hue = crate::view::scene_palette::identity_hue_degrees(nick);
             assert!((0.0..360.0).contains(&hue), "{nick} hue out of range: {hue}");
         }
     }
@@ -438,7 +428,10 @@ mod tests {
         let nicks = [
             "mcp/toad", "kaijutsu-app", "mcp/fern", "acp/claude", "mcp/newt", "mcp/moth", "mcp/wisp",
         ];
-        let hues: Vec<f32> = nicks.iter().map(|n| nick_hue_degrees(n)).collect();
+        let hues: Vec<f32> = nicks
+            .iter()
+            .map(|n| crate::view::scene_palette::identity_hue_degrees(n))
+            .collect();
         for i in 0..hues.len() {
             for j in (i + 1)..hues.len() {
                 assert!(
@@ -456,8 +449,8 @@ mod tests {
     fn similar_nicks_do_not_hash_to_adjacent_hues() {
         // The whole point of the golden-angle decorrelation step: two nicks
         // one byte apart must not produce two hues a few degrees apart.
-        let a = nick_hue_degrees("mcp/toad");
-        let b = nick_hue_degrees("mcp/toae");
+        let a = crate::view::scene_palette::identity_hue_degrees("mcp/toad");
+        let b = crate::view::scene_palette::identity_hue_degrees("mcp/toae");
         let diff = (a - b).abs();
         let wrapped = diff.min(360.0 - diff);
         assert!(wrapped > 5.0, "adjacent nicks landed suspiciously close: {a} vs {b}");

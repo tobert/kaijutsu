@@ -44,6 +44,9 @@ pub enum Screen {
     /// focused diff block in the conversation, left by `q`/`ZQ`/`:q` (never by
     /// Esc — the vi surface owns Esc while it is live).
     Diff,
+    /// The heroic view — full-window 3D anticipation & commitment road
+    /// (`docs/newui.md`, `view::heroic`). Reached by `Ctrl+A k`, left by `Esc`.
+    Heroic,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -100,6 +103,14 @@ impl Plugin for ScreenPlugin {
         // there is no second screen for a station dive to enter any more.
         app.add_systems(
             OnEnter(Screen::Room),
+            (hide_conversation_root, set_focus_conversation),
+        );
+
+        // ── Heroic ──
+        // Full-viewport 3D view (`view::heroic`): hide conversation chrome and
+        // park focus off Compose so keys route to `InputContext::Heroic`.
+        app.add_systems(
+            OnEnter(Screen::Heroic),
             (hide_conversation_root, set_focus_conversation),
         );
     }

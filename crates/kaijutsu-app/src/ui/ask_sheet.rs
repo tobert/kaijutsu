@@ -225,7 +225,7 @@ pub struct AskSheetSurface;
 /// is live, so the sheet stays down there and the ask waits — the hints line
 /// still carries `!n`.
 pub fn screen_allows_sheet(screen: Screen) -> bool {
-    matches!(screen, Screen::Conversation | Screen::Room)
+    matches!(screen, Screen::Conversation | Screen::Room | Screen::Heroic)
 }
 
 /// Whether [`refresh_aside`] would change anything — the guard that keeps

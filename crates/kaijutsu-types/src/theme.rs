@@ -228,6 +228,12 @@ pub struct ThemeData {
     /// parsing (the live kernel theme.toml predates it). See `docs/color.md`.
     #[serde(default)]
     pub scene: SceneData,
+
+    /// The heroic view (`[heroic]` table): framing targets, hues, OKLCH rainbow,
+    /// distance fog, element sizes, and motion durations. `serde(default)` so
+    /// existing host `theme.toml` files without `[heroic]` keep parsing.
+    #[serde(default)]
+    pub heroic: HeroicData,
 }
 
 impl Default for ThemeData {
@@ -376,6 +382,7 @@ impl Default for ThemeData {
             label_pad: 6.0,
 
             scene: SceneData::default(),
+            heroic: HeroicData::default(),
         }
     }
 }
@@ -603,6 +610,215 @@ impl Default for SceneLightingData {
     }
 }
 
+// ─── Heroic view (`[heroic]`) ────────────────────────────────────────────────
+
+/// `[heroic]` — tunables for the full-window 3D heroic view (`docs/newui.md`).
+/// Every field defaults to the shipped value so existing host themes without
+/// `[heroic]` deserialize cleanly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeroicData {
+    pub intensity: f32,
+    pub reduced_motion: bool,
+    pub display_offset_ms: i64,
+    pub alarm_beats: f32,
+    pub lane_width: f32,
+    pub road_seconds: f32,
+    pub units_per_second: f32,
+    pub unselected_opacity: f32,
+    pub framing: HeroicFramingData,
+    pub hues: HeroicHuesData,
+    pub rainbow: HeroicRainbowData,
+    pub fog: HeroicFogData,
+    pub sizes: HeroicSizesData,
+    pub durations_ms: HeroicDurationsData,
+}
+
+impl Default for HeroicData {
+    fn default() -> Self {
+        Self {
+            intensity: 0.6,
+            reduced_motion: false,
+            display_offset_ms: 0,
+            alarm_beats: 8.0,
+            lane_width: 1.0,
+            road_seconds: 20.0,
+            units_per_second: 1.8,
+            unselected_opacity: 0.3,
+            framing: HeroicFramingData::default(),
+            hues: HeroicHuesData::default(),
+            rainbow: HeroicRainbowData::default(),
+            fog: HeroicFogData::default(),
+            sizes: HeroicSizesData::default(),
+            durations_ms: HeroicDurationsData::default(),
+        }
+    }
+}
+
+/// `[heroic.framing]` — screen-fraction targets that solve the camera pose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeroicFramingData {
+    pub fov_degrees: f32,
+    pub horizon: f32,
+    pub strike_line: f32,
+    pub strike_width: f32,
+    pub orbit_radians: f32,
+}
+
+impl Default for HeroicFramingData {
+    fn default() -> Self {
+        Self {
+            fov_degrees: 58.0,
+            horizon: 0.67,
+            strike_line: 0.11,
+            strike_width: 0.55,
+            orbit_radians: 1.0,
+        }
+    }
+}
+
+/// `[heroic.hues]` — sRGB hex colors for the heroic view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeroicHuesData {
+    pub sky_top: String,
+    pub sky_mid: String,
+    pub sky_low: String,
+    pub horizon: String,
+    pub fog: String,
+    pub ground: String,
+    pub hill_fill: String,
+    pub rail: String,
+    pub beat_line: String,
+    pub sun: [String; 3],
+    pub trouble: String,
+    pub now: String,
+}
+
+impl Default for HeroicHuesData {
+    fn default() -> Self {
+        Self {
+            sky_top: "#06010f".into(),
+            sky_mid: "#1d0638".into(),
+            sky_low: "#5a0f6b".into(),
+            horizon: "#ff2e88".into(),
+            fog: "#2a0845".into(),
+            ground: "#0d0221".into(),
+            hill_fill: "#12041f".into(),
+            rail: "#00f0ff".into(),
+            beat_line: "#234a66".into(),
+            sun: ["#ffe66d".into(), "#ff5e8a".into(), "#c800ff".into()],
+            trouble: "#ff2020".into(),
+            now: "#ffffff".into(),
+        }
+    }
+}
+
+/// `[heroic.rainbow]` — OKLCH rainbow ramp parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeroicRainbowData {
+    pub lightness: f32,
+    pub chroma_min: f32,
+    pub chroma_max: f32,
+}
+
+impl Default for HeroicRainbowData {
+    fn default() -> Self {
+        Self {
+            lightness: 0.78,
+            chroma_min: 0.02,
+            chroma_max: 0.20,
+        }
+    }
+}
+
+/// `[heroic.fog]` — distance fog bounds in world units.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeroicFogData {
+    pub start: f32,
+    pub end: f32,
+}
+
+impl Default for HeroicFogData {
+    fn default() -> Self {
+        Self {
+            start: 18.0,
+            end: 55.0,
+        }
+    }
+}
+
+/// `[heroic.sizes]` — world-unit dimensions for road, performers, and environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeroicSizesData {
+    pub note_radius: f32,
+    pub note_height: f32,
+    pub pad_radius: f32,
+    pub performer_radius: f32,
+    pub cage_scale: f32,
+    pub hover_height: f32,
+    pub hop_arc: f32,
+    pub fire_height: f32,
+    pub fire_offset: f32,
+    pub hill_width: f32,
+    pub hill_length: f32,
+    pub hill_inner_edge: f32,
+    pub sun_diameter: f32,
+    pub sun_distance: f32,
+    pub ring_radius: f32,
+    pub panel_size: [f32; 2],
+    pub panel_yaw_degrees: f32,
+}
+
+impl Default for HeroicSizesData {
+    fn default() -> Self {
+        Self {
+            note_radius: 0.34,
+            note_height: 0.14,
+            pad_radius: 0.38,
+            performer_radius: 0.3,
+            cage_scale: 1.24,
+            hover_height: 0.34,
+            hop_arc: 0.45,
+            fire_height: 3.4,
+            fire_offset: 0.35,
+            hill_width: 26.0,
+            hill_length: 64.0,
+            hill_inner_edge: 6.0,
+            sun_diameter: 20.0,
+            sun_distance: 60.0,
+            ring_radius: 4.5,
+            panel_size: [2.35, 1.75],
+            panel_yaw_degrees: 16.0,
+        }
+    }
+}
+
+/// `[heroic.durations_ms]` — animation durations in milliseconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeroicDurationsData {
+    pub hop: u32,
+    pub pad_pulse: u32,
+    pub instruction_fall: u32,
+    pub performer_flare: u32,
+}
+
+impl Default for HeroicDurationsData {
+    fn default() -> Self {
+        Self {
+            hop: 150,
+            pad_pulse: 300,
+            instruction_fall: 700,
+            performer_flare: 800,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +860,54 @@ mod tests {
         assert_eq!(defaults.scene.hues.gold, deserialized.scene.hues.gold);
         assert_eq!(defaults.scene.tiers.crest, deserialized.scene.tiers.crest);
         assert_eq!(defaults.scene.post.tonemapper, deserialized.scene.post.tonemapper);
+        assert_eq!(defaults.heroic, deserialized.heroic);
+    }
+
+    #[test]
+    fn theme_without_heroic_section_still_parses() {
+        let stripped = DEFAULT_THEME_TOML
+            .split("\n[heroic]")
+            .next()
+            .unwrap()
+            .to_string();
+        let td: ThemeData = toml::from_str(&stripped)
+            .expect("a theme.toml without [heroic] must deserialize");
+        assert_eq!(td.heroic, HeroicData::default());
+    }
+
+    #[test]
+    fn partial_heroic_section_overrides_only_named_keys() {
+        let toml_src = format!(
+            "{}\n[heroic]\nintensity = 0.85\n[heroic.framing]\nhorizon = 0.55\n",
+            DEFAULT_THEME_TOML.split("\n[heroic]").next().unwrap()
+        );
+        let td: ThemeData = toml::from_str(&toml_src).unwrap();
+        assert_eq!(td.heroic.intensity, 0.85);
+        assert_eq!(td.heroic.framing.horizon, 0.55);
+        assert_eq!(td.heroic.framing.fov_degrees, HeroicFramingData::default().fov_degrees);
+        assert_eq!(td.heroic.hues, HeroicHuesData::default());
+    }
+
+    #[test]
+    fn unknown_heroic_key_is_refused() {
+        let base = DEFAULT_THEME_TOML.split("\n[heroic]").next().unwrap();
+        for table in [
+            "heroic",
+            "heroic.framing",
+            "heroic.hues",
+            "heroic.rainbow",
+            "heroic.fog",
+            "heroic.sizes",
+            "heroic.durations_ms",
+        ] {
+            let toml_src = format!("{base}\n[{table}]\nretired_key = 1\n");
+            let err = toml::from_str::<ThemeData>(&toml_src)
+                .expect_err(&format!("an unknown [{table}] key must not load"));
+            assert!(
+                err.to_string().contains("retired_key"),
+                "[{table}] error names the key: {err}"
+            );
+        }
     }
 
     #[test]

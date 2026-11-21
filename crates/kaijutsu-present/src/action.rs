@@ -209,6 +209,10 @@ pub enum Action {
     CloseAndDemoteContext,
     /// `Ctrl+A w` / `Ctrl+A "` / gamepad Start — go to the well, from anywhere.
     GoToWell,
+    /// `Ctrl+A k` — enter the heroic view (`Screen::Heroic`).
+    GoToHeroic,
+    /// `r` in the heroic view — re-fetch `theme.toml` over RPC for live tuning.
+    ReloadTheme,
     /// `Ctrl+A d` — detach: back to the Conversation view from any scene or
     /// the editor (the editor session stays alive, suspend-style).
     DetachToConversation,

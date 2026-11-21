@@ -932,7 +932,7 @@ pub fn handle_dock_click(
 /// attached: both render content *of* the active context.
 pub(crate) fn hud_detached(screen: crate::ui::screen::Screen) -> bool {
     use crate::ui::screen::Screen;
-    matches!(screen, Screen::Room)
+    matches!(screen, Screen::Room | Screen::Heroic)
 }
 
 /// The mode slot's label while the room owns the viewport: where you are,
@@ -997,6 +997,7 @@ pub fn update_mode(
         Screen::Editor | Screen::Diff => (theme.mode_normal, &theme.mode_label_normal),
         // Detached screens: the slot names the place, not a mode.
         Screen::Room => (theme.accent, room_slot_label(room.zoomed)),
+        Screen::Heroic => (theme.accent, "HEROIC"),
     };
 
     if dock.mode.text != label || dock.mode.color != color {
@@ -2152,6 +2153,7 @@ pub fn update_hints(
             // surface-only keys.
             Some(_) => "\u{2191}/Esc: room",
         },
+        Screen::Heroic => "0-9/\u{2190}\u{2192}: select \u{2502} r: reload theme \u{2502} Esc: clear / leave",
     };
 
     let text = hints_with_notice(hints, ledger.pending_count(), notice);

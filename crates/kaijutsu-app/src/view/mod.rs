@@ -30,6 +30,7 @@ pub mod document;
 pub mod diff_view;
 pub mod editor;
 pub mod geometry;
+pub mod heroic;
 pub mod lifecycle;
 pub mod overlay;
 pub mod render_store;

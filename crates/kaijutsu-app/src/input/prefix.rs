@@ -98,6 +98,7 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // w and " — the well (the window list IS the well); ' — the
         // switch-by-prompt (screen's `'` select).
         KeyCode::KeyW => Some(Action::GoToWell),
+        KeyCode::KeyK => Some(Action::GoToHeroic),
         KeyCode::Quote if shift => Some(Action::GoToWell),
         KeyCode::Quote => Some(Action::PromptContextSwitch),
         // n / p — walk ring-0 seats.
@@ -175,6 +176,7 @@ mod tests {
     fn well_chords() {
         assert_eq!(resolve_chord(KeyCode::KeyW, false, false), Some(Action::GoToWell));
         assert_eq!(resolve_chord(KeyCode::Quote, false, true), Some(Action::GoToWell));
+        assert_eq!(resolve_chord(KeyCode::KeyK, false, false), Some(Action::GoToHeroic));
     }
 
     #[test]

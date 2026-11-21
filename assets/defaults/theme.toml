@@ -232,3 +232,72 @@ key_light_intensity = 5.0e8  # lumens; large — the room is ~1300 units, not me
 key_light_range = 2000.0     # cutoff radius, covers the floor disc and walls
 ambient_color = "#ffe6cc"    # faint warm fill so far walls are not pure black
 ambient_brightness = 150.0
+
+# ─── The heroic view (docs/newui.md) ─────────────────────────────────────────
+# Every field defaults cleanly if absent so existing host theme.toml files
+# continue to load without reseeding.
+
+[heroic]
+intensity = 0.6
+reduced_motion = false
+display_offset_ms = 0
+alarm_beats = 8.0            # alarm threshold until a performer has a measured lead
+lane_width = 1.0
+road_seconds = 20.0          # how much future the road shows
+units_per_second = 1.8       # 0.9 per beat at 120 bpm
+unselected_opacity = 0.3
+
+[heroic.framing]
+fov_degrees = 58.0
+horizon = 0.67               # fraction of frame height from the bottom
+strike_line = 0.11           # fraction of frame height from the bottom
+strike_width = 0.55          # fraction of frame width the strike line spans
+orbit_radians = 1.0          # how far the player may orbit left or right
+
+[heroic.hues]
+sky_top = "#06010f"          # also the clear color while the view is open
+sky_mid = "#1d0638"
+sky_low = "#5a0f6b"
+horizon = "#ff2e88"          # horizon glow and grid magenta
+fog = "#2a0845"
+ground = "#0d0221"
+hill_fill = "#12041f"
+rail = "#00f0ff"
+beat_line = "#234a66"
+sun = ["#ffe66d", "#ff5e8a", "#c800ff"]
+trouble = "#ff2020"
+now = "#ffffff"
+
+[heroic.rainbow]
+lightness = 0.78
+chroma_min = 0.02
+chroma_max = 0.20
+
+[heroic.fog]
+start = 18.0
+end = 55.0
+
+[heroic.sizes]
+note_radius = 0.34
+note_height = 0.14
+pad_radius = 0.38
+performer_radius = 0.3
+cage_scale = 1.24
+hover_height = 0.34
+hop_arc = 0.45
+fire_height = 3.4
+fire_offset = 0.35           # outside the road edge
+hill_width = 26.0
+hill_length = 64.0
+hill_inner_edge = 6.0        # from the road center
+sun_diameter = 20.0
+sun_distance = 60.0
+ring_radius = 4.5
+panel_size = [2.35, 1.75]
+panel_yaw_degrees = 16.0
+
+[heroic.durations_ms]
+hop = 150
+pad_pulse = 300
+instruction_fall = 700
+performer_flare = 800

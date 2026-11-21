@@ -35,6 +35,8 @@ pub enum InputContext {
     /// Screen::Room, zoomed into a station with no keyboard of its own
     /// (Radiators)
     StationZoomed,
+    /// Screen::Heroic — the 3D anticipation & commitment road (`docs/newui.md`)
+    Heroic,
     /// The quick-context overlay is HELD (`Ctrl+A h`, `ui::quick_context`).
     /// Active on top of whatever surface is underneath, and outranked only
     /// by `Dialog` — a modal still owns Esc. Its single binding is Esc →
@@ -156,7 +158,7 @@ pub fn derive_contexts(
     // live, and under its grab only Global bindings match anyway. The raise
     // logic already declines those screens; this arm makes the doctrine hold
     // even if it did not.
-    if matches!(screen, Screen::Conversation | Screen::Room)
+    if matches!(screen, Screen::Conversation | Screen::Room | Screen::Heroic)
         && let Some(claimant) = approval.claimant()
     {
         let mut contexts = vec![InputContext::Global, claimant];
@@ -200,6 +202,11 @@ pub fn derive_contexts(
                 Some(Station::TimeWell) => InputContext::WellZoomed,
                 Some(_) => InputContext::StationZoomed,
             });
+            return (contexts, KeyboardGrab::None);
+        }
+
+        Screen::Heroic => {
+            contexts.push(InputContext::Heroic);
             return (contexts, KeyboardGrab::None);
         }
 
@@ -350,6 +357,20 @@ mod tests {
         );
         assert!(ctxs.contains(&InputContext::StationZoomed));
         assert!(!ctxs.contains(&InputContext::WellZoomed));
+    }
+
+    #[test]
+    fn heroic_derives_heroic_context_with_no_grab() {
+        let (ctxs, grab) = derive_contexts(
+            Screen::Heroic,
+            None,
+            &FocusArea::Conversation,
+            false,
+            surfaces(false, false),
+        );
+        assert!(ctxs.contains(&InputContext::Heroic));
+        assert!(!ctxs.contains(&InputContext::Navigation));
+        assert_eq!(grab, KeyboardGrab::None);
     }
 
     /// A held quick-context overlay adds its context ON TOP of whatever

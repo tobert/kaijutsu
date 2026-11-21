@@ -382,7 +382,11 @@ pub fn sync_card_live_uniforms(
         let beat = quantize(beats.envelope(beat_key, now));
         let border = match tracks.track_of.get(&card.context_id) {
             Some(track_id) => {
-                let c = super::scene::accent_color(track_id).to_linear();
+                let c = crate::view::scene_palette::identity_color_linear(
+                    track_id,
+                    super::scene::ACCENT_SATURATION,
+                    super::scene::ACCENT_LIGHTNESS,
+                );
                 Vec4::new(c.red, c.green, c.blue, TRACK_BORDER_STRENGTH)
             }
             None => Vec4::ZERO,

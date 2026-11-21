@@ -184,25 +184,28 @@ fn cache_with_bevy_libraries() -> (Cache, u128) {
     (cache, next_id)
 }
 
-/// Composes one shader under `defs`, with all sibling `.wesl` assets
-/// registered at their asset paths (`shaders/<name>.wesl`).
+/// Composes one shader under `defs`, with all `.wesl` assets under
+/// `assets/shaders/` (including subdirectories like `kaijutsu/` and `heroic/`)
+/// registered at their asset paths (`shaders/<rel>.wesl`).
 fn compose(file: &str, defs: &[ShaderDefVal]) -> Result<Arc<String>, ShaderCacheError> {
     let (mut cache, mut next_id) = cache_with_bevy_libraries();
     let shader_dir = workspace_root().join("assets/shaders");
+    let mut files = Vec::new();
+    collect_wesl(&shader_dir, &mut files);
     let mut root_id = None;
-    for entry in std::fs::read_dir(&shader_dir).expect("read assets/shaders") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().is_none_or(|e| e != "wesl") {
-            continue;
-        }
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+    for path in files {
+        let rel = path
+            .strip_prefix(&shader_dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         let source = std::fs::read_to_string(&path).expect("read shader");
         let id = asset_id(next_id);
         next_id += 1;
-        if name == file {
+        if rel == file {
             root_id = Some(id);
         }
-        cache.set_shader(id, Shader::from_wesl(source, format!("shaders/{name}")));
+        cache.set_shader(id, Shader::from_wesl(source, format!("shaders/{rel}")));
     }
     let root_id = root_id.unwrap_or_else(|| panic!("no assets/shaders/{file}"));
     cache.get(0, root_id, defs)
@@ -233,9 +236,12 @@ fn mesh_material_shaders_compose() {
         "terrace_ring.wesl",
         "trace_glow.wesl",
         "well_card.wesl",
+        "heroic/sun.wesl",
+        "heroic/fire.wesl",
     ] {
         assert_composes(file, &mesh_material_defs(), &["fragment"]);
     }
+    assert_composes("heroic/hills.wesl", &mesh_material_defs(), &["vertex", "fragment"]);
 }
 
 #[test]

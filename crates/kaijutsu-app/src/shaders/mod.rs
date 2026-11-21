@@ -4,6 +4,7 @@
 //! post-processing (SDF border glow, animation, text halo, cursor beam).
 
 pub mod block_fx_material;
+pub mod heroic_materials;
 pub mod selection;
 pub mod terrace_ring_material;
 pub mod trace_glow_material;
@@ -17,6 +18,7 @@ mod shader_assets_test;
 use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;
+pub use heroic_materials::{HeroicFireMaterial, HeroicHillsMaterial, HeroicSunMaterial};
 pub use selection::{SelectionRect, SelectionRects, pack_selection_rects};
 pub use terrace_ring_material::TerraceRingMaterial;
 pub use trace_glow_material::TraceGlowMaterial;

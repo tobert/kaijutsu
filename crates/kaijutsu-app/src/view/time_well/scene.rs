@@ -2370,7 +2370,11 @@ pub fn move_cards_toward_target(time: Res<Time>, mut cards: Query<(&mut Transfor
 /// linear, correct for `WellCardMaterial`'s uniform (the 3D scene lane wants
 /// linear values, docs/color.md). Verified correct; no fix needed.
 pub fn accent_vec4(accent: &str) -> Vec4 {
-    let c = accent_color(accent).to_linear();
+    let c = crate::view::scene_palette::identity_color_linear(
+        accent,
+        ACCENT_SATURATION,
+        ACCENT_LIGHTNESS,
+    );
     Vec4::new(c.red, c.green, c.blue, 0.94)
 }
 
@@ -2561,16 +2565,5 @@ fn card_block_mesh() -> Mesh {
 /// FNV→hue hashing itself). Shared by the rim cards' body/track-hue border
 /// (`accent_vec4`, [`super::live::sync_card_live_uniforms`]) and the track
 /// rays (`super::rays::sync_track_rays`). **Amy-tunable.**
-const ACCENT_SATURATION: f32 = 0.42;
-const ACCENT_LIGHTNESS: f32 = 0.45;
-
-pub fn accent_color(accent: &str) -> Color {
-    // FNV-1a over the bytes → hue. Stable, dependency-free.
-    let mut h: u32 = 2166136261;
-    for b in accent.bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(16777619);
-    }
-    let hue = (h % 360) as f32;
-    Color::hsl(hue, ACCENT_SATURATION, ACCENT_LIGHTNESS)
-}
+pub(super) const ACCENT_SATURATION: f32 = 0.42;
+pub(super) const ACCENT_LIGHTNESS: f32 = 0.45;

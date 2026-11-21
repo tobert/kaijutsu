@@ -6592,6 +6592,7 @@ dependencies = [
  "kaijutsu-client",
  "kaijutsu-diff",
  "kaijutsu-editor",
+ "kaijutsu-hyoushigi",
  "kaijutsu-kernel",
  "kaijutsu-present",
  "kaijutsu-telemetry",
@@ -6928,6 +6929,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_reflect",
  "kaijutsu-audio",
+ "kaijutsu-hyoushigi",
  "kaijutsu-types",
  "kaish-kernel",
  "pulldown-cmark",

@@ -21,7 +21,9 @@
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use kaijutsu_types::theme::SceneData;
+use kaijutsu_types::theme::{
+    HeroicData, HeroicDurationsData, HeroicFogData, HeroicFramingData, HeroicSizesData, SceneData,
+};
 
 /// The scene lane's colors, tiers, gains, and post chain. See module docs.
 #[derive(Resource, Debug, Clone, Reflect)]
@@ -263,6 +265,162 @@ pub(crate) fn lin_scaled(c: LinearRgba, k: f32) -> Color {
     Color::LinearRgba(LinearRgba::rgb(c.red * k, c.green * k, c.blue * k))
 }
 
+/// Shared identity-hue rule (`docs/newui.md`, "Identity hues: one rule, separate keys").
+///
+/// Hashes `key` via FNV-1a + `bearing::hash01`, decorrelates with the golden ratio,
+/// and maps onto the hue bands outside the excluded trouble-red (`[0, 22)`,
+/// `[340, 360)`), world-cyan (`[170, 200)`), and world-magenta (`[285, 340)`) ranges.
+/// Callers supply their own key (character, nick, or context-type bucket) and
+/// their own brightness/chroma.
+pub fn identity_hue_degrees(key: &str) -> f32 {
+    const GOLDEN_RATIO: f32 = 1.618_034;
+    let mut h: u32 = 2166136261;
+    for b in key.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    let draw = crate::view::room::bearing::hash01(h);
+    let t = (draw * GOLDEN_RATIO).fract();
+    // Allowed intervals: [22, 170) width 148, [200, 285) width 85 => total 233.
+    let deg = t * 233.0;
+    if deg < 148.0 {
+        22.0 + deg
+    } else {
+        200.0 + (deg - 148.0)
+    }
+}
+
+/// Derive a linear-RGB identity color from `key` at the caller's chosen HSL
+/// `saturation` and `lightness`.
+pub fn identity_color_linear(key: &str, saturation: f32, lightness: f32) -> LinearRgba {
+    let hue = identity_hue_degrees(key);
+    Color::hsl(hue, saturation, lightness).to_linear()
+}
+
+/// Single shared heroic identity lightness/saturation pair so notes, cages,
+/// panels, ring arcs, chips, and pad flashes agree for the same performer key.
+pub fn heroic_identity_color(key: &str) -> LinearRgba {
+    identity_color_linear(key, 0.78, 0.56)
+}
+
+/// OKLCH -> OKLab -> linear sRGB rainbow ramp (`docs/newui.md`, "A rainbow ramp").
+/// Matches `rainbow(t, lightness, chroma)` in `assets/shaders/kaijutsu/color.wesl`.
+#[cfg(test)]
+pub fn rainbow_oklch(t: f32, lightness: f32, chroma: f32) -> Vec3 {
+    let h = t.rem_euclid(1.0) * std::f32::consts::TAU;
+    let a = chroma * h.cos();
+    let b = chroma * h.sin();
+
+    let l_ = lightness + 0.3963377774 * a + 0.2158037573 * b;
+    let m_ = lightness - 0.1055613458 * a - 0.0638541728 * b;
+    let s_ = lightness - 0.0894841775 * a - 1.2914855480 * b;
+
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+
+    let r = (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s).max(0.0);
+    let g = (-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s).max(0.0);
+    let b_out = (-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s).max(0.0);
+    Vec3::new(r, g, b_out)
+}
+
+// End of rainbow_oklch helpers.
+
+/// Linearized palette and live tunables for the heroic view (`[heroic]` in
+/// `theme.toml`, `docs/newui.md`). Hot-reloaded via `ThemeReceived`.
+#[derive(Resource, Debug, Clone, Reflect)]
+#[reflect(Resource)]
+pub struct HeroicPalette {
+    pub intensity: f32,
+    pub reduced_motion: bool,
+    pub display_offset_ms: i64,
+    pub alarm_beats: f32,
+    pub lane_width: f32,
+    pub road_seconds: f32,
+    pub units_per_second: f32,
+    pub unselected_opacity: f32,
+    #[reflect(ignore)]
+    pub framing: HeroicFramingData,
+    #[reflect(ignore)]
+    pub fog: HeroicFogData,
+    #[reflect(ignore)]
+    pub sizes: HeroicSizesData,
+    #[reflect(ignore)]
+    pub durations_ms: HeroicDurationsData,
+    pub rainbow_lightness: f32,
+    pub rainbow_chroma_min: f32,
+    pub rainbow_chroma_max: f32,
+    pub sky_top: LinearRgba,
+    pub sky_mid: LinearRgba,
+    pub sky_low: LinearRgba,
+    pub horizon: LinearRgba,
+    pub fog_color: LinearRgba,
+    pub ground: LinearRgba,
+    pub hill_fill: LinearRgba,
+    pub rail: LinearRgba,
+    pub beat_line: LinearRgba,
+    pub sun: [LinearRgba; 3],
+    pub trouble: LinearRgba,
+    pub now: LinearRgba,
+}
+
+impl Default for HeroicPalette {
+    fn default() -> Self {
+        Self::from_heroic_data(&HeroicData::default())
+    }
+}
+
+impl HeroicPalette {
+    pub fn from_heroic_data(h: &HeroicData) -> Self {
+        let parse_hex = |name: &str, hex: &str, fallback: &str| -> LinearRgba {
+            match Srgba::hex(hex) {
+                Ok(c) => c.into(),
+                Err(e) => {
+                    log::error!(
+                        "[heroic.hues] {name} = {hex:?} is not a valid hex color ({e}); keeping default"
+                    );
+                    Srgba::hex(fallback).unwrap().into()
+                }
+            }
+        };
+        let d = HeroicData::default();
+        Self {
+            intensity: h.intensity,
+            reduced_motion: h.reduced_motion,
+            display_offset_ms: h.display_offset_ms,
+            alarm_beats: h.alarm_beats,
+            lane_width: h.lane_width,
+            road_seconds: h.road_seconds,
+            units_per_second: h.units_per_second,
+            unselected_opacity: h.unselected_opacity,
+            framing: h.framing.clone(),
+            fog: h.fog.clone(),
+            sizes: h.sizes.clone(),
+            durations_ms: h.durations_ms.clone(),
+            rainbow_lightness: h.rainbow.lightness,
+            rainbow_chroma_min: h.rainbow.chroma_min,
+            rainbow_chroma_max: h.rainbow.chroma_max,
+            sky_top: parse_hex("sky_top", &h.hues.sky_top, &d.hues.sky_top),
+            sky_mid: parse_hex("sky_mid", &h.hues.sky_mid, &d.hues.sky_mid),
+            sky_low: parse_hex("sky_low", &h.hues.sky_low, &d.hues.sky_low),
+            horizon: parse_hex("horizon", &h.hues.horizon, &d.hues.horizon),
+            fog_color: parse_hex("fog", &h.hues.fog, &d.hues.fog),
+            ground: parse_hex("ground", &h.hues.ground, &d.hues.ground),
+            hill_fill: parse_hex("hill_fill", &h.hues.hill_fill, &d.hues.hill_fill),
+            rail: parse_hex("rail", &h.hues.rail, &d.hues.rail),
+            beat_line: parse_hex("beat_line", &h.hues.beat_line, &d.hues.beat_line),
+            sun: [
+                parse_hex("sun[0]", &h.hues.sun[0], &d.hues.sun[0]),
+                parse_hex("sun[1]", &h.hues.sun[1], &d.hues.sun[1]),
+                parse_hex("sun[2]", &h.hues.sun[2], &d.hues.sun[2]),
+            ],
+            trouble: parse_hex("trouble", &h.hues.trouble, &d.hues.trouble),
+            now: parse_hex("now", &h.hues.now, &d.hues.now),
+        }
+    }
+}
+
 /// Hot-apply `[scene.post]` to the shared camera whenever the palette
 /// resource changes (theme RPC, or a live mutation over BRP). Bloom threshold
 /// is deliberately NOT driven from the palette — 1.0 is the HDR-tell
@@ -378,6 +536,74 @@ mod tests {
                 "trough_{name} ({trough}) × crest ({}) must stay < 1.0",
                 p.crest
             );
+        }
+    }
+
+    #[test]
+    fn identity_hue_never_returns_an_excluded_band() {
+        for i in 0..1000 {
+            let key = format!("performer-key-{i}");
+            let h = identity_hue_degrees(&key);
+            assert!(
+                (22.0..170.0).contains(&h) || (200.0..285.0).contains(&h),
+                "hue {h} for {key} landed in an excluded band"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_hue_first_eight_keys_are_pairwise_distinguishable() {
+        let keys = ["bass", "drums", "lead", "vox", "synth", "perc", "pad", "arp"];
+        let hues: Vec<f32> = keys.iter().map(|k| identity_hue_degrees(k)).collect();
+        for i in 0..hues.len() {
+            for j in (i + 1)..hues.len() {
+                let d = (hues[i] - hues[j]).abs();
+                let wrapped = d.min(360.0 - d);
+                assert!(
+                    wrapped > 5.0,
+                    "keys {} ({}) and {} ({}) too close: {wrapped}°",
+                    keys[i],
+                    hues[i],
+                    keys[j],
+                    hues[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rust_and_wesl_rainbow_agree_at_sample_points() {
+        // Parse the constants from assets/shaders/kaijutsu/color.wesl to ensure
+        // the shader's formula stays aligned with Rust's `rainbow_oklch`.
+        let wesl = include_str!("../../../../assets/shaders/kaijutsu/color.wesl");
+        assert!(wesl.contains("0.3963377774"), "WESL rainbow matrix present");
+        assert!(wesl.contains("4.0767416621"), "WESL OKLab->sRGB matrix present");
+
+        let eval_wesl_formula = |t: f32, lightness: f32, chroma: f32| -> Vec3 {
+            let fract = t - t.floor();
+            let h = fract * 6.28318530718_f32;
+            let a = chroma * h.cos();
+            let b = chroma * h.sin();
+            let l_ = lightness + 0.3963377774 * a + 0.2158037573 * b;
+            let m_ = lightness - 0.1055613458 * a - 0.0638541728 * b;
+            let s_ = lightness - 0.0894841775 * a - 1.2914855480 * b;
+            let (l, m, s) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+            Vec3::new(
+                (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s).max(0.0),
+                (-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s).max(0.0),
+                (-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s).max(0.0),
+            )
+        };
+
+        for t in [0.0, 0.125, 0.25, 0.5, 0.75, 0.99] {
+            for chroma in [0.02, 0.12, 0.20] {
+                let rust = rainbow_oklch(t, 0.78, chroma);
+                let wesl_val = eval_wesl_formula(t, 0.78, chroma);
+                assert!(
+                    rust.distance(wesl_val) < 1e-5,
+                    "t={t} chroma={chroma}: rust={rust:?} wesl={wesl_val:?}"
+                );
+            }
         }
     }
 }

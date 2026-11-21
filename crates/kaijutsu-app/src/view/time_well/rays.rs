@@ -401,7 +401,11 @@ pub fn sync_track_rays(
     let mesh = state.ray_mesh.get_or_insert_with(|| meshes.add(spiral_ribbon_mesh())).clone();
     for t in new {
         let angle = ray_angle(&t.id);
-        let c = super::scene::accent_color(&t.id).to_linear();
+        let c = crate::view::scene_palette::identity_color_linear(
+            &t.id,
+            super::scene::ACCENT_SATURATION,
+            super::scene::ACCENT_LIGHTNESS,
+        );
         let material = materials.add(TrackRayMaterial::new(Vec4::new(
             c.red, c.green, c.blue, 0.85,
         )));

@@ -4,7 +4,7 @@
 
 App input flows through a central action table that maps key combinations to `ActionFired` events handled by specific input contexts (`InputContext`). 
 - **Vi editor:** Only the vi editor grabs raw keyboard input directly. Vi owns `Esc` where live; elsewhere, an `Esc` triggers a `PopLevel` action.
-- **Muscle memory:** Standard screen/tmux `Ctrl+A` bindings and standard vi keybindings are preserved.
+- **Muscle memory:** Standard screen/tmux `Ctrl+A` bindings and standard vi keybindings are preserved. `Ctrl+A k` enters the heroic view (`Screen::Heroic` in the app; "not built yet" notice in the tui).
 
 ## The vi editor and registers
 
