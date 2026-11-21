@@ -14,7 +14,7 @@ use kaijutsu_audio::RENDER_FLUSH_MIME;
 use kaijutsu_client::ServerEvent;
 use kaijutsu_hyoushigi::{Disposition, FallbackReason, WorkStatus};
 use kaijutsu_present::work::compute_performer_slack;
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{BlockKind, ContextId, Role};
 
 use super::state::{
     ConstellationStar, HeroicLane, HeroicPerformer, HeroicState, PadFlashEvent,
@@ -169,42 +169,81 @@ pub fn apply_heroic_work_results(
     }
 }
 
-/// Ingest `RenderCue` onsets into `HeroicState::band_energies` and pad flashes
-/// (`docs/newui.md`, "Band energies").
+/// Ingest `RenderCue` onsets into `HeroicState::band_energies` and pad flashes,
+/// plus live instruction blocks into falling [`super::state::HeroicInstruction`] markers
+/// (`docs/newui.md`, "Band energies", "On the road").
 pub fn ingest_heroic_cues(
     mut events: MessageReader<ServerEventMessage>,
+    time: Res<Time>,
     tracks: Res<WellTracks>,
     palette: Res<HeroicPalette>,
     mut state: ResMut<HeroicState>,
 ) {
+    let now_secs = time.elapsed_secs_f64();
     for ServerEventMessage(ev) in events.read() {
-        if let ServerEvent::RenderCue { context_id, cue } = ev {
-            if cue.mime == RENDER_FLUSH_MIME {
-                continue;
-            }
-            if let Some(track_id) = tracks.track_of.get(context_id)
-                && let Some(li) = tracks
-                    .tracks
-                    .iter()
-                    .filter(|t| t.playing)
-                    .position(|t| &t.id == track_id)
-            {
-                let band = (li * 4).min(15);
-                state.band_energies[band] = (state.band_energies[band] + 0.9).min(1.5);
-                if band > 0 {
-                    state.band_energies[band - 1] =
-                        (state.band_energies[band - 1] + 0.45).min(1.5);
+        match ev {
+            ServerEvent::RenderCue { context_id, cue } => {
+                if cue.mime == RENDER_FLUSH_MIME {
+                    continue;
                 }
-                if band + 1 < 16 {
-                    state.band_energies[band + 1] =
-                        (state.band_energies[band + 1] + 0.45).min(1.5);
+                if let Some(track_id) = tracks.track_of.get(context_id)
+                    && let Some(li) = tracks
+                        .tracks
+                        .iter()
+                        .filter(|t| t.playing)
+                        .position(|t| &t.id == track_id)
+                {
+                    let band = (li * 4).min(15);
+                    state.band_energies[band] = (state.band_energies[band] + 0.9).min(1.5);
+                    if band > 0 {
+                        state.band_energies[band - 1] =
+                            (state.band_energies[band - 1] + 0.45).min(1.5);
+                    }
+                    if band + 1 < 16 {
+                        state.band_energies[band + 1] =
+                            (state.band_energies[band + 1] + 0.45).min(1.5);
+                    }
+                    state.pending_flashes.push(PadFlashEvent {
+                        lane_idx: li,
+                        color: palette.now,
+                        hollow: false,
+                    });
                 }
-                state.pending_flashes.push(PadFlashEvent {
-                    lane_idx: li,
-                    color: palette.now,
-                    hollow: false,
-                });
             }
+            ServerEvent::BlockInserted { context_id, block, .. } => {
+                let is_instruction = block.kind == BlockKind::Drift
+                    || (block.role == Role::User
+                        && block.kind == BlockKind::Text
+                        && !block.content.starts_with("Commit at tick "));
+                if is_instruction {
+                    let label: String = block
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(40)
+                        .collect();
+                    for lane in &mut state.lanes {
+                        let bpp = lane.beats_per_phrase.max(1) as f64;
+                        let target_beat = ((lane.playhead_beats / bpp).floor() + 1.0) * bpp;
+                        for perf in &mut lane.performers {
+                            if perf.context_id == *context_id {
+                                let next_id =
+                                    perf.instructions.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+                                perf.instructions.push(super::state::HeroicInstruction {
+                                    id: next_id,
+                                    label: label.clone(),
+                                    target_beat,
+                                    spawned_at_secs: now_secs,
+                                    heard: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -374,13 +413,17 @@ pub fn sync_heroic_state(
                     } else {
                         (None, Some(cur_phrase), 0.0)
                     };
-                    (
-                        prev.instructions,
-                        (prev.flare_remaining - dt).max(0.0),
-                        hf,
-                        ht,
-                        he,
-                    )
+                    let flare_dur = (palette.durations_ms.performer_flare as f32 / 1000.0).max(0.4);
+                    let mut flare = (prev.flare_remaining - dt).max(0.0);
+                    let mut instrs = prev.instructions;
+                    instrs.retain(|instr| instr.target_beat >= playhead_beats - bpp as f64);
+                    for instr in &mut instrs {
+                        if !instr.heard && playhead_beats >= instr.target_beat {
+                            instr.heard = true;
+                            flare = flare_dur;
+                        }
+                    }
+                    (instrs, flare, hf, ht, he)
                 } else {
                     (Vec::new(), 0.0, None, Some(cur_phrase), 0.0)
                 };

@@ -1,0 +1,35 @@
+{
+  "instructions": "You are the drummer in a tune in E minor, 4/4. Keep a steady kick, snare, and hi-hat pocket across most 8-bar phrases. When an instruction asks for a 2-bar fill every 32 or 64 bars (or on every 4th/8th phrase boundary), choose a bar-7 fill option followed by a bar-8 fill option across bars 7 and 8; otherwise hold the groove cleanly through bar 8.",
+  "input_label": "The phrase so far",
+  "question": "The drum bar to play next.",
+  "prefix": "X:1\n%%MIDI channel 10\nM:4/4\nL:1/8\nK:C\n",
+  "join": " | ",
+  "suffix": " |]",
+  "shuffle": 2,
+  "history_messages": 8,
+  "no_repeat": true,
+  "options": {
+    "p0": {"means": "standard kick-snare backbeat with closed hi-hat quarters", "text": "[C,,^F,,]2 ^F,,2 [D,,^F,,]2 ^F,,2"},
+    "p1": {"means": "downbeat crash accent into steady kick-snare groove", "text": "[C,,^C,]2 ^F,,2 [D,,^F,,]2 ^F,,2"},
+    "p2": {"means": "driving eighth-note hi-hat pocket with kick pickups", "text": "[C,,^F,,]^F,, [C,,^F,,]^F,, [D,,^F,,]^F,, [C,,^F,,]^F,,"},
+    "p3": {"means": "syncopated kick push with open hi-hat lift on beat 4", "text": "[C,,^F,,]2 ^F,,[C,,^F,,] [D,,^F,,]2 ^F,,_B,,"},
+    "p4": {"means": "ride cymbal pocket keeping quiet time", "text": "[C,,_E,]2 _E,2 [D,,_E,]2 _E,2"},
+    "p5": {"means": "ghosted snare turnaround into eighth kick", "text": "[C,,^F,,]2 ^F,,2 [D,,^F,,]^F,, C,,^F,,"},
+    "p6": {"means": "spacious half-time breath", "text": "[C,,^F,,]2 z2 [D,,^F,,]2 z2"},
+    "p7": {"means": "double-backbeat snare push on beat 4", "text": "[C,,^F,,]2 ^F,,[C,,^F,,] [D,,^F,,]2 [D,,^F,,]^F,,"},
+    "p8": {"means": "2-bar fill part 1 (bar 7): pocket into snare & high-tom build", "text": "[C,,^F,,]2 ^F,,2 D,,D,, C,C,"},
+    "p9": {"means": "2-bar fill part 1 (bar 7): rolling snare & high/mid tom fill", "text": "[C,,^F,,]2 D,,D,, D,D, B,,B,,"},
+    "p10": {"means": "2-bar fill part 2 (bar 8): descending tom cascade into crash setup", "text": "D,,D,, C,C, B,,B,, [A,,^C,]2"},
+    "p11": {"means": "2-bar fill part 2 (bar 8): big snare-tom climax for bar 1 crash", "text": "D,,2 [D,,B,,]2 A,,A,, [C,,D,,^C,]2"}
+  },
+  "slots": [
+    {"case": "Bar 1 of 8.", "options": ["p0", "p1", "p2", "p4"]},
+    {"case": "Bar 2 of 8.", "options": ["p0", "p2", "p3", "p4", "p6"]},
+    {"case": "Bar 3 of 8.", "options": ["p0", "p2", "p3", "p4", "p5", "p7"]},
+    {"case": "Bar 4 of 8, midpoint.", "options": ["p0", "p3", "p5", "p6", "p7"]},
+    {"case": "Bar 5 of 8.", "options": ["p0", "p1", "p2", "p4"]},
+    {"case": "Bar 6 of 8.", "options": ["p0", "p2", "p3", "p4", "p5"]},
+    {"case": "Bar 7 of 8 (choose groove, or part 1 of a 2-bar fill).", "options": ["p0", "p2", "p3", "p8", "p9"]},
+    {"case": "Bar 8 of 8, last bar (close groove, or part 2 of a 2-bar fill).", "options": ["p0", "p3", "p5", "p10", "p11"]}
+  ]
+}
