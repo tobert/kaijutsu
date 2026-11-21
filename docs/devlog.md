@@ -431,3 +431,31 @@ slot like `max_tokens`, so a small model can take less than Codex's 40 KiB.
 The shell and its tool description read the same value. It stops at 48 KiB,
 below the broker's 64 KiB shell budget, which would otherwise cut the
 envelope with no `/v/cas` copy.
+
+## The heroic view and the eight-bar council band (November 21)
+
+The heroic view (`Screen::Heroic`, `Ctrl+A k`) renders every playing track's
+anticipation and commitment along a perspective highway driven by wall time.
+Its camera is solved from framing ratios rather than fixed world coordinates,
+its identity hues share one golden-ratio OKLCH rule with the room and the time
+well, and `kaijutsu-present` owns the pure 10-rule `WorkStatus` classification
+and covered-phrase slack math. When no track is playing, the highway stays calm
+and empty; no client-side fake driver generates synthetic traffic.
+
+Live testing across `zorak` (TiMidity++ on `ff4sf2.sf2`) and `moltar`
+(FluidSynth over PipeWire) turned up four practical lessons:
+
+- `rays::apply_tracks` had been gated to `Screen::Room`, so entering
+  `Screen::Heroic` from the conversation view left `WellTracks` and beat
+  phasors unpopulated until `apply_tracks` moved ungated and `live.rs` seeded
+  `WellBeatsRes` from live `TrackInfo`.
+- Real FluidSynth advertises `"FLUID Synth (<pid>)"` with a space in ALSA
+  sequencer client names, which `"fluidsynth"` missed until `"fluid synth"`
+  joined `SYNTH_PATTERNS`.
+- Metronome click config defaulted to `enabled = true` and loaded only at
+  connect; defaulting it to `false` and polling `metronome.toml` every five
+  seconds lets clients mute or toggle clicks without restarting `audiod`.
+- Musician decision programs must match the track's 32-beat phrase (`PHRASE`):
+  4-bar programs leave eight seconds of silence per phrase at 120 BPM, whereas
+  8-bar programs (`bass-bars.json`, `pad-bars.json`, `drum-bars.json` with
+  `shuffle = 2`) play continuously across the 3-track `lfm3-omni` band.
