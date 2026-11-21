@@ -54,6 +54,19 @@ trap cleanup EXIT
 check "agent control is on at startup" wait_state agent_control true 30
 check "the app joined a context on the Conversation screen" wait_state screen Conversation 30
 
+# `text` blocks until the app has run the frames the typing needs (a press and
+# a release per character); returning early would let the next key overtake it.
+text_waits_for_the_typing() {
+  local before after
+  before="$("$HARNESS" frames)"
+  "$HARNESS" text "abcdefghij" >/dev/null
+  after="$("$HARNESS" frames)"
+  (( after - before >= 20 ))
+}
+"$HARNESS" act FocusCompose >/dev/null
+check "text returns only after 2 frames per character" text_waits_for_the_typing
+"$HARNESS" act PopLevel >/dev/null
+
 "$HARNESS" act GoToWell >/dev/null
 check "act GoToWell reaches the Room screen" wait_state screen Room 15
 

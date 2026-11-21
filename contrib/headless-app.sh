@@ -13,10 +13,11 @@
 #                                 [--wayland NAME] [--agent-control] [--build]
 #   contrib/headless-app.sh act ACTION         BRP kaijutsu/act (needs --agent-control)
 #   contrib/headless-app.sh state              BRP kaijutsu/state
+#   contrib/headless-app.sh frames             the app's frame count
 #   contrib/headless-app.sh status
 #   contrib/headless-app.sh shot NAME [DIR]    BRP screenshot -> DIR/NAME.png
 #   contrib/headless-app.sh keys KEY...        BRP send_keys: all KEYs held at once (a chord)
-#   contrib/headless-app.sh text STRING        BRP type_text: type STRING one char per frame
+#   contrib/headless-app.sh text STRING        BRP type_text: one char per two frames; returns when typed
 #   contrib/headless-app.sh logs               path of the app, kernel, labwc logs
 #   contrib/headless-app.sh stop
 #
@@ -290,22 +291,49 @@ cmd_shot() {
   die "no screenshot written to $out"
 }
 
+# The app's frame counter (BRP diagnostics). Synthetic input advances with
+# frames, so waiting on frames is steady at any frame rate.
+frame_count() {
+  brp brp_extras/get_diagnostics '{}' | python3 -c '
+import json, sys
+print(int(json.load(sys.stdin)["result"]["frame_count"]))'
+}
+
+# Block until the app has run N more frames than FROM, or die after 120 s.
+wait_frames_after() { # from-count, n
+  local target=$(( $1 + $2 )) deadline=$(( SECONDS + 120 ))
+  while (( $(frame_count) < target )); do
+    (( SECONDS < deadline )) || die "app ran fewer than $2 frames in 120 s"
+    sleep 0.25
+  done
+}
+
 cmd_keys() {
   load_env
   [[ $# -gt 0 ]] || die "usage: keys KEY..."
-  local list
+  local list from
   list="$(printf '"%s",' "$@")"
+  from="$(frame_count)"
   brp brp_extras/send_keys "{\"keys\":[${list%,}]}"
   echo
+  wait_frames_after "$from" 3   # the keys release after their hold
 }
 
 cmd_text() {
   load_env
   [[ $# -eq 1 ]] || die "usage: text STRING"
-  local json
+  local json reply queued from
   json="$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$1")"
-  brp brp_extras/type_text "$json"
-  echo
+  from="$(frame_count)"
+  reply="$(brp brp_extras/type_text "$json")"
+  echo "$reply"
+  queued="$(python3 -c '
+import json, sys
+r = json.loads(sys.argv[1])
+print(r["result"]["chars_queued"]) if "result" in r else sys.exit(1)' "$reply")" \
+    || die "type_text failed: $reply"
+  # One character is a press frame and a release frame; return after the last.
+  wait_frames_after "$from" $(( 2 * queued + 2 ))
 }
 
 cmd_act() {
@@ -348,6 +376,7 @@ case "${1:-}" in
   text) shift; cmd_text "$@" ;;
   act) shift; cmd_act "$@" ;;
   state) cmd_state ;;
+  frames) load_env; frame_count ;;
   logs) echo "$STATE/logs" ;;
   stop) cmd_stop ;;
   *) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 2 ;;
