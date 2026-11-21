@@ -20,6 +20,8 @@
 #   contrib/headless-app.sh logs               path of the app, kernel, labwc logs
 #   contrib/headless-app.sh stop
 #
+# `contrib/headless-smoke.sh` runs this harness as a pass/fail check.
+#
 # The kernel is a second kaijutsu-server on its own port with its own XDG trees,
 # config root, and keys; it never touches the operator's kernel on 2222. Host
 # execution is denied (the kernel default). The app authenticates with a
@@ -238,7 +240,7 @@ cmd_start() {
     wayland="gamescope-headless"
     env "${app_env[@]}" gamescope --backend headless --expose-wayland \
       -W "${size%x*}" -H "${size#*x}" -w "${size%x*}" -h "${size#*x}" \
-      -- "${app_cmd[@]}" --fullscreen >"$STATE/logs/app.log" 2>&1 &
+      -- "${app_cmd[@]}" --window-size "$size" >"$STATE/logs/app.log" 2>&1 &
   else
     env WAYLAND_DISPLAY="$wayland" "${app_env[@]}" "${app_cmd[@]}" --maximize \
       >"$STATE/logs/app.log" 2>&1 &

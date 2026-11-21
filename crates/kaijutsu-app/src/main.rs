@@ -60,6 +60,12 @@ struct Cli {
     #[arg(long)]
     maximize: bool,
 
+    /// Open the window at this logical size (`WIDTHxHEIGHT`), skipping the
+    /// fit-to-monitor resize. For a compositor that sends no size, such as
+    /// gamescope's headless backend.
+    #[arg(long, value_name = "WxH", value_parser = parse_window_size, conflicts_with_all = ["fullscreen", "maximize"])]
+    window_size: Option<(u32, u32)>,
+
     /// Start with agent control on: an agent may fire actions over BRP
     /// (`kaijutsu/act`). Off by default; `Ctrl+A g` toggles it at runtime.
     #[arg(long)]
@@ -204,10 +210,12 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "会術 Kaijutsu".into(),
-                        resolution: (
-                            constants::INITIAL_WINDOW_WIDTH,
-                            constants::INITIAL_WINDOW_HEIGHT,
-                        )
+                        resolution: cli
+                            .window_size
+                            .unwrap_or((
+                                constants::INITIAL_WINDOW_WIDTH,
+                                constants::INITIAL_WINDOW_HEIGHT,
+                            ))
                             .into(),
                         position: WindowPosition::Centered(MonitorSelection::Primary),
                         mode: if cli.fullscreen {
@@ -336,6 +344,7 @@ fn main() {
         .insert_resource(StartupWindowArgs {
             fullscreen: cli.fullscreen,
             maximize: cli.maximize,
+            sized: cli.window_size.is_some(),
         })
         // Power management — sleep between events instead of spinning every vsync tick.
         // Input events (keyboard, mouse, window) wake immediately with zero added latency.
@@ -422,6 +431,22 @@ fn setup_camera(
 struct StartupWindowArgs {
     fullscreen: bool,
     maximize: bool,
+    /// `--window-size` named the size; there is nothing to fit.
+    sized: bool,
+}
+
+/// Parse `WIDTHxHEIGHT` (logical pixels, both above zero).
+fn parse_window_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s
+        .split_once('x')
+        .ok_or_else(|| format!("'{s}' is not WIDTHxHEIGHT"))?;
+    let dim = |v: &str| {
+        v.parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| format!("'{v}' is not a size of at least 1"))
+    };
+    Ok((dim(w)?, dim(h)?))
 }
 
 /// Resize window to fit the primary monitor on the first frame.
@@ -439,8 +464,8 @@ fn adapt_window_to_monitor(
     if *done {
         return;
     }
-    if args.fullscreen {
-        // Mode was set at construction; nothing to adapt.
+    if args.fullscreen || args.sized {
+        // Mode or size was set at construction; nothing to adapt.
         *done = true;
         return;
     }
@@ -548,6 +573,26 @@ mod cli_tests {
     fn cli_is_well_formed() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn window_size_parses_width_x_height() {
+        assert_eq!(parse_window_size("1920x1080"), Ok((1920, 1080)));
+        let cli = Cli::try_parse_from(["kaijutsu", "--window-size", "1280x720"]).unwrap();
+        assert_eq!(cli.window_size, Some((1280, 720)));
+    }
+
+    #[test]
+    fn window_size_rejects_what_is_not_a_size() {
+        for bad in ["1920", "axb", "0x600", "800x0", "-1x5", "800x", "x600", "1.5x2"] {
+            assert!(parse_window_size(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn window_size_conflicts_with_fullscreen_and_maximize() {
+        assert!(Cli::try_parse_from(["kaijutsu", "--window-size", "800x600", "--fullscreen"]).is_err());
+        assert!(Cli::try_parse_from(["kaijutsu", "--window-size", "800x600", "--maximize"]).is_err());
     }
 
     #[test]

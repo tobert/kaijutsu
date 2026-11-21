@@ -94,7 +94,7 @@ Agent control (`docs/input.md`, "Agent control over BRP") is a latch that only t
 
 ## The headless app harness: input at a low frame rate
 
-`contrib/headless-app.sh start` runs end to end on gamescope's headless backend (about 10 fps with a debug build); `--compositor labwc` keeps the old path. `type_text` and `keys` are not yet re-checked at this rate: key names are BRP key codes such as `KeyW`, and a `type_text` burst can still drop characters after a surface switch. The app's window does not fill the gamescope output (a screenshot is 800x600 at a 1920x1080 output), and the dock's `AGENT CONTROL` marker clips at that width. `kaijutsu/act` and `kaijutsu/state` (`docs/input.md`, "Agent control over BRP") now replace most key synthesis; move the harness's `keys` users onto `act`.
+`contrib/headless-app.sh start` runs end to end on gamescope's headless backend (about 10 fps with a debug build), at the size `--size` names (the app takes it as `--window-size`, since gamescope sends no size); `--compositor labwc` keeps the old path. `contrib/headless-smoke.sh` checks start, `act`, `state`, and a screenshot. `type_text` and `keys` are not yet re-checked at this rate: key names are BRP key codes such as `KeyW`, and a `type_text` burst can still drop characters after a surface switch. `kaijutsu/act` and `kaijutsu/state` (`docs/input.md`, "Agent control over BRP") now replace most key synthesis; move the harness's `keys` users onto `act`.
 
 ## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
 
