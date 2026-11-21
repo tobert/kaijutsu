@@ -93,7 +93,14 @@ impl Plugin for TimeWellPlugin {
                 scene::handle_go_to_well.after(crate::input::InputPhase::Dispatch),
             )
             // Fully ungated: opens warm on every screen, well included.
-            .add_systems(Update, (live::ingest_live_events, scene::tick_ring_activity))
+            .add_systems(
+                Update,
+                (
+                    live::ingest_live_events,
+                    rays::apply_tracks,
+                    scene::tick_ring_activity,
+                ),
+            )
             // Ambient: room-scale truth. The well breathes here whether
             // you're dived into it or just walking past its bearing.
             .add_systems(
@@ -111,7 +118,6 @@ impl Plugin for TimeWellPlugin {
                         sync::poll_clusters,
                         sync::apply_clusters,
                         rays::poll_tracks,
-                        rays::apply_tracks,
                         rays::sync_track_rays,
                         rays::animate_track_rays,
                         sync::sync_time_well,

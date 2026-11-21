@@ -129,15 +129,42 @@ pub fn poll_heroic_live_data(
     }
 }
 
-/// Drain `TrackWorkReceived` into [`HeroicLiveCache`].
+/// Drain `TrackWorkReceived` into [`HeroicLiveCache`] and `TracksReceived` into
+/// [`WellTracks`] / [`WellBeatsRes`].
 pub fn apply_heroic_work_results(
     mut events: MessageReader<RpcResultMessage>,
     mut cache: ResMut<HeroicLiveCache>,
+    mut tracks: ResMut<WellTracks>,
+    mut beats: ResMut<WellBeatsRes>,
 ) {
+    let now_inst = Instant::now();
     for ev in events.read() {
-        if let RpcResultMessage::TrackWorkReceived { track_id, statuses } = ev {
-            cache.in_flight_tracks.remove(track_id);
-            cache.work_by_track.insert(track_id.clone(), statuses.clone());
+        match ev {
+            RpcResultMessage::TrackWorkReceived { track_id, statuses } => {
+                cache.in_flight_tracks.remove(track_id);
+                cache.work_by_track.insert(track_id.clone(), statuses.clone());
+            }
+            RpcResultMessage::TracksReceived { tracks: fresh } => {
+                if tracks.tracks != *fresh {
+                    tracks.set_tracks(fresh.clone());
+                }
+                for t in fresh.iter().filter(|t| t.playing && t.period_us > 0) {
+                    let drift_too_far = beats
+                        .beat_position(&t.score_context_id, now_inst)
+                        .map(|pos| (pos - t.playhead_tick as f64).abs() > 4.0)
+                        .unwrap_or(true);
+                    if drift_too_far {
+                        let tempo_bps = 1_000_000.0 / t.period_us as f64;
+                        beats.observe(
+                            t.score_context_id,
+                            kaijutsu_audio::BeatRef::new(t.playhead_tick as f64, tempo_bps),
+                            now_inst,
+                            now_inst,
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -210,6 +237,12 @@ pub fn sync_heroic_state(
         return;
     }
 
+    let mut prev_performers: HashMap<ContextId, HeroicPerformer> = state
+        .lanes
+        .drain(..)
+        .flat_map(|l| l.performers.into_iter().map(|p| (p.context_id, p)))
+        .collect();
+
     // Apply signed display offset to the visual clock (`docs/newui.md`, "Clock and latency").
     let now_inst = Instant::now();
     let shifted_inst = if palette.display_offset_ms >= 0 {
@@ -264,11 +297,12 @@ pub fn sync_heroic_state(
                 .unwrap_or_else(|| track.id.clone());
             let parent_context_id = info.and_then(|c| c.forked_from);
 
-            // Lead stand-in: newest record's `estimate` until the wire event carries measured lead.
+            // Lead stand-in: newest record's non-zero `estimate` until the wire event carries measured lead.
             let lead_beats = work
                 .iter()
+                .filter(|w| w.estimate.0 > 0)
                 .max_by_key(|w| w.start)
-                .map(|w| w.estimate.0.max(0) as f32)
+                .map(|w| w.estimate.0 as f32)
                 .unwrap_or(0.0);
 
             let slack = compute_performer_slack(
@@ -308,6 +342,49 @@ pub fn sync_heroic_state(
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
                 .unwrap_or_default();
 
+            let bpp = track.beats_per_phrase.max(1) as i64;
+            let active_target_beat = work
+                .iter()
+                .filter(|w| w.disposition.is_none())
+                .map(|w| w.start.0)
+                .max()
+                .unwrap_or(beat_idx);
+            let cur_phrase = active_target_beat.div_euclid(bpp);
+            let (instructions, flare_remaining, hop_from_phrase, hop_to_phrase, hop_elapsed) =
+                if let Some(prev) = prev_performers.remove(&ctx_id) {
+                    let prev_phrase = prev.hop_to_phrase.unwrap_or_else(|| {
+                        prev.statuses
+                            .iter()
+                            .filter(|w| w.disposition.is_none())
+                            .map(|w| w.start.0)
+                            .max()
+                            .unwrap_or(beat_idx)
+                            .div_euclid(bpp)
+                    });
+                    let hop_dur = (palette.durations_ms.hop as f32 / 1000.0).max(0.05);
+                    let (hf, ht, he) = if cur_phrase != prev_phrase {
+                        (Some(prev_phrase), Some(cur_phrase), 0.0)
+                    } else if prev.hop_from_phrase.is_some() {
+                        let next_e = prev.hop_elapsed + dt;
+                        if next_e >= hop_dur {
+                            (None, Some(cur_phrase), 0.0)
+                        } else {
+                            (prev.hop_from_phrase, prev.hop_to_phrase, next_e)
+                        }
+                    } else {
+                        (None, Some(cur_phrase), 0.0)
+                    };
+                    (
+                        prev.instructions,
+                        (prev.flare_remaining - dt).max(0.0),
+                        hf,
+                        ht,
+                        he,
+                    )
+                } else {
+                    (Vec::new(), 0.0, None, Some(cur_phrase), 0.0)
+                };
+
             performers.push(HeroicPerformer {
                 context_id: ctx_id,
                 parent_context_id,
@@ -320,11 +397,11 @@ pub fn sync_heroic_state(
                 candidates: Vec::new(),
                 recent_picks: Vec::new(),
                 tail_lines: tail,
-                instructions: Vec::new(),
-                flare_remaining: 0.0,
-                hop_from_phrase: None,
-                hop_to_phrase: None,
-                hop_elapsed: 0.0,
+                instructions,
+                flare_remaining,
+                hop_from_phrase,
+                hop_to_phrase,
+                hop_elapsed,
             });
         }
 
@@ -429,5 +506,33 @@ mod tests {
 
         let state = world.resource::<HeroicState>();
         assert!(state.lanes.is_empty());
+    }
+
+    #[test]
+    fn apply_heroic_work_results_drains_tracks_and_anchors_rolling_phasor() {
+        let mut world = World::new();
+        world.insert_resource(Messages::<RpcResultMessage>::default());
+        world.insert_resource(HeroicLiveCache::default());
+        world.insert_resource(WellTracks::default());
+        world.insert_resource(WellBeatsRes::default());
+
+        let mut track = make_track("live-bass", true);
+        track.playhead_tick = 120;
+        let score_ctx = track.score_context_id;
+        world
+            .resource_mut::<Messages<RpcResultMessage>>()
+            .write(RpcResultMessage::TracksReceived { tracks: vec![track] });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(apply_heroic_work_results);
+        schedule.run(&mut world);
+
+        assert_eq!(world.resource::<WellTracks>().tracks.len(), 1);
+        let t_later = Instant::now() + Duration::from_millis(250);
+        let pos = world
+            .resource::<WellBeatsRes>()
+            .beat_position(&score_ctx, t_later)
+            .expect("phasor seeded from playing TrackInfo");
+        assert!(pos > 120.2, "phasor should advance smoothly over time, got {pos}");
     }
 }

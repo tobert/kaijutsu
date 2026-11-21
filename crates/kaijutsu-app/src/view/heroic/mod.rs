@@ -163,7 +163,6 @@ fn enter_heroic(
     palette: Res<HeroicPalette>,
     mut state: ResMut<HeroicState>,
     actor: Option<Res<RpcActor>>,
-    tracks: Res<crate::view::time_well::rays::WellTracks>,
     result_channel: Res<RpcResultChannel>,
     mut saved: ResMut<HeroicSavedCamera>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform, &mut Projection), With<Camera3d>>,
@@ -177,7 +176,7 @@ fn enter_heroic(
     }
 
     state.clear_driver_state();
-    if tracks.tracks.is_empty() && actor.is_some() {
+    if actor.is_some() {
         live::request_initial_tracks(actor.as_deref(), &result_channel);
     }
 

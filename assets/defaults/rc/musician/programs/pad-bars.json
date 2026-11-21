@@ -1,11 +1,11 @@
 {
-  "instructions": "You are the pads player in a tune in E minor, 4/4. Choose the next bar of sustained chords. Follow what has been played, leave space around the bass, and resolve smoothly on the last bar of the phrase.",
+  "instructions": "You are the pads player in a tune in E minor, 4/4. Choose the next bar of sustained chords. Follow what has been played, leave space around the bass, and resolve smoothly on bar 8 of the 8-bar phrase.",
   "input_label": "The phrase so far",
   "question": "The chordal pad bar to play next.",
   "prefix": "X:1\n%%MIDI channel 2\n%%MIDI program 49\nM:4/4\nL:1/8\nK:Em\n",
   "join": " | ",
   "suffix": " |]",
-  "shuffle": 4,
+  "shuffle": 2,
   "history_messages": 4,
   "no_repeat": true,
   "options": {
@@ -23,9 +23,13 @@
     "p11": {"means": "G major resolving home to E minor", "text": "[GBd]4 [EGB]4"}
   },
   "slots": [
-    {"case": "Bar 1 of 4.", "options": ["p0", "p1", "p2", "p5", "p10"]},
-    {"case": "Bar 2 of 4.", "options": ["p1", "p2", "p4", "p5", "p6", "p7", "p8", "p9", "p10"]},
-    {"case": "Bar 3 of 4.", "options": ["p2", "p3", "p4", "p6", "p7", "p8", "p9", "p11"]},
-    {"case": "Bar 4 of 4, the last bar.", "options": ["p0", "p10", "p11"]}
+    {"case": "Bar 1 of 8.", "options": ["p0", "p1", "p2", "p5", "p10"]},
+    {"case": "Bar 2 of 8.", "options": ["p1", "p2", "p4", "p5", "p6", "p7", "p8", "p9", "p10"]},
+    {"case": "Bar 3 of 8.", "options": ["p2", "p3", "p4", "p6", "p7", "p8", "p9", "p11"]},
+    {"case": "Bar 4 of 8, midpoint turnaround.", "options": ["p3", "p4", "p8", "p9", "p11"]},
+    {"case": "Bar 5 of 8.", "options": ["p0", "p1", "p2", "p5", "p6"]},
+    {"case": "Bar 6 of 8.", "options": ["p1", "p2", "p4", "p5", "p6", "p7", "p8", "p9"]},
+    {"case": "Bar 7 of 8.", "options": ["p2", "p3", "p4", "p7", "p8", "p9", "p11"]},
+    {"case": "Bar 8 of 8, the last bar.", "options": ["p0", "p10", "p11"]}
   ]
 }

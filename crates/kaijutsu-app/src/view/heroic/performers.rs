@@ -294,7 +294,21 @@ pub fn performer_world_pos(
         (perf_idx as f32 / (n_perf - 1) as f32 - 0.5) * (palette.lane_width * 0.42)
     };
     let lane_x = state.lane_center_x(lane_idx, palette.lane_width) + x_spread;
-    let lead_z = -perf.lead_beats.max(0.0) * lane.period_secs * palette.units_per_second;
+    let road_len = (palette.road_seconds * palette.units_per_second).max(10.0);
+    let target_beats = perf
+        .statuses
+        .iter()
+        .filter(|w| w.disposition.is_none())
+        .map(|w| (w.start.0 as f64 - lane.playhead_beats) as f32)
+        .filter(|b| *b > 0.0)
+        .fold(f32::MIN, f32::max);
+    let ahead_beats = if target_beats > 0.0 {
+        target_beats
+    } else {
+        perf.lead_beats.max(4.0)
+    };
+    let lead_z = (-ahead_beats * lane.period_secs * palette.units_per_second)
+        .clamp(-road_len * 0.82, -1.4);
 
     let hop_y = if let (Some(_from), Some(_to)) = (perf.hop_from_phrase, perf.hop_to_phrase) {
         let hop_dur = (palette.durations_ms.hop as f32 / 1000.0).max(0.05);
