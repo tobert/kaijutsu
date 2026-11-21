@@ -144,9 +144,8 @@ mod tests {
         let (tl, cell) = commit_one("audio/midi", b"MThd....");
         let block = tl.materialize(&cell, block_id()).unwrap();
 
-        // No `Midi` render variant exists yet → unknown MIME projects to Plain,
-        // gracefully, with zero substrate change. The bytes live in CAS.
-        assert_eq!(block.content_type, ContentType::Plain);
+        // `audio/*` projects to `ContentType::Media`; the bytes live in CAS.
+        assert_eq!(block.content_type, ContentType::Media);
         assert_eq!(block.role, Role::Asset);
         // content holds the 32-hex CAS hash (img_block convention), and it resolves.
         assert_eq!(block.content.len(), 32);
