@@ -403,6 +403,28 @@ impl KernelDb {
         }
     }
 
+    /// Whether `actor` may archive `target` from the live context it plays
+    /// without the Operator capability or a separate shell approval. This
+    /// follows the direct senpai edge, not fork provenance. Existing archive
+    /// refusals still apply.
+    pub(crate) fn may_archive_direct_kohai(
+        &self,
+        target: ContextId,
+        seat: Option<ContextId>,
+        actor: PrincipalId,
+    ) -> KernelDbResult<bool> {
+        let Some(seat) = seat.filter(|seat| *seat != target) else { return Ok(false) };
+        let Some(row) = self.get_context(target)? else { return Ok(false) };
+        if row.is_archived() || row.senpai_ctx != Some(seat) {
+            return Ok(false);
+        }
+        let Some(senpai) = self.get_context(seat)? else { return Ok(false) };
+        if senpai.is_archived() || senpai.performer != Some(actor) {
+            return Ok(false);
+        }
+        Ok(self.shadow_kind(&row)?.is_none() && !self.is_console(target)?)
+    }
+
     /// The one authority rule (`docs/senpai-kohai.md`, "Authority"): the
     /// performer of `target`'s senpai (climbing past senpais with no
     /// performer), or the lineage root, may perform `act` on it. The context's

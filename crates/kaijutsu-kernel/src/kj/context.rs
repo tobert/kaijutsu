@@ -256,13 +256,13 @@ enum ContextCommand {
         #[arg(long, requires = "compact", value_parser = clap::value_parser!(u64).range(1..))]
         keep: Option<u64>,
     },
-    /// Archive one context, retaining its history (latched). Needs the
-    /// operator capability, or a person's live root character acting from
-    /// any context. Its judge shadows are archived with it; other children
-    /// keep their parent edge and state. A push to an archived context and
-    /// `kj context set --senpai` onto it refuse, and its other forks and the
-    /// contexts that answer to it stay live. Restore with `kj context promote <id>`. A character
-    /// may also archive an `mcp` context it plays.
+    /// Archive a context, retaining its history. Requires --confirm. From
+    /// the live senpai context you play, you may archive a direct kohai
+    /// without the operator capability, except a console or a shadow.
+    /// Other targets and --children require operator or a live root
+    /// character, plus authority over the target. Judge shadows are archived
+    /// with their source; other children stay live. Restore with
+    /// `kj context promote <id>`.
     /// The context's `archive` rc lifecycle runs first, while it is still
     /// live; a failing script is recorded and the archive still commits.
     Archive {
@@ -644,9 +644,9 @@ impl KjDispatcher {
         // seat may act on which target is decided per target
         // (`require_placement_authority`).
         //
-        // `archive` and `rotate` take Operator, or a live root character
-        // acting from any context (`docs/character.md`, "The console places
-        // contexts").
+        // Bulk archive and rotate take Operator or a live root character.
+        // Single-target archive checks the direct senpai exception after
+        // resolving its target.
         let changes_controls = matches!(&parsed.command, ContextCommand::Control(c) if c.changes_list());
         if (changes_controls || matches!(
             parsed.command,
@@ -654,7 +654,7 @@ impl KjDispatcher {
                 | ContextCommand::Set { .. }
                 | ContextCommand::Unset { .. }
                 | ContextCommand::Rename { .. }
-                | ContextCommand::Archive { .. }
+                | ContextCommand::Archive { children: true, .. }
                 | ContextCommand::Rotate { .. }
                 | ContextCommand::Retag { .. }
                 | ContextCommand::Hydrate { .. }
@@ -2347,13 +2347,20 @@ impl KjDispatcher {
             };
             (target_id, label)
         };
-        if let Err(why) = self.archive_refusal(target_id) {
-            return KjResult::Err(format!("kj context archive: {why}"));
-        }
         let person = match self.caller_is_live_root(caller) {
             Ok(person) => person,
             Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
         };
+        if !person && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "context") {
+            match self.kernel_db().lock().may_archive_direct_kohai(target_id, caller.context_id, caller.actor_id) {
+                Ok(true) => {}
+                Ok(false) => return denied,
+                Err(e) => return KjResult::Err(format!("kj context archive: could not check the senpai edge: {e}")),
+            }
+        }
+        if let Err(why) = self.archive_refusal(target_id) {
+            return KjResult::Err(format!("kj context archive: {why}"));
+        }
         // Only the person whose console it is archives the console, while
         // that person is a live root; after that, any live person may. The
         // archive write checks it again and clears the pointer.
@@ -7477,6 +7484,42 @@ mod tests {
         amy.confirmed = true;
         let archived = f.d.dispatch(&[s("context"), s("archive"), s("lane")], &amy).await;
         assert!(archived.is_ok(), "amy may archive the lane from inside it: {}", archived.message());
+        assert!(placement_row(&f, f.lane).is_archived());
+    }
+
+    /// The narrow exception follows the live senpai seat, not fork provenance
+    /// or the actor alone. It does not grant authority over judge shadows.
+    #[tokio::test]
+    async fn a_senpai_without_operator_archives_only_its_direct_kohai() {
+        let f = placement_fixture().await;
+        let shadow = register_context(&f.d, Some("judge-lane"), Some(f.seat), f.banto);
+        let fork = register_context(&f.d, Some("provenance-only"), Some(f.seat), f.banto);
+        {
+            let mut db = f.d.kernel_db().lock();
+            let mut binding = crate::mcp::ContextToolBinding::new();
+            binding.grant(crate::mcp::Capability::Fork);
+            db.upsert_context_binding(f.seat, &binding).unwrap();
+            db.update_performer(shadow, Some(f.coder)).unwrap();
+            db.mark_judge_shadow(shadow).unwrap();
+            db.set_context_senpai(fork, Some(f.root)).unwrap();
+        }
+        let mut senpai = placement_caller(f.seat, f.banto);
+        let archive = |target: &str| vec![s("context"), s("archive"), s(target)];
+        let result = f.d.dispatch(&archive("lane"), &senpai).await;
+        assert!(result.is_latch(), "archive still needs confirmation: {result:?}");
+        senpai.confirmed = true;
+        for (target, id, caller) in [
+            ("judge-lane", shadow, senpai.clone()),
+            ("provenance-only", fork, senpai.clone()),
+            ("lane", f.lane, crate::kj::KjCaller { actor_id: f.coder, ..senpai.clone() }),
+            ("lane", f.lane, crate::kj::KjCaller { context_id: Some(f.elsewhere), ..senpai.clone() }),
+        ] {
+            let refused = f.d.dispatch(&archive(target), &caller).await;
+            assert!(!refused.is_ok() && refused.message().contains("'operator'"), "{target}: {refused:?}");
+            assert!(!placement_row(&f, id).is_archived());
+        }
+        let archived = f.d.dispatch(&archive("lane"), &senpai).await;
+        assert!(archived.is_ok(), "{}", archived.message());
         assert!(placement_row(&f, f.lane).is_archived());
     }
 

@@ -109,7 +109,9 @@ pub(crate) enum Layer {
     /// A judge allowed a statement no other layer covered.
     Judge { spec: String, council: bool },
     /// A drift along the caller's senpai edge — to its senpai or to a context
-    /// that answers to it — that no key decided (`docs/senpai-kohai.md`, "Reports and drift").
+    /// that answers to it — or the archive of a direct kohai from the seat the
+    /// caller plays, that no key decided (`docs/contexts.md`, "Rotation,
+    /// handoffs, and archive").
     SenpaiEdge,
 }
 
@@ -1712,7 +1714,9 @@ pub(crate) fn evaluate(
 
     let family = family_layer_per_gated_statement(db, spec, &caller, &context)?;
     let edge = |cmd: &PlannedCommand| {
-        senpai_edge_drift(db, cmd, &caller).or_else(|| mcp_session_create(db, cmd, &caller))
+        senpai_edge_drift(db, cmd, &caller)
+            .or_else(|| senpai_edge_archive(db, cmd, &caller))
+            .or_else(|| mcp_session_create(db, cmd, &caller))
     };
     let lower = lower_layers_per_gated_statement(spec, layers, &edge);
     // The acts that always ask, per gated statement: decided over every
@@ -2075,6 +2079,50 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
     }
 }
 
+/// Whether `cmd` archives a direct kohai from the live seat the caller plays,
+/// which needs no Operator (`docs/contexts.md`, "Rotation, handoffs, and
+/// archive"): `kj context archive <ctx>`, resolved as the verb resolves it,
+/// where [`KernelDb::may_archive_direct_kohai`] holds. That predicate follows
+/// the direct senpai edge, never fork provenance, and refuses a console or a
+/// shadow. `--children` selects its targets by fork provenance and archives a
+/// set of them, so it is not read here. Every argument must be a literal word
+/// and the command plain (no redirect, background flag or heredoc), since the
+/// decision reads the target out of the arguments. `None` for anything else;
+/// the verb still refuses a target it may not archive, and the archive of a
+/// console still always asks.
+fn senpai_edge_archive(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
+    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+        return None;
+    }
+    let here = caller.context_id?;
+    let mut args = literal_args(cmd)?;
+    // After `--` a token such as `--json` is a word, which `strip_flag`
+    // would drop: the target read here could then differ from the verb's.
+    if args.iter().any(|a| a == "--") {
+        return None;
+    }
+    super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
+    let matches = super::effect::cached_kj_args_command().try_get_matches_from(&args).ok()?;
+    let ("context", context) = matches.subcommand()? else { return None };
+    let ("archive", archive) = context.subcommand()? else { return None };
+    match archive.try_get_one::<bool>("children") {
+        Ok(Some(true)) | Err(_) => return None,
+        Ok(_) => {}
+    }
+    let target = archive.try_get_one::<String>("context").ok()??;
+    let target = super::refs::resolve_context_arg_from(Some(target.as_str()), Some(here), db).ok()?;
+    if !db.may_archive_direct_kohai(target, Some(here), caller.actor_id).ok()? {
+        return None;
+    }
+    let label = db
+        .get_context(target)
+        .ok()
+        .flatten()
+        .and_then(|row| row.label)
+        .unwrap_or_else(|| target.short());
+    Some(Decision { layer: Layer::SenpaiEdge, key: format!("kj context archive of {label}, its direct kohai") })
+}
+
 /// Every argument's word, when each is known before the command runs.
 fn literal_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
     use kaish_types::plan::PlannedValue;
@@ -2134,15 +2182,17 @@ fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>, edge: &
 }
 
 /// The database checks [`statement_verdict`] consults for a command no key
-/// decided: a drift along the senpai edge, or a context created under the
-/// caller's own MCP hub. `Some` names the allow. Only [`evaluate`] reads the
-/// database; [`evaluate_planned`] passes a check that finds neither.
+/// decided: a drift along the senpai edge, the archive of a direct kohai from
+/// the seat the caller plays, or a context created under the caller's own MCP
+/// hub. `Some` names the allow. Only [`evaluate`] reads the database;
+/// [`evaluate_planned`] passes a check that finds none.
 type EdgeCheck<'a> = dyn Fn(&PlannedCommand) -> Option<Decision> + 'a;
 
 /// One statement's verdict: the fold of its commands' verdicts. A
 /// statement with no commands is not an allow. A command no key decides
-/// is allowed when it drifts along the caller's senpai edge or creates a
-/// context under the caller's own MCP hub, before the uncovered tier.
+/// is allowed when it drifts along the caller's senpai edge, archives its
+/// direct kohai, or creates a context under the caller's own MCP hub, before
+/// the uncovered tier.
 fn statement_verdict(statement: &PlannedStatement, layers: Layers<'_>, edge: &EdgeCheck<'_>) -> PolicyVerdict {
     let verdicts: Vec<PolicyVerdict> = statement
         .plan
@@ -2781,6 +2831,98 @@ mod tests {
         let e = unconfigured("kj context archive 01a0-abc");
         assert_eq!(e.per_statement[0], PolicyVerdict::Uncovered);
         assert_eq!(e.verdict(), AskVerdict::Escalate);
+    }
+
+    /// The archive exception on the senpai edge: from the live seat it plays,
+    /// an actor may archive a direct kohai without Operator
+    /// (`docs/contexts.md`, "Rotation, handoffs, and archive"), so a plain
+    /// shell command with one literal target allows there instead of asking.
+    /// The edge is the target's senpai, never where it was forked from; a
+    /// shadow, a console, a grandchild and `--children` get no edge allow; and
+    /// a key or an ask still decides above it.
+    ///
+    /// Falsified by following `forked_from` as the edge, by reading
+    /// `--children` as a single target, by allowing a shadow or a console, or
+    /// by letting the edge outrank an ask or a key.
+    #[tokio::test]
+    async fn archive_of_a_direct_kohai_allows_along_the_senpai_edge() {
+        use crate::kj::test_helpers::{register_context, test_dispatcher, test_reviewer_principal};
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let (banto, coder, judge) = (PrincipalId::new(), PrincipalId::new(), PrincipalId::new());
+        for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (judge, "judge")] {
+            d.kernel_db()
+                .lock()
+                .insert_character(&crate::kernel_db::CharacterRow {
+                    rc_dir: Some("coder".into()),
+                    console_ctx: None,
+                    mcp_hub_ctx: None,
+                    principal_id,
+                    name: name.into(),
+                    created_at: 0,
+                    retired_at: None,
+                    handoff_ctx: None,
+                    root_ctx: None,
+                    root: false,
+                })
+                .unwrap();
+        }
+        let root = register_context(&d, Some("amy"), None, amy);
+        let seat = register_context(&d, Some("banto-seat"), Some(root), amy);
+        let lane = register_context(&d, Some("lane"), Some(seat), amy);
+        let grandchild = register_context(&d, Some("lane-child"), Some(lane), amy);
+        let shadow = register_context(&d, Some("judge-lane"), Some(seat), amy);
+        let console = register_context(&d, Some("console"), Some(seat), amy);
+        // Forked under the seat but answering to the root, and the converse.
+        let forked = register_context(&d, Some("seat-fork"), Some(seat), amy);
+        let adopted = register_context(&d, Some("adopted"), Some(root), amy);
+        {
+            let db = d.kernel_db().lock();
+            for (ctx, who) in [(seat, banto), (lane, coder), (grandchild, coder), (shadow, judge), (console, coder), (adopted, coder)] {
+                db.update_performer(ctx, Some(who)).unwrap();
+            }
+            db.mark_judge_shadow(shadow).unwrap();
+            db.set_character_console_ctx(banto, Some(console)).unwrap();
+            db.set_context_senpai(forked, Some(root)).unwrap();
+            db.set_context_senpai(adopted, Some(seat)).unwrap();
+        }
+        let caller = RuleCaller { context_id: Some(seat), principal_id: banto, actor_id: banto };
+        let verdict = |source: &str, cfg: &GateConfig| {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+            let db = d.kernel_db().lock();
+            evaluate(&db, &spec, caller, Layers { config: cfg, performer: None }).unwrap().per_statement.remove(0)
+        };
+        let no_edge = |v: &PolicyVerdict| !matches!(v, PolicyVerdict::Allow(ds) if ds.iter().any(|d| d.layer == Layer::SenpaiEdge));
+        let none = GateConfig::default();
+
+        let allowed = verdict("kj context archive lane", &none);
+        assert_eq!(
+            allow_keys(&allowed),
+            vec![(Layer::SenpaiEdge, "kj context archive of lane, its direct kohai".to_string())],
+            "the seat's direct kohai allows along the edge"
+        );
+        assert!(
+            !no_edge(&verdict("kj context archive adopted", &none)),
+            "a context answering to the seat allows, whatever it was forked from"
+        );
+
+        assert!(no_edge(&verdict("kj context archive banto-seat", &none)), "a context is not its own kohai");
+        assert!(no_edge(&verdict("kj context archive lane-child", &none)), "a grandchild answers to the lane");
+        assert!(no_edge(&verdict("kj context archive seat-fork", &none)), "fork provenance grants nothing");
+        assert!(no_edge(&verdict("kj context archive judge-lane", &none)), "a judge shadow is no kohai of the edge");
+        assert!(no_edge(&verdict("kj context archive console", &none)), "a console is no kohai of the edge");
+        assert!(no_edge(&verdict("kj context archive --children banto-seat", &none)), "--children selects by provenance");
+        assert!(no_edge(&verdict("kj context archive lane > /tmp/x", &none)), "a redirect cannot be read as one target");
+        assert!(no_edge(&verdict("kj context archive nope", &none)), "a target that does not resolve is the verb's refusal");
+
+        let asks = config("[global]\nask = [\"kj context archive\"]\n");
+        assert!(matches!(verdict("kj context archive lane", &asks), PolicyVerdict::Ask(_)), "an ask outranks the edge");
+        let allows = config("[global]\nallow = [\"kj context archive\"]\n");
+        assert_eq!(
+            allow_keys(&verdict("kj context archive lane", &allows)),
+            vec![(Layer::Config(Section::Global), "kj context archive".to_string())],
+            "a key outranks the edge"
+        );
     }
 
     /// The argv alone allows no create: the MCP session rule reads the

@@ -89,7 +89,12 @@ separate batch before using relative paths in that directory.
   (`kj context promote <id>`).** Contexts are never deleted. Archiving runs the
   performer's `archive` rc lifecycle, abandons pending asks for that context,
   and marks `archived_at` while retaining all blocks, lineage, execution
-  receipts, and approval history.
+  receipts, and approval history. From the live senpai context it plays, a
+  character can archive a direct kohai without `operator`. The default shell
+  policy allows a plain command with one literal target. Neither exception
+  applies to consoles or shadows. Fork provenance grants no archive
+  authority, and `--children` still selects by fork provenance under the
+  existing authority checks.
 
 ## Context shadows and renditions
 
