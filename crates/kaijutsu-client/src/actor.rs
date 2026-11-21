@@ -3971,9 +3971,7 @@ async fn dispatch_kernel_command(
 const JITTER_FLOOR: f64 = 0.5;
 
 fn backoff_for_attempt(attempt: u32) -> Duration {
-    backoff_for_attempt_jittered(attempt, || {
-        rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..1.0)
-    })
+    backoff_for_attempt_jittered(attempt, || rand::random_range(0.0..1.0))
 }
 
 /// Same exponential-capped schedule as `backoff_for_attempt`, but the jitter

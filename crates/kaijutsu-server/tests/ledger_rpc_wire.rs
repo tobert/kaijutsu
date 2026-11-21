@@ -65,7 +65,7 @@ impl Rig {
         let coder = PrincipalId::new();
         let lead = PrincipalId::new();
         let keys: Vec<PrivateKey> = (0..3)
-            .map(|_| PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap()).collect();
+            .map(|_| PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()).collect();
         let auth = AuthDb::open(&auth_path).unwrap();
         auth.add_key(amy, keys[0].public_key(), Some("amy")).unwrap();
         auth.add_key(coder, keys[1].public_key(), Some("coder")).unwrap();

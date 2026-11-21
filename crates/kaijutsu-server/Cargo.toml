@@ -42,7 +42,6 @@ anyhow.workspace = true
 shellexpand.workspace = true
 async-trait.workspace = true
 rand.workspace = true
-rand_v10 = { package = "rand", version = "0.10" }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

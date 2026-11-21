@@ -426,7 +426,7 @@ mod tests {
 
     fn make_test_key() -> ssh_key::PublicKey {
         let private = russh::keys::PrivateKey::random(
-            &mut rand_v10::rng(),
+            &mut rand::rng(),
             russh::keys::Algorithm::Ed25519,
         )
         .unwrap();

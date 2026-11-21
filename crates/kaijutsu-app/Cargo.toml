@@ -54,7 +54,7 @@ bevy_remote.workspace = true
 # 2026-08-12, docs/issues.md — the dock chrome was its last consumer);
 # `kurbo`/`peniko` stay as direct dependencies since Parley's own types
 # (`Brush`, transforms) are drawn from them.
-parley = "0.9.0"
+parley = "0.11"
 
 # Not called from our code — here to flip one feature on a transitive dep, via
 # cargo's feature unification. parley 0.9 line-breaks through icu_segmenter,

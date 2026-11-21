@@ -121,7 +121,7 @@ async fn register_players() -> RegisterPlayers {
     let addr = listener.local_addr().unwrap();
     let config = kaijutsu_server::SshServerConfig::ephemeral(addr.port());
     common::register_root_key(addr, config.root_key());
-    let other_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    let other_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     kaijutsu_server::AuthDb::open(config.auth_db_path.as_ref().expect("an ephemeral config has an auth db"))
         .unwrap()
         .add_key(kaijutsu_types::PrincipalId::new(), other_key.public_key(), Some("other"))

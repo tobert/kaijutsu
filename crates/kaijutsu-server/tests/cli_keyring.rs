@@ -58,7 +58,7 @@ impl Fixture {
     }
 
     fn write_pubkey(&self, name: &str) -> (PathBuf, String) {
-        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let mut pubkey = key.public_key().clone();
         pubkey.set_comment(name);
         let path = self.home_path().join(format!("{name}.pub"));

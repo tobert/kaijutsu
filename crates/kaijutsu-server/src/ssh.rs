@@ -53,7 +53,7 @@ impl KeySource {
         match self {
             KeySource::Persistent(path) => load_or_generate_host_key(path),
             KeySource::Ephemeral => {
-                PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+                PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
                     .map_err(std::io::Error::other)
             }
         }
@@ -77,7 +77,7 @@ pub fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey, std::io::Err
             fs::create_dir_all(parent)?;
         }
 
-        let key = PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
             .map_err(std::io::Error::other)?;
 
         // Save in OpenSSH format
@@ -360,7 +360,7 @@ impl SshServerConfig {
         seed_ephemeral_rc(&config_mounts.host_dir(kaijutsu_types::paths::RC_ROOT));
 
         let root_key = russh::keys::PrivateKey::random(
-            &mut rand_v10::rng(),
+            &mut rand::rng(),
             russh::keys::Algorithm::Ed25519,
         )
         .expect("generate the ephemeral root key");
@@ -1097,13 +1097,17 @@ impl server::Handler for ConnectionHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let principal = match &self.identity {
             Some(id) => id.clone(),
             None => {
                 log::warn!("Channel open without authentication");
-                return Ok(false);
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
             }
         };
 
@@ -1120,7 +1124,10 @@ impl server::Handler for ConnectionHandler {
                     current,
                     self.max_connections,
                 );
-                return Ok(false);
+                reply
+                    .reject(russh::ChannelOpenFailure::ResourceShortage)
+                    .await;
+                return Ok(());
             }
             self.counted = true;
             log::debug!(
@@ -1143,8 +1150,9 @@ impl server::Handler for ConnectionHandler {
             principal.short(),
         );
         self.pending_channels.insert(channel_id, channel);
+        reply.accept().await;
 
-        Ok(true)
+        Ok(())
     }
 
     async fn subsystem_request(
@@ -1267,8 +1275,9 @@ impl server::Handler for ConnectionHandler {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &ssh_key::PublicKey,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
+        let public_key = key.public_key;
         let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
         let peer = self
             .peer_addr
@@ -1361,7 +1370,7 @@ mod tests {
 
     #[test]
     fn accepted_sockets_disable_nagle() {
-        let key = PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
             .expect("generate a host key");
         assert!(russh_config(key).nodelay, "keystroke-sized writes must not wait on Nagle");
     }

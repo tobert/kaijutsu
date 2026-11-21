@@ -114,7 +114,7 @@ impl TestKernel {
         // generated fresh per boot, never reused, and the label survives
         // into the key comment so a stray entry is unmistakably a throwaway.
         let key = Arc::new(
-            PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
                 .expect("generate ephemeral client key"),
         );
         let mut pubkey = key.public_key().clone();

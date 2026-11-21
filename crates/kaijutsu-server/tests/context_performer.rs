@@ -83,7 +83,7 @@ fn create_context_refuses_a_characterless_principal() {
         let tmp = tempfile::tempdir().unwrap();
         let auth_db_path = tmp.path().join("auth.db");
         let unmapped = PrincipalId::new();
-        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         {
             // Bind the key BEFORE the server opens the same file, so
             // `db.authenticate` finds it on the very first connection —

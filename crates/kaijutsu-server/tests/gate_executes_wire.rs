@@ -121,8 +121,8 @@ async fn seats() -> Seats {
     let amy_principal = PrincipalId::new();
     let worker_principal = PrincipalId::new();
     let approver_principal = PrincipalId::new();
-    let worker_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-    let approver_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    let worker_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let approver_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let auth_db = AuthDb::open(&auth_db_path).unwrap();
     auth_db.add_key(worker_principal, worker_key.public_key(), Some("gate-worker")).unwrap();
     auth_db.add_key(approver_principal, approver_key.public_key(), Some("gate-approver")).unwrap();

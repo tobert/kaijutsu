@@ -7,7 +7,7 @@
 //! an `http` or `sse` server is refused by name rather than dropped. See
 //! docs/acp.md, "Client-declared MCP servers".
 
-use agent_client_protocol::schema::v1::McpServer;
+use agent_client_protocol::v1::schema::McpServer;
 use kaijutsu_client::ContextMcpServerDecl;
 
 /// Translate a declaration, refusing a transport this agent does not
@@ -45,7 +45,7 @@ fn unsupported(name: &str, transport: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{EnvVariable, McpServerHttp, McpServerStdio};
+    use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
 
     #[test]
     fn stdio_servers_carry_command_args_and_env() {

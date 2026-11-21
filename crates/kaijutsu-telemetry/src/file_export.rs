@@ -203,7 +203,7 @@ impl FileLogExporter {
 impl LogExporter for FileLogExporter {
     async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
         let request = ExportLogsServiceRequest {
-            resource_logs: group_logs_by_resource_and_scope(batch, &self.resource),
+            resource_logs: group_logs_by_resource_and_scope(&batch, &self.resource),
         };
         if request.resource_logs.iter().all(|r| r.scope_logs.is_empty()) {
             return Ok(());

@@ -57,7 +57,7 @@ impl KeySource {
 
     /// Generate an ephemeral Ed25519 key in memory (useful for tests)
     pub fn ephemeral() -> Self {
-        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
             .expect("Failed to generate ephemeral key");
         Self::InMemory(Arc::new(key))
     }
@@ -119,8 +119,9 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        let server_public_key = server_public_key.public_key();
         let fingerprint = server_public_key.fingerprint(HashAlg::Sha256);
         self.server_key = Some(server_public_key.clone());
 
@@ -135,7 +136,7 @@ impl client::Handler for ClientHandler {
         // TOFU: Trust On First Use via ~/.ssh/known_hosts
         use russh::keys::known_hosts;
 
-        match known_hosts::check_known_hosts(&self.host, self.port, server_public_key) {
+        match known_hosts::check_known_hosts(&self.host, self.port, &server_public_key) {
             Ok(true) => {
                 log::info!(
                     "Server key verified for {}:{} ({})",
@@ -154,7 +155,7 @@ impl client::Handler for ClientHandler {
                     fingerprint
                 );
                 if let Err(e) =
-                    known_hosts::learn_known_hosts(&self.host, self.port, server_public_key)
+                    known_hosts::learn_known_hosts(&self.host, self.port, &server_public_key)
                 {
                     log::warn!(
                         "Failed to save server key to known_hosts: {}. \
@@ -625,7 +626,7 @@ mod tests {
     }
 
     fn identity_with_fingerprint() -> (AgentIdentity, String) {
-        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
             .expect("generate test key");
         let public = key.public_key().clone();
         let fingerprint = public.fingerprint(HashAlg::Sha256).to_string();
@@ -680,10 +681,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("id_ed25519");
 
-        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
             .expect("generate test key");
         let encrypted = key
-            .encrypt(&mut rand_v10::rng(), "correct horse battery staple")
+            .encrypt(&mut rand::rng(), "correct horse battery staple")
             .expect("encrypt test key");
         let pem = encrypted.to_openssh(LineEnding::LF).expect("serialize encrypted key");
         std::fs::write(&path, pem.as_str()).expect("write encrypted key file");

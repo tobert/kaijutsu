@@ -34,7 +34,7 @@ kaijutsu-telemetry.workspace = true
 # behind `unstable_protocol_v2`, which we deliberately leave OFF (docs/acp.md,
 # "Version stance"). Default features only: every `unstable_*` schema type is
 # off-limits here.
-agent-client-protocol = "2.0.0"
+agent-client-protocol = { version = "5.5", features = ["stdio"] }
 
 # `time` on top of the workspace set: the connect wait is bounded by a
 # timeout, and relying on another crate's feature unification for that would

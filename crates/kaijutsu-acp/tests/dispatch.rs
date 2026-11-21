@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, DeleteSessionRequest, DeleteSessionResponse,
     InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
@@ -26,7 +26,8 @@ use agent_client_protocol::schema::v1::{
     ResumeSessionRequest, ResumeSessionResponse, StopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
+use agent_client_protocol::{Agent, Client};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
 
 /// Which handler saw traffic. The point of the test is that each name appears
 /// exactly once, in the right place.
@@ -46,7 +47,7 @@ fn agent_shape(log: Log) -> impl agent_client_protocol::ConnectTo<Client> + 'sta
         log.clone(),
     );
     Agent
-        .builder()
+        .v1()
         .name("kaijutsu-acp-test")
         .on_receive_request(
             async move |req: InitializeRequest,
@@ -138,7 +139,7 @@ async fn every_acp_method_reaches_its_own_handler() {
     let agent = agent_shape(log.clone());
 
     Client
-        .builder()
+        .v1()
         .name("test-client")
         .connect_with(agent, async move |cx| {
             let init = cx
@@ -214,13 +215,16 @@ async fn a_method_we_do_not_implement_is_refused_not_mishandled() {
     // Nothing in the chain claims `session/set_mode`; the SDK must answer
     // method_not_found rather than letting it fall into a neighbouring
     // handler.
-    use agent_client_protocol::schema::v1::SetSessionModeRequest;
+    use agent_client_protocol::v1::schema::SetSessionModeRequest;
     let log: Log = Arc::default();
     let agent = agent_shape(log.clone());
 
     Client
-        .builder()
+        .v1()
         .connect_with(agent, async move |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
             let err = cx
                 .send_request(SetSessionModeRequest::new(SessionId::new("ctx-hex"), "mode"))
                 .block_task()
@@ -228,15 +232,16 @@ async fn a_method_we_do_not_implement_is_refused_not_mishandled() {
                 .expect_err("session/set_mode is not implemented");
             assert_eq!(
                 err.code,
-                agent_client_protocol::schema::v1::Error::method_not_found().code
+                agent_client_protocol::v1::schema::Error::method_not_found().code
             );
             Ok(())
         })
         .await
         .expect("acp session");
 
-    assert!(
-        log.lock().unwrap().is_empty(),
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["initialize"],
         "an unimplemented method must not wake any handler"
     );
 }

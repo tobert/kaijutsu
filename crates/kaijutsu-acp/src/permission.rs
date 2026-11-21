@@ -78,11 +78,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SessionId, SessionNotification, SessionUpdate, ToolCallUpdate, ToolCallUpdateFields,
 };
-use agent_client_protocol::{Client, ConnectionTo};
+use agent_client_protocol::Client;
+use agent_client_protocol::v1::ConnectionTo;
 use kaijutsu_client::LedgerState;
 use kaijutsu_client::rpc::AskAnswer;
 use kaijutsu_types::{
@@ -637,7 +638,7 @@ fn map_response(response: &RequestPermissionResponse, kinds: &OptionKinds) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{PermissionOptionId, SelectedPermissionOutcome};
+    use agent_client_protocol::v1::schema::{PermissionOptionId, SelectedPermissionOutcome};
     use kaijutsu_types::{AskOrigin, AskStatus, PrincipalRef};
 
     fn selected(response: &str) -> RequestPermissionResponse {
@@ -846,7 +847,8 @@ mod tests {
         answer: impl Fn(usize) -> Option<RequestPermissionResponse> + Send + Sync + 'static,
         drive: impl AsyncFnOnce(Arc<std::sync::Mutex<Seen>>, Option<oneshot::Sender<()>>, oneshot::Receiver<Prompted>) + Send + 'static,
     ) {
-        use agent_client_protocol::{Agent, Responder};
+        use agent_client_protocol::Agent;
+        use agent_client_protocol::v1::Responder;
 
         let seen: Arc<std::sync::Mutex<Seen>> = Arc::default();
         let held: Arc<std::sync::Mutex<Vec<Responder<RequestPermissionResponse>>>> = Arc::default();
@@ -856,7 +858,7 @@ mod tests {
         let withdrawn = std::sync::Mutex::new(Some(withdrawn));
         let outcome_tx = std::sync::Mutex::new(Some(outcome_tx));
 
-        let agent = Agent.builder().name("permission-test").with_spawned(move |cx: ConnectionTo<Client>| {
+        let agent = Agent.v1().name("permission-test").with_spawned(move |cx: ConnectionTo<Client>| {
             let mut withdrawn = withdrawn.lock().unwrap().take().expect("spawned once");
             let outcome_tx = outcome_tx.lock().unwrap().take().expect("spawned once");
             async move {
@@ -873,7 +875,7 @@ mod tests {
         let seen_notes = Arc::clone(&seen);
         let seen_drive = Arc::clone(&seen);
         Client
-            .builder()
+            .v1()
             .name("permission-test-client")
             .on_receive_request(
                 async move |request: RequestPermissionRequest,
@@ -1057,7 +1059,8 @@ mod tests {
         answer: impl Fn(usize) -> Result<RequestPermissionResponse, ()> + Send + Sync + 'static,
         drive: impl AsyncFnOnce(Arc<std::sync::Mutex<Seen>>, Arc<std::sync::Mutex<Vec<AskVerdict>>>) + Send + 'static,
     ) {
-        use agent_client_protocol::{Agent, Responder};
+        use agent_client_protocol::Agent;
+        use agent_client_protocol::v1::Responder;
 
         let me = PrincipalId::new();
         let mut ask = summary("req-1", Some(me));
@@ -1073,7 +1076,7 @@ mod tests {
         let decided = Arc::clone(&kernel.decided);
         let timing = Timing { request_timeout: Duration::from_secs(30), reoffer_after: Duration::from_millis(100) };
 
-        let agent = Agent.builder().name("pump-test").with_spawned(move |cx: ConnectionTo<Client>| async move {
+        let agent = Agent.v1().name("pump-test").with_spawned(move |cx: ConnectionTo<Client>| async move {
             let (_ledger_tx, ledger) = watch::channel(LedgerState::from_listing(1, vec![ask]));
             let sessions = SessionRegistry::default();
             let binds = sessions.subscribe_binds();
@@ -1087,7 +1090,7 @@ mod tests {
         let seen: Arc<std::sync::Mutex<Seen>> = Arc::default();
         let seen_handler = Arc::clone(&seen);
         Client
-            .builder()
+            .v1()
             .name("pump-test-client")
             .on_receive_request(
                 async move |request: RequestPermissionRequest,
@@ -1100,7 +1103,7 @@ mod tests {
                     };
                     match answer(n) {
                         Ok(response) => responder.respond(response),
-                        Err(()) => responder.respond_with_error(agent_client_protocol::util::internal_error("client fault")),
+                        Err(()) => responder.respond_with_error(agent_client_protocol::Error::internal_error().data("client fault")),
                     }
                 },
                 agent_client_protocol::on_receive_request!(),

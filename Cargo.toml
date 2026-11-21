@@ -105,9 +105,9 @@ kaish-help = { version = "0.19" }
 
 
 # Cap'n Proto
-capnp = "0.25"
-capnp-rpc = "0.25"
-capnpc = "0.25"
+capnp = "0.28"
+capnp-rpc = "0.28"
+capnpc = "0.28"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "process", "io-util", "signal"] }
@@ -115,8 +115,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 
 # SSH
-russh = "0.61"
-russh-sftp = "2.3"
+russh = "0.65"
+russh-sftp = "2.4"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -133,7 +133,7 @@ thiserror = "2"
 anyhow = "1"
 whoami = "1.5"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
-strum = { version = "0.26", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 regex = "1"
 include_dir = "0.7"
 dirs = "6"
@@ -153,9 +153,8 @@ async-trait = "0.1"
 dashmap = "6"
 parking_lot = "0.12"
 
-# RNG — 0.8 was pinned by diamond-types-extended (jumprope), which is gone.
-# Nothing forces this version now; it is free to move on its own merits.
-rand = "0.8"
+# RNG
+rand = "0.10"
 shellexpand = "3"
 
 # Bevy Remote Protocol (debugging)
@@ -193,13 +192,13 @@ vt100 = "0.16"
 imara-diff = "0.2"
 
 # Persistence
-rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.43", features = ["bundled", "hooks"] }
 
 # Configuration
-toml = "0.8"
+toml = "1.2"
 
 # MCP (Model Context Protocol)
-rmcp = { version = "3.1", features = ["client", "elicitation", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.11", features = ["client", "elicitation", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 http = "1"
 
 # Vi-modal editing (keystroke → semantic action state machine)
@@ -227,12 +226,12 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs"] }
-opentelemetry-appender-tracing = "0.31"
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
-tracing-opentelemetry = "0.32"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs"] }
+opentelemetry-appender-tracing = "0.33"
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
+tracing-opentelemetry = "0.34"
 
 # Testing
 tempfile = "3"

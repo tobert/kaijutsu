@@ -146,8 +146,8 @@ async fn two_connections(mock_llm: bool) -> TwoConnections {
     let auth_db_path = tmp.path().join("auth.db");
     let a_principal = PrincipalId::new();
     let b_principal = PrincipalId::new();
-    let a_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-    let b_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    let a_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let b_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let auth_db = AuthDb::open(&auth_db_path).unwrap();
     auth_db.add_key(a_principal, a_key.public_key(), Some("conn-a")).unwrap();
     auth_db.add_key(b_principal, b_key.public_key(), Some("conn-b")).unwrap();
@@ -539,8 +539,8 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         let worker_principal = PrincipalId::new();
         let coder_principal = PrincipalId::new();
         let amy_principal = PrincipalId::new();
-        let worker_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-        let coder_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+        let worker_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let coder_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let auth_db = AuthDb::open(&auth_db_path).unwrap();
         auth_db.add_key(worker_principal, worker_key.public_key(), Some("worker")).unwrap();
         auth_db.add_key(coder_principal, coder_key.public_key(), Some("coder")).unwrap();

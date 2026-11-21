@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_client_protocol::schema::v1::{SessionId, SessionInfo};
+use agent_client_protocol::v1::schema::{SessionId, SessionInfo};
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
 

@@ -99,7 +99,7 @@ async fn start_server_on(
             std::fs::create_dir_all(&dir).expect("create reconnect-fsm state dir");
             let auth_db_path = dir.join("auth.db");
             let root_key = russh::keys::PrivateKey::random(
-                &mut rand_v10::rng(),
+                &mut rand::rng(),
                 russh::keys::Algorithm::Ed25519,
             )
             .expect("generate root key for reconnect-fsm state dir");
@@ -464,7 +464,7 @@ fn black_hole_address_falls_into_cooldown_quickly() {
         // No real server is listening, so authentication never happens —
         // any key will do.
         let throwaway_key = Arc::new(
-            russh::keys::PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
                 .expect("generate throwaway key"),
         );
         let actor = spawn_test_actor(addr, throwaway_key, "test-blackhole");

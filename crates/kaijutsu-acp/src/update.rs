@@ -33,7 +33,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionId,
     SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind as AcpToolKind, UsageUpdate,

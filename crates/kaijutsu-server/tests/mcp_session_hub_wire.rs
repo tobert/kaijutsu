@@ -58,7 +58,7 @@ fn a_non_root_registration_lands_under_the_hub_and_archives_itself_with_no_ask()
         let auth = kaijutsu_server::AuthDb::open(config.auth_db_path.as_ref().unwrap()).unwrap();
         let mut keys = Vec::new();
         for name in ["claude", "bob"] {
-            let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+            let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
             let principal = PrincipalId::new();
             auth.add_key(principal, key.public_key(), Some(name)).unwrap();
             keys.push((name, principal, Arc::new(key)));

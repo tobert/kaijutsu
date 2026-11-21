@@ -91,8 +91,8 @@ impl Held {
         let auth_db_path = tmp.path().join("auth.db");
         let performer = PrincipalId::new();
         let reviewer = PrincipalId::new();
-        let performer_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-        let reviewer_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+        let performer_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let reviewer_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let auth_db = AuthDb::open(&auth_db_path).unwrap();
         auth_db.add_key(performer, performer_key.public_key(), Some("held-performer")).unwrap();
         auth_db.add_key(reviewer, reviewer_key.public_key(), Some("held-reviewer")).unwrap();

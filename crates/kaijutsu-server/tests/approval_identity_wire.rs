@@ -68,10 +68,10 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         let coder = PrincipalId::new();
         let lead = PrincipalId::new();
         let judge = PrincipalId::new();
-        let amy_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-        let coder_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-        let lead_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-        let judge_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+        let amy_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let coder_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let lead_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let judge_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let auth = AuthDb::open(&auth_path).unwrap();
         auth.add_key(amy, amy_key.public_key(), Some("amy")).unwrap();
         auth.add_key(coder, coder_key.public_key(), Some("coder")).unwrap();

@@ -351,7 +351,7 @@ pub async fn start_state_dir_server(state_dir: std::path::PathBuf) -> StateDirSe
     // and hands back a key that also authenticates.
     std::fs::create_dir_all(&state_dir).expect("create state dir");
     let auth_db_path = state_dir.join("auth.db");
-    let root_key = PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+    let root_key = PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
         .expect("generate root key for state dir");
     {
         let kernel_db = kaijutsu_kernel::kernel_db::KernelDb::open(state_dir.join("kernel.db"))

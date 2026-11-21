@@ -35,10 +35,10 @@ pub mod update;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CloseSessionRequest, CloseSessionResponse,
-    DeleteSessionRequest, DeleteSessionResponse, Error, Implementation,
+    DeleteSessionRequest, DeleteSessionResponse, Implementation,
     InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
@@ -48,8 +48,9 @@ use agent_client_protocol::schema::v1::{
     SessionResumeCapabilities, SessionUpdate, UnstructuredCommandInput,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::ContentBlock;
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
+use agent_client_protocol::v1::schema::ContentBlock;
+use agent_client_protocol::{Agent, Client, Error, Stdio};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
 use kaijutsu_client::ContextMcpServerDecl;
 use kaijutsu_types::ContextId;
 use parking_lot::Mutex;
@@ -182,7 +183,7 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
     let permission = Arc::clone(&bridge);
 
     Agent
-        .builder()
+        .v1()
         .name("kaijutsu-acp")
         .with_spawned(move |cx| async move {
             permission::start_permission_pump(&permission, cx).await;
@@ -237,7 +238,7 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_notification(
-            async move |notif: agent_client_protocol::schema::v1::CancelNotification, _cx| {
+            async move |notif: agent_client_protocol::v1::schema::CancelNotification, _cx| {
                 handle_cancel(Arc::clone(&cancel), notif).await
             },
             agent_client_protocol::on_receive_notification!(),
@@ -374,7 +375,7 @@ async fn handle_load_session(
         Ok(i) => i,
         Err(e) => {
             return responder
-                .respond_with_error(Error::resource_not_found(Some(e.to_string())));
+                .respond_with_error(agent_client_protocol::v1::schema::Error::resource_not_found(Some(e.to_string())).into());
         }
     };
     if let Err(e) = bridge.kernel.set_context_cwd(context_id, &req.cwd).await {
@@ -417,7 +418,7 @@ async fn handle_resume_session(
         Ok(i) => i,
         Err(e) => {
             return responder
-                .respond_with_error(Error::resource_not_found(Some(e.to_string())));
+                .respond_with_error(agent_client_protocol::v1::schema::Error::resource_not_found(Some(e.to_string())).into());
         }
     };
     if let Err(e) = bridge.kernel.set_context_cwd(context_id, &req.cwd).await {
@@ -667,7 +668,7 @@ async fn handle_delete_session(
             bridge.sessions.unbind(&req.session_id);
             responder.respond(DeleteSessionResponse::new())
         }
-        Err(e) => responder.respond_with_error(Error::resource_not_found(Some(e.to_string()))),
+        Err(e) => responder.respond_with_error(agent_client_protocol::v1::schema::Error::resource_not_found(Some(e.to_string())).into()),
     }
 }
 
@@ -680,10 +681,13 @@ async fn handle_close_session(
     responder: Responder<CloseSessionResponse>,
 ) -> Result<(), Error> {
     let Some(session) = bridge.sessions.get(&req.session_id) else {
-        return responder.respond_with_error(Error::resource_not_found(Some(format!(
-            "no such session: {} — it is not open on this connection",
-            req.session_id
-        ))));
+        return responder.respond_with_error(
+            agent_client_protocol::v1::schema::Error::resource_not_found(Some(format!(
+                "no such session: {} — it is not open on this connection",
+                req.session_id
+            )))
+            .into(),
+        );
     };
     if let Err(e) = bridge.kernel.interrupt(session.context_id, false).await {
         return responder.respond_with_error(internal(e));
@@ -710,10 +714,11 @@ fn handle_prompt(
     cx.spawn(async move {
         let Some(session) = bridge.sessions.get(&req.session_id) else {
             return responder.respond_with_error(
-                Error::resource_not_found(Some(format!(
+                agent_client_protocol::v1::schema::Error::resource_not_found(Some(format!(
                     "no such session: {} — call session/new or session/load first",
                     req.session_id
-                ))),
+                )))
+                .into(),
             );
         };
         if let Err(e) = refresh_command_catalog(
@@ -773,7 +778,7 @@ fn handle_prompt(
                     );
                 }
                 return responder.respond(PromptResponse::new(
-                    agent_client_protocol::schema::v1::StopReason::EndTurn,
+                    agent_client_protocol::v1::schema::StopReason::EndTurn,
                 ));
             }
             Ok(None) => {}
@@ -846,7 +851,7 @@ fn classify_command(
 /// which is what ACP requires of a cancelled prompt.
 async fn handle_cancel(
     bridge: Arc<AcpBridge>,
-    notif: agent_client_protocol::schema::v1::CancelNotification,
+    notif: agent_client_protocol::v1::schema::CancelNotification,
 ) -> Result<(), Error> {
     let Some(session) = bridge.sessions.get(&notif.session_id) else {
         tracing::warn!(session = %notif.session_id, "cancel for an unknown session");
@@ -867,7 +872,7 @@ fn internal(e: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{ResourceLink, TextContent};
+    use agent_client_protocol::v1::schema::{ResourceLink, TextContent};
 
     fn command(
         name: &str,

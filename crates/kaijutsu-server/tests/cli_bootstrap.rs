@@ -28,7 +28,7 @@ fn text(out: &Output) -> String {
 #[test]
 fn bootstrap_finds_the_key_and_the_provider_in_home() {
     let home = tempfile::tempdir().unwrap();
-    let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
     std::fs::write(home.path().join(".ssh/id_ed25519.pub"), key.public_key().to_openssh().unwrap()).unwrap();
     std::fs::write(home.path().join(".deepseek-key"), "sk-test\n").unwrap();
@@ -57,7 +57,7 @@ fn bootstrap_finds_the_key_and_the_provider_in_home() {
 #[test]
 fn a_model_with_no_provider_found_is_refused() {
     let home = tempfile::tempdir().unwrap();
-    let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
     std::fs::write(home.path().join(".ssh/id_ed25519.pub"), key.public_key().to_openssh().unwrap()).unwrap();
 

@@ -9,8 +9,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate, StopReason};
-use agent_client_protocol::{Client, ConnectionTo};
+use agent_client_protocol::v1::schema::{SessionId, SessionNotification, SessionUpdate, StopReason};
+use agent_client_protocol::Client;
+use agent_client_protocol::v1::ConnectionTo;
 use kaijutsu_client::{
     ContextChange, ContextDelivery, ContextInfo, ContextMirror, FeedEvent, ServerEvent, TurnOrigin,
 };
@@ -853,7 +854,7 @@ mod tests {
         let SessionUpdate::AgentMessageChunk(chunk) = &updates[0] else {
             panic!("expected an agent message chunk, got {:?}", updates[0]);
         };
-        let agent_client_protocol::schema::v1::ContentBlock::Text(text) = &chunk.content else {
+        let agent_client_protocol::v1::schema::ContentBlock::Text(text) = &chunk.content else {
             panic!("expected text content, got {:?}", chunk.content);
         };
         assert_eq!(text.text, "hello from the feed");

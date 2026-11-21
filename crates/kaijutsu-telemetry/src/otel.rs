@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use opentelemetry::trace::{
-    Link, SamplingDecision, SamplingResult, SpanContext, SpanId, SpanKind, TraceContextExt,
-    TraceFlags, TraceId, TraceState, TracerProvider as _,
+    Link, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId, TraceState,
+    TracerProvider as _,
 };
 use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -12,7 +12,9 @@ use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, ShouldSample, SpanLimits};
+use opentelemetry_sdk::trace::{
+    Sampler, SamplingDecision, SamplingResult, SdkTracerProvider, ShouldSample, SpanLimits,
+};
 use crate::file_export::{FileLogExporter, FileMetricExporter, FileSpanExporter};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::filter_fn;

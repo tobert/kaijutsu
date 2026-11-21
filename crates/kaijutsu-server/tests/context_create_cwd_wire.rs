@@ -83,7 +83,7 @@ fn a_held_create_drops_a_directory_the_kernel_cannot_see_when_it_runs() {
         common::allow_in_shipped_gate(&config, &[]);
         let amy_key = config.root_key();
         let claude = kaijutsu_types::PrincipalId::new();
-        let claude_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+        let claude_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         kaijutsu_server::AuthDb::open(config.auth_db_path.as_ref().unwrap())
             .unwrap()
             .add_key(claude, claude_key.public_key(), Some("claude"))
