@@ -15,6 +15,7 @@
 //! - `helpers`: Parsing and utility functions
 //! - `tree`: DAG visualization as ASCII tree
 
+pub mod elicitation;
 mod helpers;
 pub mod hook_listener;
 pub mod hook_adapter;
@@ -41,7 +42,10 @@ use rmcp::{
         router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters,
     },
     model::{
+        CallToolResponse,
         CallToolResult,
+        // Task types
+        CancelTaskParams,
         // Resource types
         CancelledNotificationParam,
         ContentBlock,
@@ -49,8 +53,12 @@ use rmcp::{
         CompleteRequestParams,
         CompleteResult,
         CompletionInfo,
+        CreateTaskResult,
+        ElicitationSchema,
         // Prompt types
         GetPromptResult,
+        GetTaskParams,
+        GetTaskResult,
         ListResourceTemplatesResult,
         ListResourcesResult,
         PaginatedRequestParams,
@@ -61,6 +69,8 @@ use rmcp::{
         ReadResourceRequestParams,
         ReadResourceResponse,
         ReadResourceResult,
+        RequestId,
+        RequestStateCodec,
         Resource,
         ResourceContents,
         ResourceTemplate,
@@ -72,10 +82,12 @@ use rmcp::{
         ServerCapabilities,
         ServerConfig,
         SubscriptionFilter,
+        UpdateTaskParams,
     },
     prompt, prompt_handler, prompt_router,
     schemars::JsonSchema,
     service::{NotificationContext, Peer, RequestContext, SubscriptionContext, SubscriptionSendError},
+    task_manager::{TaskExit, TaskManager, TaskOptions},
     tool, tool_handler, tool_router,
 };
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kaijutsu still wants to
@@ -95,9 +107,10 @@ use kaijutsu_client::{
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, watch};
+use tokio_util::sync::CancellationToken;
 
 // Re-export public types
 use helpers::*;
@@ -863,6 +876,38 @@ pub struct KaijutsuMcp {
     startup: StartupGate,
     /// Coalesced resource subscription hub shared with pulse and listen tasks.
     subscriptions: SubscriptionHub,
+    /// Per-instance HMAC codec for MRTR `requestState` tokens.
+    request_state_codec: RequestStateCodec,
+    /// Server-side task runtime for MCP Tasks (`io.modelcontextprotocol/tasks`).
+    tasks: TaskManager,
+    /// In-flight request cancellation tokens keyed by JSON-RPC `RequestId`.
+    inflight: Arc<Mutex<HashMap<RequestId, CancellationToken>>>,
+}
+
+/// Associated data binding MRTR `requestState` tokens to `register_session`.
+const REGISTER_SESSION_STATE_AD: &[u8] = b"kaijutsu-mcp:tools/call:register_session";
+
+/// Input request key for session label elicitation.
+const SESSION_LABEL_ELICIT_KEY: &str = "session_label";
+
+/// Payload sealed into `requestState` during `register_session` elicitation.
+#[derive(Debug, Serialize, Deserialize)]
+struct RegisterSessionElicitState {
+    tool: String,
+}
+
+/// Removes an in-flight `RequestId` entry when a tool call finishes.
+struct InflightGuard {
+    inflight: Arc<Mutex<HashMap<RequestId, CancellationToken>>>,
+    request_id: RequestId,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.inflight.lock() {
+            map.remove(&self.request_id);
+        }
+    }
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -894,6 +939,9 @@ impl KaijutsuMcp {
             character: None,
             startup: StartupGate::open(),
             subscriptions: SubscriptionHub::new(),
+            request_state_codec: elicitation::random_request_state_codec(),
+            tasks: TaskManager::new(),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -995,6 +1043,9 @@ impl KaijutsuMcp {
             character: None,
             startup: StartupGate::open(),
             subscriptions,
+            request_state_codec: elicitation::random_request_state_codec(),
+            tasks: TaskManager::new(),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1010,6 +1061,32 @@ impl KaijutsuMcp {
     /// Access the server's coalesced resource subscription hub.
     pub fn subscriptions(&self) -> &SubscriptionHub {
         &self.subscriptions
+    }
+
+    /// Track a cancellation token for `request_id` so `notifications/cancelled` cancels it.
+    pub fn track_inflight_token(&self, request_id: RequestId, token: CancellationToken) {
+        if let Ok(mut map) = self.inflight.lock() {
+            map.insert(request_id, token);
+        }
+    }
+
+    /// Register `token` for `request_id` and return an RAII guard that removes it on drop.
+    fn register_inflight(&self, request_id: RequestId, token: CancellationToken) -> InflightGuard {
+        self.track_inflight_token(request_id.clone(), token);
+        InflightGuard {
+            inflight: self.inflight.clone(),
+            request_id,
+        }
+    }
+
+    /// Best-effort interrupt of the joined remote context when a shell call or task is cancelled.
+    async fn best_effort_interrupt_joined(&self) {
+        if let Some(remote) = self.remote()
+            && let Some(ctx_id) = remote.joined.read().await.as_ref().map(|j| j.context_id)
+            && let Err(e) = remote.actor.interrupt_context(ctx_id, false).await
+        {
+            tracing::debug!(context_id = %ctx_id, "best-effort interrupt on cancel failed: {e}");
+        }
     }
 
     /// Hold tool calls on `gate` until the caller settles it.
@@ -2904,8 +2981,10 @@ impl KaijutsuMcp {
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for KaijutsuMcp {
-    /// Every tool call waits for startup registration (`StartupGate`), then
-    /// dispatches through the tool router as `#[tool_handler]` would.
+    /// Every tool call waits for startup registration (`StartupGate`), tracks
+    /// cancellation by `RequestId`, handles protocol-aware elicitation on
+    /// `register_session` and task materialization on `shell`, then dispatches
+    /// remaining calls through the tool router.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -2914,8 +2993,163 @@ impl ServerHandler for KaijutsuMcp {
         if !self.startup.settled_within(STARTUP_WAIT).await {
             tracing::warn!(tool = %request.name, "startup has not settled; running the call anyway");
         }
+
+        let cancel_token = context.ct.child_token();
+        let _inflight_guard = self.register_inflight(context.id.clone(), cancel_token.clone());
+
+        if request.name == "register_session" {
+            if let Some(ref sealed_state) = request.request_state {
+                let state: RegisterSessionElicitState = elicitation::open_request_state(
+                    &self.request_state_codec,
+                    sealed_state,
+                    REGISTER_SESSION_STATE_AD,
+                )?;
+                if state.tool != "register_session" {
+                    return Err(McpError::invalid_params(
+                        "invalid or expired requestState",
+                        None,
+                    ));
+                }
+                let elicit_result = elicitation::extract_form_response(
+                    request.input_responses.as_ref(),
+                    SESSION_LABEL_ELICIT_KEY,
+                )?;
+                let label = elicit_result
+                    .as_ref()
+                    .and_then(|res| elicitation::accepted_string_field(res, "label"));
+                let reply = self.register_session_auto(label).await;
+                return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                    ContentBlock::text(reply),
+                ])));
+            }
+
+            let parsed_req = serde_json::from_value::<RegisterSessionRequest>(
+                serde_json::Value::Object(request.arguments.clone().unwrap_or_default()),
+            );
+            if let Ok(req) = parsed_req {
+                let has_session_id = self
+                    .session_id
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .is_some();
+                let already_joined = match self.remote() {
+                    Some(remote) => remote.joined.read().await.is_some(),
+                    None => false,
+                };
+                if req.label.is_none() && !has_session_id && !already_joined {
+                    let schema = ElicitationSchema::builder()
+                        .required_string_property("label", |s| {
+                            s.description("Human-readable label for the context")
+                        })
+                        .build()
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("failed to build elicitation schema: {e}"),
+                                None,
+                            )
+                        })?;
+                    let state = RegisterSessionElicitState {
+                        tool: "register_session".to_string(),
+                    };
+                    match elicitation::elicit_form(
+                        &self.request_state_codec,
+                        &context,
+                        SESSION_LABEL_ELICIT_KEY,
+                        "Enter a label for this Kaijutsu session context (decline to auto-generate).",
+                        schema,
+                        &state,
+                        REGISTER_SESSION_STATE_AD,
+                        Some(elicitation::DEFAULT_REQUEST_STATE_TTL),
+                    )
+                    .await?
+                    {
+                        elicitation::ElicitationOutcome::InputRequired(result) => {
+                            return Ok(CallToolResponse::InputRequired(result));
+                        }
+                        elicitation::ElicitationOutcome::Inline(elicit_result) => {
+                            let label =
+                                elicitation::accepted_string_field(&elicit_result, "label");
+                            let reply = self.register_session_auto(label).await;
+                            return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                                ContentBlock::text(reply),
+                            ])));
+                        }
+                        elicitation::ElicitationOutcome::Unsupported => {}
+                    }
+                }
+            }
+        }
+
+        if request.name == "shell"
+            && context
+                .client_capabilities()
+                .is_some_and(|c| c.supports_tasks())
+        {
+            let parsed_req = serde_json::from_value::<ShellRequest>(serde_json::Value::Object(
+                request.arguments.clone().unwrap_or_default(),
+            ));
+            if let Ok(req) = parsed_req
+                && !req.run_in_background
+            {
+                let progress = context
+                    .meta
+                    .get_progress_token()
+                    .map(|token| (context.peer.clone(), token));
+                let this = self.clone();
+                let task = self.tasks.spawn(TaskOptions::default(), move |task_ctx| {
+                    Box::pin(async move {
+                        tokio::select! {
+                            result = this.shell_impl(req, progress) => Ok(result),
+                            _ = task_ctx.cancelled() => {
+                                this.best_effort_interrupt_joined().await;
+                                Err(TaskExit::Cancelled)
+                            }
+                        }
+                    })
+                });
+                return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+            }
+        }
+
+        let is_shell = request.name == "shell";
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        tokio::select! {
+            res = self.tool_router.call(tcc) => res,
+            _ = cancel_token.cancelled() => {
+                if is_shell {
+                    self.best_effort_interrupt_joined().await;
+                }
+                Ok(CallToolResponse::Complete(CallToolResult::error(vec![
+                    ContentBlock::text("Request cancelled"),
+                ])))
+            }
+        }
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks.get_task(&request.task_id).map(GetTaskResult::new)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel_task(&request.task_id)
     }
 
     // `enable_logging` is deprecated by SEP-2577 — see the import-site
@@ -2925,6 +3159,7 @@ impl ServerHandler for KaijutsuMcp {
         ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tasks()
                 .enable_prompts()
                 .enable_prompts_list_changed()
                 .enable_resources()
@@ -3498,7 +3733,12 @@ impl ServerHandler for KaijutsuMcp {
             reason = ?notification.reason,
             "Request cancelled"
         );
-        // Future: track in-flight operations and cancel them
+        if let Some(ref request_id) = notification.request_id
+            && let Ok(map) = self.inflight.lock()
+            && let Some(token) = map.get(request_id)
+        {
+            token.cancel();
+        }
     }
 }
 

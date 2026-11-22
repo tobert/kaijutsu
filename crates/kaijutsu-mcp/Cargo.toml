@@ -31,7 +31,7 @@ clap.workspace = true
 hostname.workspace = true
 
 # MCP server
-rmcp = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp = { workspace = true, features = ["server", "macros", "request-state", "transport-io", "transport-streamable-http-server"] }
 
 # Streamable HTTP service mode (UDS + optional loopback TCP)
 http.workspace = true
