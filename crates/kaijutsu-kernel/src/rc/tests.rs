@@ -119,10 +119,11 @@
             let prefix = format!("/config/rc/{dir}/create/");
             let mut expected = Vec::new();
             for (path, _) in crate::seed_scripts::seed_files().into_iter()
-                .filter(|(path, _)| path.starts_with(&prefix) && path.ends_with(".md")) {
+                .filter(|(path, _)| path.starts_with(&prefix) && path.ends_with(".md") && !path.ends_with("/S18-arrival.md")) {
                 let data = d.kernel().vfs().read_all(std::path::Path::new(&path)).await.unwrap();
                 expected.push(String::from_utf8(data).unwrap());
             }
+            // S18-arrival.md is route data the arrival card reads, not an instruction.
             assert!(!expected.is_empty(), "{dir} must exercise companion data");
             if dir == "musician" {
                 // The chair script (S05) reads its text from `chairs/`, bass by default.
@@ -4524,4 +4525,126 @@ esac
             let unique: std::collections::HashSet<&str> = emitted.iter().map(|s| s.as_str()).collect();
             assert_eq!(unique.len(), 3, "gpt, qwen, and gemma should emit distinct tuning blocks: {emitted:?}");
         });
+    }
+
+    // ── Arrival card (lib/create/S18-arrival.kai) ─────────────────────────
+
+    /// First words of the arrival card.
+    const ARRIVAL_MARKER: &str = "=== You are ";
+
+    /// Create a context played by the shipped `dir` rc, named `name`, with the
+    /// given extra `kj context create` flags, and return the arrival cards in
+    /// it, every Error block, and the context.
+    async fn arrival_card_for(d: &std::sync::Arc<KjDispatcher>, caller: &KjCaller, dir: &str, name: &str, extra: &[&str])
+        -> (Vec<kaijutsu_types::BlockSnapshot>, Vec<String>, ContextId)
+    {
+        let mut args: Vec<String> = ["context", "create", rc_performer(d, dir).as_str(), "--name", name].map(String::from).to_vec();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let r = d.dispatch(&args, caller).await;
+        assert!(r.is_ok(), "create failed: {}", r.message());
+        let ctx = lookup_context_id(d, name);
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let errors = blocks.iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content.clone()).collect();
+        let cards = blocks.into_iter().filter(|b| b.kind == BlockKind::Notification && b.content.starts_with(ARRIVAL_MARKER)).collect();
+        (cards, errors, ctx)
+    }
+
+    /// A senpai and a kohai each get one card in a NOTIFICATION block that
+    /// names the label, the senpai, the reviewer, and the cwd; the run leaves
+    /// no Error block, and the card stays out of the cached system prompt.
+    #[test]
+    fn senpai_and_kohai_creates_write_one_arrival_card() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
+            let caller = console_caller(&d);
+            let (cards, errors, ctx) = arrival_card_for(&d, &caller, "senpai", "lead", &["--cwd", "/work"]).await;
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(cards.len(), 1, "{cards:#?}");
+            let text = &cards[0].content;
+            assert_eq!(cards[0].role, Role::System);
+            for needle in ["'lead'", "You answer to", "reviews your asks", "/work", "Waiting on you: no asks, no workers"] {
+                assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+            }
+            assert!(text.lines().count() <= 10, "{text}");
+            let blocks = d.block_store().block_snapshots(ctx).unwrap();
+            assert!(crate::extract_system_prompt_sections(&blocks).iter().all(|s| !s.contains(ARRIVAL_MARKER)));
+            let run = find_run_for_context(&d, ctx, "create").expect("run row");
+            assert_eq!(run.outcome, Some(RcOutcome::Ok));
+
+            let (cards, errors, _) = arrival_card_for(&d, &caller, "kohai", "worker", &["--senpai", "lead", "--cwd", "/work"]).await;
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(cards.len(), 1, "{cards:#?}");
+            let text = &cards[0].content;
+            for needle in ["'worker'", "You answer to 'lead'", "working in /work."] {
+                assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+            }
+            assert!(!text.contains("Where to send"), "a kohai ships no routes:\n{text}");
+        });
+    }
+
+    /// The senpai's route to `banto` says it is not running while no context
+    /// has that label, and names the context once one does.
+    #[test]
+    fn the_arrival_card_route_says_whether_banto_is_running() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let caller = console_caller(&d);
+            let (cards, errors, _) = arrival_card_for(&d, &caller, "senpai", "lead-a", &[]).await;
+            assert!(errors.is_empty(), "{errors:?}");
+            let text = &cards[0].content;
+            assert!(text.contains("Kernel administration: banto is not running; ask the person"), "{text}");
+
+            let (_, errors, banto) = arrival_card_for(&d, &caller, "banto", "banto", &[]).await;
+            assert!(errors.is_empty(), "{errors:?}");
+            let (cards, errors, _) = arrival_card_for(&d, &caller, "senpai", "lead-b", &[]).await;
+            assert!(errors.is_empty(), "{errors:?}");
+            let want = format!("Kernel administration: banto (live, {})", &banto.to_hex()[..8]);
+            assert!(cards[0].content.contains(&want), "missing {want:?} in:\n{}", cards[0].content);
+        });
+    }
+
+    /// A context with no cwd, and a context with no senpai, still get a card
+    /// and a clean run.
+    #[test]
+    fn the_arrival_card_survives_no_cwd_and_no_senpai() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let caller = console_caller(&d);
+            let (cards, errors, ctx) = arrival_card_for(&d, &caller, "senpai", "no-cwd", &[]).await;
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(cards.len(), 1);
+            assert!(cards[0].content.contains("no working directory"), "{}", cards[0].content);
+            let run = find_run_for_context(&d, ctx, "create").expect("run row");
+            assert_eq!(run.outcome, Some(RcOutcome::Ok));
+
+            // A root context: no senpai, no performer-set reviewer.
+            let root = register_context(&d, Some("root-console"), None, PrincipalId::new());
+            perform_with_rc_dir(&d, root, "senpai");
+            let admission = admit(&d, root);
+            crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(root)).await.unwrap();
+            let blocks = d.block_store().block_snapshots(root).unwrap();
+            assert!(blocks.iter().all(|b| b.kind != BlockKind::Error), "{blocks:#?}");
+            let cards: Vec<_> = blocks.iter().filter(|b| b.content.starts_with(ARRIVAL_MARKER)).collect();
+            assert_eq!(cards.len(), 1, "{blocks:#?}");
+            let text = &cards[0].content;
+            eprintln!("{text}");
+            assert!(text.contains("no senpai context; this is a root context"), "{text}");
+        });
+    }
+
+    /// The shipped set: the senpai, kohai, and banto directories link the
+    /// shared card, and only the senpai ships a route.
+    #[test]
+    fn the_arrival_card_ships_to_senpai_kohai_and_banto() {
+        for dir in ["senpai", "kohai", "banto"] {
+            let link = crate::seed_scripts::seed_body(&format!("/config/rc/{dir}/create/S18-arrival.kai")).expect(dir);
+            assert_eq!(link.trim(), "/config/rc/lib/create/S18-arrival.kai");
+        }
+        assert_eq!(crate::seed_scripts::seed_body("/config/rc/senpai/create/S18-arrival.md").unwrap().trim(), "Kernel administration: banto");
+        assert!(crate::seed_scripts::seed_body("/config/rc/kohai/create/S18-arrival.md").is_none());
+        assert!(crate::seed_scripts::seed_body("/config/rc/banto/create/S18-arrival.md").is_none());
     }

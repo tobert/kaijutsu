@@ -1,0 +1,156 @@
+# Arrival card: who this context is, who it answers to, where it works, what
+# is waiting, and where named routes lead. It reads like a colleague leaving
+# the desk, generated from live state at create time.
+#
+# Rules this script follows (the same as S25-datetime.kai and S35-orient.kai):
+#
+#  - NOTIFICATION, never (System, Text). The card differs per create and must
+#    not fold into the cached system prompt.
+#  - Never exit nonzero. A nonzero rc exit puts a model-visible Error block in
+#    the new context, so every probe brackets itself in `set +e` / `set -e`
+#    and a failure becomes a line of the card. The kaish traps are documented
+#    in assistant/tick/S10-checkin.kai: take `rc=$?` right after a plain
+#    substitution, never use `||` on one, keep numbers unpadded, and pass
+#    JSON to jq with --arg and --argjson.
+#  - Bounded. At most 8 routes, every line cut at 160 characters.
+#  - Builtins and kj only.
+#
+# Routes are data. An optional `S18-arrival.md` beside the linking script
+# holds lines of `what: label`, for example `Kernel administration: banto`.
+# Each route says whether a live context has that label. The file is read,
+# never executed. A role with no such file has no named routes.
+
+info=""
+set +e
+info="$(kj context info --json)"
+rc=$?
+set -e
+if test "$rc" -ne 0; then
+  kj block create --role system --kind notification --content "Arrival card unavailable: kj context info failed. Run 'kj context info' yourself." || true
+  echo "arrival: context info failed"
+  exit 0
+fi
+
+label="$(jq -n -r --argjson i "$info" '$i | .label // (.context_id[0:8]) // "this context"' || true)"
+character="$(jq -n -r --argjson i "$info" '$i | .performer_name // empty' || true)"
+cwd="$(jq -n -r --argjson i "$info" '$i | .cwd // empty' || true)"
+reviewer="$(jq -n -r --argjson i "$info" '$i | .reviewer_name // empty' || true)"
+senpai_label="$(jq -n -r --argjson i "$info" '$i | .senpai | if . == null then empty else (.label // (.context[0:8]) // "") end' || true)"
+senpai_character="$(jq -n -r --argjson i "$info" '$i | .senpai | if . == null then empty else (.character // "") end' || true)"
+
+if test -n "$character"; then
+  out="=== You are '$label' ($character) ==="
+else
+  out="=== You are '$label' ==="
+fi
+
+if test -n "$senpai_label"; then
+  line="You answer to '$senpai_label'"
+  if test -n "$senpai_character"; then
+    line="$line ($senpai_character)"
+  fi
+else
+  line="You answer to no senpai context; this is a root context"
+fi
+if test -n "$reviewer"; then
+  line="$line. $reviewer reviews your asks."
+else
+  line="$line. No one is set to review your asks; ask the person."
+fi
+out="$out
+$line"
+
+if test -n "$cwd"; then
+  out="$out
+You are working in $cwd."
+else
+  out="$out
+You have no working directory, so your shell starts where the kernel runs."
+fi
+
+# Asks wait kernel-wide, oldest first; count the pending ones.
+asks="unknown"
+set +e
+raw_asks="$(kj ledger list --json)"
+rc=$?
+set -e
+if test "$rc" -eq 0; then
+  asks="$(jq -n -r --arg a "$raw_asks" '$a | fromjson? | if type == "array" then length else "unknown" end' || true)"
+fi
+case "$asks" in
+  0) asks_text="no asks" ;;
+  1) asks_text="1 ask" ;;
+  unknown|"") asks_text="asks unknown (run 'kj ledger list')" ;;
+  *) asks_text="$asks asks" ;;
+esac
+
+workers="unknown"
+set +e
+raw_workers="$(kj context list --senpai . --json)"
+rc=$?
+set -e
+if test "$rc" -eq 0; then
+  workers="$(jq -n -r --arg a "$raw_workers" '$a | fromjson? | if type == "array" then length else "unknown" end' || true)"
+fi
+case "$workers" in
+  0) workers_text="no workers" ;;
+  1) workers_text="1 worker" ;;
+  unknown|"") workers_text="workers unknown (run 'kj context list --senpai .')" ;;
+  *) workers_text="$workers workers" ;;
+esac
+out="$out
+Waiting on you: $asks_text, $workers_text."
+
+# Named routes, from the optional companion file.
+routes=""
+companion="$(dirname "$0")/$(basename "$0" .kai).md"
+if test -f "$companion"; then
+  routes="$(cat "$companion" || true)"
+fi
+if test -n "$routes"; then
+  roster="[]"
+  set +e
+  raw_roster="$(kj context list --json)"
+  rc=$?
+  set -e
+  if test "$rc" -eq 0; then
+    roster="$(jq -n -c --arg a "$raw_roster" '$a | fromjson? | if type == "array" then . else [] end' || true)"
+  fi
+  out="$out
+Where to send what you cannot do:"
+  for i in 0 1 2 3 4 5 6 7; do
+    what="$(jq -n -r --arg r "$routes" --argjson i "$i" '$r | split("\n") | map(select(contains(": "))) | .[$i] // "" | split(": ")[0] | .[0:80]' || true)"
+    target="$(jq -n -r --arg r "$routes" --argjson i "$i" '$r | split("\n") | map(select(contains(": "))) | .[$i] // "" | split(": ")[1:] | join(": ") | gsub("^ +| +$"; "") | .[0:80]' || true)"
+    if test -z "$what"; then
+      continue
+    fi
+    if test -z "$target"; then
+      continue
+    fi
+    live="$(jq -n -r --argjson r "$roster" --arg l "$target" '$r | index($l) != null' || true)"
+    if test "$live" = "true"; then
+      tid=""
+      set +e
+      tinfo="$(kj context info "$target" --json)"
+      rc=$?
+      set -e
+      if test "$rc" -eq 0; then
+        tid="$(jq -n -r --argjson i "$tinfo" '$i | .context_id[0:8] // empty' || true)"
+      fi
+      if test -n "$tid"; then
+        out="$out
+  $what: $target (live, $tid)"
+      else
+        out="$out
+  $what: $target (live)"
+      fi
+    else
+      out="$out
+  $what: $target is not running; ask the person"
+    fi
+  done
+fi
+
+kj block create --role system --kind notification --content "$out" || true
+echo "arrival: card written for $label"
+exit 0
