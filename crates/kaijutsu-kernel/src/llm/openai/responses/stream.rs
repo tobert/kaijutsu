@@ -207,6 +207,14 @@ impl StateMachine {
                 let error = event.get("error").filter(|e| e.is_object()).unwrap_or(event);
                 out.push(StreamEvent::Error(error_from(error)));
             }
+            // The server may say here what it saw in the request (moderation,
+            // a verification recommendation). An empty event, which every
+            // response opens with, says nothing.
+            "response.metadata" | "codex.response.metadata" => {
+                if let Some(metadata) = event.get("metadata").filter(|m| m.as_object().is_some_and(|o| !o.is_empty())) {
+                    tracing::info!(target: "llm.server_metadata", %metadata, "server metadata on the response");
+                }
+            }
             _ => {}
         }
         out
@@ -383,6 +391,26 @@ mod tests {
 
     fn completed() -> Value {
         json!({ "type": "response.completed", "response": { "status": "completed", "usage": usage() } })
+    }
+
+    /// A metadata event with content is logged, since the server may say what
+    /// it saw there; an empty one, which every response opens with, is not.
+    #[test]
+    fn server_metadata_with_content_is_logged_and_an_empty_one_is_not() {
+        let (log, _guard) = crate::test_logs::capture_logs();
+        run(vec![json!({ "type": "codex.response.metadata", "metadata": {} }), completed()]);
+        assert!(!log.text().contains("server metadata"), "an empty event logs nothing");
+
+        run(vec![
+            json!({ "type": "response.metadata", "metadata": {
+                "openai_chatgpt_moderation_metadata": { "presentation": "inline" },
+                "openai_verification_recommendation": ["trusted_access_for_cyber"] } }),
+            completed(),
+        ]);
+        let logged = log.text();
+        for expected in ["server metadata", "openai_chatgpt_moderation_metadata", "trusted_access_for_cyber"] {
+            assert!(logged.contains(expected), "{expected} missing from: {logged}");
+        }
     }
 
     /// Reasoning, then text, then a tool call: each item is bracketed, the

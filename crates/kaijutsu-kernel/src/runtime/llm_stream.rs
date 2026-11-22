@@ -3545,6 +3545,19 @@ async fn run_llm_stream(
                         resending = true;
                         continue 'agentic;
                     }
+                    if err.kind.is_refusal() {
+                        // A refusal repeats for the same request: log how the
+                        // request was shaped, so the next one can be compared
+                        // with the turns before it. Shape and sizes only.
+                        tracing::error!(
+                            target: "llm.refusal",
+                            %context_id, %turn_id, step = iteration, attempt = step_attempt,
+                            provider = provider.name(), code = err.kind.label(),
+                            request_id = err.request_id.as_deref().unwrap_or("none"),
+                            request = %crate::llm::stream::request_shape(&build_opts, &messages),
+                            "the provider refused the request: {}", err.message
+                        );
+                    }
                     tracing::error!("LLM stream error: {}", err);
                     let payload = kaijutsu_types::ErrorPayload {
                         category: kaijutsu_types::ErrorCategory::Stream,
@@ -4668,6 +4681,24 @@ mod publish_tests {
         let ok = completed.try_recv().is_some();
         let requests = sent.lock().iter().map(|m| serde_json::to_value(m).unwrap()).collect();
         (ok, documents.block_snapshots(ctx).unwrap(), requests)
+    }
+
+    /// A provider's policy refusal is logged once, clearly, with the request's
+    /// shape and none of its text, and it is not sent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_policy_refusal_is_logged_with_the_request_shape_and_not_sent_again() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (log, _guard) = crate::test_logs::capture_logs();
+            let refusal = crate::llm::StreamEvent::Error(crate::llm::StreamError::new(
+                crate::llm::StreamErrorKind::Unknown("cyber_policy".into()), "flagged for possible cybersecurity risk"));
+            let (ok, _blocks, requests) = midstream_turn("policy-refusal", vec![vec![refusal], text_reply("again")]).await;
+            assert!(!ok);
+            assert_eq!(requests.len(), 1, "a refusal is not retried");
+            let logged = log.text();
+            for expected in ["the provider refused the request", "llm.refusal", "cyber_policy", "messages=", "tool_results="] {
+                assert!(logged.contains(expected), "{expected} missing from: {logged}");
+            }
+        }).await;
     }
 
     /// A cut before any block was written leaves nothing to duplicate, so the

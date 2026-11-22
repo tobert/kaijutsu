@@ -50,6 +50,9 @@ pub mod secret_source;
 pub mod seed_presets;
 pub mod seed_scripts;
 #[cfg(test)]
+pub(crate) mod test_logs;
+
+#[cfg(test)]
 pub(crate) mod test_backends;
 pub mod vfs;
 

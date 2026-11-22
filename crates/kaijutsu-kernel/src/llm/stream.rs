@@ -134,6 +134,80 @@ pub enum RetryDisposition {
     Permanent,
 }
 
+/// Provider error codes that decline a request on policy grounds.
+const REFUSAL_CODES: &[&str] = &["cyber_policy"];
+
+/// How a request was shaped, for the log line of a refused one: counts and
+/// sizes, and the last few messages by role and block kind. It carries no
+/// text from the system prompt, the history, the tool descriptions, or any
+/// result.
+pub fn request_shape(opts: &BuildOpts, messages: &[super::Message]) -> String {
+    use super::{ContentBlock, MessageContent, Role};
+    let (mut users, mut assistants, mut systems) = (0, 0, 0);
+    let (mut tool_calls, mut tool_results, mut reasoning, mut media) = (0, 0, 0, 0);
+    let (mut text_bytes, mut largest) = (0usize, 0usize);
+    let mut tail: Vec<String> = Vec::new();
+    for message in messages {
+        match message.role {
+            Role::User => users += 1,
+            Role::Assistant => assistants += 1,
+            Role::System => systems += 1,
+        }
+        let (kinds, bytes) = match &message.content {
+            MessageContent::Text(text) => ("text".to_string(), text.len()),
+            MessageContent::Blocks(blocks) => {
+                let mut kinds: Vec<&str> = Vec::new();
+                let mut bytes = 0;
+                for block in blocks {
+                    let (kind, size) = match block {
+                        ContentBlock::Text { text } => ("text", text.len()),
+                        ContentBlock::ToolUse { input, .. } => {
+                            tool_calls += 1;
+                            ("tool_call", input.to_string().len())
+                        }
+                        ContentBlock::ToolResult { content, .. } => {
+                            tool_results += 1;
+                            ("tool_result", content.len())
+                        }
+                        ContentBlock::Media { .. } => {
+                            media += 1;
+                            ("media", 0)
+                        }
+                        ContentBlock::Reasoning { text, .. } => {
+                            reasoning += 1;
+                            ("reasoning", text.len())
+                        }
+                    };
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                    bytes += size;
+                }
+                (kinds.join("+"), bytes)
+            }
+        };
+        text_bytes += bytes;
+        largest = largest.max(bytes);
+        tail.push(format!("{:?}:{kinds}:{bytes}B", message.role).to_lowercase());
+    }
+    let tail: Vec<String> = tail.into_iter().rev().take(4).rev().collect();
+    let tool_names: Vec<&str> = opts.tools.iter().map(|t| t.name.as_str()).take(60).collect();
+    let tool_bytes: usize = opts.tools.iter().map(|t| t.description.len() + t.input_schema.to_string().len()).sum();
+    format!(
+        "model={} effort={} messages={} (user {users}, assistant {assistants}, system {systems}) \
+         tool_calls={tool_calls} tool_results={tool_results} reasoning={reasoning} media={media} \
+         text_bytes={text_bytes} largest_message_bytes={largest} system_bytes={} tools={} tool_bytes={tool_bytes} \
+         tool_names=[{}] tail=[{}]",
+        opts.model,
+        opts.effort.as_deref().unwrap_or("default"),
+        messages.len(),
+        opts.system.as_ref().map_or(0, |s| s.len()),
+        opts.tools.len(),
+        tool_names.join(","),
+        tail.join(" "),
+    )
+}
+
 /// What kind of failure ended a stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamErrorKind {
@@ -186,6 +260,14 @@ impl StreamErrorKind {
             | Self::Protocol
             | Self::Unknown(_) => RetryDisposition::Permanent,
         }
+    }
+
+    /// Whether the provider declined the request on policy grounds: its
+    /// content filter, or a refusal code a plan route names (`cyber_policy`).
+    /// A refusal repeats for the same request, so it is logged with the
+    /// request's shape ([`request_shape`]).
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::ContentFilter) || matches!(self, Self::Unknown(code) if REFUSAL_CODES.contains(&code.as_str()))
     }
 
     /// The name logs and error blocks lead with.
@@ -671,6 +753,42 @@ mod tests {
         ] {
             assert_eq!(kind.retry_disposition(), RetryDisposition::Permanent, "{kind:?}");
         }
+    }
+
+    /// A refusal is the provider declining the request on policy grounds, which
+    /// no other failure kind is.
+    #[test]
+    fn a_policy_refusal_is_told_from_other_failures() {
+        use StreamErrorKind::*;
+        for refusal in [ContentFilter, Unknown("cyber_policy".into())] {
+            assert!(refusal.is_refusal(), "{refusal:?}");
+        }
+        for other in [Overloaded, RateLimited, Auth, InvalidRequest, Billing, Protocol, Truncated("x".into()),
+            Unknown("something_else".into())] {
+            assert!(!other.is_refusal(), "{other:?}");
+        }
+    }
+
+    /// The log line for a refused request says how much was sent and what
+    /// shape it had, and never what it said.
+    #[test]
+    fn the_request_shape_counts_the_request_and_leaks_none_of_its_text() {
+        use crate::llm::{ContentBlock, Message, ToolDefinition};
+        let mut opts = BuildOpts::new("gpt-6.2-sol", 1000);
+        opts.system = Some("SECRET-SYSTEM-TEXT".repeat(10));
+        opts.tools = vec![ToolDefinition { name: "shell_write".into(), description: "SECRET-TOOL-DESCRIPTION".into(),
+            input_schema: serde_json::json!({"type": "object"}) }];
+        let messages = vec![
+            Message::user("SECRET-USER-TEXT"),
+            Message::with_tool_uses(Some("plan".into()), vec![ContentBlock::ToolUse {
+                id: "c1".into(), name: "shell_write".into(), input: serde_json::json!({"command": "SECRET-COMMAND"}), signature: None }]),
+            Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "c1".into(), content: "SECRET-OUTPUT".repeat(50), is_error: false }]),
+        ];
+        let shape = request_shape(&opts, &messages);
+        for expected in ["model=gpt-6.2-sol", "messages=3", "tool_calls=1", "tool_results=1", "tools=1", "shell_write"] {
+            assert!(shape.contains(expected), "{expected} missing from: {shape}");
+        }
+        assert!(!shape.contains("SECRET"), "the shape must not carry request text: {shape}");
     }
 
     #[test]
