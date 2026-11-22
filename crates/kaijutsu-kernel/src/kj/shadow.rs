@@ -85,6 +85,16 @@ impl Classify for ShadowArgs {
     }
 }
 
+/// What a `describe` request needs to check before making a shadow.
+struct DescribeSlot {
+    backend: String,
+    model: String,
+    character: String,
+    existing_shadow: Option<String>,
+    requires_max_tokens: bool,
+    max_tokens: Option<i64>,
+}
+
 /// What a `describe` request produced.
 struct Described {
     text: String,
@@ -201,23 +211,15 @@ impl KjDispatcher {
         }
         let (hash, media_type) = self.describable_media(id)?;
         let hash_text = hash.to_string();
-        let shadow = self.ensure_description_shadow(source)?;
-        let bound = {
-            let db = self.kernel_db().lock();
-            crate::model_resolution::role_slot(&db, shadow.context_id, crate::model_resolution::MODEL)
-                .map_err(|e| format!("could not read the description shadow's model: {e}"))?
-        };
-        let bound = match bound {
-            crate::model_resolution::RoleSlot::Slot(bound) => bound,
-            crate::model_resolution::RoleSlot::None(none) => return Err(none.refusal_as("cannot describe")),
-        };
-        let maker = format!("{}/{}", bound.backend, bound.slot.model);
+        let slot = self.describe_preflight(source)?;
+        let maker = format!("{}/{}", slot.backend, slot.model);
         let key = IndexKey::new(&hash_text, DESCRIBE_SHADOW, &maker);
-        let performer = shadow.performer.ok_or_else(|| format!("description shadow {} has no performer", shadow.context_id.short()))?;
 
         let hit = self.kernel_db().lock().indexed_rendition(&key).map_err(|e| e.to_string())?;
         if let Some(earlier) = hit {
             let text = self.rendition_text(earlier)?;
+            let shadow = self.ensure_description_shadow(source)?;
+            let performer = shadow.performer.ok_or_else(|| format!("description shadow {} has no performer", shadow.context_id.short()))?;
             let held_here = earlier.context_id == shadow.context_id
                 && self
                     .kernel_db()
@@ -234,20 +236,28 @@ impl KjDispatcher {
             return Ok(Described { text, rendition, shadow: shadow.context_id, maker, media_type, hash: hash_text, reused: true });
         }
 
-        let max_tokens = bound.request_max_tokens(crate::model_resolution::IMAGE).map_err(|error| {
-            format!(
-                "{error}; `kj character slot set {} image {maker} --max-tokens <n>`, \
-                 then archive {} so the next request makes a new shadow",
-                bound.character, bound.context
-            )
-        })?;
-        let provider = self.kernel.llm().read().await.get(&bound.backend).ok_or_else(|| {
+        if slot.requires_max_tokens
+            && slot.max_tokens.and_then(|v| u64::try_from(v).ok()).filter(|m| *m > 0).is_none()
+        {
+            let archive_note = match &slot.existing_shadow {
+                Some(ctx) => format!(", then archive {ctx} so the next request makes a new shadow"),
+                None => String::new(),
+            };
+            return Err(format!(
+                "{} slot {} has no max_tokens, which backend {} requires; `kj character slot set {} image {maker} --max-tokens <n>`{archive_note}",
+                slot.existing_shadow.as_deref().unwrap_or(&slot.character),
+                crate::model_resolution::IMAGE,
+                slot.backend,
+                slot.character,
+            ));
+        }
+        let provider = self.kernel.llm().read().await.get(&slot.backend).ok_or_else(|| {
             format!(
                 "backend '{}' of the image slot is not registered (missing key? see `kj backend show {}`)",
-                bound.backend, bound.backend
+                slot.backend, slot.backend
             )
         })?;
-        if let Some(why) = provider.media_refusal(&bound.slot.model, &media_type).await.map_err(|e| e.to_string())? {
+        if let Some(why) = provider.media_refusal(&slot.model, &media_type).await.map_err(|e| e.to_string())? {
             return Err(format!(
                 "{maker} cannot read {media_type} ({why}), so the request would send a marker instead of the media. No model was called"
             ));
@@ -274,12 +284,102 @@ impl KjDispatcher {
             return Err(format!("the bytes of {hash_text} were not found in CAS, so there is nothing to describe"));
         }
 
+        let shadow = self.ensure_description_shadow(source)?;
+        let bound = {
+            let db = self.kernel_db().lock();
+            crate::model_resolution::role_slot(&db, shadow.context_id, crate::model_resolution::MODEL)
+                .map_err(|e| format!("could not read the description shadow's model: {e}"))?
+        };
+        let bound = match bound {
+            crate::model_resolution::RoleSlot::Slot(bound) => bound,
+            crate::model_resolution::RoleSlot::None(none) => return Err(none.refusal_as("cannot describe")),
+        };
+        let max_tokens = bound.request_max_tokens(crate::model_resolution::IMAGE).map_err(|error| {
+            format!(
+                "{error}; `kj character slot set {} image {maker} --max-tokens <n>`, \
+                 then archive {} so the next request makes a new shadow",
+                bound.character, bound.context
+            )
+        })?;
+        let performer = shadow.performer.ok_or_else(|| format!("description shadow {} has no performer", shadow.context_id.short()))?;
         let reply = self.call_describer(&provider, &bound, shadow.context_id, performer, max_tokens, &instruction, messages, timeout).await?;
         let text = reply.trim().to_string();
         // A request that made the same description at the same time may have
         // taken the key first; this one is then linked and not indexed.
         let (rendition, _) = self.write_rendition(shadow.context_id, performer, &text, id, Some(&key))?;
         Ok(Described { text, rendition, shadow: shadow.context_id, maker, media_type, hash: hash_text, reused: false })
+    }
+
+    /// Resolve the `image` slot (or existing shadow's `model` slot) for
+    /// `source` without creating a shadow.
+    fn describe_preflight(&self, source: ContextId) -> Result<DescribeSlot, String> {
+        let db = self.kernel_db().lock();
+        let source_row = db
+            .get_context(source)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("context {} has no row", source.short()))?;
+        if source_row.is_archived() {
+            return Err(format!(
+                "{} is archived, and a shadow of it would be a live context under an archived senpai. \
+                 Bring it back first with `kj context promote {}`",
+                db.context_name(source),
+                source.to_hex()
+            ));
+        }
+        let performer = source_row.performer.ok_or_else(|| {
+            format!("{} has no performer, so it has no image slot", db.context_name(source))
+        })?;
+        let sheet = db
+            .get_character(performer)
+            .map_err(|e| e.to_string())?
+            .filter(|sheet| sheet.retired_at.is_none())
+            .ok_or_else(|| format!("the performer of {} is not a live character", db.context_name(source)))?;
+        if let Some(existing) = db.live_shadow(source, DESCRIBE_SHADOW).map_err(|e| e.to_string())? {
+            let bound = crate::model_resolution::role_slot(&db, existing.context_id, crate::model_resolution::MODEL)
+                .map_err(|e| format!("could not read the description shadow's model: {e}"))?;
+            return match bound {
+                crate::model_resolution::RoleSlot::Slot(bound) => Ok(DescribeSlot {
+                    backend: bound.backend.clone(),
+                    model: bound.slot.model.clone(),
+                    character: bound.character.clone(),
+                    existing_shadow: Some(bound.context.clone()),
+                    requires_max_tokens: bound.kind().sends_output_limit(),
+                    max_tokens: bound.slot.max_tokens,
+                }),
+                crate::model_resolution::RoleSlot::None(none) => Err(none.refusal_as("cannot describe")),
+            };
+        }
+        let slot = db
+            .get_character_slot(performer, crate::model_resolution::IMAGE)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "{} cannot get a description: its performer {} has no `image` slot. \
+                     Fix: `kj character slot set {} image <backend>/<model> --max-tokens <n>`",
+                    db.context_name(source),
+                    sheet.name,
+                    sheet.name
+                )
+            })?;
+        let backend = db
+            .get_backend(slot.backend_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("character {} image slot names a backend that does not exist", sheet.name))?;
+        let kind = crate::llm::BackendKind::parse(&backend.kind).map_err(|e| e.to_string())?;
+        let model_row = db
+            .list_backend_models(slot.backend_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|m| m.model_id == slot.model);
+        let max_tokens = slot.max_tokens.or_else(|| model_row.and_then(|m| m.tunables.max_tokens));
+        Ok(DescribeSlot {
+            backend: backend.name,
+            model: slot.model,
+            character: sheet.name,
+            existing_shadow: None,
+            requires_max_tokens: kind.sends_output_limit(),
+            max_tokens,
+        })
     }
 
     /// The CAS hash and recorded media type of `id`, a media block whose
@@ -317,7 +417,11 @@ impl KjDispatcher {
     /// names the verb that sets it.
     fn ensure_description_shadow(&self, source: ContextId) -> Result<ContextRow, String> {
         let _create = CREATE.lock();
-        let (row, source_row) = {
+        enum State {
+            Existing(ContextRow),
+            Created(ContextRow),
+        }
+        let state = {
             let db = self.kernel_db().lock();
             let source_row = db
                 .get_context(source)
@@ -340,44 +444,59 @@ impl KjDispatcher {
                 .filter(|sheet| sheet.retired_at.is_none())
                 .ok_or_else(|| format!("the performer of {} is not a live character", db.context_name(source)))?;
             if let Some(existing) = db.live_shadow(source, DESCRIBE_SHADOW).map_err(|e| e.to_string())? {
+                State::Existing(existing)
+            } else {
+                if db
+                    .get_character_slot(performer, crate::model_resolution::IMAGE)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    return Err(format!(
+                        "{} cannot get a description: its performer {} has no `image` slot. \
+                         Fix: `kj character slot set {} image <backend>/<model> --max-tokens <n>`",
+                        db.context_name(source),
+                        sheet.name,
+                        sheet.name
+                    ));
+                }
+                let row = crate::council::shadow::shadow_row(&db, &source_row, DESCRIBE_SHADOW).map_err(|e| e.to_string())?;
+                db.in_transaction(|db| {
+                    super::context::insert_new_context_rows(
+                        db,
+                        &row,
+                        super::context::CharacterPlacement::Shadow {
+                            performer,
+                            senpai: source,
+                            model_role: crate::model_resolution::IMAGE,
+                        },
+                    )?;
+                    db.mark_shadow(row.context_id, DESCRIBE_SHADOW)
+                })
+                .map_err(|e| e.to_string())?;
+                State::Created(row)
+            }
+        };
+        let row = match state {
+            State::Existing(existing) => {
+                crate::council::shadow::ensure_existing_shadow_document(
+                    &self.blocks,
+                    &self.drift,
+                    &existing,
+                    source,
+                )?;
                 return Ok(existing);
             }
-            if db
-                .get_character_slot(performer, crate::model_resolution::IMAGE)
-                .map_err(|e| e.to_string())?
-                .is_none()
-            {
-                return Err(format!(
-                    "{} cannot get a description: its performer {} has no `image` slot. \
-                     Fix: `kj character slot set {} image <backend>/<model> --max-tokens <n>`",
-                    db.context_name(source),
-                    sheet.name,
-                    sheet.name
-                ));
-            }
-            let row = crate::council::shadow::shadow_row(&db, &source_row, DESCRIBE_SHADOW).map_err(|e| e.to_string())?;
-            db.in_transaction(|db| {
-                super::context::insert_new_context_rows(
-                    db,
+            State::Created(row) => {
+                crate::council::shadow::create_shadow_document(
+                    self.kernel_db(),
+                    &self.blocks,
+                    &self.drift,
                     &row,
-                    super::context::CharacterPlacement::Shadow {
-                        performer,
-                        senpai: source,
-                        model_role: crate::model_resolution::IMAGE,
-                    },
+                    source,
                 )?;
-                db.mark_shadow(row.context_id, DESCRIBE_SHADOW)
-            })
-            .map_err(|e| e.to_string())?;
-            (row, source_row)
+                row
+            }
         };
-        self.blocks
-            .create_document(row.context_id, kaijutsu_types::DocKind::Conversation, None)
-            .map_err(|e| format!("shadow document: {e}"))?;
-        let registered = self.drift.write().register(row.context_id, row.label.as_deref(), Some(source), row.created_by);
-        if let Err(error) = registered {
-            tracing::error!(source = %source_row.context_id, shadow = %row.context_id, "shadow: label not registered: {error}");
-        }
         self.kernel_db()
             .lock()
             .get_context(row.context_id)
@@ -831,9 +950,173 @@ mod tests {
             "{r:?}"
         );
         assert_eq!(requests(&seen), ["GET /council/v2/identity"]);
-        let shadow = shadow_of(&w.d, w.source);
-        assert_eq!(w.d.kernel_db().lock().rendition_count(shadow.context_id).unwrap(), 0);
-        assert!(w.d.kernel_db().lock().list_turns(shadow.context_id, 10).unwrap().is_empty(), "no turn was recorded");
+        assert!(
+            w.d.kernel_db().lock().live_shadow(w.source, DESCRIBE_SHADOW).unwrap().is_none(),
+            "a refused marker must not create an empty shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_refusals_do_not_create_an_empty_shadow() {
+        // Unregistered provider leaves no shadow.
+        let d = test_dispatcher().await;
+        let performer = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.upsert_backend(&crate::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(),
+                name: "unreg".into(),
+                kind: "council".into(),
+                base_url: Some("http://127.0.0.1:9".into()),
+                api_key_env: None,
+                api_key_file: None,
+                key_optional: true,
+                request_timeout_secs: None,
+                idle_timeout_secs: None,
+                max_concurrent: None,
+                created_at: 0,
+                created_by: PrincipalId::system(),
+            })
+            .unwrap();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                rc_dir: Some("coder".into()),
+                console_ctx: None,
+                mcp_hub_ctx: None,
+                principal_id: performer,
+                name: "describer-unreg".into(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: false,
+            })
+            .unwrap();
+            db.seed_test_slot_entries(performer, &[("model", "mock", "mock-model"), ("image", "unreg", "qwen")]).unwrap();
+        }
+        let source = context_of(&d, "unreg-src", performer);
+        let image = media(&d, source, PICTURE, "image/png");
+        let r = describe(&d, source, image).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("not registered")), "{r:?}");
+        assert!(d.kernel_db().lock().live_shadow(source, DESCRIBE_SHADOW).unwrap().is_none());
+
+        // Missing max_tokens on a backend that requires it leaves no shadow.
+        let set_anth = d
+            .dispatch(&[s("backend"), s("set"), s("anth"), s("--kind"), s("anthropic"), s("--key-optional")], &test_caller())
+            .await;
+        assert!(set_anth.is_ok(), "{}", set_anth.message());
+        let no_max_performer = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                rc_dir: Some("coder".into()),
+                console_ctx: None,
+                mcp_hub_ctx: None,
+                principal_id: no_max_performer,
+                name: "describer-nomax".into(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: false,
+            })
+            .unwrap();
+            db.seed_test_slot_entries(no_max_performer, &[("model", "mock", "mock-model")]).unwrap();
+        }
+        let no_max_src = context_of(&d, "nomax-src", no_max_performer);
+        {
+            let db = d.kernel_db().lock();
+            let anth_id = db.get_backend_by_name("anth").unwrap().unwrap().backend_id;
+            db.set_character_slot(&crate::kernel_db::CharacterSlotRow {
+                principal_id: no_max_performer,
+                role: crate::model_resolution::IMAGE.into(),
+                backend_id: anth_id,
+                model: "claude-sonnet".into(),
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                effort: None,
+                thinking_budget: None,
+                thinking_style: None,
+            })
+            .unwrap();
+        }
+        let no_max_img = media(&d, no_max_src, PICTURE, "image/png");
+        let r = describe(&d, no_max_src, no_max_img).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("max_tokens")), "{r:?}");
+        assert!(d.kernel_db().lock().live_shadow(no_max_src, DESCRIBE_SHADOW).unwrap().is_none());
+
+        // Missing/empty CAS bytes leaves no shadow.
+        let (base, seen) = serve(vec![identity(json!(["image/png"]))]).await;
+        let w = world(&base, Some("qwen")).await;
+        let missing_bytes_img = media(&w.d, w.source, b"temp-png-bytes", "image/png");
+        let hash = w.d.kernel().cas().store(b"temp-png-bytes", "image/png").unwrap();
+        let obj_path = w
+            .d
+            .kernel()
+            .cas()
+            .config()
+            .objects_dir()
+            .join(hash.prefix())
+            .join(hash.remainder());
+        std::fs::write(&obj_path, b"").unwrap();
+        let r = describe(&w.d, w.source, missing_bytes_img).await;
+        assert!(matches!(&r, KjResult::Err(m) if m.contains("were not found in CAS")), "{r:?}");
+        assert_eq!(requests(&seen), ["GET /council/v2/identity"]);
+        assert!(w.d.kernel_db().lock().live_shadow(w.source, DESCRIBE_SHADOW).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_description_shadow_does_not_strand_on_create_document_failure_and_recovers_existing_shadow() {
+        let (base, _) = serve(vec![]).await;
+        let w = world(&base, Some("qwen")).await;
+
+        // 1) Diverging workspace causes create_document to fail; no live_shadow row may remain.
+        let alt_ws = kaijutsu_types::WorkspaceId::new();
+        {
+            let db = w.d.kernel_db().lock();
+            db.insert_workspace(&crate::kernel_db::WorkspaceRow {
+                workspace_id: alt_ws,
+                label: "alt".into(),
+                description: None,
+                created_at: 0,
+                created_by: w.performer,
+                archived_at: None,
+            })
+            .unwrap();
+            db.update_workspace(w.source, Some(alt_ws)).unwrap();
+        }
+        let err = w.d.ensure_description_shadow(w.source).unwrap_err();
+        assert!(err.contains("shadow document"), "{err}");
+        assert!(
+            w.d.kernel_db().lock().live_shadow(w.source, DESCRIBE_SHADOW).unwrap().is_none(),
+            "failed create_document must not leave a live_shadow row"
+        );
+
+        // 2) An existing live_shadow row without a loaded BlockStore document is recovered on lookup.
+        let other = context_of(&w.d, "recover-src", w.performer);
+        let stranded = {
+            let db = w.d.kernel_db().lock();
+            let source_row = db.get_context(other).unwrap().unwrap();
+            let row = crate::council::shadow::shadow_row(&db, &source_row, DESCRIBE_SHADOW).unwrap();
+            db.in_transaction(|db| {
+                super::super::context::insert_new_context_rows(
+                    db,
+                    &row,
+                    super::super::context::CharacterPlacement::Shadow {
+                        performer: w.performer,
+                        senpai: other,
+                        model_role: crate::model_resolution::IMAGE,
+                    },
+                )?;
+                db.mark_shadow(row.context_id, DESCRIBE_SHADOW)
+            })
+            .unwrap();
+            row
+        };
+        assert!(!w.d.block_store().contains(stranded.context_id));
+        let recovered = w.d.ensure_description_shadow(other).unwrap();
+        assert_eq!(recovered.context_id, stranded.context_id);
+        assert!(w.d.block_store().contains(recovered.context_id));
     }
 
     /// A model that does not answer within the timeout is an error that names

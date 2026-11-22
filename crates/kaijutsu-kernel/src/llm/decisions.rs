@@ -677,6 +677,24 @@ mod tests {
         assert_eq!(client.url(), OPENROUTER_DECISIONS_URL);
     }
 
+    #[test]
+    fn ipv6_loopback_endpoint_preserves_brackets() {
+        assert_eq!(
+            endpoint("http://[::1]:9/v1beta/decisions"),
+            Ok((Wire::Gemini, "http://[::1]:9/v1beta/decisions".to_string()))
+        );
+        assert_eq!(
+            endpoint("http://[::1]/v1beta/decisions"),
+            Ok((Wire::Gemini, "http://[::1]/v1beta/decisions".to_string()))
+        );
+        let with_port = Client::new("gem", "http://[::1]:9/v1beta/decisions", "k", Duration::from_secs(5)).unwrap();
+        assert_eq!(with_port.url(), "http://[::1]:9/v1beta/decisions");
+        assert_eq!(with_port.wire(), Wire::Gemini);
+        let without_port = Client::new("gem", "http://[::1]/v1beta/decisions", "k", Duration::from_secs(5)).unwrap();
+        assert_eq!(without_port.url(), "http://[::1]/v1beta/decisions");
+        assert_eq!(without_port.wire(), Wire::Gemini);
+    }
+
     /// The standard key variable is read only at the API's own host and
     /// path; a proxy, or one API's path on the other's host, names its own.
     ///

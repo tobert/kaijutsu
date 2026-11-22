@@ -159,7 +159,12 @@ fn truncate_at_bytes(s: &str, max: usize) -> (&str, bool) {
 
 /// One rendered tail entry.
 fn tail_entry(b: &BlockSnapshot, max_bytes: usize) -> serde_json::Value {
-    let (text, truncated) = truncate_at_bytes(&b.content, max_bytes);
+    let body = if b.content.is_empty() {
+        b.stderr.as_deref().unwrap_or("")
+    } else {
+        b.content.as_str()
+    };
+    let (text, truncated) = truncate_at_bytes(body, max_bytes);
     let mut entry = serde_json::json!({
         "id": b.id.to_key(),
         "role": format!("{:?}", b.role).to_lowercase(),
@@ -753,6 +758,50 @@ mod tests {
         assert!(s.starts_with(kept));
         assert!(kept.len() <= 7);
         assert_eq!(kept, "日本");
+    }
+
+    #[test]
+    fn tail_entry_surfaces_stderr_when_content_is_empty() {
+        let mut empty_with_stderr = snap(Role::Tool, BlockKind::ToolResult, Status::Error, "");
+        empty_with_stderr.stderr = Some("permission denied\ndetail line".into());
+        let entry = tail_entry(&empty_with_stderr, 2048);
+        assert_eq!(entry["content"], "permission denied\ndetail line");
+        assert_eq!(entry["truncated"], false);
+
+        let truncated_entry = tail_entry(&empty_with_stderr, 10);
+        assert_eq!(truncated_entry["content"], "permission");
+        assert_eq!(truncated_entry["truncated"], true);
+
+        let mut content_and_stderr = snap(Role::Tool, BlockKind::ToolResult, Status::Done, "stdout wins");
+        content_and_stderr.stderr = Some("warning on stderr".into());
+        let entry = tail_entry(&content_and_stderr, 2048);
+        assert_eq!(entry["content"], "stdout wins");
+    }
+
+    #[tokio::test]
+    async fn wait_report_surfaces_stderr_for_empty_content_blocks() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("stderr-tail"), None, principal);
+        let mut result_block = snap(Role::Tool, BlockKind::ToolResult, Status::Error, "");
+        result_block.stderr = Some("script changed after judgment".into());
+        let blocks = vec![user("run it"), result_block, model("done")];
+        let args = WaitArgs::try_parse_from(["--include", "tools"]).unwrap();
+        let report = d.wait_report(
+            ctx,
+            &blocks,
+            None,
+            &args,
+            "completed",
+            None,
+            None,
+            "log",
+            std::time::Instant::now(),
+        );
+        let msg = report.message();
+        assert!(msg.contains("[toolresult] script changed after judgment"), "{msg}");
+        let data = data_of(&report);
+        assert_eq!(data["blocks"][1]["content"], "script changed after judgment");
     }
 
     // ---- dispatcher-level tests: the park loop itself ----

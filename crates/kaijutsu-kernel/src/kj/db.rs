@@ -33,7 +33,10 @@ enum DbCommand {
     /// Backup kernel.db to path via SQLite VACUUM INTO.
     #[command(
         long_about = "Backup kernel.db to path via SQLite VACUUM INTO. \
-                      The path must be absolute and must not already exist."
+                      The path must be absolute and must not already exist. \
+                      Restore is deliberately NOT a kj verb: stop the kernel, \
+                      replace kernel.db (removing any -wal and -shm siblings), \
+                      and start the kernel."
     )]
     Backup {
         /// Absolute destination path for the backup file.

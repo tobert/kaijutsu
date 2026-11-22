@@ -504,13 +504,77 @@ fn name_of(row: &ContextRow) -> String {
     row.label.clone().unwrap_or_else(|| row.context_id.short())
 }
 
+/// Ensure an already-persisted shadow context has an in-memory `BlockStore`
+/// document and drift handle, recovering from DB or creating the document if
+/// needed.
+pub(crate) fn ensure_existing_shadow_document(
+    blocks: &crate::block_store::BlockStore,
+    drift: &crate::drift::SharedDriftRouter,
+    row: &ContextRow,
+    source: ContextId,
+) -> Result<(), String> {
+    if !blocks.contains(row.context_id) {
+        let loaded = blocks
+            .load_one_from_db(row.context_id)
+            .map_err(|e| format!("shadow document: {e}"))?;
+        if !loaded && !blocks.contains(row.context_id) {
+            match blocks.create_document(row.context_id, DocKind::Conversation, None) {
+                Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {}
+                Err(e) => return Err(format!("shadow document: {e}")),
+            }
+        }
+    }
+    if drift.read().get(row.context_id).is_none()
+        && let Err(error) = drift
+            .write()
+            .register(row.context_id, row.label.as_deref(), Some(source), row.created_by)
+    {
+        tracing::error!(%source, shadow = %row.context_id, "shadow: label not registered: {error}");
+    }
+    Ok(())
+}
+
+/// Create the in-memory `BlockStore` document for a newly-inserted shadow
+/// row and register it in `drift`. If `create_document` fails, archive the
+/// shadow row so no `live_shadow` row is left without an in-memory document.
+pub(crate) fn create_shadow_document(
+    db: &Arc<parking_lot::Mutex<crate::KernelDb>>,
+    blocks: &crate::block_store::BlockStore,
+    drift: &crate::drift::SharedDriftRouter,
+    row: &ContextRow,
+    source: ContextId,
+) -> Result<(), String> {
+    if let Err(e) = blocks.create_document(row.context_id, DocKind::Conversation, None) {
+        if let Err(archive_err) = db.lock().archive_context(row.context_id) {
+            tracing::error!(
+                %source,
+                shadow = %row.context_id,
+                error = %archive_err,
+                "shadow: failed to archive shadow after document creation failed"
+            );
+        }
+        return Err(format!("shadow document: {e}"));
+    }
+    if let Err(error) = drift
+        .write()
+        .register(row.context_id, row.label.as_deref(), Some(source), row.created_by)
+    {
+        tracing::error!(%source, shadow = %row.context_id, "shadow: label not registered: {error}");
+    }
+    Ok(())
+}
+
 /// The seat's live judge shadow, created when the seat's council names a
 /// judge character and no shadow exists yet. The shadow is found by its fork
 /// edge, its performer, and its `context_shadows` row of kind `judge`, never by its label. Returns the judge and
 /// whether this call created its shadow.
 fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad) -> KernelDbResult<Option<(Judge, bool)>> {
     let _create = CREATE.lock();
-    let (row, judge) = {
+    enum State {
+        Existing(ContextRow, Judge),
+        Created(ContextRow, Judge, Option<String>),
+    }
+    let state = {
         let db = kernel.kernel_db().lock();
         let Some(seat_row) = db.get_context(seat)? else {
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
@@ -530,46 +594,52 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
             judge.shadow = existing.context_id;
             judge.shadow_label = name_of(&existing);
             judge.server = shadow_server(&db, existing.context_id)?;
-            return Ok(Some((judge, false)));
-        }
-        // A shadow is performed by the judge character, a child of its seat
-        // that answers to it, with the judge character's slots.
-        let row = shadow_row(&db, &seat_row, JUDGE)?;
-        db.in_transaction(|db| {
-            crate::kj::context::insert_new_context_rows(
-                db,
-                &row,
-                crate::kj::context::CharacterPlacement::Start { performer: sheet.principal_id, senpai: Some(seat) },
-            )?;
-            db.mark_judge_shadow(row.context_id)
-        })?;
-        judge.shadow = row.context_id;
-        judge.shadow_label = name_of(&row);
-        judge.server = shadow_server(&db, row.context_id)?;
-        if judge.server.is_none() {
-            // The shadow row is already written, so a fault here names the
-            // backend as unread rather than failing the creation.
-            let backend = match super::gate::seat_slot_backend(&db, row.context_id, crate::model_resolution::MODEL) {
-                Ok(Some((backend, _))) => format!("{} (kind {})", backend.name, backend.kind),
-                Ok(None) => "none".into(),
-                Err(e) => format!("unread: {e}"),
+            State::Existing(existing, judge)
+        } else {
+            // A shadow is performed by the judge character, a child of its seat
+            // that answers to it, with the judge character's slots.
+            let row = shadow_row(&db, &seat_row, JUDGE)?;
+            db.in_transaction(|db| {
+                crate::kj::context::insert_new_context_rows(
+                    db,
+                    &row,
+                    crate::kj::context::CharacterPlacement::Start { performer: sheet.principal_id, senpai: Some(seat) },
+                )?;
+                db.mark_judge_shadow(row.context_id)
+            })?;
+            judge.shadow = row.context_id;
+            judge.shadow_label = name_of(&row);
+            judge.server = shadow_server(&db, row.context_id)?;
+            let unread_backend = if judge.server.is_none() {
+                Some(match super::gate::seat_slot_backend(&db, row.context_id, crate::model_resolution::MODEL) {
+                    Ok(Some((backend, _))) => format!("{} (kind {})", backend.name, backend.kind),
+                    Ok(None) => "none".into(),
+                    Err(e) => format!("unread: {e}"),
+                })
+            } else {
+                None
             };
-            tracing::warn!(
-                %seat, shadow = %judge.shadow, judge = %name, %backend,
-                "shadow: the judge's model is not on a council backend, so this judge shadow is created but its judge is never read"
-            );
+            State::Created(row, judge, unread_backend)
         }
-        (row, judge)
     };
-    kernel
-        .blocks()
-        .create_document(row.context_id, DocKind::Conversation, None)
-        .map_err(|e| KernelDbError::Validation(format!("shadow document: {e}")))?;
-    let registered = kernel.drift().write().register(row.context_id, row.label.as_deref(), Some(seat), row.created_by);
-    if let Err(error) = registered {
-        tracing::error!(%seat, shadow = %row.context_id, "shadow: label not registered: {error}");
+    match state {
+        State::Existing(existing, judge) => {
+            ensure_existing_shadow_document(kernel.blocks(), kernel.drift(), &existing, seat)
+                .map_err(KernelDbError::Validation)?;
+            Ok(Some((judge, false)))
+        }
+        State::Created(row, judge, unread_backend) => {
+            create_shadow_document(kernel.kernel_db(), kernel.blocks(), kernel.drift(), &row, seat)
+                .map_err(KernelDbError::Validation)?;
+            if let Some(backend) = unread_backend {
+                tracing::warn!(
+                    %seat, shadow = %judge.shadow, %backend,
+                    "shadow: the judge's model is not on a council backend, so this judge shadow is created but its judge is never read"
+                );
+            }
+            Ok(Some((judge, true)))
+        }
     }
-    Ok(Some((judge, true)))
 }
 
 /// The council server a judge shadow reads on, from its own `model` slot:
@@ -663,5 +733,100 @@ mod tests {
         assert!(text.starts_with("shell_write: echo é"));
         assert!(text.ends_with("more bytes]"), "{text}");
         assert!(text.len() < input.len());
+    }
+
+    #[tokio::test]
+    async fn judge_shadow_does_not_strand_on_create_document_failure_and_recovers_existing_shadow() {
+        use crate::kj::gate_policy::GateConfig;
+        use crate::kj::test_helpers::{register_rooted_context, test_dispatcher};
+
+        let d = test_dispatcher().await;
+        let judge_id = PrincipalId::new();
+        let performer_id = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                rc_dir: Some("judge".into()),
+                console_ctx: None,
+                mcp_hub_ctx: None,
+                principal_id: judge_id,
+                name: JUDGE.into(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: false,
+            })
+            .unwrap();
+            db.seed_test_slot_entries(judge_id, &[("model", "mock", "mock-model")]).unwrap();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                rc_dir: Some("coder".into()),
+                console_ctx: None,
+                mcp_hub_ctx: None,
+                principal_id: performer_id,
+                name: "coder".into(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: false,
+            })
+            .unwrap();
+            db.seed_test_slot_entries(performer_id, &[("model", "mock", "mock-model")]).unwrap();
+        }
+
+        let config = Ok(GateConfig::parse(
+            "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"loglinear\", weights = \"mass\" }\ndeadline_ms = 500\n\
+             [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\
+             [rc.coder.council]\nenabled = true\njudge = \"judge\"\n",
+        )
+        .unwrap());
+
+        // 1) A seat with a diverging workspace causes create_document to fail; no live_shadow may remain.
+        let bad_seat = register_rooted_context(&d, Some("bad-seat"), performer_id);
+        let alt_ws = kaijutsu_types::WorkspaceId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_workspace(&crate::kernel_db::WorkspaceRow {
+                workspace_id: alt_ws,
+                label: "alt".into(),
+                description: None,
+                created_at: 0,
+                created_by: performer_id,
+                archived_at: None,
+            })
+            .unwrap();
+            db.update_workspace(bad_seat, Some(alt_ws)).unwrap();
+        }
+        let err = judge_shadow(d.kernel(), bad_seat, &config).err().expect("create_document failure");
+        assert!(err.to_string().contains("shadow document"), "{err}");
+        assert!(
+            live_shadow(&d.kernel_db().lock(), bad_seat, judge_id).unwrap().is_none(),
+            "failed create_document must not leave a live_shadow row"
+        );
+
+        // 2) An existing live_shadow row without a loaded BlockStore document is recovered on lookup.
+        let good_seat = register_rooted_context(&d, Some("good-seat"), performer_id);
+        let stranded_row = {
+            let db = d.kernel_db().lock();
+            let seat_row = db.get_context(good_seat).unwrap().unwrap();
+            let row = shadow_row(&db, &seat_row, JUDGE).unwrap();
+            db.in_transaction(|db| {
+                crate::kj::context::insert_new_context_rows(
+                    db,
+                    &row,
+                    crate::kj::context::CharacterPlacement::Start { performer: judge_id, senpai: Some(good_seat) },
+                )?;
+                db.mark_judge_shadow(row.context_id)
+            })
+            .unwrap();
+            row
+        };
+        assert!(!d.block_store().contains(stranded_row.context_id));
+        let (judge, created) = judge_shadow(d.kernel(), good_seat, &config).unwrap().unwrap();
+        assert!(!created);
+        assert_eq!(judge.shadow, stranded_row.context_id);
+        assert!(d.block_store().contains(judge.shadow), "existing live_shadow document must be recovered");
+        assert!(append(d.kernel(), judge.shadow, Role::User, "call".into()).is_ok());
     }
 }

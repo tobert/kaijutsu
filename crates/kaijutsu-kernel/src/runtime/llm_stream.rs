@@ -342,6 +342,8 @@ enum Delivery {
 async fn deliver_live_input(
     kernel: &Kernel,
     documents: &SharedBlockStore,
+    kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
+    media_slots: &crate::model_resolution::TurnMediaSlots,
     context_id: ContextId,
     turn_id: kaijutsu_types::TurnId,
     mailbox: &crate::ConversationMailbox,
@@ -371,7 +373,15 @@ async fn deliver_live_input(
     if delivered.is_empty() {
         return Ok(false);
     }
-    crate::resolve_media_blocks_from_cas(&mut delivered, kernel.cas().clone(), Some(media_cache)).await;
+    crate::llm::resolve_turn_media(
+        &mut delivered,
+        kernel.cas().clone(),
+        Some(media_cache),
+        kernel_db,
+        documents,
+        media_slots,
+    )
+    .await;
     tracing::info!(%context_id, blocks = tail.delivered.len(), messages = delivered.len(),
         "Delivered input to the running turn");
     crate::llm::hydrate::append_delivered(messages, delivered);
@@ -928,6 +938,8 @@ pub(crate) const INSTRUCTION_FORM: InstructionForm = InstructionForm::SystemMess
 async fn instruct(
     kernel: &Kernel,
     documents: &SharedBlockStore,
+    kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
+    media_slots: &crate::model_resolution::TurnMediaSlots,
     context_id: ContextId,
     turn_id: kaijutsu_types::TurnId,
     mailbox: &crate::ConversationMailbox,
@@ -943,7 +955,7 @@ async fn instruct(
     let after = pending.delivered.last().copied().unwrap_or(*write_point);
     documents.insert_block_as(context_id, None, Some(&after), Role::System, BlockKind::Notification, text,
         Status::Done, ContentType::Plain, Some(PrincipalId::system()))?;
-    deliver_live_input(kernel, documents, context_id, turn_id, mailbox, media_cache, messages, write_point,
+    deliver_live_input(kernel, documents, kernel_db, media_slots, context_id, turn_id, mailbox, media_cache, messages, write_point,
         carried, Delivery::Instruction).await?;
     Ok(())
 }
@@ -2893,22 +2905,37 @@ async fn run_llm_stream(
     // appends don't write through to the mailbox. The next turn's
     // catch_up picks up the assistant blocks via the block log.
 
-    // Resolve any (Asset, Text, Media) blocks against CAS so
-    // vision-capable providers receive the actual bytes. CAS reads
-    // are blocking std::fs; the resolver delegates each to
-    // spawn_blocking so the runtime stays responsive on stacks of
-    // images. Unresolved hashes fall back to a text marker via
-    // to_rig_request — never panic.
-    //
-    // The per-hash image cache (owned by ConversationCache) skips
-    // disk + base64 work for hashes already resolved this session,
-    // so a 20-image conversation doesn't re-encode every turn.
+    // Resolve media blocks per the context's `image`, `audio`, and `video`
+    // slots (`docs/contexts.md`): matching slot -> native bytes, other slot ->
+    // cached shadow description (or marker), absent slot -> text marker.
+    let media_slots = match crate::model_resolution::turn_media_slots(&kernel_db.lock(), context_id) {
+        Ok(mut slots) => {
+            if slots.turn_model.is_none() {
+                slots.turn_backend = Some(provider.name().to_string());
+                slots.turn_model = Some(model_name.clone());
+            }
+            slots
+        }
+        Err(e) => {
+            tracing::warn!(%context_id, "failed to read media slots, treating as unset: {e}");
+            crate::model_resolution::TurnMediaSlots {
+                turn_backend: Some(provider.name().to_string()),
+                turn_model: Some(model_name.clone()),
+                image: None,
+                audio: None,
+                video: None,
+            }
+        }
+    };
     {
         let cas: std::sync::Arc<dyn crate::ContentStore> = kernel.cas().clone();
-        crate::resolve_media_blocks_from_cas(
+        crate::llm::resolve_turn_media(
             &mut messages,
             cas,
             Some(conversation_cache.media_cache()),
+            &kernel_db,
+            &documents,
+            &media_slots,
         )
         .await;
     }
@@ -3621,7 +3648,7 @@ async fn run_llm_stream(
                 // writes above): the notice and the message sent are one
                 // fact, and continuing with only the wire copy would send an
                 // instruction no later hydration can reproduce.
-                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.media_cache(),
+                instruct(&kernel, &documents, &kernel_db, &media_slots, context_id, turn_id, mailbox, conversation_cache.media_cache(),
                     &mut messages, &mut last_block_id, &mut carried_input, &notice).await?;
                 continue 'agentic;
             }
@@ -3662,7 +3689,7 @@ async fn run_llm_stream(
                     continue with a tool call.";
                 tracing::info!(%context_id, nudge = done_nudges, limit = MAX_DONE_NUDGES,
                     "Text-only reply in a context offered `done`; continuing the turn with a notice");
-                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.media_cache(),
+                instruct(&kernel, &documents, &kernel_db, &media_slots, context_id, turn_id, mailbox, conversation_cache.media_cache(),
                     &mut messages, &mut last_block_id, &mut carried_input, notice).await?;
                 continue 'agentic;
             }
@@ -3670,7 +3697,7 @@ async fn run_llm_stream(
             // another one when its wake says so. A stopping turn, or one a
             // beat waits on, leaves input pending for the turn's end.
             if takes_live_input(&interrupt, turn_lease) && deliver_live_input(&kernel, &documents,
-                context_id, turn_id, mailbox, conversation_cache.media_cache(), &mut messages,
+                &kernel_db, &media_slots, context_id, turn_id, mailbox, conversation_cache.media_cache(), &mut messages,
                 &mut last_block_id, &mut carried_input, Delivery::FinalInference).await?
             {
                 continue 'agentic;
@@ -3837,7 +3864,7 @@ async fn run_llm_stream(
         // Input that arrived during this round joins here, after its
         // results: the next request already extends the cached prefix here.
         if takes_live_input(&interrupt, turn_lease) {
-            deliver_live_input(&kernel, &documents, context_id, turn_id, mailbox,
+            deliver_live_input(&kernel, &documents, &kernel_db, &media_slots, context_id, turn_id, mailbox,
                 conversation_cache.media_cache(), &mut messages, &mut last_block_id,
                 &mut carried_input, Delivery::ToolRound).await?;
         }
@@ -7975,6 +8002,13 @@ mod lifetime_tests {
     use std::time::Duration;
 
     async fn fixture(mock: Option<MockClient>) -> (Arc<Kernel>, ContextId, BlockId, crate::ExecContext) {
+        fixture_with_slots(mock, &[("model", "mock", "mock-model")]).await
+    }
+
+    async fn fixture_with_slots(
+        mock: Option<MockClient>,
+        slot_entries: &[(&str, &str, &str)],
+    ) -> (Arc<Kernel>, ContextId, BlockId, crate::ExecContext) {
         let kernel = Arc::new(Kernel::new_ephemeral("turn-lifetime").await.with_timeouts(
             kaijutsu_types::TimeoutPolicy {
                 llm_idle_timeout: Duration::from_millis(100),
@@ -8019,7 +8053,7 @@ mod lifetime_tests {
             // when a mock provider is wanted; without one the binding has
             // no model.
             if mock.is_some() {
-                db.seed_test_slots(actor, "mock", "mock-model", &["model"]).unwrap();
+                db.seed_test_slot_entries(actor, slot_entries).unwrap();
             }
             db.update_performer(context, Some(actor)).unwrap();
             db.set_context_senpai(context, Some(senpai)).unwrap();
@@ -9826,7 +9860,11 @@ mod lifetime_tests {
                 done("tool_use")],
             text_reply("I see a pixel"),
         ]).recording_sent_messages();
-        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let (kernel, context, _after, call) = fixture_with_slots(
+            Some(mock),
+            &[("model", "mock", "mock-model"), ("image", "mock", "mock-model")],
+        )
+        .await;
         let instance = InstanceId::new("snap-test");
         kernel.broker().register(Arc::new(Snap { id: instance.clone(), images: kernel.image_store() }),
             InstancePolicy::default()).await.unwrap();
@@ -9858,6 +9896,102 @@ mod lifetime_tests {
         }
         expected.push(LlmMessage::assistant("I see a pixel"));
         assert_same_wire(&rehydrated(&kernel, context), &expected);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// Without an explicit `image` slot, a turn sends a text marker instead of
+    /// resolving or sending raw image bytes — even when the provider supports images.
+    #[tokio::test]
+    async fn media_without_slot_sends_marker_instead_of_bytes() {
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R'];
+        let (mock, sent) = MockClient::new("")
+            .with_scripted_stream(vec![text_reply("no image slot")])
+            .recording_sent_messages();
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let hash = kernel.image_store().attach(context, call.principal_id, "image/png", PNG).unwrap();
+        let _ = after;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "describe").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 1);
+        let wire = serde_json::to_string(&sent[0]).unwrap();
+        assert!(!wire.contains("\"Media\""), "bytes/Media block must not be sent without image slot: {wire}");
+        assert!(wire.contains("no `image` slot"), "marker must name missing slot: {wire}");
+        assert!(wire.contains(&hash.to_string()));
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// When a context's `image` slot names a different model than its `model` slot
+    /// and `rendition_index` holds a cached description by that maker, the turn
+    /// substitutes the description text in place of raw media bytes.
+    #[tokio::test]
+    async fn media_with_different_slot_substitutes_cached_rendition_description() {
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R'];
+        let (mock, sent) = MockClient::new("")
+            .with_scripted_stream(vec![text_reply("got description")])
+            .recording_sent_messages();
+        let (kernel, context, _after, call) = fixture_with_slots(
+            Some(mock),
+            &[("model", "mock", "mock-model"), ("image", "vision", "vision-pro")],
+        )
+        .await;
+        let hash = kernel.image_store().attach(context, call.principal_id, "image/png", PNG).unwrap();
+        {
+            let db = kernel.kernel_db().lock();
+            let actor = db.context_character(context).unwrap().unwrap().principal_id;
+
+            let shadow = ContextId::new();
+            let ws = db.get_or_create_default_workspace(actor).unwrap();
+            db.insert_context_with_document(&crate::ContextRow {
+                context_id: shadow, label: Some("desc-shadow".into()), system_prompt: None,
+                context_state: ContextState::Live, created_at: 0, created_by: actor,
+                forked_from: Some(context), fork_kind: None, archived_at: None, workspace_id: None,
+                preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+                demoted_at: None, paused_at: None, origin_host: None,
+                performer: Some(actor), senpai_ctx: Some(context), persona: None,
+            }, ws).unwrap();
+            db.mark_shadow(shadow, crate::kernel_db::DESCRIBE_SHADOW).unwrap();
+            drop(db);
+            kernel.blocks().create_document(shadow, DocumentKind::Conversation, None).unwrap();
+            let source_block = kernel.blocks().non_draft_snapshots(context).unwrap()
+                .into_iter().find(|b| b.content_type == ContentType::Media).unwrap().id;
+            let key = crate::kernel_db::IndexKey::new(
+                &hash.to_string(),
+                crate::kernel_db::DESCRIBE_SHADOW,
+                "vision/vision-pro",
+            );
+            kernel.blocks().append_block_recorded(
+                shadow,
+                crate::block_store::RecordedBlockInsert {
+                    role: Role::Model,
+                    kind: BlockKind::Text,
+                    content: "a neon synthwave sun over a grid".into(),
+                    status: Status::Done,
+                    content_type: ContentType::Plain,
+                    author: actor,
+                    ansi: None,
+                    shell: None,
+                },
+                |db, rendition_id| {
+                    db.record_rendition(
+                        &crate::kernel_db::Rendition { block: *rendition_id, source: source_block, span: None },
+                        Some(&key),
+                    )
+                },
+            ).unwrap();
+        }
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "look").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 1);
+        let wire = serde_json::to_string(&sent[0]).unwrap();
+        assert!(!wire.contains("\"Media\""), "raw bytes must not be sent when routed to another slot: {wire}");
+        assert!(wire.contains("a neon synthwave sun over a grid"), "description missing: {wire}");
+        assert!(wire.contains("vision/vision-pro"), "maker missing: {wire}");
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

@@ -18,15 +18,27 @@ pub const MODEL: &str = "model";
 pub const DISTILL: &str = "distill";
 
 /// The slot role that reads images for a character: the model of its
-/// description shadow (`docs/shadows.md`).
+/// description shadow (`docs/contexts.md`).
 pub const IMAGE: &str = "image";
+
+/// The slot role that reads audio for a character.
+pub const AUDIO: &str = "audio";
+
+/// The slot role that reads video for a character.
+pub const VIDEO: &str = "video";
 
 /// The roles a character's slots may hold: `distill` (a cheaper model for
 /// `kj fork --compact` and `kj drift pull|merge`), `gate` (the council
-/// server that judges the gate), and `image` (the model that reads images for
-/// the character). The character's chat model is its one model
-/// (`character_models`), not a slot.
-pub const CHARACTER_SLOT_ROLES: &[&str] = &[DISTILL, crate::council::gate::GATE, IMAGE];
+/// server that judges the gate), and `image` / `audio` / `video` (the models
+/// that read media for the character). The character's chat model is its one
+/// model (`character_models`), not a slot.
+pub const CHARACTER_SLOT_ROLES: &[&str] = &[
+    DISTILL,
+    crate::council::gate::GATE,
+    IMAGE,
+    AUDIO,
+    VIDEO,
+];
 
 /// The backend kind of a council server. A slot on such a backend names a
 /// served model, needs no `max_tokens`, and is never a chat model.
@@ -53,7 +65,7 @@ pub fn refuse_character_slot_role(role: &str, character: &str) -> Result<(), Str
     }
     Err(format!(
         "a character has one model; `kj character model set {character} <backend>/<model>`. \
-         A character's slots are `distill`, `gate`, and `image`, not `{role}`"
+         A character's slots are `distill`, `gate`, `image`, `audio`, and `video`, not `{role}`"
     ))
 }
 
@@ -332,13 +344,16 @@ impl BoundSlot {
     }
 
     pub(crate) fn is_gate_only(&self) -> bool {
-        self.kind == BackendKind::Council && self.slot.max_tokens.is_none()
+        self.kind == BackendKind::Council
+            && self.slot.max_tokens.is_none()
+            && self.slot.decide.is_none()
     }
 
     /// The limit for a generation request. A backend that does not send a
-    /// limit ignores even a configured value.
+    /// limit ignores even a configured value, and a `--decide` model slot
+    /// samples no tokens.
     pub(crate) fn request_max_tokens(&self, role: &str) -> KernelDbResult<Option<u64>> {
-        if !self.kind.sends_output_limit() {
+        if !self.kind.sends_output_limit() || (role == MODEL && self.slot.decide.is_some()) {
             return Ok(None);
         }
         non_negative(self.slot.max_tokens).filter(|m| *m > 0).map(Some).ok_or_else(|| {
@@ -395,4 +410,76 @@ pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<Con
             }))
         }
     }
+}
+
+/// Target `(backend, model)` bound to a context's media slot (`image`, `audio`, or `video`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaSlotTarget {
+    pub role: &'static str,
+    pub backend: String,
+    pub model: String,
+}
+
+impl MediaSlotTarget {
+    pub fn maker(&self) -> String {
+        format!("{}/{}", self.backend, self.model)
+    }
+}
+
+/// Media slot bindings for a live turn, read from `context_slots`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnMediaSlots {
+    pub turn_backend: Option<String>,
+    pub turn_model: Option<String>,
+    pub image: Option<MediaSlotTarget>,
+    pub audio: Option<MediaSlotTarget>,
+    pub video: Option<MediaSlotTarget>,
+}
+
+impl TurnMediaSlots {
+    /// Target media slot for `media_type`, if it is `image/*`, `audio/*`, or `video/*`.
+    pub fn slot_for_mime(&self, media_type: &str) -> (&'static str, Option<&MediaSlotTarget>) {
+        if media_type.starts_with("image/") {
+            (IMAGE, self.image.as_ref())
+        } else if media_type.starts_with("audio/") {
+            (AUDIO, self.audio.as_ref())
+        } else if media_type.starts_with("video/") {
+            (VIDEO, self.video.as_ref())
+        } else {
+            ("media", None)
+        }
+    }
+
+    /// Whether `target` names the same backend and model as the turn's `model` slot.
+    pub fn matches_turn_model(&self, target: &MediaSlotTarget) -> bool {
+        self.turn_backend.as_deref() == Some(target.backend.as_str())
+            && self.turn_model.as_deref() == Some(target.model.as_str())
+    }
+}
+
+/// Read a context's `model`, `image`, `audio`, and `video` slot bindings for turn-path media routing.
+pub fn turn_media_slots(db: &KernelDb, context_id: ContextId) -> KernelDbResult<TurnMediaSlots> {
+    let read_pair = |role: &str| -> KernelDbResult<Option<(String, String)>> {
+        let Some(slot) = db.context_slot(context_id, role)? else {
+            return Ok(None);
+        };
+        let Some(backend) = db.get_backend(slot.backend_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((backend.name, slot.model)))
+    };
+    let (turn_backend, turn_model) = match read_pair(MODEL)? {
+        Some((b, m)) => (Some(b), Some(m)),
+        None => (None, None),
+    };
+    let media_target = |role: &'static str| -> KernelDbResult<Option<MediaSlotTarget>> {
+        Ok(read_pair(role)?.map(|(backend, model)| MediaSlotTarget { role, backend, model }))
+    };
+    Ok(TurnMediaSlots {
+        turn_backend,
+        turn_model,
+        image: media_target(IMAGE)?,
+        audio: media_target(AUDIO)?,
+        video: media_target(VIDEO)?,
+    })
 }

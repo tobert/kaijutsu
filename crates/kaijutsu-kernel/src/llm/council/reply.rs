@@ -34,7 +34,12 @@ pub(super) struct Timing {
     pub(super) wall_ms: u64,
 }
 
-pub(super) struct Reply {
+pub(super) enum Reply {
+    Phased(PhasedReply),
+    Decisions(Box<super::decide::DecisionRunner>),
+}
+
+pub(super) struct PhasedReply {
     phase: Phase,
     think: Block,
     answer: Block,
@@ -43,17 +48,66 @@ pub(super) struct Reply {
 impl Reply {
     /// `thinking` is whether generation starts inside thinking.
     pub(super) fn new(thinking: bool) -> Self {
-        Reply {
+        Self::Phased(PhasedReply {
             phase: if thinking { Phase::Think } else { Phase::Answer },
             think: Block::new(Kind::Think),
             answer: Block::new(Kind::Answer),
-        }
+        })
+    }
+
+    pub(super) fn decisions(runner: super::decide::DecisionRunner) -> Self {
+        Self::Decisions(Box::new(runner))
     }
 
     /// A council v2 piece in `phase`. A change of phase closes the block of
     /// the phase before it; a call's pieces and a phase this kernel does not
     /// know add no text.
     pub(super) fn phased(&mut self, phase: CouncilPhase, piece: &str) -> Vec<StreamEvent> {
+        match self {
+            Self::Phased(phased) => phased.phased(phase, piece),
+            Self::Decisions(_) => Vec::new(),
+        }
+    }
+
+    /// The events that end a council v2 generation. Its calls keep the ids
+    /// the server gave them, which the next turn's tool results name.
+    /// `model` and `weight_hash` are the server's identity.
+    pub(super) fn done(
+        self,
+        done: GenerationDone,
+        model: &str,
+        weight_hash: &str,
+        timing: Timing,
+    ) -> Result<Vec<StreamEvent>, String> {
+        match self {
+            Self::Phased(phased) => phased.done(done, model, weight_hash, timing),
+            Self::Decisions(_) => Err("generation done called on a decision stream".into()),
+        }
+    }
+
+    /// The events of a reply that is already whole: `text` as the answer, a
+    /// normal end of turn, and `usage` as `(prompt, completion, extra)`.
+    /// Preserves `text` verbatim without edge trimming.
+    pub(super) fn whole(text: &str, usage: (u64, u64, CouncilUsageExtra)) -> Result<Vec<StreamEvent>, String> {
+        let mut out = Vec::new();
+        if !text.is_empty() {
+            out.push(StreamEvent::TextStart);
+            out.push(StreamEvent::TextDelta(text.to_string()));
+            out.push(StreamEvent::TextEnd);
+        }
+        let (prompt, completion, extra) = usage;
+        out.push(StreamEvent::Done {
+            stop_reason: Some("end_turn".into()),
+            input_tokens: Some(prompt),
+            output_tokens: Some(completion),
+            extra: Some(UsageExtra::Council(extra)),
+        });
+        Ok(out)
+    }
+}
+
+impl PhasedReply {
+    fn phased(&mut self, phase: CouncilPhase, piece: &str) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         let phase = match phase {
             CouncilPhase::Reasoning => Phase::Think,
@@ -81,10 +135,7 @@ impl Reply {
         }
     }
 
-    /// The events that end a council v2 generation. Its calls keep the ids
-    /// the server gave them, which the next turn's tool results name.
-    /// `model` and `weight_hash` are the server's identity.
-    pub(super) fn done(
+    fn done(
         self,
         done: GenerationDone,
         model: &str,
@@ -120,17 +171,6 @@ impl Reply {
             CouncilFinish::MaxTokens | CouncilFinish::ContextFull => "max_tokens",
         };
         self.end(&done.reasoning, &done.content, stop_reason, calls, usage)
-    }
-
-    /// The events of a reply that is already whole: `text` as the answer, a
-    /// normal end of turn, and `usage` as `(prompt, completion, extra)`. The
-    /// answer is trimmed as a streamed one is.
-    pub(super) fn whole(text: &str, usage: (u64, u64, CouncilUsageExtra)) -> Result<Vec<StreamEvent>, String> {
-        let mut reply = Reply::new(false);
-        let mut out = reply.phased(CouncilPhase::Content, text);
-        let content = reply.answer.text.clone();
-        out.extend(reply.end("", &content, "end_turn", Vec::new(), usage)?);
-        Ok(out)
     }
 
     /// Closes the open block, checks the streamed text against the reply's,
@@ -371,5 +411,46 @@ mod tests {
         assert_eq!((a.as_str(), n0.as_str(), input), ("c0", "ls", &serde_json::json!({"path": "/tmp"})));
         assert_eq!((b.as_str(), n1.as_str(), c.as_str(), n2.as_str()), ("c1", "ls", "c2", UNNAMED_CALL));
         assert!(error.contains("did not parse") && error.contains("no name"), "{error}");
+    }
+
+    #[test]
+    fn whole_preserves_edge_whitespace_and_empty_text() {
+        let extra = || CouncilUsageExtra {
+            kept: 4,
+            fed: 6,
+            first_token_ms: 1,
+            wall_ms: 2,
+            seed: Some(7),
+            model: "m".into(),
+            weight_hash: "w".into(),
+        };
+        let events = Reply::whole("  hello\n", (10, 0, extra())).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextStart,
+                StreamEvent::TextDelta("  hello\n".into()),
+                StreamEvent::TextEnd,
+                StreamEvent::Done {
+                    stop_reason: Some("end_turn".into()),
+                    input_tokens: Some(10),
+                    output_tokens: Some(0),
+                    extra: Some(UsageExtra::Council(extra())),
+                },
+            ]
+        );
+
+        let spaces = Reply::whole("   ", (10, 0, extra())).unwrap();
+        assert!(
+            matches!(
+                spaces.as_slice(),
+                [StreamEvent::TextStart, StreamEvent::TextDelta(t), StreamEvent::TextEnd, StreamEvent::Done { .. }]
+                if t == "   "
+            ),
+            "{spaces:?}"
+        );
+
+        let empty = Reply::whole("", (10, 0, extra())).unwrap();
+        assert!(matches!(empty.as_slice(), [StreamEvent::Done { .. }]), "{empty:?}");
     }
 }

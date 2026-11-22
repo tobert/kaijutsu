@@ -395,7 +395,7 @@ impl KernelDb {
         let slots = self.list_character_slots(principal_id)?;
         if let Some(stray) = slots.iter().find(|slot| !CHARACTER_SLOT_ROLES.contains(&slot.role.as_str())) {
             return Err(KernelDbError::Validation(format!(
-                "character {who} holds a `{}` slot, and a character's slots are `distill`, `gate`, and `describe`; \
+                "character {who} holds a `{}` slot, and a character's slots are `distill`, `gate`, `image`, `audio`, and `video`; \
                  `kj character slot unset {who} {}` removes it",
                 stray.role, stray.role
             )));

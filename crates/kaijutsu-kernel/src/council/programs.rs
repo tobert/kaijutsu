@@ -631,8 +631,23 @@ pub(crate) async fn read_programs<V: crate::vfs::VfsOps + ?Sized>(
 /// `Err` names the first file that changed or can no longer be read.
 pub(crate) async fn verify_judged<V: crate::vfs::VfsOps + ?Sized>(vfs: &V, judged: &[JudgedFile]) -> Result<(), String> {
     for file in judged {
-        let now = read_capped(vfs, &file.path, false).await.ok().flatten().map(|bytes| sha256_of(&bytes));
-        if now.as_deref() != Some(file.sha256.as_str()) {
+        let bytes = match read_capped(vfs, &file.path, false).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                return Err(format!(
+                    "the script could not be verified after the council judged it; send the command again. Nothing was run. \
+                     ({} returned no bytes)",
+                    file.path
+                ));
+            }
+            Err(why) => {
+                return Err(format!(
+                    "the script could not be verified after the council judged it; send the command again. Nothing was run. \
+                     ({why})"
+                ));
+            }
+        };
+        if sha256_of(&bytes) != file.sha256 {
             return Err(format!(
                 "the script changed after the council judged it; send the command again. Nothing was run. \
                  ({} no longer holds the text the council read)",
@@ -846,5 +861,27 @@ mod tests {
         vfs.write_all(Path::new("/work/fix.py"), b"print(2)\n").await.unwrap();
         let refused = verify_judged(&vfs, &judged).await.unwrap_err();
         assert!(refused.starts_with("the script changed after the council judged it; send the command again"), "{refused}");
+        assert!(refused.contains("no longer holds the text"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_judged_file_read_error_propagates_explicitly() {
+        use crate::vfs::VfsOps;
+        let vfs = vfs_with(&[("/work/fix.py", b"print(1)\n")]).await;
+        let found = read(&vfs, "python3 fix.py").await;
+        let judged = vec![found[0].text.as_ref().unwrap().file.clone().unwrap()];
+
+        // Missing file after judgment propagates the VFS read error instead of claiming the file changed.
+        vfs.unlink(Path::new("/work/fix.py")).await.unwrap();
+        let err = verify_judged(&vfs, &judged).await.unwrap_err();
+        assert!(err.contains("/work/fix.py could not be read:"), "{err}");
+        assert!(!err.contains("no longer holds the text"), "{err}");
+
+        // Exceeding the program cap after judgment propagates the size error explicitly.
+        let big = vec![b'#'; PROGRAM_CAP + 1];
+        vfs.write_all(Path::new("/work/fix.py"), &big).await.unwrap();
+        let err = verify_judged(&vfs, &judged).await.unwrap_err();
+        assert!(err.contains("16384-byte limit"), "{err}");
+        assert!(!err.contains("no longer holds the text"), "{err}");
     }
 }

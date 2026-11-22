@@ -996,23 +996,35 @@ impl Provider {
 
     /// Why a media part of `media_type` would reach `model` as a marker
     /// instead of its bytes, or `None` when the provider sends it. A council
-    /// backend reads the served model's identity; any other provider sends
-    /// images and marks the rest. A request for a marker is refused before
-    /// the model is called.
+    /// backend reads the served model's identity; Gemini reads image, audio,
+    /// and video inline; other providers send images only. A request for a
+    /// marker is refused before the model is called.
     pub async fn media_refusal(&self, model: &str, media_type: &str) -> LlmResult<Option<String>> {
         match self {
             Self::Council(client) => client.media_refusal(model, media_type).await,
             _ if !media_type_is_recorded(media_type) => Ok(Some(UNRECORDED_MEDIA_TYPE.to_string())),
+            Self::Gemini(_)
+                if media_type.starts_with("image/")
+                    || media_type.starts_with("audio/")
+                    || media_type.starts_with("video/") =>
+            {
+                Ok(None)
+            }
+            Self::Gemini(_) => Ok(Some(format!(
+                "{model} on provider {} reads image, audio, and video only, so it cannot read {media_type}",
+                self.name()
+            ))),
             _ if media_type.starts_with("image/") => Ok(None),
             _ => Ok(Some(format!("{model} on provider {} reads images only, so it cannot read {media_type}", self.name()))),
         }
     }
 
     /// The request options a one-shot prompt runs with. A one-shot wants the
-    /// answer text, and thinking tokens count against `max_tokens`, so each
-    /// provider that can turns thinking off, unless `opts` names an effort or
-    /// a thinking style: an explicit slot value is the operator's choice.
-    fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
+    /// answer text, never a context's decision program, and thinking tokens
+    /// count against `max_tokens`, so each provider that can turns thinking
+    /// off unless `opts` names an effort or a thinking style.
+    fn one_shot_opts(&self, mut opts: BuildOpts) -> BuildOpts {
+        opts.decide = None;
         if opts.effort.is_some() || opts.thinking_style.is_some() {
             return opts;
         }
@@ -1431,27 +1443,45 @@ pub(crate) fn test_credentials() -> Arc<chatgpt::credentials::Credentials> {
     Arc::new(chatgpt::credentials::Credentials::at(std::env::temp_dir().join("kaijutsu-test-credentials-unused")))
 }
 
-/// The image bytes of a media part a provider that reads only images can
-/// send, or the marker text that stands in for the part and says why it was
-/// left out. Bytes that were not found, and a type that is not an image,
-/// each get their own reason.
-pub(crate) fn image_or_marker<'a>(
+/// The bytes of a media part when `reads(media_type)` holds and the CAS
+/// recorded a real MIME type, or the marker text that stands in for the part
+/// and says why it was left out.
+pub(crate) fn media_or_marker<'a>(
     hash: &str,
     media_type: &str,
     data_base64: Option<&'a str>,
+    reads: impl FnOnce(&str) -> bool,
+    reads_what: &str,
 ) -> Result<&'a str, String> {
     match data_base64 {
         Some(data) if !data.is_empty() && !media_type_is_recorded(media_type) => Err(format!(
             "[media {hash} ({media_type}) omitted: {UNRECORDED_MEDIA_TYPE}]"
         )),
-        Some(data) if !data.is_empty() && media_type.starts_with("image/") => Ok(data),
+        Some(data) if !data.is_empty() && reads(media_type) => Ok(data),
         Some(data) if !data.is_empty() => Err(format!(
-            "[media {hash} ({media_type}) omitted: this provider reads images only]"
+            "[media {hash} ({media_type}) omitted: this provider reads {reads_what}]"
         )),
         _ => Err(format!(
             "[media {hash} ({media_type}) omitted: its bytes were not found]"
         )),
     }
+}
+
+/// The image bytes of a media part a provider that reads only images can
+/// send, or the marker text that stands in for the part and says why it was
+/// left out.
+pub(crate) fn image_or_marker<'a>(
+    hash: &str,
+    media_type: &str,
+    data_base64: Option<&'a str>,
+) -> Result<&'a str, String> {
+    media_or_marker(
+        hash,
+        media_type,
+        data_base64,
+        |t| t.starts_with("image/"),
+        "images only",
+    )
 }
 
 /// Why a media part whose CAS record names no type is left out. The block
@@ -1552,6 +1582,133 @@ pub async fn resolve_media_blocks_from_cas(
                 *data_base64 = Some(encoded);
             }
             // Otherwise stay unresolved — provider build() emits a text marker.
+        }
+    }
+}
+
+/// Route hydrated `ContentBlock::Media` parts on the turn path according to
+/// the context's `image`, `audio`, and `video` slots (`docs/contexts.md`):
+/// - Slot absent: replace with a text marker naming the missing slot.
+/// - Slot names the same `(backend, model)` as the turn's `model` slot: resolve
+///   bytes from CAS / `cache` for native multimodal delivery.
+/// - Slot names a different model: look up any cached rendition in
+///   `rendition_index` and substitute its description text, or a text marker if
+///   none is cached yet.
+pub(crate) async fn resolve_turn_media(
+    messages: &mut [Message],
+    cas: std::sync::Arc<dyn kaijutsu_cas::ContentStore>,
+    cache: Option<&media_cache::MediaBase64Cache>,
+    db: &std::sync::Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
+    documents: &crate::block_store::SharedBlockStore,
+    slots: &crate::model_resolution::TurnMediaSlots,
+) {
+    use base64::Engine;
+    use kaijutsu_cas::ContentHash;
+    use media_cache::ResolvedMedia;
+
+    for msg in messages.iter_mut() {
+        let MessageContent::Blocks(blocks) = &mut msg.content else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            let ContentBlock::Media {
+                hash,
+                media_type,
+                data_base64,
+            } = block
+            else {
+                continue;
+            };
+            let parsed = match ContentHash::from_str_checked(hash) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            // Identify real CAS MIME type first (from cache or CAS sidecar)
+            // without loading bytes if the slot will substitute text or a marker.
+            let mut cached_hit = cache.and_then(|c| c.get(&parsed));
+            if let Some(hit) = &cached_hit {
+                *media_type = hit.mime_type.clone();
+            } else if !media_type_is_recorded(media_type) {
+                let cas_for_task = cas.clone();
+                let parsed_for_task = parsed.clone();
+                if let Ok(Some(reference)) = tokio::task::spawn_blocking(move || {
+                    cas_for_task.inspect(&parsed_for_task).ok().flatten()
+                })
+                .await
+                {
+                    *media_type = reference.mime_type;
+                }
+            }
+
+            let (role, target) = slots.slot_for_mime(media_type);
+            let replacement = match target {
+                None => Some(format!(
+                    "[media {hash} ({media_type}) omitted: no `{role}` slot is configured on this character]"
+                )),
+                Some(slot) if slots.matches_turn_model(slot) => {
+                    if data_base64.is_none() {
+                        if let Some(hit) = cached_hit.take() {
+                            *media_type = hit.mime_type;
+                            *data_base64 = Some(hit.data_base64);
+                        } else {
+                            let cas_for_task = cas.clone();
+                            let parsed_for_task = parsed.clone();
+                            if let Ok((inspected, bytes)) = tokio::task::spawn_blocking(move || {
+                                let inspected = cas_for_task.inspect(&parsed_for_task).ok().flatten();
+                                let bytes = cas_for_task.retrieve(&parsed_for_task).ok().flatten();
+                                (inspected, bytes)
+                            })
+                            .await
+                            {
+                                if let Some(reference) = inspected {
+                                    *media_type = reference.mime_type;
+                                }
+                                if let Some(bytes) = bytes {
+                                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                    if let Some(cache) = cache {
+                                        cache.insert(
+                                            parsed,
+                                            ResolvedMedia {
+                                                mime_type: media_type.clone(),
+                                                data_base64: encoded.clone(),
+                                            },
+                                        );
+                                    }
+                                    *data_base64 = Some(encoded);
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+                Some(slot) => {
+                    let maker = slot.maker();
+                    let key = crate::kernel_db::IndexKey::new(
+                        hash,
+                        crate::kernel_db::DESCRIBE_SHADOW,
+                        &maker,
+                    );
+                    let hit = db.lock().indexed_rendition(&key).ok().flatten();
+                    let description = hit.and_then(|block_id| {
+                        documents
+                            .non_draft_snapshots(block_id.context_id)
+                            .ok()?
+                            .into_iter()
+                            .find(|b| b.id == block_id)
+                            .map(|b| b.content)
+                    });
+                    Some(match description {
+                        Some(text) => format!("[media {hash} ({media_type}) description by {maker}:\n{text}]"),
+                        None => format!(
+                            "[media {hash} ({media_type}) omitted: routed to `{role}` slot {maker}, which has no cached description yet]"
+                        ),
+                    })
+                }
+            };
+            if let Some(text) = replacement {
+                *block = ContentBlock::Text { text };
+            }
         }
     }
 }

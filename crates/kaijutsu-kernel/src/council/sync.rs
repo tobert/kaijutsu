@@ -274,15 +274,16 @@ impl Default for CouncilSync {
 /// The seat's house rules: the first `AGENTS.md` found walking up from its
 /// working directory (`no_cwd_dir` when it has none), read through the
 /// kernel VFS, up to one byte past the budget so the projection can mark a
-/// cut. A file that cannot be read, or is not UTF-8, is skipped with a
-/// warning; the decision reads no house-rules context rather than missing.
-pub(crate) async fn house_rules(kernel: &crate::Kernel, seat: ContextId, house_rules_tokens: u64) -> Option<HouseRules> {
+/// cut. Returns `Ok(None)` when no `AGENTS.md` is found, and `Err` when the
+/// seat's working directory cannot be read or an existing `AGENTS.md` fails
+/// to read or decode UTF-8.
+pub(crate) async fn house_rules(kernel: &crate::Kernel, seat: ContextId, house_rules_tokens: u64) -> Result<Option<HouseRules>, String> {
     use crate::vfs::VfsOps;
     let cwd = match kernel.kernel_db().lock().get_context_shell(seat) {
         Ok(row) => row.and_then(|row| row.cwd),
         Err(e) => {
-            tracing::warn!(seat = %seat.short(), error = %e, "the seat's working directory cannot be read; no house rules");
-            return None;
+            tracing::warn!(seat = %seat.short(), error = %e, "the seat's working directory cannot be read");
+            return Err(format!("the seat's working directory cannot be read: {e}"));
         }
     }
     .unwrap_or_else(|| crate::runtime::shell_state::no_cwd_dir().to_string_lossy().into_owned());
@@ -295,27 +296,27 @@ pub(crate) async fn house_rules(kernel: &crate::Kernel, seat: ContextId, house_r
         let shown = path.to_string_lossy().into_owned();
         return match kernel.vfs().read(&path, 0, limit).await {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => Some(HouseRules { path: shown, text }),
+                Ok(text) => Ok(Some(HouseRules { path: shown, text })),
                 Err(e) => {
                     // A cut can split a character; keep the valid prefix.
                     let valid = e.utf8_error().valid_up_to();
                     if valid + 4 > limit as usize {
                         let mut bytes = e.into_bytes();
                         bytes.truncate(valid);
-                        Some(HouseRules { path: shown, text: String::from_utf8(bytes).unwrap_or_default() })
+                        Ok(Some(HouseRules { path: shown, text: String::from_utf8(bytes).unwrap_or_default() }))
                     } else {
-                        tracing::warn!(path = %shown, "house rules are not UTF-8; the decision reads none");
-                        None
+                        tracing::warn!(path = %shown, "house rules are not UTF-8");
+                        Err(format!("house rules {shown} are not valid UTF-8"))
                     }
                 }
             },
             Err(e) => {
-                tracing::warn!(path = %shown, error = %e, "house rules cannot be read; the decision reads none");
-                None
+                tracing::warn!(path = %shown, error = %e, "house rules cannot be read");
+                Err(format!("house rules {shown} could not be read: {e}"))
             }
         };
     }
-    None
+    Ok(None)
 }
 
 impl CouncilSync {
@@ -396,7 +397,9 @@ impl CouncilSync {
         let house = match seat {
             None => None,
             Some(context_id) => {
-                let rules = house_rules(kernel, context_id, council.house_rules_tokens).await;
+                let rules = house_rules(kernel, context_id, council.house_rules_tokens)
+                    .await
+                    .map_err(PrepareMiss)?;
                 match (project_house_rules(rules.as_ref(), thinking, council.house_rules_tokens), rules) {
                     (Some(body), Some(rules)) => {
                         let slot = Slot::HouseRules { path: rules.path, tokens: council.house_rules_tokens };
@@ -2037,6 +2040,33 @@ mod tests {
         assert!(p.house_rules().is_none());
         assert_eq!(p.contexts.len(), 1);
         assert_eq!(r.mock.builds().len(), 1, "only the labeled context");
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_non_utf8_agents_md_is_an_error_not_none() {
+        use crate::vfs::VfsOps;
+        let mut r = rig().await;
+        r.council.house_rules = true;
+        r.kernel.vfs().mount("/work", crate::vfs::MemoryBackend::new()).await;
+        r.kernel.vfs().mkdir(std::path::Path::new("/work/bad-utf8"), 0o755).await.unwrap();
+        r.kernel
+            .vfs()
+            .write_all(std::path::Path::new("/work/bad-utf8/AGENTS.md"), &[0xff, 0xfe, 0x00])
+            .await
+            .unwrap();
+        let bad_utf8_seat = seat_in(&r, "lane-utf8", Some("/work/bad-utf8"));
+        let err = house_rules(&r.kernel, bad_utf8_seat, 2000).await.unwrap_err();
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        let miss = prepare_seat(&r, bad_utf8_seat).await.err().expect("prepare_labels must miss");
+        assert!(miss.0.contains("not valid UTF-8"), "{}", miss.0);
+
+        r.kernel.vfs().mkdir(std::path::Path::new("/work/unreadable"), 0o755).await.unwrap();
+        r.kernel.vfs().mkdir(std::path::Path::new("/work/unreadable/AGENTS.md"), 0o755).await.unwrap();
+        let unreadable_seat = seat_in(&r, "lane-dir", Some("/work/unreadable"));
+        let err = house_rules(&r.kernel, unreadable_seat, 2000).await.unwrap_err();
+        assert!(err.contains("could not be read"), "{err}");
+        let miss = prepare_seat(&r, unreadable_seat).await.err().expect("prepare_labels must miss");
+        assert!(miss.0.contains("could not be read"), "{}", miss.0);
     }
 
     /// The labels and the house-rules context together must fit the

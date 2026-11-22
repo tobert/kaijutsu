@@ -109,7 +109,20 @@ impl Client {
     /// left before the deadline and no more than the client's timeout, and
     /// each attempt ends at the deadline. Returns the slot, which a stream
     /// holds until it ends. With no endpoint, the call goes straight out.
-    async fn call<T, F, Fut>(&self, turn: &Turn, opens_stream: bool, mut call: F) -> LlmResult<(Option<Slot>, T)>
+    async fn call<T, F, Fut>(&self, turn: &Turn, opens_stream: bool, call: F) -> LlmResult<(Option<Slot>, T)>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, CouncilError>>,
+    {
+        self.call_classified(turn, opens_stream, call).await.map_err(|(_, e)| e)
+    }
+
+    async fn call_classified<T, F, Fut>(
+        &self,
+        turn: &Turn,
+        opens_stream: bool,
+        mut call: F,
+    ) -> Result<(Option<Slot>, T), (StreamErrorKind, LlmError)>
     where
         F: FnMut(Duration) -> Fut,
         Fut: std::future::Future<Output = Result<T, CouncilError>>,
@@ -120,7 +133,10 @@ impl Client {
             async move { tokio::time::timeout_at(turn.deadline, sent).await.unwrap_or(Err(CouncilError::Timeout)) }
         };
         let Some(endpoint) = &self.endpoint else {
-            return attempt().await.map(|v| (None, v)).map_err(|e| to_llm(&self.name, e));
+            return attempt()
+                .await
+                .map(|v| (None, v))
+                .map_err(|e| (error_kind(&e), to_llm(&self.name, e)));
         };
         let answered = if opens_stream {
             crate::llm::endpoint::council_open(endpoint, turn.deadline, &turn.waits, attempt).await
@@ -129,8 +145,13 @@ impl Client {
         };
         tracing::Span::current().record("llm.slot_wait_ms", turn.waits.total().as_millis() as u64);
         match answered {
-            Ok((slot, result)) => result.map(|v| (Some(slot), v)).map_err(|e| to_llm(&self.name, e)),
-            Err(no_slot) => Err(LlmError::RateLimited(format!("council backend '{}': {no_slot}", self.name))),
+            Ok((slot, result)) => result
+                .map(|v| (Some(slot), v))
+                .map_err(|e| (error_kind(&e), to_llm(&self.name, e))),
+            Err(no_slot) => Err((
+                StreamErrorKind::RateLimited,
+                LlmError::RateLimited(format!("council backend '{}': {no_slot}", self.name)),
+            )),
         }
     }
 
@@ -238,16 +259,61 @@ pub struct Stream {
 }
 
 impl Stream {
+    fn cancel_confirm_done(&mut self) -> StreamEvent {
+        if let Some(Reply::Decisions(runner)) = self.reply.take() {
+            return runner.cancel_done(self.started);
+        }
+        StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None }
+    }
+
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         loop {
             if self.finished {
                 self.slot = None;
+                return self.pending.pop_front();
+            }
+            if self.cancel.is_cancelled() {
+                self.finished = true;
+                self.inner = None;
+                self.pending.clear();
+                self.slot = None;
+                return Some(self.cancel_confirm_done());
             }
             if let Some(ev) = self.pending.pop_front() {
                 return Some(ev);
             }
-            if self.finished {
-                return None;
+            if matches!(self.reply, Some(Reply::Decisions(_))) {
+                let started = self.started;
+                let cancel = self.cancel.clone();
+                let outcome = {
+                    let Some(Reply::Decisions(runner)) = self.reply.as_mut() else { unreachable!() };
+                    let step = runner.step(started);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => None,
+                        out = step => Some(out),
+                    }
+                };
+                match outcome {
+                    None => {
+                        self.finished = true;
+                        self.pending.clear();
+                        self.slot = None;
+                        return Some(self.cancel_confirm_done());
+                    }
+                    Some(decide::StepOutcome::Continue) => continue,
+                    Some(decide::StepOutcome::Finished(events)) => {
+                        self.finished = true;
+                        self.reply = None;
+                        self.pending.extend(events);
+                        continue;
+                    }
+                    Some(decide::StepOutcome::Failed(err)) => {
+                        self.finished = true;
+                        self.reply = None;
+                        return Some(StreamEvent::Error(err));
+                    }
+                }
             }
             let inner = self.inner.as_mut()?;
             let cancel = self.cancel.clone();
@@ -256,7 +322,9 @@ impl Stream {
                 _ = cancel.cancelled() => {
                     self.finished = true;
                     self.inner = None;
-                    return Some(StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None });
+                    self.pending.clear();
+                    self.slot = None;
+                    return Some(self.cancel_confirm_done());
                 }
                 item = inner.next() => match item {
                     Some(Ok(GenerationEvent::Token(token))) => {
@@ -1037,6 +1105,32 @@ mod tests {
         let events = drain(&mut stream).await;
         assert!(
             matches!(events.as_slice(), [StreamEvent::Done { stop_reason: None, input_tokens: None, .. }]),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_with_buffered_pending_events_yields_cancel_confirm_done() {
+        let mut stream = Stream {
+            name: "nagaya".into(),
+            inner: None,
+            reply: None,
+            pending: std::collections::VecDeque::from([
+                StreamEvent::TextStart,
+                StreamEvent::TextDelta("buffered".into()),
+                StreamEvent::TextEnd,
+            ]),
+            cancel: CancellationToken::new(),
+            finished: false,
+            started: Instant::now(),
+            first_token: None,
+            slot: None,
+            reply_identity: None,
+        };
+        stream.cancel();
+        let events = drain(&mut stream).await;
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None }]),
             "{events:?}"
         );
     }

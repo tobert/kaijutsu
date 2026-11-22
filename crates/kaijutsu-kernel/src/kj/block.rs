@@ -76,6 +76,12 @@ enum BlockCommand {
         /// Filter by status: pending|running|waiting|done|error|draft
         #[arg(long)]
         status: Option<String>,
+        /// Filter by content type: a MIME type (e.g. text/plain, audio/wav) or plain|markdown|svg|abc|diff|media
+        #[arg(long, value_name = "MIME")]
+        content_type: Option<String>,
+        /// Show only non-excluded blocks
+        #[arg(long)]
+        included: bool,
         /// Show only the newest N blocks that pass the filters, in log order
         #[arg(long, value_name = "N")]
         tail: Option<usize>,
@@ -315,8 +321,19 @@ impl KjDispatcher {
                 kind,
                 role,
                 status,
+                content_type,
+                included,
                 tail,
-            } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), tail, caller),
+            } => self.block_list(
+                context.as_deref(),
+                kind.as_deref(),
+                role.as_deref(),
+                status.as_deref(),
+                content_type.as_deref(),
+                included,
+                tail,
+                caller,
+            ),
             BlockCommand::Inspect {
                 block_id,
                 context,
@@ -501,12 +518,15 @@ impl KjDispatcher {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn block_list(
         &self,
         ctx_ref: Option<&str>,
         kind_arg: Option<&str>,
         role_arg: Option<&str>,
         status_arg: Option<&str>,
+        content_type_arg: Option<&str>,
+        included: bool,
         tail: Option<usize>,
         caller: &KjCaller,
     ) -> KjResult {
@@ -535,13 +555,30 @@ impl KjDispatcher {
             Ok(v) => v,
             Err(e) => return KjResult::Err(e),
         };
+        let ctf = match parse_filter(
+            "list",
+            content_type_arg,
+            parse_content_type_filter,
+            "content-type",
+            "plain|markdown|svg|abc|diff|media or <type>/<subtype>",
+        ) {
+            Ok(v) => v,
+            Err(e) => return KjResult::Err(e),
+        };
 
         let mut filtered: Vec<_> = snapshots
             .iter()
             .filter(|b| {
-                kf.is_none_or(|k| b.kind == k)
+                (!included || !b.excluded)
+                    && kf.is_none_or(|k| b.kind == k)
                     && rf.is_none_or(|r| b.role == r)
                     && sf.is_none_or(|s| b.status == s)
+                    && ctf.as_ref().is_none_or(|ct| match ct {
+                        ContentTypeFilter::Kind(kind) => b.content_type == *kind,
+                        ContentTypeFilter::Mime(mime) => {
+                            self.block_resolved_mime(b).as_deref() == Some(mime.as_str())
+                        }
+                    })
             })
             .collect();
         let matched = filtered.len();
@@ -1895,6 +1932,33 @@ fn parse_filter<T>(
         Some(value) => parse(value).map(Some).ok_or_else(|| {
             format!("kj block {verb}: invalid --{flag} '{value}' (expected {accepted})")
         }),
+    }
+}
+
+enum ContentTypeFilter {
+    Kind(ContentType),
+    Mime(String),
+}
+
+fn parse_content_type_filter(value: &str) -> Option<ContentTypeFilter> {
+    match value {
+        "plain" => Some(ContentTypeFilter::Kind(ContentType::Plain)),
+        "markdown" => Some(ContentTypeFilter::Kind(ContentType::Markdown)),
+        "svg" => Some(ContentTypeFilter::Kind(ContentType::Svg)),
+        "abc" => Some(ContentTypeFilter::Kind(ContentType::Abc)),
+        "diff" => Some(ContentTypeFilter::Kind(ContentType::Diff)),
+        "media" => Some(ContentTypeFilter::Kind(ContentType::Media)),
+        mime => {
+            let (ty, sub) = mime.split_once('/')?;
+            if ty.is_empty()
+                || sub.is_empty()
+                || sub.contains('/')
+                || mime.chars().any(char::is_whitespace)
+            {
+                return None;
+            }
+            Some(ContentTypeFilter::Mime(mime.to_string()))
+        }
     }
 }
 
@@ -3997,6 +4061,7 @@ mod tests {
             ("--kind", "explosion"),
             ("--role", "explosion"),
             ("--status", "explosion"),
+            ("--content-type", "explosion"),
         ] {
             let result = d
                 .dispatch(&[s("block"), s("list"), s(flag), s(bad)], &c)
@@ -4128,6 +4193,69 @@ mod tests {
                 result.message()
             );
         }
+        for name in ["plain", "markdown", "svg", "abc", "diff", "media", "audio/wav", "text/markdown"] {
+            let result = d
+                .dispatch(&[s("block"), s("list"), s("--content-type"), s(name)], &c)
+                .await;
+            assert!(
+                result.is_ok(),
+                "`{name}` is advertised by --help but was rejected: {}",
+                result.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn block_list_filters_by_content_type_and_included() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let text_id = insert_text_block(&d, ctx, "hello");
+        let wav1 = d.kernel().cas().store(b"RIFF1", "audio/wav").unwrap();
+        let wav2 = d.kernel().cas().store(b"RIFF2", "audio/wav").unwrap();
+        let png = d.kernel().cas().store(TEST_REAL_PNG, "image/png").unwrap();
+
+        assert!(d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("asset"), s("--kind"), s("text"),
+            s("--content-type"), s("audio/wav"), s("--content"), wav1.to_string(),
+        ], &c).await.is_ok());
+        assert!(d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("asset"), s("--kind"), s("text"),
+            s("--content-type"), s("audio/wav"), s("--content"), wav2.to_string(),
+        ], &c).await.is_ok());
+        assert!(d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("asset"), s("--kind"), s("text"),
+            s("--content-type"), s("image/png"), s("--content"), png.to_string(),
+        ], &c).await.is_ok());
+
+        let ids_of = |res: KjResult| -> Vec<String> {
+            match res {
+                KjResult::Ok { data: Some(serde_json::Value::Array(arr)), .. } => {
+                    arr.into_iter().map(|v| v.as_str().unwrap().to_string()).collect()
+                }
+                other => panic!("expected array data, got {other:?}"),
+            }
+        };
+
+        let all_wav = ids_of(d.dispatch(&[
+            s("block"), s("list"), s("--role"), s("asset"), s("--content-type"), s("audio/wav"),
+        ], &c).await);
+        assert_eq!(all_wav.len(), 2, "{all_wav:?}");
+        assert!(!all_wav.contains(&text_id.to_key()));
+
+        let all_media = ids_of(d.dispatch(&[
+            s("block"), s("list"), s("--content-type"), s("media"),
+        ], &c).await);
+        assert_eq!(all_media.len(), 3, "two wavs plus one png: {all_media:?}");
+
+        let first_wav = kaijutsu_types::BlockId::from_key(&all_wav[0]).unwrap();
+        d.block_store().set_excluded(ctx, &first_wav, true).unwrap();
+
+        let included_wav = ids_of(d.dispatch(&[
+            s("block"), s("list"), s("--role"), s("asset"), s("--content-type"), s("audio/wav"), s("--included"),
+        ], &c).await);
+        assert_eq!(included_wav, vec![all_wav[1].clone()]);
     }
 
     #[tokio::test]

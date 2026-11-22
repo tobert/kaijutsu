@@ -140,10 +140,15 @@ fn build_user_block(
                 ..Default::default()
             })
         }
-        // Gemini's API reads audio and video inline too; this builder sends
-        // images only until a Gemini omni model needs the rest.
+        // Gemini reads images, audio, and video inline via inlineData.
         ContentBlock::Media { hash, media_type, data_base64 } => {
-            match crate::llm::image_or_marker(hash, media_type, data_base64.as_deref()) {
+            match crate::llm::media_or_marker(
+                hash,
+                media_type,
+                data_base64.as_deref(),
+                |t| t.starts_with("image/") || t.starts_with("audio/") || t.starts_with("video/"),
+                "image, audio, and video only",
+            ) {
                 Ok(data) => Some(Part {
                     inline_data: Some(InlineData {
                         mime_type: media_type.clone(),
@@ -287,5 +292,44 @@ mod tests {
         assert_eq!(req.contents.len(), 1);
         assert_eq!(req.contents[0].role.as_deref(), Some("user"));
         assert_eq!(req.contents[0].parts.len(), 2);
+    }
+
+    #[test]
+    fn sends_image_audio_video_inline_and_marks_unsupported_media() {
+        let opts = BuildOpts::new("gemini-2.5-flash", 1024);
+        let messages = vec![Message {
+            role: crate::llm::Role::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Media {
+                    hash: "h_img".into(),
+                    media_type: "image/png".into(),
+                    data_base64: Some("QUJD".into()),
+                },
+                ContentBlock::Media {
+                    hash: "h_aud".into(),
+                    media_type: "audio/wav".into(),
+                    data_base64: Some("REVG".into()),
+                },
+                ContentBlock::Media {
+                    hash: "h_vid".into(),
+                    media_type: "video/mp4".into(),
+                    data_base64: Some("R0hJ".into()),
+                },
+                ContentBlock::Media {
+                    hash: "h_pdf".into(),
+                    media_type: "application/pdf".into(),
+                    data_base64: Some("SktM".into()),
+                },
+            ]),
+            turn_scoped: false,
+        }];
+        let req = build_request(&opts, &messages).unwrap();
+        let parts = &req.contents[0].parts;
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0].inline_data.as_ref().unwrap().mime_type, "image/png");
+        assert_eq!(parts[1].inline_data.as_ref().unwrap().mime_type, "audio/wav");
+        assert_eq!(parts[2].inline_data.as_ref().unwrap().mime_type, "video/mp4");
+        assert!(parts[3].inline_data.is_none());
+        assert!(parts[3].text.as_deref().unwrap().contains("image, audio, and video only"));
     }
 }

@@ -1941,7 +1941,7 @@ fn streaming_output_limit_preserves_the_command_exit() {
         let s = seats().await;
         s.worker_kj.join_context(s.worker, "stream-spill").await.unwrap();
         let mut rx = s.worker_kj.subscribe_output().await.unwrap();
-        let id = s.worker_kj.execute("seq 1 5000").await.unwrap();
+        let id = s.worker_kj.execute("seq 1 10000").await.unwrap();
         let (stdout, _, code) = streaming_output(&mut rx, id).await;
         assert!(stdout.contains("[output truncated"), "the output limit must be visible");
         assert_eq!(code, 0, "spilling output does not change the command's physical exit");

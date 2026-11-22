@@ -91,9 +91,9 @@ enum AudioCommand {
     /// committed, up to its playhead. Prints the clip's hash and a summary.
     /// Needs a SoundFont at ~/.local/share/kaijutsu/models/soundfont/default.sf2
     /// unless --soundfont is given. Output is capped at 120 seconds.
+    #[command(group(clap::ArgGroup::new("input").args(["sources", "track"]).required(true)))]
     Render {
         /// CAS hashes of text/vnd.abc or audio/midi content, mixed from time 0.
-        #[arg(conflicts_with = "track", required_unless_present = "track")]
         sources: Vec<String>,
         /// Render the committed notation of this live track instead of hashes.
         /// A track that committed nothing in the window is refused.
@@ -273,7 +273,7 @@ pub(crate) fn abc_to_midis(abc: &str, label: &str) -> Result<Vec<Vec<u8>>, Strin
 /// The committed ABC cells whose tick lies in `[playhead - span, playhead)`,
 /// oldest first (ties keep block order).
 pub(crate) fn window_cells(blocks: &[BlockSnapshot], playhead: i64, span: i64) -> Vec<Cell<'_>> {
-    let start = playhead - span;
+    let start = playhead.saturating_sub(span);
     let mut cells: Vec<Cell<'_>> = blocks
         .iter()
         .filter(|b| b.content_type == ContentType::Abc)
@@ -311,8 +311,12 @@ pub(crate) fn cell_offset_samples(
     beat_period: Duration,
     rate: u32,
 ) -> usize {
-    let ticks = (tick - window_start).max(0) as u128;
-    (ticks * beat_period.as_nanos() * rate as u128 / 1_000_000_000) as usize
+    let ticks = tick.saturating_sub(window_start).max(0) as u128;
+    let samples = ticks
+        .saturating_mul(beat_period.as_nanos())
+        .saturating_mul(rate as u128)
+        / 1_000_000_000;
+    usize::try_from(samples).unwrap_or(usize::MAX)
 }
 
 /// Select and place the last `phrases` phrases a track committed. A window
@@ -332,8 +336,29 @@ pub(crate) fn track_parts(
             "kj audio render: track '{track}' has no phrase length (beats_per_phrase is 0)"
         ));
     }
-    let span = i64::try_from(phrases.saturating_mul(beats_per_phrase))
+    let span_beats = phrases
+        .checked_mul(beats_per_phrase)
+        .ok_or_else(|| format!("kj audio render: --phrases {phrases} is too large"))?;
+    let span = i64::try_from(span_beats)
         .map_err(|_| format!("kj audio render: --phrases {phrases} is too large"))?;
+    let max_ns = RENDER_MAX_SECONDS as u128 * 1_000_000_000;
+    let phrase_ns = (beats_per_phrase as u128).checked_mul(beat_period.as_nanos());
+    let window_ns = phrase_ns.and_then(|p| (phrases as u128).checked_mul(p));
+    if window_ns.is_none_or(|ns| ns > max_ns) {
+        let detail = match window_ns {
+            Some(ns) => format!("{:.1} s", ns as f64 / 1_000_000_000.0),
+            None => "more than the limit".to_string(),
+        };
+        let max_hint = phrase_ns
+            .filter(|&p| p > 0)
+            .map(|p| max_ns / p)
+            .filter(|&m| m >= 1)
+            .map(|m| format!(" (at most {m} phrase(s) at this tempo)"))
+            .unwrap_or_default();
+        return Err(format!(
+            "kj audio render: --phrases {phrases} spans {detail}, over the {RENDER_MAX_SECONDS} s cap{max_hint}"
+        ));
+    }
     let nothing = || format!("kj audio render: track '{track}' committed nothing in the last {phrases} phrase(s)");
     let mut parts = Vec::new();
     let mut labels = Vec::new();
@@ -575,9 +600,22 @@ impl KjDispatcher {
         })?;
         let Some(snapshot) = snapshots.iter().find(|s| s.id.as_str() == track) else {
             let live: Vec<&str> = snapshots.iter().map(|s| s.id.as_str()).collect();
+            let live_list = if live.is_empty() { "none".to_string() } else { live.join(", ") };
+            let persisted = if track.is_empty() {
+                None
+            } else {
+                self.kernel_db()
+                    .lock()
+                    .get_track(track)
+                    .map_err(|e| format!("kj audio render: checking track '{track}': {e}"))?
+            };
+            if persisted.is_some() {
+                return Err(format!(
+                    "kj audio render: track '{track}' is dormant (not live in the beat scheduler; live tracks: {live_list})"
+                ));
+            }
             return Err(format!(
-                "kj audio render: unknown track '{track}' (live tracks: {})",
-                if live.is_empty() { "none".to_string() } else { live.join(", ") }
+                "kj audio render: unknown track '{track}' (live tracks: {live_list})"
             ));
         };
         let blocks = self
@@ -1471,6 +1509,44 @@ mod tests {
             "kj audio render: track 'hush' committed nothing in the last 1 phrase(s)"
         );
         assert!(calls.lock().unwrap().is_empty());
+
+        d.kernel_db()
+            .lock()
+            .upsert_track(&crate::kernel_db::PersistedTrack {
+                track_id: "dormant-keys".into(),
+                period_ms: 500,
+                beats_per_phrase: 16,
+                playhead_tick: Some(32),
+                playing: false,
+                score_context_id: Some(score),
+                clock_kind: "system".into(),
+            })
+            .unwrap();
+        let (loader, calls) = fake_loader();
+        let dormant = d.audio_render(track_request("dormant-keys", 1), loader).await;
+        assert!(!dormant.is_ok());
+        assert!(dormant.message().contains("track 'dormant-keys' is dormant"), "{}", dormant.message());
+        assert!(!dormant.message().contains("unknown track"), "{}", dormant.message());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn track_parts_bounds_phrases_against_render_max_seconds() {
+        let abc = one_note_abc("C");
+        let bad_abc = "X:1\nnot valid abc!!";
+        // Put unparseable ABC far back in the score to confirm bounding happens
+        // before scanning/parsing earlier cells.
+        let blocks = vec![abc_block(1, 0, bad_abc), abc_block(2, 1000, &abc)];
+        let beat = Duration::from_millis(500);
+        // 16 beats * 0.5 s = 8 s/phrase; 15 phrases = 120 s (fits), 16 phrases = 128 s (over).
+        let over = track_parts("bass", &blocks, 1016, 16, beat, 16, 16000, &|_| Ok(None)).unwrap_err();
+        assert!(over.contains("120 s cap") && over.contains("at most 15 phrase(s)"), "{over}");
+
+        let huge = track_parts("bass", &blocks, 1016, 16, beat, u64::MAX, 16000, &|_| Ok(None)).unwrap_err();
+        assert!(huge.contains("too large"), "{huge}");
+
+        let ok = track_parts("bass", &blocks, 1016, 16, beat, 15, 16000, &|_| Ok(None)).unwrap();
+        assert_eq!(ok.0.len(), 1);
     }
 
     /// Needs a real SoundFont: set KAIJUTSU_TEST_SOUNDFONT to an .sf2 path.

@@ -5,9 +5,9 @@
 //! archives every live context the character performs.
 //!
 //! `model set|unset|show` and `slot set|unset|list` (`kj/slot.rs`) hold the
-//! one model a character runs and its `distill`, `gate`, and `image` slots. `unset` and
-//! `list` work on a retired character too, so its slots can be tidied; `set`
-//! refuses one.
+//! one model a character runs and its `distill`, `gate`, `image`, `audio`, and
+//! `video` slots. `unset` and `list` work on a retired character too, so its
+//! slots can be tidied; `set` refuses one.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, ContextState, PrincipalId, SessionId};
@@ -118,9 +118,9 @@ enum CharacterCommand {
     #[command(subcommand)]
     Model(super::slot::CharacterModelCommand),
     /// A character's `distill` slot (the model that summarizes), `gate`
-    /// slot (its council server), and `image` slot (the model that reads
-    /// images for it). A context copies the slots when it is made,
-    /// so a change reaches a running context at `kj context rotate`.
+    /// slot (its council server), and media slots (`image`, `audio`, `video`).
+    /// A context copies the slots when it is made, so a change reaches a
+    /// running context at `kj context rotate`.
     #[command(subcommand)]
     Slot(super::slot::CharacterSlotCommand),
     /// Retire a character and conclude and archive every live context it plays.

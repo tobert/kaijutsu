@@ -266,7 +266,8 @@ impl Judged {
 }
 
 /// A program the submission runs, as the prompt shows it: its file or the
-/// command that runs it, and its text.
+/// command that runs it, its text, and any local imports whose text is not
+/// shown.
 #[derive(Debug)]
 pub(crate) struct ShownProgram {
     pub(crate) name: String,
@@ -274,6 +275,8 @@ pub(crate) struct ShownProgram {
     /// The file the text was read from, by the hash of the bytes shown.
     /// The submission runs only while it still holds them.
     pub(crate) file: Option<super::programs::JudgedFile>,
+    /// Local Python imports beside the program whose text is not shown.
+    pub(crate) imports_not_shown: Vec<String>,
 }
 
 /// Every program a submission runs, as a model judge is shown it. `Err` is
@@ -304,7 +307,12 @@ pub(crate) fn shown_programs(read: Vec<super::programs::ReadProgram>) -> Result<
                     text.text.len()
                 ));
             }
-            Ok(ShownProgram { name, text: text.text, file: text.file })
+            Ok(ShownProgram {
+                name,
+                text: text.text,
+                file: text.file,
+                imports_not_shown: text.imports_not_shown,
+            })
         })
         .collect()
 }
@@ -360,7 +368,15 @@ pub(crate) fn prompt(
     let action = serde_json::to_string_pretty(action).expect("the action is plain data");
     text.push_str(&format!("# The planned action\n\n{action}\n"));
     for program in programs {
-        text.push_str(&format!("\n# Program text it runs: {}\n\n{}\n", program.name, program.text));
+        text.push_str(&format!("\n# Program text it runs: {}\n", program.name));
+        if !program.imports_not_shown.is_empty() {
+            text.push_str(&format!(
+                "Local imports beside {} whose text is not shown: {}\n",
+                program.name,
+                program.imports_not_shown.join(", ")
+            ));
+        }
+        text.push_str(&format!("\n{}\n", program.text));
     }
     text.push_str("\nJudge the planned action.");
     text
@@ -400,7 +416,9 @@ pub(crate) async fn evidence(
         .map_err(|why| {
             format!("the {noun} policy {path} could not be read ({why}); `kj config reset {POLICY_PATH}` restores the shipped one")
         })?;
-    let house = super::sync::house_rules(kernel, context, config.house_rules_tokens).await;
+    let house = super::sync::house_rules(kernel, context, config.house_rules_tokens)
+        .await
+        .map_err(|why| format!("the {noun} could not read house rules ({why})"))?;
     let budget = usize::try_from(config.transcript_tokens.saturating_mul(super::projection::HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
     let blocks = kernel
         .blocks()
@@ -740,6 +758,66 @@ mod tests {
         let many: Vec<_> = (0..=super::super::gate::MAX_PROGRAMS).map(|_| read_text("print(1)", None)).collect();
         let cause = shown_programs(many).unwrap_err();
         assert!(cause.contains("more than"), "{cause}");
+    }
+
+    #[test]
+    fn omitted_local_imports_are_noted_in_the_prompt() {
+        use super::super::programs::{JudgedFile, ProgramSource, ProgramText, ReadProgram};
+        let file = JudgedFile { path: "/work/fix.py".into(), sha256: "sha256:ab".into() };
+        let read = ReadProgram {
+            run: run(ProgramSource::File { path: "/work/fix.py".into(), shebang: false }),
+            text: Ok(ProgramText {
+                text: "import helper\nhelper.run()\n".into(),
+                file: Some(file),
+                written: None,
+                imports_not_shown: vec!["helper".into(), "pkg".into()],
+            }),
+        };
+        let shown = shown_programs(vec![read]).unwrap();
+        assert_eq!(shown[0].imports_not_shown, vec!["helper", "pkg"]);
+
+        let rendered = prompt(None, "", &serde_json::json!({"cmd": "python3 fix.py"}), &shown);
+        assert!(rendered.contains("Local imports beside /work/fix.py whose text is not shown: helper, pkg"), "{rendered}");
+
+        let plain = shown_programs(vec![read_text("print(1)", None)]).unwrap();
+        let rendered_plain = prompt(None, "", &serde_json::json!({"cmd": "python3"}), &plain);
+        assert!(!rendered_plain.contains("whose text is not shown"), "{rendered_plain}");
+    }
+
+    #[tokio::test]
+    async fn evidence_misses_when_existing_agents_md_cannot_be_read_or_decoded() {
+        use crate::kj::test_helpers::{register_context, test_dispatcher_rc};
+        use crate::vfs::VfsOps;
+        let d = test_dispatcher_rc().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("guardian-house-rules"), None, principal);
+        d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        d.kernel().vfs().mount("/work", crate::vfs::MemoryBackend::new()).await;
+        d.kernel().vfs().write_all(std::path::Path::new("/work/AGENTS.md"), &[0xff, 0xfe]).await.unwrap();
+        d.kernel()
+            .kernel_db()
+            .lock()
+            .upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: ctx,
+                cwd: Some("/work".into()),
+                updated_at: 0,
+            })
+            .unwrap();
+
+        let config = crate::kj::gate_policy::GuardianConfig::default();
+        let err = evidence(
+            d.kernel(),
+            &config,
+            JudgeKind::Guardian,
+            ctx,
+            &serde_json::json!({"cmd": "ls"}),
+            &[],
+        )
+        .await
+        .err()
+        .expect("non-UTF-8 AGENTS.md must miss");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert!(!err.contains("None was found"), "{err}");
     }
 
     #[test]

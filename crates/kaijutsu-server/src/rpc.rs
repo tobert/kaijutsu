@@ -965,26 +965,6 @@ fn create_block_store_with_kernel_db(
     Ok(store)
 }
 
-/// Map a config RPC `path` (a bare name like `theme.toml`, or an already-full
-/// `/config/kernel/…` path) to its canonical path under the config mount. Config is
-/// a flat namespace, so this is just a root prepend when the caller passed a
-/// bare name.
-fn config_canonical(path: &str) -> String {
-    let trimmed = path.trim();
-    // Already an absolute config-namespace path — the flat kernel-global
-    // `/config/kernel`, or the per-client `/config/client` (hierarchical:
-    // `<root>/<client-id>/<file>`, docs/config-namespace.md). Pass it
-    // through so per-client config is reachable through the same config RPCs.
-    // The boundary check (component-correct, not a bare prefix match) comes
-    // from the shared `kaijutsu_types::paths` predicates.
-    if paths::is_config_path(trimmed) || paths::is_client_path(trimmed) {
-        trimmed.to_string()
-    } else {
-        // A bare name defaults to the kernel-global config mount.
-        paths::config_path(trimmed.trim_start_matches('/'))
-    }
-}
-
 /// One-time seed override for a `/config/kernel/<name>` path: the body of a host
 /// file under `config_dir`, if both the dir and file exist. Returns `None`
 /// (→ caller uses the embedded default) when no dir is given or no host file is
@@ -5071,7 +5051,14 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(
             async move {
                 use kaijutsu_kernel::vfs::VfsOps;
-                let canonical = config_canonical(&path);
+                let canonical = match kaijutsu_kernel::kj::config::config_canonical(&path) {
+                    Ok(canonical) => canonical,
+                    Err(e) => {
+                        results.get().set_content("");
+                        results.get().set_error(e);
+                        return Ok(());
+                    }
+                };
                 match kernel
                     .vfs()
                     .read_all(std::path::Path::new(&canonical))
@@ -10702,5 +10689,64 @@ mod semantic_search_tests {
                 Err(error) => assert!(error.to_string().contains("semantic index unavailable"), "{error}"),
             }
         }).await;
+    }
+}
+
+#[cfg(test)]
+mod get_config_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_config_rejects_invalid_paths_and_reads_valid_config() {
+        tokio::task::LocalSet::new().run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                rc_dir: Some("person".into()),
+                console_ctx: None,
+                mcp_hub_ctx: None,
+                principal_id: PrincipalId::new(),
+                name: "tester".to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: true,
+            })
+            .unwrap();
+            drop(db);
+            let shared = create_shared_kernel(
+                None,
+                &crate::config_mounts::ConfigMounts::new(dir.path().join("config")),
+                Some(dir.path()),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+            let connection = Rc::new(RefCell::new(ConnectionState::new(
+                PrincipalId::system(),
+                shared.session_contexts.clone(),
+            )));
+            let client: kernel::Client = capnp_rpc::new_client(KernelImpl::new(shared, connection));
+
+            for bad in ["../secret", "/config/kernel/../secret", "/config/client/flat.toml", ""] {
+                let mut req = client.get_config_request();
+                req.get().set_path(bad);
+                let resp = req.send().promise.await.expect("RPC completes with error field");
+                let reader = resp.get().unwrap();
+                let err = reader.get_error().unwrap().to_str().unwrap();
+                assert!(!err.is_empty(), "expected error for invalid config path {bad:?}");
+                assert_eq!(reader.get_content().unwrap().to_str().unwrap(), "");
+            }
+
+            let mut req = client.get_config_request();
+            req.get().set_path("theme.toml");
+            let resp = req.send().promise.await.expect("valid config path succeeds");
+            let reader = resp.get().unwrap();
+            assert_eq!(reader.get_error().unwrap().to_str().unwrap(), "");
+            assert!(reader.get_content().unwrap().to_str().unwrap().contains("bg"));
+        })
+        .await;
     }
 }

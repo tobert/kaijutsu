@@ -142,6 +142,8 @@ struct Header<'a> {
     turn: String,
     step: u32,
     attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<u64>,
     provider: &'a str,
     model: &'a str,
     endpoint_host: &'a str,
@@ -180,19 +182,37 @@ pub(crate) fn utc_stamp(ms: u64) -> String {
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn file_name(ms: u64, t: &RequestTrace, provider: &str) -> String {
+    file_name_with_decision(ms, t, provider, None)
+}
+
+fn file_name_with_decision(ms: u64, t: &RequestTrace, provider: &str, decision: Option<u64>) -> String {
     let provider: String = provider
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    format!("{}-{}-{}-s{:03}-a{}-{}.json",
-        utc_stamp(ms),
-        t.context.short(),
-        t.turn.short(),
-        t.step,
-        t.attempt,
-        provider
-    )
+    match decision {
+        Some(d) => format!(
+            "{}-{}-{}-s{:03}-a{}-d{:03}-{}.json",
+            utc_stamp(ms),
+            t.context.short(),
+            t.turn.short(),
+            t.step,
+            t.attempt,
+            d,
+            provider
+        ),
+        None => format!(
+            "{}-{}-{}-s{:03}-a{}-{}.json",
+            utc_stamp(ms),
+            t.context.short(),
+            t.turn.short(),
+            t.step,
+            t.attempt,
+            provider
+        ),
+    }
 }
 
 /// Write `bytes` as `dir/name` whole: a private temp file, then a rename, so a
@@ -216,7 +236,8 @@ fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> 
 }
 
 /// Replace base64 image payloads in a dump copy with markers naming media
-/// type, size and hash. Covers Anthropic `source.data` and `data:` URLs.
+/// type, size and hash. Covers Anthropic `source.data`, Gemini `inlineData`,
+/// and `data:` URLs.
 fn elide_images(v: &mut serde_json::Value) {
     use serde_json::Value;
     match v {
@@ -228,6 +249,15 @@ fn elide_images(v: &mut serde_json::Value) {
             let is_b64 = map.get("type").and_then(Value::as_str) == Some("base64");
             if let (true, Some(Value::String(data))) = (is_b64, map.get_mut("data")) {
                 *data = marker(media.as_deref().unwrap_or("unknown"), data);
+            }
+            if let Some(Value::Object(inline)) = map.get_mut("inlineData") {
+                let media = inline
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(Value::String(data)) = inline.get_mut("data") {
+                    *data = marker(media.as_deref().unwrap_or("unknown"), data);
+                }
             }
             for child in map.values_mut() {
                 elide_images(child);
@@ -268,6 +298,37 @@ pub fn record<B: Serialize>(
     messages: &[Message],
     body: &B,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    record_inner(trace, None, provider, model, endpoint_url, system, messages, body)
+}
+
+/// Log the request summary and, when the trace names a dump directory, write
+/// the body in the background for one decision request. `decision` is a 1-based
+/// sequence number so multiple decisions in the same `(step, attempt)`
+/// millisecond write to non-colliding files.
+pub fn record_decision<B: Serialize>(
+    trace: Option<&RequestTrace>,
+    decision: u64,
+    provider: &str,
+    model: &str,
+    endpoint_url: &str,
+    system: Option<&str>,
+    messages: &[Message],
+    body: &B,
+) -> Option<tokio::task::JoinHandle<()>> {
+    record_inner(trace, Some(decision), provider, model, endpoint_url, system, messages, body)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_inner<B: Serialize>(
+    trace: Option<&RequestTrace>,
+    decision: Option<u64>,
+    provider: &str,
+    model: &str,
+    endpoint_url: &str,
+    system: Option<&str>,
+    messages: &[Message],
+    body: &B,
+) -> Option<tokio::task::JoinHandle<()>> {
     let s = summarize(system, messages);
     let (last_chars, last_hash) = match &s.last_user {
         Some(l) => (Some(l.chars), Some(l.hash.clone())),
@@ -280,6 +341,7 @@ pub fn record<B: Serialize>(
         turn = turn.as_deref(),
         step = trace.map(|t| t.step),
         attempt = trace.map(|t| t.attempt),
+        decision,
         provider,
         model,
         messages = s.messages,
@@ -319,6 +381,7 @@ pub fn record<B: Serialize>(
             turn: t.turn.to_hex(),
             step: t.step,
             attempt: t.attempt,
+            decision,
             provider: &provider,
             model: &model,
             endpoint_host: &host,
@@ -331,7 +394,7 @@ pub fn record<B: Serialize>(
         };
         let result = serde_json::to_vec_pretty(&serde_json::json!({ "header": header, "body": body }))
             .map_err(std::io::Error::other)
-            .and_then(|bytes| write_file(&dir, &file_name(kaijutsu_types::now_millis(), &t, &provider), &bytes));
+            .and_then(|bytes| write_file(&dir, &file_name_with_decision(kaijutsu_types::now_millis(), &t, &provider, decision), &bytes));
         if let Err(e) = result {
             warn(&e);
         }
@@ -594,5 +657,73 @@ mod tests {
         let h = record(Some(&trace(Some(tmp.path().to_path_buf()))), "p", "m", "http://h/", None, &[], &json!({"a": 1}));
         h.expect("a task was spawned").await.unwrap();
         assert_eq!(files(tmp.path()).len(), 1);
+    }
+
+    #[test]
+    fn gemini_inline_data_is_elided_in_the_dump_copy_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "QUJD".repeat(50_000);
+        let body = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": big}},
+                    {"inlineData": {"data": big}},
+                    {"text": "keep me"}
+                ]
+            }]
+        });
+        let before = body.to_string();
+        record(Some(&trace(Some(tmp.path().to_path_buf()))), "gemini", "gemini-2.5", "http://h/", None, &[], &body);
+        assert_eq!(body.to_string(), before, "the wire value is untouched");
+        let text = std::fs::read_to_string(&files(tmp.path())[0]).unwrap();
+        assert!(text.len() < 2_000, "payload leaked: {} bytes", text.len());
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let parts = &v["body"]["contents"][0]["parts"];
+        assert_eq!(
+            parts[0]["inlineData"]["data"],
+            format!("<image elided: media_type=image/png base64_chars=200000 sha256_8={}>", hash8(&big))
+        );
+        assert_eq!(parts[0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(
+            parts[1]["inlineData"]["data"],
+            format!("<image elided: media_type=unknown base64_chars=200000 sha256_8={}>", hash8(&big))
+        );
+        assert_eq!(parts[2]["text"], "keep me");
+    }
+
+    #[tokio::test]
+    async fn record_decision_writes_non_colliding_files_in_same_step_and_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = trace(Some(tmp.path().to_path_buf()));
+        let mut handles = Vec::new();
+        for seq in 1..=6u64 {
+            if let Some(h) = record_decision(
+                Some(&t),
+                seq,
+                "council",
+                "gemma-4",
+                "http://127.0.0.1:8080/",
+                None,
+                &[Message::user("hi")],
+                &json!({"decision": seq}),
+            ) {
+                handles.push(h);
+            }
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let written = files(tmp.path());
+        assert_eq!(written.len(), 6, "no collisions among concurrent decision dumps");
+        let names: Vec<String> = written.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        for seq in 1..=6u64 {
+            assert!(names.iter().any(|n| n.contains(&format!("-s003-a1-d{seq:03}-council.json"))), "{names:?}");
+        }
+        for (i, path) in written.iter().enumerate() {
+            let v: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(v["header"]["decision"], (i + 1) as u64);
+            assert_eq!(v["body"]["decision"], (i + 1) as u64);
+        }
     }
 }

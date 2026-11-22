@@ -3679,7 +3679,9 @@ mod tests {
         use crate::kj::gate::GateVerdict::{Allowed, Pending};
         let d = test_dispatcher().await;
         let house = character_house(&d);
-        let source = "kj context archive lane-a --confirm";
+        // `kj drive` asks on the first call (no senpai-edge bypass) and
+        // supports exact character-rule target rechecking when `lane-a` moves.
+        let source = "kj drive lane-a --prompt go";
 
         let first = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
         assert_eq!(first.verdict, Pending, "{}", first.reason);

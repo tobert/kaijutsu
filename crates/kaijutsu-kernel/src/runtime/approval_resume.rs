@@ -804,15 +804,31 @@ async fn act_on_executable_answer(
     run_cancel.cancel();
     // Released by now unless a background command never started.
     if held.is_some() { kernel.held_asks().release(&answer.request_id); }
+    if let Ok(outcome) = &outcome {
+        log_resumed_outcome(&answer.request_id, context_id, &output_block_id, outcome);
+    }
     if reads_result(&held) {
         if let Err(error) = &outcome {
-            tracing::error!(ask = %answer.request_id, %error, "approved command settlement failed for a holding turn");
+            tracing::error!(
+                request_id = %answer.request_id,
+                context_id = %context_id,
+                output_block_id = %output_block_id.to_key(),
+                %error,
+                "approved command settlement failed for a holding turn"
+            );
         }
         return ExecAction::Settled;
     }
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
+            tracing::error!(
+                request_id = %answer.request_id,
+                context_id = %context_id,
+                output_block_id = %output_block_id.to_key(),
+                %error,
+                "gate-resume: approved command settlement failed"
+            );
             kernel.turns().conversations().evict(context_id);
             return ExecAction::Tell(format!("Approved command settlement failed: {error}. Inspect operation output {} before retrying.", output_block_id.to_key()));
         }
@@ -833,6 +849,89 @@ async fn act_on_executable_answer(
         ExecAction::Tell(executed_turn_seed(&who, source, &outcome.envelope(), &output_block_id))
     } else {
         ExecAction::Settled
+    }
+}
+
+/// Log rejected, faulted, refused, or erroring resumed command outcomes so
+/// settlement with an empty stdout body is never silent.
+fn log_resumed_outcome(
+    request_id: &str,
+    context_id: ContextId,
+    output_block_id: &BlockId,
+    outcome: &super::command_outcome::CommandOutcome,
+) {
+    use super::command_outcome::{CommandExecution, CommandHookEffect};
+    let output_block = output_block_id.to_key();
+    let mut logged = false;
+
+    match &outcome.execution {
+        CommandExecution::Rejected(reason) => {
+            tracing::warn!(
+                request_id = %request_id,
+                context_id = %context_id,
+                output_block_id = %output_block,
+                reason = %reason,
+                "gate-resume: approved command execution was rejected"
+            );
+            logged = true;
+        }
+        CommandExecution::Fault(reason) => {
+            tracing::error!(
+                request_id = %request_id,
+                context_id = %context_id,
+                output_block_id = %output_block,
+                reason = %reason,
+                "gate-resume: approved command execution faulted"
+            );
+            logged = true;
+        }
+        CommandExecution::NotRun | CommandExecution::Completed(_) => {}
+    }
+
+    if let Some(CommandHookEffect::Refused { reason, waiting, ask_id, .. }) = &outcome.hook {
+        tracing::warn!(
+            request_id = %request_id,
+            context_id = %context_id,
+            output_block_id = %output_block,
+            waiting = *waiting,
+            ask_id = ?ask_id,
+            reason = %reason,
+            "gate-resume: approved command outcome was refused by hook"
+        );
+        logged = true;
+    }
+
+    if let Some(reason) = &outcome.settlement_error {
+        tracing::error!(
+            request_id = %request_id,
+            context_id = %context_id,
+            output_block_id = %output_block,
+            reason = %reason,
+            "gate-resume: approved command settlement recorded an error"
+        );
+        logged = true;
+    }
+
+    let envelope = outcome.envelope();
+    if !logged && envelope.is_error() {
+        let reason = envelope
+            .error
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let stderr = envelope.stderr.trim();
+                (!stderr.is_empty()).then_some(stderr)
+            })
+            .unwrap_or("command finished with error status");
+        tracing::warn!(
+            request_id = %request_id,
+            context_id = %context_id,
+            output_block_id = %output_block,
+            status = ?envelope.status,
+            exit_code = ?envelope.exit_code,
+            reason = %reason,
+            "gate-resume: approved command finished with error"
+        );
     }
 }
 
@@ -2379,4 +2478,181 @@ mod answerer_tests {
         assert_eq!(super::answerer_name(&kdb, Some(&[1, 2, 3])), "a human", "a malformed id names nobody");
     }
 
+}
+
+#[cfg(test)]
+mod resumed_outcome_log_tests {
+    use super::*;
+    use crate::runtime::command_outcome::{CommandExecution, CommandHookEffect, CommandOutcome};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_log(f: impl FnOnce()) -> String {
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn rejected_fault_refused_and_error_outcomes_emit_diagnostics() {
+        let ctx = ContextId::new();
+        let out = BlockId::new(ctx, PrincipalId::system(), 4);
+        let key = out.to_key();
+
+        let rejected = CommandOutcome::new(CommandExecution::Rejected("script changed".into()), 0);
+        let log = capture_log(|| log_resumed_outcome("ask-rej", ctx, &out, &rejected));
+        assert!(log.contains("ask-rej") && log.contains(&ctx.to_string()) && log.contains(&key) && log.contains("script changed"), "{log}");
+
+        let fault = CommandOutcome::new(CommandExecution::Fault("shell panicked".into()), 0);
+        let log = capture_log(|| log_resumed_outcome("ask-flt", ctx, &out, &fault));
+        assert!(log.contains("ask-flt") && log.contains(&ctx.to_string()) && log.contains(&key) && log.contains("shell panicked"), "{log}");
+
+        let mut refused = CommandOutcome::new(
+            CommandExecution::Completed(kaish_kernel::interpreter::ExecResult::success("")),
+            1,
+        );
+        refused.hook = Some(CommandHookEffect::Refused {
+            reason: "blocked by result hook".into(),
+            waiting: false,
+            ask_id: None,
+            refusal: None,
+            interrupted: false,
+        });
+        let log = capture_log(|| log_resumed_outcome("ask-hook", ctx, &out, &refused));
+        assert!(log.contains("ask-hook") && log.contains(&ctx.to_string()) && log.contains(&key) && log.contains("blocked by result hook"), "{log}");
+
+        let err_exec = CommandOutcome::new(
+            CommandExecution::Completed(kaish_kernel::interpreter::ExecResult::failure(2, "permission denied")),
+            1,
+        );
+        let log = capture_log(|| log_resumed_outcome("ask-err", ctx, &out, &err_exec));
+        assert!(log.contains("ask-err") && log.contains(&ctx.to_string()) && log.contains(&key) && log.contains("permission denied"), "{log}");
+
+        let ok = CommandOutcome::new(
+            CommandExecution::Completed(kaish_kernel::interpreter::ExecResult::success("ok")),
+            1,
+        );
+        let log = capture_log(|| log_resumed_outcome("ask-ok", ctx, &out, &ok));
+        assert!(log.is_empty(), "healthy completion should not warn: {log}");
+    }
+
+    #[tokio::test]
+    async fn act_on_executable_answer_logs_stderr_error_when_returning_settled() {
+        use crate::kj::test_helpers::{register_context, test_dispatcher_persistent};
+        use approval_ledger::{ask::create_ask, decide::{Answerer, DecideInput, decide}, types::{NewAsk, Origin}};
+        use tracing::instrument::WithSubscriber;
+
+        let dispatcher = Arc::new(test_dispatcher_persistent().await);
+        dispatcher.set_self_arc();
+        let kernel = dispatcher.kernel();
+        kernel.broker().set_kj_dispatcher(&dispatcher).await;
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("settled-error-log"), None, actor);
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+
+        let source = "echo boom >&2; false";
+        let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+            context_id: context.as_bytes().to_vec(),
+            actor_id: actor.as_bytes().to_vec(),
+            reviewer_id: reviewer.as_bytes().to_vec(),
+            principal_id: actor.as_bytes().to_vec(),
+            origin: Origin::ShellGate,
+            instance: None,
+            tool: None,
+            hook_id: None,
+            description: "failing resumed command".into(),
+            statements: vec![],
+            authorized_label: None,
+            rc_run_id: None,
+            expires_at: None,
+            options: vec![],
+            signals: vec![],
+            cwd: None,
+            exec_source: Some(source.into()),
+            exec_stdin: None,
+            continuation_epoch: None,
+            env: vec![],
+        }).unwrap();
+        decide(kernel.kernel_db().lock().conn_for_ledger(), &request, DecideInput {
+            allow: true,
+            decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+            ..Default::default()
+        }).unwrap();
+        let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+        let ask = ExecutableAsk {
+            source: source.into(),
+            stdin: None,
+            cwd: None,
+            actor,
+            reviewer,
+            read_only: false,
+            denial: "not denied".into(),
+        };
+        let receipt = kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: false,
+            context,
+            principal: actor,
+            actor,
+            source,
+            tool: "shell",
+            input: serde_json::json!({"code": source}),
+            kind: TypesToolKind::Shell,
+            role: kaijutsu_types::Role::Model,
+            excluded: false,
+            status: Status::Running,
+            ask: None,
+        }).unwrap();
+        kernel.kernel_db().lock().link_ask_blocks(&request, &receipt.command_block_id, &receipt.output_block_id, crate::PairOwner::Session).unwrap();
+
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt().with_writer(buf.clone()).with_ansi(false).finish();
+        let action = act_on_executable_answer(
+            kernel,
+            context,
+            actor,
+            &answer,
+            &ask,
+            "reviewer",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .with_subscriber(sub)
+        .await;
+        assert!(matches!(action, ExecAction::Settled));
+        let snap = kernel.blocks().get_block_snapshot(context, &receipt.output_block_id).unwrap().unwrap();
+        assert_eq!(snap.content, "");
+        assert_eq!(snap.stderr.as_deref(), Some("boom\n"));
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains(&request)
+                && log.contains(&context.to_string())
+                && log.contains(&receipt.output_block_id.to_key())
+                && log.contains("boom"),
+            "{log}"
+        );
+    }
 }

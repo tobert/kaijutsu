@@ -1142,30 +1142,27 @@ mod tests {
         assert!(result.content.iter().all(|c| matches!(c, ToolContent::Json(_))), "{:?}", texts(&result));
     }
 
-    /// Pins the client half of the 2026-07-28 fix. `ClientConfig::default()`
-    /// takes `ProtocolVersion::default()`, which is `LATEST` — and rmcp pins
-    /// `LATEST = V_2025_11_25` while `KNOWN_VERSIONS` tops out at
-    /// `V_2026_07_28`. Taking the default silently negotiated every external
-    /// server down two versions. This fails if someone drops the explicit
-    /// assignment, and it fails *loudly* rather than degrading quietly on the
-    /// wire, which is the whole reason it exists.
+    /// Pins the client half of the 2026-07-28 fix against the newest version in
+    /// `ProtocolVersion::KNOWN_VERSIONS`, so any future rmcp version bump
+    /// catches an outdated pinned literal.
     #[test]
     fn client_advertises_the_newest_protocol_rmcp_knows() {
         let (tx, _) = broadcast::channel(4);
         let handler = BrokerClientHandler::new(tx);
         let advertised = handler.get_info().protocol_version;
+        let newest = ProtocolVersion::KNOWN_VERSIONS
+            .last()
+            .expect("rmcp KNOWN_VERSIONS must be non-empty");
 
         assert_eq!(
             advertised,
             ProtocolVersion::V_2026_07_28,
-            "client must advertise 2026-07-28, not ProtocolVersion::default()"
+            "client must advertise 2026-07-28"
         );
-        assert_ne!(
-            advertised,
-            ProtocolVersion::default(),
-            "if rmcp's LATEST ever catches up to the newest known version this \
-             assertion goes vacuous — at that point delete it and re-read \
-             ProtocolVersion::KNOWN_VERSIONS to pick the new ceiling"
+        assert_eq!(
+            &advertised,
+            newest,
+            "client protocol_version must match the newest version in rmcp's KNOWN_VERSIONS"
         );
     }
 

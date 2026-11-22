@@ -6,18 +6,10 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Doc drift found while planning the heroic view (2026-11-21)
-
-- `docs/time.md` "Tracks and Score Contexts" says score contexts hold "open future speculations"; only committed cells become blocks (`crates/kaijutsu-hyoushigi/src/materialize.rs`). Pending and speculated work lives only in `Timeline.future`.
-- Code comments cite deleted docs: `docs/color.md` (`assets/defaults/theme.toml`, `ui/theme_loader.rs`, `connection/actor_plugin.rs`), `docs/scenes/*` (`ui/screen.rs`), `docs/timewell.md`. The color rules now live in `docs/newui.md` for the scene; the UI lane's rules have no doc.
-- `view/time_well/live.rs` comments name `metronome::ingest_beat_signals`; no metronome module exists.
-
 ## Heroic view follow-ups (2026-11-21)
 
 - Live kernel work updates still poll `kj transport work --track <id>` at 1 Hz via `execute_kj_quiet` (`view/heroic/live.rs`); a dedicated work-status wire event + measured performer lead field remains future work (`docs/newui.md`, "The live driver").
 - Audio spectrum hills currently derive 16-band energy from beat crossings and `RenderCue` onsets rather than FFT of mixed audio frames.
-- Adjacent performers aligned at the same Z/lead can still partially overlap their streaming text ribbons (`view/heroic/text.rs`); a 2D/screen-space overlap solver or alternating depth offset would separate crowded clusters.
-- Sun stripes in `assets/shaders/heroic/sun.wesl` sit mostly below `y = 0` when the disc is centered at `y = 0`; shifting the stripe band up into `[0.38, 0.72]` of UV or raising the disc slightly would show the striped bottom bands above the horizon.
 - Heroic demo/test scenarios should be driven via a kernel/fixture script that creates and plays real tracks over RPC rather than a client-side fake driver (`view/heroic/fake.rs` removed).
 - Council `/decide` turns currently emit only the final chosen ABC text block without persisting per-slot pooled option probability distributions on the block or `WorkStatus`, so live 3D candidate probability bars (`HeroicPerformer.candidates`) remain unpopulated until decision weights cross the wire.
 
@@ -28,26 +20,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **The MCP shell tool still sends the whole envelope** (stdout and `data` both) to MCP clients such as Claude Code (`kaijutsu-mcp`).
 - **`kj help` is budgeted against the default limit** (`HELP_BUDGET_BYTES` in `kj/mod.rs`), so a model with `--preview-kib` under 8 has its `kj help` cut.
 - **stdout and stderr together can pass the broker's 64 KiB shell budget** even at 40 KiB, and the broker then cuts the envelope with no `/v/cas` copy. `--preview-kib` stops at 48 for the same reason.
-- **Three tests fail on main before this change**, likely since the `[cut: …]` marker (82fa74a9): `rc_role_bindings::the_toolie_reads_run_in_its_read_only_shell` (the stance's `cat -n FILE`), `e2e_kj_workflow::test_shell_truncation_does_not_corrupt_exit_code`, `gate_executes_wire::streaming_output_limit_preserves_the_command_exit`.
-- **No doc owns the shell result contract** since the consolidation removed `docs/shell-envelope.md`; it lives in `ShellEnvelope::model_text` and the shell tool description. About 2,000 code comments still point at docs the consolidation (44a0a8cc, 46e12db4) removed or folded; only the shell output path was fixed.
-
-## rc bindings: the person-input facades are copied per directory (2026-11-15)
-
-- Every rc directory a person talks to grants `edit_input`, `submit_input`, and `commit_capture` in its own `S10-binding.kai`. When the toolie became an assistant Amy talks to, her tui hit one missing facade, then the next (`submit_input`, then `edit_input`). A shared lib script for the person input set, sourced by each person-facing directory, would keep the set in one place.
+- **No doc owns the shell result contract** since the consolidation removed `docs/shell-envelope.md`; it lives in `ShellEnvelope::model_text` and the shell tool description. About 2,000 code comments still point at docs the consolidation (44a0a8cc, 46e12db4) removed or folded (e.g., `docs/timewell.md`); only the shell output and heroic/theme paths were cleaned up.
 
 ## Context shadows: what the description slice leaves open
 
-- **A resumed ask's error is lost.** 2026-11-15, live: from an MCP seat, `kj context create --as shadow-probe --label shadow-probe` raised an ask; Amy allowed it; gate-resume logged "running approved ask" and nothing more. The ask's output block is empty (0 bytes) and no error was logged, so a command that fails to parse after approval says nothing to anyone.
 - **No RPC and no asynchronous delivery.** `kj shadow describe` waits up to `DESCRIBE_TIMEOUT` (120 seconds) and prints the description. The app and tui need a request that returns at once, and a rendition that arrives through the change feed when it is ready (`docs/contexts.md`).
-- **Turns do not follow the media slots yet.** A turn sends an image whenever its provider can; the character's `image` slot (`docs/contexts.md`) should decide: native when it names the character's model, a description in place when it names another, a marker when absent.
 - **A shadow keeps the `image` slot it was made with.** A character's later `kj character slot set <name> image ...` reaches a new shadow only after the old one is archived. The maker in the index is the shadow's own slot, so the key stays truthful. A rotation of the source does not yet carry its description shadow to the successor (`docs/contexts.md`).
-- **A refused marker leaves an empty shadow.** The shadow is made before the provider says it cannot read the type, because the maker comes from the shadow's slot. The request writes no rendition and calls no model.
 - **Simultaneous misses both call the model.** Two requests for one key that both miss the index each pay for a description. The second one is linked and not indexed, so its shadow holds a rendition the key does not name.
 - **A failed commit stops the shadow's document.** A rendition whose link or index row cannot be written fails the request and leaves no block, and the shadow's document refuses writes until the kernel restarts (the rule of `BlockStore::append_block_recorded`).
-- **A failed `create_document` strands a shadow's document.** `ensure_description_shadow` returns the live shadow before it creates the document, so after one failed `create_document` every later describe of that source fails with DocumentNotFound until the kernel restarts.
 - **A reused copy names no original.** The copy has its own link to its source block and no row that names the rendition it was copied from. The index keeps naming the original rendition after its shadow is archived; it still serves, since archive keeps blocks.
 - **Presets and spans have no writer.** `preset` in `rendition_index` is empty, and `span_start` and `span_end` are NULL.
-- **Video reads only on a council backend that lists it.** Claude, the OpenAI-compatible providers, and Gemini send images only, so `describe` of a video on them is refused before the call.
+- **`kj shadow describe` reads `image/*` only;** Claude and the OpenAI-compatible providers send images only (`video` and `audio` slot routing works on turns for Gemini and council backends).
 - **The turn path guards one kind.** `chat_turn_refusal` refuses a description shadow's chat turn; a judge shadow still relies on its slot having no `max_tokens`.
 
 ## Control lists: what the first slice leaves open
@@ -71,8 +54,6 @@ From kaibo (deepseek) on `kaijutsu-council`:
 - **No byte limit on audio or video blocks.** The 5 MiB cap lives only in the image attach path (`MAX_ATTACHED_IMAGE_BYTES`, `mcp/servers/block.rs`); `kj block create --content-type video/mp4` checks the CAS record and no size, and the resolver encodes the whole object.
 - **Audio and video bytes sit base64 in memory per turn.** The resolver fills `data_base64` for every media block, and `MediaBase64Cache` is bounded by entry count, not bytes, so a few long clips can hold far more than a few screenshots.
 - **Audio costs tokens by the second.** `estimate_tokens` charges every audio or video block the flat `ESTIMATED_TOKENS_PER_AUDIO_VIDEO`, and it sees the type only once the resolver has run; an unresolved block counts as an image. `prefix::edit_cost`, behind the cost notes of `kj stage exclude` and `kj fork`, estimates unresolved hydration, so it charges audio and video as images.
-- **The request dump keeps Gemini's media.** `request_dump::elide_images` knows Anthropic's base64 source and `data:` URLs, not Gemini's `inlineData`, so a Gemini dump holds the whole base64 body under a header that says images are elided.
-- **Gemini sends images only.** Its API reads audio and video inline; the builder writes a marker for them. Gemini omni models will want them.
 - **The `images` fork filter drops audio and video too.** `kj fork --drop images` matches every Asset `Media` block; the filter name still says image.
 - **Kaijutsu's CAS ids are 128 bits.** `ContentHash` keeps half of BLAKE3, so every council object id is computed again from the bytes.
 - **Continuations replay a cut reply as closed.** The contract marks a reply cut by `max_tokens` open, and a reply to an open message takes its place. The kernel sets `open: false` in its projection and ignores `GenerationDone.context`, so the server appends a new message instead.
@@ -119,7 +100,6 @@ The footer line grows leftward over the badge cluster when a request is pending 
 - **The picker failure is unexplained.** After Enter on the picker row, `switch_seat` never reached the kernel.
 - **A sibling's submit leaves our compose text behind.**
 - **A draft that survives a shell submit is hidden from its submitter.**
-- **The tui's `submitted` map is never pruned.**
 
 ## App and tui tune-up: what the first pass leaves open (2026-11-10)
 
@@ -130,7 +110,7 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Two layouts of tool output** (`compute_output_layout` vs `layout_output`).
 - **The tui's `:kj` completion draws no popup.**
 - **`Ctrl+O` in the tui's draft is the fold toggle.**
-- **In the app:** `ui/tiling.rs`, `cell/mod.rs`, `bindings.toml` parsing duplication, unused `agent_color_*` theme fields, and large files like `ui/dock.rs`.
+- **In the app:** `ui/tiling.rs`, `cell/mod.rs`, `bindings.toml` parsing duplication, and large files like `ui/dock.rs`.
 
 ## Council backend: what retiring mk leaves open (2026-11-08)
 
@@ -156,7 +136,7 @@ The Crusoe Aperture gateway (`http://ai.civet-hops.ts.net`) authenticates by Tai
 - **`effort` is inert on generic servers.** The gateway's vLLM DeepSeek honored `reasoning_effort: low`; `Dialect::Generic` drops `effort` with a warning (`llm/openai/build.rs`, `build_request`).
 - **Gateway errors.** GLM-5.3-Flash answered `503 {"code":"capacity_unavailable",...}`, a body not in OpenAI's error shape. The limiter cools down on 503; what a player reads has not been checked.
 - **Gateway embeddings.** `/v1/models` lists `text-embedding-3-small`, but `POST /v1/embeddings` answers 405. A local Ollama serves embeddings instead (`contrib/install-ollama-embed-macos.sh`).
-- **The kernel suite on macOS.** With `RUST_MIN_STACK=16777216` (two council and context tests overflow 2 MB test threads otherwise), 11 tests fail on macOS whether or not the embedding change is applied: `kj::cc` (4), `kj::audio_capture` staging, `kj::db` backup help, `kj::reflect::every_live_leaf_classifies` (`kj audio render` needs `<SOURCES>`), `runtime::context_shell` git (2), and `runtime::python_tool` (2). Not yet sorted into macOS-only and broken-everywhere.
+- **The kernel suite on macOS.** With `RUST_MIN_STACK=16777216` (two council and context tests overflow 2 MB test threads otherwise), 9 macOS-observed failures remain to triage (`kj::cc` (4), `kj::audio_capture` staging, `runtime::context_shell` git (2), and `runtime::python_tool` (2)); `kj::reflect::every_live_leaf_classifies` and `kj::db::db_backup_help_documents_the_no_restore_verb_stance` are fixed on `main`.
 
 ## Embedding model: what `kj embedding` leaves open (2026-11-19)
 
@@ -192,15 +172,8 @@ The Crusoe Aperture gateway (`http://ai.civet-hops.ts.net`) authenticates by Tai
   - **Namespaces:** a group of functions under one name and description. With `defer_loading`, the model sees only the namespace until it loads the schemas. OpenAI suggests fewer than 10 functions each, so one namespace per MCP server or tool family.
   - **`additional_tools` input items:** tools that become callable at a point in the conversation. They are appended where they appear and must be replayed in place.
   The ChatGPT plan route takes both but refuses `tool_search`, so deferred functions have no way to load. A loadout change could become an `additional_tools` item at the turn it happens instead of rewriting the prefix. Probe first that the plan route caches across an `additional_tools` item.
-- **Review leftovers (kaibo gpt-plan + deepseek).** Not fixed:
-  - A 401 refreshes and resends even when its code is a permanent refusal, and a failed second `bearer` call hides the first 401's detail.
-  - The refresh margin is a flat 300 s; an `expires_in` under that would refresh on every request.
-  - Only a connect error counts as an unsent refresh; a TLS failure before the request was written still drops the grant.
-  - The ID token's `azp` is not checked.
-  - `chatgpt::Client::stream` clones the history for the 401 resend.
-  - `redact` matches the bearer verbatim; a JSON-escaped or truncated echo survives.
-  - The plan route's default output ceiling is unknown.
-- **Failing kj tests on main.** `kj::reflect::tests::every_live_leaf_classifies` (`kj audio render` needs `<SOURCES>`) and `kj::db::tests::db_backup_help_documents_the_no_restore_verb_stance` (the `backup` long help lost its no-restore text) fail independent of this work.
+- **`redact` matches the bearer verbatim; a JSON-escaped or truncated echo survives.**
+- **The plan route's default output ceiling is unknown.**
 
 ## The guardian: what the first pass leaves open (2026-11-18)
 
@@ -209,11 +182,8 @@ Live, on Sol's third task (gpt-6-luna as guardian): it allowed a run of read-onl
 Second kaibo review (DeepSeek, of 1bdec2df) confirmed the first round's fixes and found:
 
 - **The pin is checked once per submission.** `verify_judged` runs before `kaish.execute`, so a submission can rewrite a judged file mid-run: through a program's own write (`python3 -c 'open("fix.py","w")…'; python3 fix.py`) or an existing symlink or hardlink, which `writes_of` does not resolve. Re-verify before the statement that runs each file.
-- **Local imports are neither shown to a model judge nor pinned.** The council records `imports_not_shown`; `ShownProgram` drops it, and `-m` module imports resolve against cwd.
-- **An unreadable `AGENTS.md` reads as "None was found".** A read failure on a file that exists should be a miss or say it could not be read.
+- **Local imports are not pinned.** `ShownProgram` now notes omitted local imports in the guardian prompt, while `-m` / local imports beside a judged file are still not hashed/pinned.
 - **An ask's approved run is not pinned.** The approval worker runs without `judged`, so a program a judge read can change before a person approves it.
-- **IPv6 loopback decisions endpoints validate but never work** (`decisions.rs` endpoint drops brackets).
-- **The two `config_canonical` functions differ:** the RPC one passes `..` through to the VFS, which refuses it.
 
 A chat model (the guardian) or a Decisions API (the decisions judge) on a context's `gate` slot judges escalated shell submissions (`council/guardian.rs`, `council/decisions_judge.rs`; `docs/approval-identity.md`, "The guardian"). Not done:
 
@@ -299,23 +269,16 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
   - Audio in a decision works as an audio part of a context message (0.99 "sparse", 1.00 "busy" on test clips). The same clip as `case_media` is read but changes nothing; this is the nagaya's to examine. In a generation, omni called an 82 Hz tone "high-pitched".
   - The lfm engines left zorak's served list for about a minute and came back; a player must survive that.
 - **Listening players: what is open.** `kj audio render` turns CAS notation or MIDI, or a track's last phrases, into a WAV in the CAS, and a musician with `KJ_LISTEN=<track>` gets that clip in its context before each turn (`rc/musician/tick/S10-drive.kai`). From the first live run and a kaibo review:
-  - Every tick stores a new clip and a new block, and nothing prunes them: about 250 KB a phrase at 16 kHz, so a player left running fills the CAS. Wanted: one replaced block, or a kept window.
+  - Prior listening blocks in the context are now excluded (`KJ_LISTEN_KEEP`), but older WAV blobs still accumulate in CAS with no blob pruning (~250 KB a phrase at 16 kHz).
   - A decision turn with clips in its context took 18 to 32 s on `lfm3-omni`, against 4 s without, and it grows as the kept history holds more clips. Each of the 16 decisions reads the audio again. The lead adapts and phrases commit, with repeats between them; one committed with no margin left.
-  - A dormant or misspelled track is one failure: the tick drives, then ends with status 1 and an error block every phrase. After a restart every track is dormant until attached.
   - The render reads the whole score context and loads the soundfont file on every call, on the dispatch task; only synthesis runs on the blocking pool.
   - Cells are placed with the track's current beat period, so a tempo change misplaces earlier phrases in a clip.
-  - A rate under 16 kHz is made by averaging sample pairs with no filter. `--phrases` has no upper bound before the offset arithmetic.
+  - A rate under 16 kHz is made by averaging sample pairs with no filter.
   - The render uses its own soundfont (`~/.local/share/kaijutsu/models/soundfont/default.sf2`); the speakers use the audio node's synth. They can differ.
   - The second source is not built: a clip taken from an audio node's buffer (microphone, eurorack) should feed the same step.
-- **Decision turns: what is open.** A character model with `--decide <program>` on a council backend builds its reply from `choice` decisions (`llm/council/decide.rs`; the shipped program is `rc/musician/programs/bass-bars.json`). From the kaibo review of the first build:
-  - The whole turn runs inside `provider.stream`, before the runtime's request and idle deadlines start, so only the council client's per-call timeout bounds it, and a transient failure runs every decision again. The request sends no `timeout_ms`.
-  - A slot that fails loses the usage of the decisions before it; the done event reports the largest prompt and not the spend of all decisions.
-  - A council `model` slot with no `max_tokens` is refused at turn time, though a decision turn samples no tokens. Set `--max-tokens` on the character for now.
+- **Decision turns: what is open.** A character model with `--decide <program>` on a council backend builds its reply from `choice` decisions (`llm/council/decide.rs`; the shipped program is `rc/musician/programs/bass-bars.json`). Remaining open items:
+  - Individual decision requests send no `timeout_ms`, and a transient failure inside a slot re-runs that decision via `call_classified` rather than resuming partial slot progress across stream retries.
   - Any 404 from a decision is read as a spec the server lost; a server with no decisions route gets a spec post per decision before the turn fails.
-  - A decision turn writes no `llm request` line and no request dump.
-  - `Provider::one_shot_opts` returns early for a slot with an effort or thinking style, before the council client clears `decide`. No one-shot carries a program today.
-  - `Reply::whole` trims white space at the edges of the program's reply, and a cancelled decision stream yields no cancel-confirm `Done`.
-  - With fewer distinct orderings than `shuffle`, orderings repeat and the pool is uneven (a 2-option slot with `shuffle` above 2).
   - The turn refuses a served model without `reads`; the gate decides without that check. The contract should settle which is right.
   - A context past the server's decision limit (3,072 tokens on the nagaya) drops its oldest messages and the slot is sent again. The size that fit is not remembered, so each turn pays for the refused sends again: about 1 s of a 4 s turn on the live `omnijam` run, where the musician stance and ABC primer fill most of the limit. A decision player wants a shorter create rc, or a measured size before the first send.
 

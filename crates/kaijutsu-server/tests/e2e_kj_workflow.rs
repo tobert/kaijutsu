@@ -481,9 +481,9 @@ fn test_shell_propagates_exit_code() {
 }
 
 /// A model-facing shell's output past the preview limit keeps the command's
-/// exit. `seq 1 5000` is a kaish builtin (no host exec) that prints ~19 KB
-/// and always exits 0, so it crosses the limit on every host. The durable
-/// ToolResult must record exit 0 and carry the preview's
+/// exit. `seq 1 10000` is a kaish builtin (no host exec) that prints ~48 KB
+/// and always exits 0, so it crosses the 40 KiB default preview limit. The
+/// durable ToolResult must record exit 0 and carry the preview's
 /// `[output truncated: ...]` line, which names the `/v/cas` path of the rest.
 #[test]
 fn test_shell_truncation_does_not_corrupt_exit_code() {
@@ -494,9 +494,9 @@ fn test_shell_truncation_does_not_corrupt_exit_code() {
         let ctx = create_context(&kernel, "truncation-exit-code-test").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 
-        // seq 1 5000 prints far more than the 8 KB agent cap and always
+        // seq 1 10000 prints ~48 KB (> 40 KiB PreviewLimit::DEFAULT) and always
         // succeeds — the exact "succeeded but got capped" shape the bug hid.
-        let (cmd_id, output, status) = shell_exec_wait(&kernel, "seq 1 5000", ctx).await;
+        let (cmd_id, output, status) = shell_exec_wait(&kernel, "seq 1 10000", ctx).await;
         assert_eq!(
             status,
             Status::Done,

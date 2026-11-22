@@ -13,10 +13,12 @@
 # KJ_LISTEN, from the context env, names a track to listen to. When set, the
 # tick renders that track's last phrase with `kj audio render` and appends the
 # clip to this context as an audio block before it drives, so a model that
-# reads audio hears what the track just played. A track that committed nothing
-# in that phrase is skipped quietly. Any other render failure does not stop the
-# phrase: the tick still drives, then ends with status 1 and the cause, so the
-# player keeps playing and the failure is on record. Unset, nothing changes.
+# reads audio hears what the track just played. Only the newest KJ_LISTEN_KEEP
+# (default 1) audio/wav asset blocks stay included; older ones are excluded with
+# `kj stage exclude`. A dormant track or a track that committed nothing in that
+# phrase is skipped quietly. Any other render failure does not stop the phrase:
+# the tick still drives, then ends with status 1 and the cause, so the player
+# keeps playing and the failure is on record. Unset, nothing changes.
 #
 # One phrase is open at a time. While this performer still has unsettled work
 # on the track (KJ_OPEN_WORK above 0), the tick admits nothing and ends with
@@ -42,14 +44,27 @@ if [[ "$KJ_OPEN_WORK" -gt 0 ]]; then
 fi
 listen_failed=""
 if [[ -n "$KJ_LISTEN" ]]; then
+  keep="${KJ_LISTEN_KEEP:-1}"
+  case "$keep" in
+    *[!0-9]*|"")
+      echo "tick: KJ_LISTEN_KEEP is '$keep'; expected a non-negative integer"
+      exit 1
+      ;;
+  esac
   heard="$(kj audio render --track "$KJ_LISTEN" --phrases 1 --json 2>&1 || true)"
   case "$heard" in
     *"committed nothing"*)
       echo "tick: nothing committed on $KJ_LISTEN in the last phrase; not listening"
       ;;
+    *"is dormant"*)
+      echo "tick: track $KJ_LISTEN is dormant; not listening"
+      ;;
     *'"hash"'*)
       clip="$(echo "$heard" | jq -r '.hash')"
       kj block create --role asset --kind text --content-type audio/wav --content "$clip"
+      for old in $(kj block list --role asset --content-type audio/wav --included --json | jq -r --argjson k "$keep" 'if length > $k then .[0:(length - $k)][] else empty end'); do
+        kj stage exclude "$old"
+      done
       ;;
     *)
       listen_failed="$heard"

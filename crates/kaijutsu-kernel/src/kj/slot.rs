@@ -6,14 +6,14 @@
 //! `distill` when the character has no `distill` slot. A root character runs
 //! no model.
 //!
-//! A character also holds up to three **slots**: `distill`, a cheaper model
+//! A character also holds **slots**: `distill`, a cheaper model
 //! that summarizes for `kj fork --compact` and `kj drift pull|merge`,
 //! `gate`, the model that judges the gate: a council server (a backend of kind
 //! `council`, `docs/council.md`, "Configuration"), a decisions backend (kind
 //! `decisions`), or a chat model, the guardian (`docs/approval-identity.md`,
-//! "The guardian"), and `image`, the model that reads
-//! images for the character (`docs/shadows.md`). No other role exists: the judge is
-//! a character of its own, whose model is its council server.
+//! "The guardian"), and `image`, `audio`, and `video`, the models that read
+//! media for the character (`docs/contexts.md`). No other role exists: the
+//! judge is a character of its own, whose model is its council server.
 //!
 //! A slot names a backend + model and may set any request parameter. A
 //! parameter the slot leaves unset is read from the model's `backend_models`
@@ -40,10 +40,10 @@ pub(super) enum CharacterSlotCommand {
         /// Role: `distill` for the model that summarizes for `kj fork
         /// --compact` and `kj drift pull|merge`, `gate` for the model that
         /// judges the gate (a council or decisions backend, or a chat model
-        /// when `gate.toml` enables the guardian), or `image` for the
-        /// model that reads images for the character, which `kj shadow
-        /// describe` asks for a description. The character's chat model is
-        /// `kj character model set`
+        /// when `gate.toml` enables the guardian), or `image`, `audio`, or
+        /// `video` for the models that read media for the character (`kj
+        /// shadow describe` uses `image`). The character's chat model is `kj
+        /// character model set`
         role: String,
         /// The model as `<backend>/<model>`, split at the first `/`, as `kj
         /// character show` prints it (for example `deepseek/deepseek-flash`).
@@ -76,7 +76,7 @@ pub(super) enum CharacterSlotCommand {
     Unset {
         /// The character's name
         character: String,
-        /// Role: `distill`, `gate`, or `image`
+        /// Role: `distill`, `gate`, `image`, `audio`, or `video`
         role: String,
     },
     /// List a character's slots.
@@ -110,7 +110,8 @@ pub(super) enum CharacterModelCommand {
         model: String,
         /// Maximum response tokens. Omit to use the backend model's limit.
         /// ChatGPT ignores this setting. A council model without a limit can
-        /// judge gate decisions but cannot generate text.
+        /// judge gate decisions or run `--decide` turns, but cannot generate
+        /// text.
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0
@@ -1028,10 +1029,18 @@ mod tests {
             .dispatch(&argv(&["character", "slot", "set", "house", "image", "anthropic/claude-opus-5", "--max-tokens", "512"]), &c)
             .await;
         assert!(set.is_ok(), "{}", set.message());
+        for media_role in ["audio", "video"] {
+            let media_set = d
+                .dispatch(&argv(&["character", "slot", "set", "house", media_role, "anthropic/claude-opus-5", "--max-tokens", "512"]), &c)
+                .await;
+            assert!(media_set.is_ok(), "{media_role}: {}", media_set.message());
+        }
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
         let slot = db.get_character_slot(house.principal_id, "image").unwrap().expect("the slot is written");
         assert_eq!((slot.model.as_str(), slot.max_tokens), ("claude-opus-5", Some(512)));
+        assert!(db.get_character_slot(house.principal_id, "audio").unwrap().is_some());
+        assert!(db.get_character_slot(house.principal_id, "video").unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1188,6 +1197,87 @@ mod tests {
         assert!(!again.is_ok() && again.message().contains("no slot for 'distill'"), "{}", again.message());
         let listed = d.dispatch(&argv(&["character", "slot", "list", "house"]), &c).await;
         assert!(listed.message().contains("gate") && !listed.message().contains("distill"), "{}", listed.message());
+    }
+
+    #[tokio::test]
+    async fn council_decide_model_resolves_without_max_tokens() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.kernel()
+            .vfs()
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+        let db_arc = d.kernel_db().clone();
+        let (ctx, char_id) = {
+            let db = db_arc.lock();
+            let b_id = db.get_backend_by_name("nagaya").unwrap().unwrap().backend_id;
+            let char_id = kaijutsu_types::PrincipalId::new();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: char_id,
+                name: "omni-bass".into(),
+                rc_dir: Some("musician".into()),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                console_ctx: None,
+                mcp_hub_ctx: None,
+                root: false,
+            })
+            .unwrap();
+            db.set_character_model(&CharacterModelRow {
+                principal_id: char_id,
+                backend_id: b_id,
+                model: "lfm3-omni".into(),
+                max_tokens: None,
+                temperature: Some(0.4),
+                top_p: None,
+                effort: None,
+                thinking_budget: None,
+                thinking_style: None,
+                decide: Some("/config/rc/musician/programs/bass-bars.json".into()),
+                preview_kib: None,
+            })
+            .unwrap();
+            let ctx = kaijutsu_types::ContextId::new();
+            let ws = db.get_or_create_default_workspace(char_id).unwrap();
+            db.insert_context_with_document(
+                &crate::ContextRow {
+                    context_id: ctx,
+                    label: Some("omni-test".into()),
+                    system_prompt: None,
+                    context_state: kaijutsu_types::ContextState::Live,
+                    created_at: 0,
+                    created_by: char_id,
+                    forked_from: None,
+                    fork_kind: None,
+                    archived_at: None,
+                    workspace_id: None,
+                    preset_id: None,
+                    concluded_at: None,
+                    last_activity_at: None,
+                    promoted_at: None,
+                    demoted_at: None,
+                    paused_at: None,
+                    origin_host: None,
+                    performer: None,
+                    senpai_ctx: None,
+                    persona: None,
+                },
+                ws,
+            )
+            .unwrap();
+            db.update_performer(ctx, Some(char_id)).unwrap();
+            (ctx, char_id)
+        };
+        let _ = (c, char_id);
+        let lookup = crate::model_resolution::context_model(&db_arc.lock(), ctx).unwrap();
+        let model = lookup.into_model().expect("--decide council model must resolve without max_tokens");
+        assert_eq!(model.max_tokens, None);
+        assert_eq!(
+            model.tunables.decide.as_deref(),
+            Some("/config/rc/musician/programs/bass-bars.json")
+        );
     }
 
     /// The old verb is gone, not aliased.

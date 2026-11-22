@@ -74,11 +74,11 @@ enum ConfigCommand {
     },
 }
 
-/// Canonicalize a user-supplied config arg to its `/config/kernel/<name>` path.
-/// Accepts a bare name (`theme.toml`), a nested one (`council/guardian.md`),
-/// or an already-full path. Rejects empty segments, `.`, and `..`, so a
-/// name never leaves `/config/kernel`.
-fn config_canonical(path: &str) -> Result<String, String> {
+/// Canonicalize a user-supplied config arg to its `/config/kernel/<name>` or
+/// `/config/client/<id>/<file>` path. Accepts a bare name (`theme.toml`), a
+/// nested one (`council/guardian.md`), or an already-full path. Rejects empty
+/// segments, `.`, and `..`, so a name never leaves its config root.
+pub fn config_canonical(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
     // Per-client config namespace: hierarchical, always exactly two segments —
     // `<root>/default/<file>` (the shared client default) or

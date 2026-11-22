@@ -75,17 +75,46 @@ fn walk(cmd: &clap::Command, path: String, depth: usize, mut required: Vec<Requi
 /// This node's own required arguments, positionals before options — the
 /// ordering [`synthesize_clause`] relies on within one depth.
 fn required_args_of(cmd: &clap::Command, depth: usize) -> Vec<RequiredArg> {
+    let mut seen: std::collections::HashSet<&clap::Id> = std::collections::HashSet::new();
     let mut required: Vec<RequiredArg> = cmd
         .get_positionals()
         .filter(|a| a.is_required_set())
-        .map(|a| RequiredArg { depth, flag: None, placeholder: placeholder_for(a) })
+        .map(|a| {
+            seen.insert(a.get_id());
+            RequiredArg { depth, flag: None, placeholder: placeholder_for(a) }
+        })
         .collect();
     required.extend(
         cmd.get_opts()
             .filter(|a| a.is_required_set())
             .filter_map(|a| a.get_long().map(|l| (l, a)))
-            .map(|(long, a)| RequiredArg { depth, flag: Some(format!("--{long}")), placeholder: placeholder_for(a) }),
+            .map(|(long, a)| {
+                seen.insert(a.get_id());
+                RequiredArg { depth, flag: Some(format!("--{long}")), placeholder: placeholder_for(a) }
+            }),
     );
+    // Required ArgGroups (e.g. `<sources>` vs `--track` on `kj audio render`):
+    // if no member is already emitted, pick the first positional (or option) so
+    // synthesized clauses satisfy clap's required-group check.
+    for group in cmd.get_groups().filter(|g| g.is_required_set()) {
+        if group.get_args().any(|id| seen.contains(id)) {
+            continue;
+        }
+        let positional = cmd
+            .get_positionals()
+            .find(|a| group.get_args().any(|id| id == a.get_id()));
+        if let Some(a) = positional {
+            seen.insert(a.get_id());
+            required.push(RequiredArg { depth, flag: None, placeholder: placeholder_for(a) });
+        } else if let Some((long, a)) = cmd
+            .get_opts()
+            .filter(|a| group.get_args().any(|id| id == a.get_id()))
+            .find_map(|a| a.get_long().map(|l| (l, a)))
+        {
+            seen.insert(a.get_id());
+            required.push(RequiredArg { depth, flag: Some(format!("--{long}")), placeholder: placeholder_for(a) });
+        }
+    }
     required
 }
 

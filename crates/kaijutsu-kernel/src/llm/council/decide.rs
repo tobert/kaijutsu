@@ -21,9 +21,10 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use gogi_proto::Context;
 use gogi_proto::decision::{DecisionRequest, DecisionResponse, PooledAnswer};
 use gogi_proto::identity::{Capability, ServedModel};
@@ -34,7 +35,8 @@ use serde_json::{Value, json};
 
 use super::reply::Reply;
 use super::{Client, Stream, Turn, build};
-use crate::llm::stream::{BuildOpts, CouncilUsageExtra};
+use crate::llm::request_dump::RequestTrace;
+use crate::llm::stream::{BuildOpts, CouncilUsageExtra, SpentUsage, StreamError, StreamErrorKind, StreamEvent, UsageExtra};
 use crate::llm::{LlmError, LlmResult, Message};
 
 /// A choice answer's probabilities, by option id.
@@ -249,24 +251,67 @@ impl Rng {
     }
 }
 
-/// `count` orderings of `options`. Ordering 0 is `options` as listed; the
-/// others are seeded permutations, each different from the ones before it when
-/// `options` has that many orderings.
+/// `count` orderings of `options` (capped at `options.len()!`). Ordering 0 is
+/// `options` as listed; when `options.len()! <= count` every permutation
+/// appears once, and otherwise the remaining orderings are distinct seeded
+/// permutations.
 pub(super) fn orderings(options: &[usize], count: usize, rng: &mut Rng) -> Vec<Vec<usize>> {
-    let mut out = vec![options.to_vec()];
-    while out.len() < count {
+    if count == 0 {
+        return Vec::new();
+    }
+    let fact = (1..=options.len()).fold(1usize, |a, b| a.saturating_mul(b));
+    let target = fact.min(count);
+    if target == fact {
+        let mut out = Vec::with_capacity(fact);
+        let mut perm: Vec<usize> = (0..options.len()).collect();
+        loop {
+            out.push(perm.iter().map(|&i| options[i]).collect());
+            if !next_permutation(&mut perm) {
+                break;
+            }
+        }
+        return out;
+    }
+    let mut out = Vec::with_capacity(target);
+    out.push(options.to_vec());
+    while out.len() < target {
         let mut candidate = options.to_vec();
+        let mut found = false;
         for _ in 0..16 {
             for i in (1..candidate.len()).rev() {
                 candidate.swap(i, rng.below(i + 1));
             }
             if !out.contains(&candidate) {
+                found = true;
                 break;
+            }
+        }
+        if !found {
+            let mut perm: Vec<usize> = (0..options.len()).collect();
+            loop {
+                let next: Vec<usize> = perm.iter().map(|&i| options[i]).collect();
+                if !out.contains(&next) {
+                    candidate = next;
+                    break;
+                }
+                if !next_permutation(&mut perm) {
+                    break;
+                }
             }
         }
         out.push(candidate);
     }
     out
+}
+
+fn next_permutation(slice: &mut [usize]) -> bool {
+    let Some(i) = (0..slice.len().saturating_sub(1)).rfind(|&i| slice[i] < slice[i + 1]) else {
+        return false;
+    };
+    let j = (i + 1..slice.len()).rfind(|&j| slice[j] > slice[i]).unwrap();
+    slice.swap(i, j);
+    slice[i + 1..].reverse();
+    true
 }
 
 /// The mean over `answers` of each option's probability, in `options` order.
@@ -411,7 +456,7 @@ impl Client {
         turn: Turn,
         seed: u64,
     ) -> LlmResult<Stream> {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let (served, choice_options, holds_objects) = self.served_for_decisions(&turn, &opts.model, &program).await?;
         super::generation::check_controls(&self.name, &opts.controls, &served)?;
         for (i, slot) in program.slots.iter().enumerate() {
@@ -439,72 +484,34 @@ impl Client {
                 self.name, program.path
             )));
         }
-        let mut context = Context { thinking: false, tools: Vec::new(), queue: None, control: opts.controls.clone(), messages };
-        let mut rng = Rng::new(seed);
-        let mut picks: Vec<usize> = Vec::new();
-        // The prompt count is the largest single decision's: the runtime reads it
-        // as how full the context is, and every decision sends the same context.
-        let mut usage = (0u64, 0u64, 0u64);
-        for at in 0..program.slots.len() {
-            let allowed = self.program_allowed(&program, at, &picks);
-            let so_far = if picks.is_empty() { "(nothing yet)".to_string() } else { program.picked(&picks) };
-            let case = format!("{} So far: {so_far}", program.slots[at].case);
-            let answers = loop {
-                let mut asks = Vec::new();
-                for ordering in orderings(&allowed, program.shuffle, &mut rng) {
-                    let spec = spec_for(&program, &ordering, choice_options as usize)?;
-                    let request = DecisionRequest {
-                        model: served.model.clone(),
-                        case: Value::String(case.clone()),
-                        spec_id: spec.id(),
-                        contexts: vec![context.clone()],
-                        ..Default::default()
-                    };
-                    asks.push((spec, request));
-                }
-                let too_large = AtomicBool::new(false);
-                match futures::future::try_join_all(asks.iter().map(|(spec, request)| self.decide(&turn, spec, request, &too_large))).await {
-                    Ok(answers) => break answers,
-                    Err(_) if too_large.load(Ordering::Relaxed) && keep > 1 => {
-                        keep -= 1;
-                        context.messages = trim(whole.clone(), has_system, keep);
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
-            let mut each = Vec::with_capacity(answers.len());
-            for response in &answers {
-                usage.0 = usage.0.max(response.usage.prompt);
-                usage.1 += response.usage.kept;
-                usage.2 += response.usage.fed;
-                each.push(probabilities(response).map_err(|e| self.refused_answer(&program, at, e))?);
-            }
-            let ids: Vec<&str> = allowed.iter().map(|o| program.options[*o].id.as_str()).collect();
-            let pooled = pool(&ids, &each).map_err(|e| self.refused_answer(&program, at, e))?;
-            let chosen = sample(&pooled, opts.temperature, &mut rng).map_err(|e| self.refused_answer(&program, at, e))?;
-            picks.push(allowed[chosen]);
-        }
-        let text = program.reply_text(&picks);
-        let wall_ms = started.elapsed().as_millis() as u64;
-        let extra = CouncilUsageExtra {
-            kept: usage.1,
-            fed: usage.2,
-            first_token_ms: wall_ms,
-            wall_ms,
-            seed: Some(seed),
-            model: served.model.clone(),
-            weight_hash: served.weight_hash.clone(),
+        let context = Context { thinking: false, tools: Vec::new(), queue: None, control: opts.controls.clone(), messages };
+        let runner = DecisionRunner {
+            client: self.clone(),
+            turn,
+            program,
+            opts,
+            history,
+            served,
+            choice_options,
+            whole,
+            has_system,
+            keep,
+            context,
+            rng: Rng::new(seed),
+            seed,
+            slot_idx: 0,
+            picks: Vec::new(),
+            usage: DecisionUsage::default(),
+            dump_seq: AtomicU64::new(0),
         };
-        let events = Reply::whole(&text, (usage.0, 0, extra))
-            .map_err(|e| LlmError::ApiError(format!("council backend '{}': {e}", self.name)))?;
         Ok(Stream {
             name: self.name.clone(),
             inner: None,
-            reply: None,
-            pending: events.into(),
+            reply: Some(Reply::decisions(runner)),
+            pending: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             finished: false,
-            started: std::time::Instant::now(),
+            started,
             first_token: None,
             slot: None,
             reply_identity: None,
@@ -543,14 +550,26 @@ impl Client {
     /// One decision. The spec is posted first when this client has not posted
     /// it to the server; a `404` for the spec posts it and sends the decision
     /// once more.
-    async fn decide(&self, turn: &Turn, spec: &Spec, request: &DecisionRequest, too_large: &AtomicBool) -> LlmResult<DecisionResponse> {
+    #[allow(clippy::too_many_arguments)]
+    async fn decide(
+        &self,
+        turn: &Turn,
+        spec: &Spec,
+        request: &DecisionRequest,
+        too_large: &AtomicBool,
+        trace: Option<&RequestTrace>,
+        dump_seq: &AtomicU64,
+        model: &str,
+        system: Option<&str>,
+        history: &[Message],
+    ) -> Result<DecisionResponse, (StreamErrorKind, LlmError)> {
         self.ensure_spec(turn, spec).await?;
         let missing = AtomicBool::new(false);
-        match self.decide_once(turn, request, &missing, too_large).await {
+        match self.decide_once(turn, request, &missing, too_large, trace, dump_seq, model, system, history).await {
             Err(_) if missing.load(Ordering::Relaxed) => {
                 self.specs.lock().remove(&request.spec_id);
                 self.ensure_spec(turn, spec).await?;
-                self.decide_once(turn, request, &AtomicBool::new(false), too_large).await
+                self.decide_once(turn, request, &AtomicBool::new(false), too_large, trace, dump_seq, model, system, history).await
             }
             answered => answered,
         }
@@ -560,17 +579,30 @@ impl Client {
     /// when the server answers 404, which says it does not hold the spec, and
     /// `too_large` when it answers 413, which says a context is past the
     /// decision limit.
+    #[allow(clippy::too_many_arguments)]
     async fn decide_once(
         &self,
         turn: &Turn,
         request: &DecisionRequest,
         missing: &AtomicBool,
         too_large: &AtomicBool,
-    ) -> LlmResult<DecisionResponse> {
+        trace: Option<&RequestTrace>,
+        dump_seq: &AtomicU64,
+        model: &str,
+        system: Option<&str>,
+        history: &[Message],
+    ) -> Result<DecisionResponse, (StreamErrorKind, LlmError)> {
         let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
         let traceparent = (!traceparent.is_empty()).then_some(traceparent);
+        let seq = dump_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut recorded = false;
         let (_, response) = self
-            .call(turn, false, |left: Duration| {
+            .call_classified(turn, false, |left: Duration| {
+                if !std::mem::replace(&mut recorded, true) {
+                    crate::llm::request_dump::record_decision(
+                        trace, seq, &self.name, model, &self.base_url, system, history, request,
+                    );
+                }
                 let traceparent = traceparent.as_deref();
                 async move {
                     let answered = self.client.decide_traced(request, left, traceparent).await;
@@ -588,14 +620,243 @@ impl Client {
     }
 
     /// Posts `spec` unless this client has posted it to the server.
-    async fn ensure_spec(&self, turn: &Turn, spec: &Spec) -> LlmResult<()> {
+    async fn ensure_spec(&self, turn: &Turn, spec: &Spec) -> Result<(), (StreamErrorKind, LlmError)> {
         let id = spec.id();
         if self.specs.lock().contains(&id) {
             return Ok(());
         }
-        self.call(turn, false, |_| self.client.post_spec(spec)).await?;
+        self.call_classified(turn, false, |_| self.client.post_spec(spec)).await?;
         self.specs.lock().insert(id);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DecisionUsage {
+    decisions: usize,
+    prompt: u64,
+    completion: u64,
+    kept: u64,
+    fed: u64,
+}
+
+impl DecisionUsage {
+    fn record(&mut self, response: &DecisionResponse) {
+        self.decisions += 1;
+        self.prompt += response.usage.prompt;
+        self.completion += response.usage.completion;
+        self.kept += response.usage.kept;
+        self.fed += response.usage.fed;
+    }
+
+    fn council_extra(&self, wall_ms: u64, seed: u64, served: &ServedModel) -> CouncilUsageExtra {
+        CouncilUsageExtra {
+            kept: self.kept,
+            fed: self.fed,
+            first_token_ms: wall_ms,
+            wall_ms,
+            seed: Some(seed),
+            model: served.model.clone(),
+            weight_hash: served.weight_hash.clone(),
+        }
+    }
+
+    fn spent_usage(&self, wall_ms: u64, seed: u64, served: &ServedModel) -> Option<SpentUsage> {
+        (self.decisions > 0).then(|| SpentUsage {
+            input_tokens: Some(self.prompt),
+            output_tokens: Some(self.completion),
+            extra: Some(UsageExtra::Council(self.council_extra(wall_ms, seed, served))),
+        })
+    }
+}
+
+pub(super) enum StepOutcome {
+    Continue,
+    Finished(Vec<StreamEvent>),
+    Failed(StreamError),
+}
+
+pub(super) struct DecisionRunner {
+    client: Client,
+    turn: Turn,
+    program: Program,
+    opts: BuildOpts,
+    history: Vec<Message>,
+    served: ServedModel,
+    choice_options: u64,
+    whole: Vec<CouncilMessage>,
+    has_system: bool,
+    keep: usize,
+    context: Context,
+    rng: Rng,
+    seed: u64,
+    slot_idx: usize,
+    picks: Vec<usize>,
+    usage: DecisionUsage,
+    dump_seq: AtomicU64,
+}
+
+impl DecisionRunner {
+    fn error_with_usage(&self, kind: StreamErrorKind, message: String, started: Instant) -> StreamError {
+        let mut err = StreamError::new(kind, message);
+        let wall_ms = started.elapsed().as_millis() as u64;
+        if let Some(spent) = self.usage.spent_usage(wall_ms, self.seed, &self.served) {
+            err = err.with_usage(spent);
+        }
+        err
+    }
+
+    pub(super) fn cancel_done(self, started: Instant) -> StreamEvent {
+        let wall_ms = started.elapsed().as_millis() as u64;
+        match self.usage.spent_usage(wall_ms, self.seed, &self.served) {
+            Some(spent) => StreamEvent::Done {
+                stop_reason: None,
+                input_tokens: spent.input_tokens,
+                output_tokens: spent.output_tokens,
+                extra: spent.extra,
+            },
+            None => StreamEvent::Done {
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                extra: None,
+            },
+        }
+    }
+
+    pub(super) async fn step(&mut self, started: Instant) -> StepOutcome {
+        if self.slot_idx < self.program.slots.len() {
+            let at = self.slot_idx;
+            let allowed = self.client.program_allowed(&self.program, at, &self.picks);
+            let so_far = if self.picks.is_empty() {
+                "(nothing yet)".to_string()
+            } else {
+                self.program.picked(&self.picks)
+            };
+            let case = format!("{} So far: {so_far}", self.program.slots[at].case);
+            let answers = loop {
+                let mut asks = Vec::new();
+                for ordering in orderings(&allowed, self.program.shuffle, &mut self.rng) {
+                    let spec = match spec_for(&self.program, &ordering, self.choice_options as usize) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return StepOutcome::Failed(self.error_with_usage(
+                                StreamErrorKind::InvalidRequest,
+                                e.to_string(),
+                                started,
+                            ));
+                        }
+                    };
+                    let request = DecisionRequest {
+                        model: self.served.model.clone(),
+                        case: Value::String(case.clone()),
+                        spec_id: spec.id(),
+                        contexts: vec![self.context.clone()],
+                        ..Default::default()
+                    };
+                    asks.push((spec, request));
+                }
+                let too_large = AtomicBool::new(false);
+                let mut results: Vec<Option<Result<DecisionResponse, (StreamErrorKind, LlmError)>>> =
+                    (0..asks.len()).map(|_| None).collect();
+                {
+                    let client = &self.client;
+                    let turn = &self.turn;
+                    let trace = self.opts.trace.as_deref();
+                    let dump_seq = &self.dump_seq;
+                    let model = &self.opts.model;
+                    let system = self.opts.system.as_deref();
+                    let history = &self.history;
+                    let mut futs: futures::stream::FuturesUnordered<_> = asks
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (spec, request))| {
+                            let too_large = &too_large;
+                            async move {
+                                let res = client
+                                    .decide(turn, spec, request, too_large, trace, dump_seq, model, system, history)
+                                    .await;
+                                (idx, res)
+                            }
+                        })
+                        .collect();
+                    while let Some((idx, res)) = futs.next().await {
+                        if let Ok(ref response) = res {
+                            self.usage.record(response);
+                        }
+                        results[idx] = Some(res);
+                    }
+                }
+                if too_large.load(Ordering::Relaxed) && self.keep > 1 {
+                    self.keep -= 1;
+                    self.context.messages = trim(self.whole.clone(), self.has_system, self.keep);
+                    continue;
+                }
+                let mut answers = Vec::with_capacity(results.len());
+                for item in results {
+                    match item.expect("every ask completed") {
+                        Ok(resp) => answers.push(resp),
+                        Err((kind, err)) => {
+                            return StepOutcome::Failed(self.error_with_usage(kind, err.to_string(), started));
+                        }
+                    }
+                }
+                break answers;
+            };
+            let mut each = Vec::with_capacity(answers.len());
+            for response in &answers {
+                match probabilities(response) {
+                    Ok(p) => each.push(p),
+                    Err(e) => {
+                        let err = self.client.refused_answer(&self.program, at, e);
+                        return StepOutcome::Failed(self.error_with_usage(
+                            StreamErrorKind::InvalidRequest,
+                            err.to_string(),
+                            started,
+                        ));
+                    }
+                }
+            }
+            let ids: Vec<&str> = allowed.iter().map(|o| self.program.options[*o].id.as_str()).collect();
+            let pooled = match pool(&ids, &each) {
+                Ok(p) => p,
+                Err(e) => {
+                    let err = self.client.refused_answer(&self.program, at, e);
+                    return StepOutcome::Failed(self.error_with_usage(
+                        StreamErrorKind::InvalidRequest,
+                        err.to_string(),
+                        started,
+                    ));
+                }
+            };
+            let chosen = match sample(&pooled, self.opts.temperature, &mut self.rng) {
+                Ok(c) => c,
+                Err(e) => {
+                    let err = self.client.refused_answer(&self.program, at, e);
+                    return StepOutcome::Failed(self.error_with_usage(
+                        StreamErrorKind::InvalidRequest,
+                        err.to_string(),
+                        started,
+                    ));
+                }
+            };
+            self.picks.push(allowed[chosen]);
+            self.slot_idx += 1;
+            if self.slot_idx < self.program.slots.len() {
+                return StepOutcome::Continue;
+            }
+        }
+        let text = self.program.reply_text(&self.picks);
+        let wall_ms = started.elapsed().as_millis() as u64;
+        let extra = self.usage.council_extra(wall_ms, self.seed, &self.served);
+        match Reply::whole(&text, (self.usage.prompt, self.usage.completion, extra)) {
+            Ok(events) => StepOutcome::Finished(events),
+            Err(e) => StepOutcome::Failed(self.error_with_usage(
+                StreamErrorKind::Protocol,
+                format!("council backend '{}': {e}", self.client.name),
+                started,
+            )),
+        }
     }
 }
 
@@ -764,19 +1025,27 @@ mod tests {
         Client::new("nagaya", base, Duration::from_secs(5)).unwrap()
     }
 
-    /// The text a drained stream wrote, and its `Done` event.
-    async fn drain(mut stream: Stream) -> (String, StreamEvent) {
+    /// The text a drained stream wrote, and its terminal `Done` or `Error`.
+    async fn drain_outcome(mut stream: Stream) -> Result<(String, StreamEvent), (String, StreamError)> {
         let mut text = String::new();
         let mut done = None;
         while let Some(event) = stream.next_event().await {
             match event {
                 StreamEvent::TextDelta(t) => text.push_str(&t),
                 StreamEvent::Done { .. } => done = Some(event),
-                StreamEvent::Error(e) => panic!("{e:?}"),
+                StreamEvent::Error(e) => return Err((text, e)),
                 _ => {}
             }
         }
-        (text, done.expect("a decision turn ends in done"))
+        Ok((text, done.expect("a decision turn ends in done")))
+    }
+
+    /// The text a drained stream wrote, and its `Done` event.
+    async fn drain(stream: Stream) -> (String, StreamEvent) {
+        match drain_outcome(stream).await {
+            Ok(res) => res,
+            Err((_, e)) => panic!("{e:?}"),
+        }
     }
 
     fn bodies(seen: &Mutex<Vec<Captured>>, path: &str) -> Vec<Value> {
@@ -815,8 +1084,11 @@ mod tests {
         let slots = json!([{"case": "Bar 1.", "options": ["a", "b"]}]);
         let vfs = vfs_holding(&program(1, slots).to_string()).await;
         let (base, seen) = council(Behavior { too_large_over: Some(1), ..Behavior::weighted(&[]) }).await;
-        let error = client(&base).stream(opts(vfs, Some(0.0)), history()).await.err().expect("refused");
-        assert!(error.to_string().contains("3072"), "{error}");
+        let stream = client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap();
+        let (text, error) = drain_outcome(stream).await.expect_err("refused");
+        assert!(text.is_empty());
+        assert_eq!(error.kind, StreamErrorKind::InvalidRequest);
+        assert!(error.message.contains("3072"), "{error}");
         assert_eq!(bodies(&seen, "/council/v2/decisions").len(), 2, "sent with 2 kept messages, then 1, and no more");
     }
 
@@ -831,8 +1103,10 @@ mod tests {
         assert_eq!(text, "P:B1|D1]", "slot 1 picks b; no_repeat leaves b out, and slot 2 picks d");
         let StreamEvent::Done { stop_reason, input_tokens, output_tokens, extra, .. } = done else { unreachable!() };
         assert_eq!(stop_reason.as_deref(), Some("end_turn"));
-        assert_eq!((input_tokens, output_tokens), (Some(10), Some(0)), "the largest prompt of the six decisions, not their sum");
+        assert_eq!((input_tokens, output_tokens), (Some(60), Some(0)), "total spend across all six decisions");
         let Some(crate::llm::stream::UsageExtra::Council(extra)) = extra else { panic!("{extra:?}") };
+        assert_eq!((extra.kept, extra.fed), (24, 36));
+        assert!(extra.kept <= input_tokens.unwrap() && extra.fed <= input_tokens.unwrap());
         assert!(extra.seed.is_some() && extra.model == "gemma-4", "{extra:?}");
 
         let specs = bodies(&seen, "/council/v2/specs");
@@ -962,8 +1236,10 @@ mod tests {
         let mut b = Behavior::weighted(&[]);
         b.decisions_404 = true;
         let (base, seen) = council(b).await;
-        let err = client(&base).stream(opts(vfs, Some(0.0)), history()).await.err().expect("a second 404 fails the turn");
-        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("council backend 'nagaya'")), "{err:?}");
+        let stream = client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap();
+        let (_, err) = drain_outcome(stream).await.expect_err("a second 404 fails the turn");
+        assert_eq!(err.kind, StreamErrorKind::InvalidRequest);
+        assert!(err.message.contains("council backend 'nagaya'"), "{err:?}");
         assert_eq!(bodies(&seen, "/council/v2/decisions").len(), 2, "one retry, no more");
         assert_eq!(bodies(&seen, "/council/v2/specs").len(), 2);
     }
@@ -979,8 +1255,11 @@ mod tests {
         let mut b = Behavior::weighted(&[]);
         b.decision_failure = Some(500);
         let (base, _) = council(b).await;
-        let err = client(&base).stream(opts(vfs, Some(0.0)), history()).await.err().expect("the turn fails");
-        assert!(matches!(&err, LlmError::ApiError(m) if m.contains("council backend 'nagaya'") && m.contains("the council is down")), "{err:?}");
+        let stream = client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap();
+        let (text, err) = drain_outcome(stream).await.expect_err("the turn fails");
+        assert!(text.is_empty());
+        assert_eq!(err.kind, StreamErrorKind::ServerError);
+        assert!(err.message.contains("council backend 'nagaya'") && err.message.contains("the council is down"), "{err:?}");
     }
 
     /// Every refusal names the program's path and the field, and comes before
@@ -1092,6 +1371,198 @@ mod tests {
         assert_eq!(distinct.len(), 4);
     }
 
+    #[test]
+    fn orderings_cap_at_factorial_and_enumerate_all_permutations_without_duplicates() {
+        for (options, count, expected_len) in [
+            (&[0, 1][..], 4, 2),
+            (&[0, 1, 2][..], 6, 6),
+            (&[0, 1, 2][..], 8, 6),
+            (&[0, 1, 2][..], 5, 5),
+            (&[7][..], 4, 1),
+            (&[1, 2, 3, 4][..], 8, 8),
+        ] {
+            let orders = orderings(options, count, &mut Rng::new(42));
+            assert_eq!(orders.len(), expected_len, "options={options:?} count={count}");
+            assert_eq!(orders[0], options, "ordering 0 is always the listed order");
+            let distinct: HashSet<&Vec<usize>> = orders.iter().collect();
+            assert_eq!(distinct.len(), expected_len, "no duplicates for options={options:?} count={count}: {orders:?}");
+            for o in &orders {
+                let mut a = o.clone();
+                let mut b = options.to_vec();
+                a.sort();
+                b.sort();
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_decision_turn_dumps_every_decision_without_collision() {
+        use crate::llm::request_dump::{RequestTrace, wait_for_files};
+        use kaijutsu_types::{ContextId, TurnId};
+        let slots = json!([{"case": "Bar 1.", "options": ["a", "b", "c"]}, {"case": "Bar 2.", "options": ["b", "c", "d", "a"]}]);
+        let vfs = vfs_holding(&program(3, slots).to_string()).await;
+        let (base, seen) = council(Behavior::weighted(&[("a", 1.0), ("b", 7.0), ("c", 2.0), ("d", 5.0)])).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut o = opts(vfs, Some(0.0));
+        o.trace = Some(Arc::new(RequestTrace::new(ContextId::new(), TurnId::new(), 2, Some(tmp.path().to_path_buf()))));
+        drain(client(&base).stream(o, history()).await.unwrap()).await;
+        let files = wait_for_files(tmp.path(), 6).await;
+        assert_eq!(files.len(), 6);
+        let dumped_cases: Vec<Value> = files
+            .iter()
+            .map(|p| {
+                let v: Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+                v["body"]["case"].clone()
+            })
+            .collect();
+        assert_eq!(dumped_cases.iter().filter(|c| c.as_str().unwrap().starts_with("Bar 1.")).count(), 3);
+        assert_eq!(dumped_cases.iter().filter(|c| c.as_str().unwrap().starts_with("Bar 2.")).count(), 3);
+        assert_eq!(bodies(&seen, "/council/v2/decisions").len(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_later_slot_failure_preserves_spent_usage_on_error() {
+        let slots = json!([{"case": "Bar 1.", "options": ["a", "b"]}, {"case": "Bar 2.", "options": ["a", "b"]}]);
+        let vfs = vfs_holding(&program(2, slots).to_string()).await;
+        let mut held: HashMap<String, Vec<String>> = HashMap::new();
+        let mut decided = 0usize;
+        let b = Behavior::weighted(&[("a", 1.0), ("b", 3.0)]);
+        let (base, _) = kaijutsu_council::test_server::serve_with(move |c: &Captured| {
+            let body = || -> Value { serde_json::from_str(&c.body).unwrap() };
+            match (c.method.as_str(), c.path.as_str()) {
+                ("GET", "/council/v2/identity") => identity(&b),
+                ("POST", "/council/v2/specs") => {
+                    let spec = body();
+                    let id = gogi_proto::spec_id_of(&spec).unwrap();
+                    let options = spec["questions"][0]["criteria"].as_array().unwrap().iter().map(|c| c["option"].as_str().unwrap().to_string());
+                    held.insert(id.clone(), options.collect());
+                    reply(200, json!({"spec_id": id, "spec": spec}).to_string())
+                }
+                ("POST", "/council/v2/decisions") => {
+                    decided += 1;
+                    if decided > 2 {
+                        return reply(500, json!({"error": {"type": "internal", "message": "slot 2 failed"}}).to_string());
+                    }
+                    let id = body()["spec_id"].as_str().unwrap().to_string();
+                    let ids = held.get(&id).unwrap();
+                    let p = (b.probs)(ids);
+                    reply(200, decision_response(ids, &p).to_string())
+                }
+                other => reply(500, format!("unscripted request {other:?}")),
+            }
+        })
+        .await;
+        let stream = client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap();
+        let (text, err) = drain_outcome(stream).await.expect_err("slot 2 fails");
+        assert!(text.is_empty());
+        assert_eq!(err.kind, StreamErrorKind::ServerError);
+        let spent = err.usage.expect("completed slot 1 spend must be preserved on error");
+        assert_eq!(spent.input_tokens, Some(20));
+        assert_eq!(spent.output_tokens, Some(0));
+        let Some(UsageExtra::Council(extra)) = spent.extra else { panic!("{spent:?}") };
+        assert_eq!((extra.kept, extra.fed), (8, 12));
+    }
+
+    #[tokio::test]
+    async fn a_slot_with_two_options_and_shuffle_4_sends_only_two_decisions() {
+        let slots = json!([{"case": "Bar 1.", "options": ["a", "b"]}]);
+        let vfs = vfs_holding(&program(4, slots).to_string()).await;
+        let (base, seen) = council(Behavior::weighted(&[("a", 1.0), ("b", 3.0)])).await;
+        let (text, done) = drain(client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap()).await;
+        assert_eq!(text, "P:B1]");
+        assert_eq!(bodies(&seen, "/council/v2/decisions").len(), 2, "2! = 2 orderings, not 4");
+        assert!(matches!(done, StreamEvent::Done { input_tokens: Some(20), .. }));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_decision_stream_mid_program_emits_cancel_done_with_spent_usage() {
+        let slots = json!([{"case": "Bar 1.", "options": ["a", "b"]}, {"case": "Bar 2.", "options": ["a", "b"]}]);
+        let vfs = vfs_holding(&program(2, slots).to_string()).await;
+        let mut held: HashMap<String, Vec<String>> = HashMap::new();
+        let decided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot2_started = Arc::new(tokio::sync::Notify::new());
+        let decided_srv = decided.clone();
+        let slot2_srv = slot2_started.clone();
+        let b = Behavior::weighted(&[("a", 1.0), ("b", 3.0)]);
+        let (base, _) = kaijutsu_council::test_server::serve_with(move |c: &Captured| {
+            let body = || -> Value { serde_json::from_str(&c.body).unwrap() };
+            match (c.method.as_str(), c.path.as_str()) {
+                ("GET", "/council/v2/identity") => identity(&b),
+                ("POST", "/council/v2/specs") => {
+                    let spec = body();
+                    let id = gogi_proto::spec_id_of(&spec).unwrap();
+                    let options = spec["questions"][0]["criteria"].as_array().unwrap().iter().map(|c| c["option"].as_str().unwrap().to_string());
+                    held.insert(id.clone(), options.collect());
+                    reply(200, json!({"spec_id": id, "spec": spec}).to_string())
+                }
+                ("POST", "/council/v2/decisions") => {
+                    let n = decided_srv.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n > 2 {
+                        if n == 3 {
+                            slot2_srv.notify_one();
+                        }
+                        let mut r = reply(200, decision_response(&["a".into(), "b".into()], &[0.5, 0.5]).to_string());
+                        r.delay = Duration::from_secs(5);
+                        return r;
+                    }
+                    let id = body()["spec_id"].as_str().unwrap().to_string();
+                    let ids = held.get(&id).unwrap();
+                    let p = (b.probs)(ids);
+                    reply(200, decision_response(ids, &p).to_string())
+                }
+                other => reply(500, format!("unscripted request {other:?}")),
+            }
+        })
+        .await;
+        let mut stream = client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap();
+        tokio::select! {
+            _ = slot2_started.notified() => {}
+            ev = stream.next_event() => panic!("unexpectedly finished before slot 2 stalled: {ev:?}"),
+        }
+        stream.cancel();
+        let (text, done) = drain(stream).await;
+        assert!(text.is_empty());
+        let StreamEvent::Done { stop_reason, input_tokens, output_tokens, extra } = done else { unreachable!() };
+        assert_eq!(stop_reason, None);
+        assert_eq!((input_tokens, output_tokens), (Some(20), Some(0)));
+        let Some(UsageExtra::Council(extra)) = extra else { panic!("{extra:?}") };
+        assert_eq!((extra.kept, extra.fed), (8, 12));
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_any_decision_completes_emits_empty_cancel_done() {
+        let slots = json!([{"case": "Bar 1.", "options": ["a", "b"]}]);
+        let vfs = vfs_holding(&program(1, slots).to_string()).await;
+        let b = Behavior::weighted(&[("a", 1.0), ("b", 3.0)]);
+        let (base, _) = kaijutsu_council::test_server::serve_with(move |c: &Captured| {
+            let body = || -> Value { serde_json::from_str(&c.body).unwrap() };
+            match (c.method.as_str(), c.path.as_str()) {
+                ("GET", "/council/v2/identity") => identity(&b),
+                ("POST", "/council/v2/specs") => {
+                    let spec = body();
+                    let id = gogi_proto::spec_id_of(&spec).unwrap();
+                    reply(200, json!({"spec_id": id, "spec": spec}).to_string())
+                }
+                ("POST", "/council/v2/decisions") => {
+                    let mut r = reply(200, decision_response(&["a".into(), "b".into()], &[0.5, 0.5]).to_string());
+                    r.delay = Duration::from_secs(5);
+                    r
+                }
+                other => reply(500, format!("unscripted request {other:?}")),
+            }
+        })
+        .await;
+        let stream = client(&base).stream(opts(vfs, Some(0.0)), history()).await.unwrap();
+        stream.cancel();
+        let (text, done) = drain(stream).await;
+        assert!(text.is_empty());
+        assert_eq!(
+            done,
+            StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None }
+        );
+    }
+
     /// The length in eighths of each note or rest of a bar of ABC at `L:1/8`:
     /// a note is one unit and a number after it is its length.
     fn note_lengths(bar: &str) -> Vec<u32> {
@@ -1112,26 +1583,37 @@ mod tests {
     }
 
     /// The program the musician seeds parses, every slot chooses among at
-    /// least 2 options, every bar fills 4/4, and the held endings are only
-    /// in the last slot.
+    /// least 2 options, every bar fills 4/4, and the rest endings are only
+    /// in the last slot (with bar 4 allowing the midpoint turnaround).
     ///
     /// Falsified by a bar that is short or long, a slot with one option, or
-    /// an ending offered before the last bar.
+    /// a rest ending offered before the last bar.
     #[test]
     fn the_shipped_bass_program_parses_and_its_bars_fill_the_measure() {
         let path = "/config/rc/musician/programs/bass-bars.json";
         let text = crate::seed_scripts::seed_body(path).expect("the program ships as an rc seed");
         let program = Program::parse("nagaya", path, text).unwrap();
-        assert_eq!((program.options.len(), program.slots.len(), program.shuffle, program.no_repeat), (12, 4, 4, true));
+        assert_eq!((program.options.len(), program.slots.len(), program.shuffle, program.no_repeat), (12, 8, 2, true));
         assert!(program.slots.iter().all(|s| s.options.len() >= 2));
         for option in &program.options {
             assert_eq!(eighths(&option.text), 8, "{}: {}", option.id, option.text);
         }
         let ending = |o: usize| note_lengths(&program.options[o].text).iter().any(|n| *n >= 4);
+        let rest_ending = |o: usize| ending(o) && program.options[o].text.contains('z');
         let (last, rest) = program.slots.split_last().unwrap();
         assert!(last.options.iter().all(|o| ending(*o)), "the last bar holds a note");
-        assert!(rest.iter().all(|s| s.options.iter().all(|o| !ending(*o))), "no ending before the last bar");
-        let reply = program.reply_text(&[0, 1, 2, 4]);
-        assert!(reply.starts_with("X:1\nM:4/4\nL:1/8\nK:Em\n") && reply.ends_with(" |]") && reply.contains(" | "), "{reply}");
+        assert!(rest.iter().all(|s| s.options.iter().all(|o| !rest_ending(*o))), "no rest ending before the last bar");
+        for (i, slot) in rest.iter().enumerate() {
+            if i != 3 {
+                assert!(slot.options.iter().all(|o| !ending(*o)), "no held note in bar {}", i + 1);
+            }
+        }
+        let reply = program.reply_text(&[0, 1, 2, 3, 0, 1, 2, 4]);
+        assert!(
+            reply.starts_with("X:1\n%%MIDI channel 1\n%%MIDI program 33\nM:4/4\nL:1/8\nK:Em\n")
+                && reply.ends_with(" |]")
+                && reply.contains(" | "),
+            "{reply}"
+        );
     }
 }
