@@ -336,6 +336,27 @@ impl SubscriptionHub {
                     })),
                 );
                 self.mark_dirty(SubscriptionUri::Doc(*context_id));
+                if block.kind == kaijutsu_types::BlockKind::Drift {
+                    self.push_local_drift(
+                        *context_id,
+                        DriftRecord {
+                            id: block.id.seq,
+                            source_ctx: block
+                                .source_context
+                                .map(|c| c.to_hex())
+                                .unwrap_or_default(),
+                            target_ctx: context_id.to_hex(),
+                            content: block.content.clone(),
+                            source_model: block.source_model.clone().unwrap_or_default(),
+                            drift_kind: block
+                                .drift_kind
+                                .map(drift_kind_wire)
+                                .unwrap_or("push")
+                                .to_string(),
+                            created_at: block.created_at,
+                        },
+                    );
+                }
             }
             ServerEvent::BlockStatusChanged {
                 context_id,
@@ -532,6 +553,17 @@ fn stop_reason_wire(reason: TurnCompletedStopReason) -> &'static str {
     }
 }
 
+fn drift_kind_wire(kind: kaijutsu_types::DriftKind) -> &'static str {
+    match kind {
+        kaijutsu_types::DriftKind::Push => "push",
+        kaijutsu_types::DriftKind::Pull => "pull",
+        kaijutsu_types::DriftKind::Merge => "merge",
+        kaijutsu_types::DriftKind::Distill => "distill",
+        kaijutsu_types::DriftKind::Notification => "notification",
+        kaijutsu_types::DriftKind::Fork => "fork",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +683,47 @@ mod tests {
             !hub.has_drift_subscriber(ctx),
             "dropping last subscriber must clear has_drift_subscriber"
         );
+    }
+
+    #[tokio::test]
+    async fn drift_block_inserted_marks_drift_uri_dirty() {
+        let hub = SubscriptionHub::with_coalesce_window(Duration::from_millis(15));
+        let mut rx = hub.subscribe();
+        let ctx = ContextId::new();
+        let src_ctx = ContextId::new();
+        let principal = kaijutsu_types::PrincipalId::new();
+
+        let mut block = kaijutsu_types::BlockSnapshot::text(
+            kaijutsu_types::BlockId::new(ctx, principal, 7),
+            None,
+            kaijutsu_types::Role::System,
+            "live drift content",
+        );
+        block.kind = kaijutsu_types::BlockKind::Drift;
+        block.source_context = Some(src_ctx);
+
+        hub.record_server_event(&ServerEvent::BlockInserted {
+            context_id: ctx,
+            block: Box::new(block),
+        });
+
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            let uri = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("should flush within timeout")
+                .expect("broadcast recv");
+            seen.insert(uri);
+        }
+
+        let drift_uri = SubscriptionUri::Drift(ctx).to_uri();
+        assert!(
+            seen.contains(&drift_uri),
+            "expected {drift_uri} to be marked dirty for BlockKind::Drift, saw {seen:?}"
+        );
+        let drained = hub.drain_local_drifts(ctx);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].content, "live drift content");
+        assert_eq!(drained[0].source_ctx, src_ctx.to_hex());
     }
 }

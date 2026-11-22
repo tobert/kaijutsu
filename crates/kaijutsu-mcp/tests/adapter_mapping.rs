@@ -259,3 +259,133 @@ fn hook_context_reaches_only_events_that_take_additional_context() {
         }
     }
 }
+
+#[test]
+fn antigravity_adapts_camel_case_events() {
+    let pre = HookSource::Antigravity
+        .adapt(serde_json::json!({
+            "hookEventName": "PreToolUse",
+            "conversationId": "conv-1234",
+            "workspacePaths": ["/home/user/src/kaijutsu", "/tmp/other"],
+            "transcriptPath": "/tmp/transcript.jsonl",
+            "toolName": "run_command",
+            "toolInput": { "CommandLine": "cargo test" }
+        }))
+        .expect("PreToolUse adapted");
+    assert_eq!(pre.event, "tool.before");
+    assert_eq!(pre.source, "antigravity");
+    assert_eq!(pre.session_id.as_deref(), Some("conv-1234"));
+    assert_eq!(pre.cwd.as_deref(), Some("/home/user/src/kaijutsu"));
+    assert_eq!(pre.transcript_path.as_deref(), Some("/tmp/transcript.jsonl"));
+    let pre_tool = pre.tool.expect("tool present");
+    assert_eq!(pre_tool.name, "run_command");
+    assert_eq!(pre_tool.input["CommandLine"], "cargo test");
+
+    let post = HookSource::Antigravity
+        .adapt(serde_json::json!({
+            "hookEventName": "PostToolUse",
+            "conversationId": "conv-1234",
+            "toolName": "run_command",
+            "toolInput": { "CommandLine": "echo hi" },
+            "toolOutput": "hi\n",
+            "durationMs": 42
+        }))
+        .expect("PostToolUse adapted");
+    assert_eq!(post.event, "tool.after");
+    let post_tool = post.tool.expect("tool present");
+    assert_eq!(post_tool.output.as_deref(), Some("hi\n"));
+    assert_eq!(post_tool.duration_ms, Some(42));
+
+    let start = HookSource::Antigravity
+        .adapt(serde_json::json!({
+            "hookEventName": "SessionStart",
+            "conversationId": "conv-1234",
+            "workspacePaths": ["/home/user/src/kaijutsu"],
+            "model": "gemini-3-pro"
+        }))
+        .expect("SessionStart adapted");
+    assert_eq!(start.event, "session.start");
+    assert_eq!(start.model.as_deref(), Some("gemini-3-pro"));
+
+    let prompt = HookSource::Antigravity
+        .adapt(serde_json::json!({
+            "hookEventName": "PreInvocation",
+            "conversationId": "conv-1234",
+            "prompt": "check the build"
+        }))
+        .expect("PreInvocation adapted");
+    assert_eq!(prompt.event, "prompt.submit");
+    assert_eq!(prompt.prompt.as_deref(), Some("check the build"));
+
+    let stop = HookSource::Antigravity
+        .adapt(serde_json::json!({
+            "hookEventName": "Stop",
+            "conversationId": "conv-1234",
+            "response": "all green"
+        }))
+        .expect("Stop adapted");
+    assert_eq!(stop.event, "agent.stop");
+    assert_eq!(stop.response.as_deref(), Some("all green"));
+}
+
+#[test]
+fn antigravity_response_formats_additional_context_only_on_safe_events() {
+    use kaijutsu_mcp::hook_types::HookResponse;
+    let response = HookResponse::allow_with_context("drift: check main");
+
+    for event in ["PreToolUse", "PostToolUse", "PreInvocation", "SessionStart"] {
+        let out = HookSource::Antigravity
+            .response(event, &response)
+            .unwrap_or_else(|| panic!("expected response for {event}"));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["additionalContext"], "drift: check main");
+    }
+
+    for event in ["Stop", "PostInvocation", "SessionEnd"] {
+        assert_eq!(
+            HookSource::Antigravity.response(event, &response),
+            None,
+            "{event} must not emit additionalContext"
+        );
+    }
+
+    let empty = HookResponse::allow();
+    assert_eq!(HookSource::Antigravity.response("PreToolUse", &empty), None);
+}
+
+#[test]
+fn agy_cli_alias_adapts_single_line_json() {
+    let payload = serde_json::json!({
+        "hookEventName": "PreInvocation",
+        "conversationId": "conv-9999",
+        "workspacePaths": ["/tmp/work"],
+        "prompt": "hello from agy"
+    })
+    .to_string();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kaijutsu-mcp"))
+        .args(["hook", "agy", "--dry-run"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(payload.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("run native Antigravity adapter via agy alias");
+
+    assert!(
+        out.status.success(),
+        "agy hook dry-run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let ev: HookEvent = serde_json::from_str(stdout.trim()).expect("parse HookEvent");
+    assert_eq!(ev.source, "antigravity");
+    assert_eq!(ev.event, "prompt.submit");
+    assert_eq!(ev.session_id.as_deref(), Some("conv-9999"));
+    assert_eq!(ev.cwd.as_deref(), Some("/tmp/work"));
+    assert_eq!(ev.prompt.as_deref(), Some("hello from agy"));
+}
