@@ -24,7 +24,7 @@ use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::text::color_to_rgba8;
 use crate::text::msdf::{
     FontDataMap, MsdfAtlas, MsdfBlockGeometry, MsdfBlockGlyphs, PositionedGlyph,
-    collect_msdf_glyphs, geometry::GeometryVertex,
+    collect_msdf_glyphs, geometry::{GeometryVertex, rect_quad},
 };
 use crate::shaders::BlockFxMaterial;
 use crate::view::block_render::GpuTextureLimits;
@@ -94,6 +94,30 @@ pub struct ContextsState {
     pub notification: Option<(String, String)>, // (source_ctx, preview)
 }
 
+/// The active context's performer, for the North dock's conversation header:
+/// a small identity-colored mark beside the performer's name.
+///
+/// Empty ([`PerformerBadge::default`]) means there is nothing to show — the
+/// screen is not the conversation, or the active context records no performer.
+/// The model and the context label are different facts and are never
+/// substituted: an unrecorded performer gets no mark and no name.
+#[derive(Debug, Clone)]
+pub struct PerformerBadge {
+    /// The performer's name, drawn in the dock's neutral text color.
+    pub name: String,
+    /// The mark's identity color; `Color::NONE` when `name` is empty.
+    pub mark: Color,
+}
+
+impl Default for PerformerBadge {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mark: Color::NONE,
+        }
+    }
+}
+
 /// All dock widget data — the single resource driving both dock renders.
 #[derive(Resource)]
 pub struct DockState {
@@ -106,6 +130,10 @@ pub struct DockState {
     /// `update_global_errors_badge`.
     pub global_errors: DockText,
     pub connection: DockText,
+    /// The active context's performer — the conversation header's identity
+    /// mark and name (see [`PerformerBadge`]). Empty whenever the screen is
+    /// not the conversation, or the active context records no performer.
+    pub performer: PerformerBadge,
 
     // North dock sparklines
     pub event_spark: DockSparkline,
@@ -168,6 +196,7 @@ impl Default for DockState {
                 color: Color::WHITE,
                 font_size: 16.0,
             },
+            performer: PerformerBadge::default(),
             event_spark: DockSparkline::new(40),
             activity_spark: DockSparkline::new(40),
             mode: DockText {
@@ -320,6 +349,90 @@ fn append_dock_sparkline(
         color_to_rgba8(line_color),
         Some(color_to_rgba8(line_color.with_alpha(fill_alpha))),
     ));
+}
+
+// ============================================================================
+// PERFORMER HEADER
+// ============================================================================
+
+/// Size of the performer mark in logical px. Fixed: the mark is an identity
+/// chip, not a meter, so it never scales with the data it marks.
+pub(crate) const PERFORMER_MARK_SIZE: f64 = 8.0;
+/// Distance from the mark's right edge to the name's left edge.
+pub(crate) const PERFORMER_MARK_NAME_GAP: f64 = 6.0;
+/// Space between the title and the mark, and the clearance the badge needs
+/// before the right group.
+pub(crate) const PERFORMER_BADGE_GAP: f64 = 16.0;
+/// The name's font size — the same small class as the pulse and connection
+/// text.
+pub(crate) const PERFORMER_NAME_FONT_SIZE: f32 = 13.0;
+
+/// Identity saturation and lightness for the mark, in the UI lane. The hue
+/// rule is shared with every other identity color; the brightness is this
+/// lane's, and it stays below 1.0 so no mark can reach HDR and bloom.
+const PERFORMER_MARK_SATURATION: f32 = 0.55;
+const PERFORMER_MARK_LIGHTNESS: f32 = 0.62;
+
+/// The identity color of `name`'s mark, in the UI lane.
+pub(crate) fn performer_mark_color(name: &str) -> Color {
+    Color::LinearRgba(crate::view::scene_palette::identity_color_linear(
+        name,
+        PERFORMER_MARK_SATURATION,
+        PERFORMER_MARK_LIGHTNESS,
+    ))
+}
+
+/// The badge for one frame, from what the data systems resolved.
+///
+/// `performer` is the active context's `ContextInfo::performer`: `None` when
+/// there is no active context, no entry for it, or the entry records nobody —
+/// all three mean "draw nothing". Pure, so the screen, missing-metadata and
+/// identity rules are testable without a running app.
+pub(crate) fn performer_badge(
+    screen: crate::ui::screen::Screen,
+    performer: Option<&str>,
+) -> PerformerBadge {
+    use crate::ui::screen::Screen;
+
+    if screen != Screen::Conversation {
+        return PerformerBadge::default();
+    }
+    let Some(name) = performer.filter(|name| !name.is_empty()) else {
+        return PerformerBadge::default();
+    };
+    PerformerBadge {
+        name: name.to_string(),
+        mark: performer_mark_color(name),
+    }
+}
+
+/// Where the header badge sits, in logical px from the dock's left edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PerformerBadgeLayout {
+    /// Left edge of the mark.
+    pub mark_x: f64,
+    /// Left edge of the name.
+    pub name_x: f64,
+}
+
+/// Place the badge after the title, or return `None` when it does not fit.
+///
+/// `title_right` is the title's right edge (left inset plus its advance) and
+/// `right_limit` is the right group's left edge. The badge is one unit — mark,
+/// gap, name — and it keeps one more gap of clearance before `right_limit`, so
+/// a tight header drops the badge whole rather than squeezing it or letting it
+/// run into the status text.
+pub(crate) fn performer_badge_layout(
+    title_right: f64,
+    name_width: f64,
+    right_limit: f64,
+) -> Option<PerformerBadgeLayout> {
+    let mark_x = title_right + PERFORMER_BADGE_GAP;
+    let name_x = mark_x + PERFORMER_MARK_SIZE + PERFORMER_MARK_NAME_GAP;
+    (name_x + name_width <= right_limit - PERFORMER_BADGE_GAP).then_some(PerformerBadgeLayout {
+        mark_x,
+        name_x,
+    })
 }
 
 // ============================================================================
@@ -496,6 +609,35 @@ pub fn render_north_dock(
 
     // Draw sparklines
     let spark_y = (36.0 - spark_h) / 2.0; // vertically center in 36px dock
+
+    // Conversation header: the active performer's identity mark and name,
+    // right of the title. One unit — drawn whole or omitted whole — so a
+    // narrow dock never shows a mark without its name, and the badge keeps a
+    // gap of clearance before the right group so the two never overlap.
+    let title_w = measure_text(&dock_state.title.text, dock_state.title.font_size, title_font);
+    let name_w = measure_text(&dock_state.performer.name, PERFORMER_NAME_FONT_SIZE, font);
+    if !dock_state.performer.name.is_empty()
+        && let Some(badge) = performer_badge_layout(pad_h + title_w, name_w, right_x)
+    {
+        geometry.extend(rect_quad(
+            badge.mark_x,
+            spark_y + (spark_h - PERFORMER_MARK_SIZE) * 0.5,
+            PERFORMER_MARK_SIZE,
+            PERFORMER_MARK_SIZE,
+            color_to_rgba8(dock_state.performer.mark),
+        ));
+        collect_dock_text_glyphs(
+            &mut glyphs,
+            &dock_state.performer.name,
+            badge.name_x,
+            pad_v + 4.0, // the small text class, same offset as the pulse
+            PERFORMER_NAME_FONT_SIZE,
+            font,
+            &bevy_color_to_brush(theme.fg_dim),
+            atlas,
+            &mut font_data_map,
+        );
+    }
     append_dock_sparkline(
         &mut geometry,
         &dock_state.event_spark.data,
@@ -1168,6 +1310,113 @@ mod tests {
         BackgroundActivityLevel, PRESENCE_MAX_AGE,
     };
     use crate::ui::theme::Theme;
+
+    /// The mark's color is a pure function of the performer's name: one
+    /// performer keeps one color, and different performers do not share one.
+    /// The hue comes from the shared identity rule at this lane's saturation
+    /// and lightness, so every channel stays inside sRGB — a mark that reached
+    /// HDR would bloom, and dock chrome must not (`docs/newui.md`, "Light").
+    #[test]
+    fn performer_mark_color_is_deterministic_and_ui_scale() {
+        use super::performer_mark_color;
+
+        assert_eq!(
+            performer_mark_color("soprano"),
+            performer_mark_color("soprano"),
+            "one performer, one color",
+        );
+        let names = ["bass", "drums", "lead", "vox"];
+        assert!(
+            names
+                .windows(2)
+                .any(|pair| performer_mark_color(pair[0]) != performer_mark_color(pair[1])),
+            "a constant color would satisfy determinism and nothing else",
+        );
+
+        for name in ["bass", "drums", "lead", "vox", "", "soprano"] {
+            let s = performer_mark_color(name).to_srgba();
+            for channel in [s.red, s.green, s.blue, s.alpha] {
+                assert!(
+                    (0.0..=1.0).contains(&channel),
+                    "{name}: {channel} is outside the sRGB range a dock mark may use",
+                );
+            }
+        }
+    }
+
+    /// The badge appears on the conversation screen and nowhere else, and an
+    /// unrecorded performer gets no mark and no name — the model and the
+    /// context label are different facts and never stand in. The badge is a
+    /// pure function of this frame's performer, so a switch to a context
+    /// without metadata yields the empty badge rather than the previous
+    /// identity.
+    #[test]
+    fn performer_badge_needs_the_conversation_and_a_recorded_performer() {
+        use super::{performer_badge, performer_mark_color};
+        use crate::ui::screen::Screen;
+        use bevy::prelude::Color;
+
+        let shown = performer_badge(Screen::Conversation, Some("soprano"));
+        assert_eq!(shown.name, "soprano");
+        assert_eq!(shown.mark, performer_mark_color("soprano"));
+
+        // A switch is simply the next frame's performer: the badge names the
+        // new one and never carries the previous identity forward.
+        let switched = performer_badge(Screen::Conversation, Some("baritone"));
+        assert_ne!(shown.name, switched.name);
+        assert_ne!(
+            performer_badge(Screen::Conversation, None).mark,
+            shown.mark,
+            "a context with no performer keeps no color, not the old one",
+        );
+
+        for screen in [Screen::Room, Screen::Editor, Screen::Diff, Screen::Heroic] {
+            let badge = performer_badge(screen, Some("soprano"));
+            assert!(
+                badge.name.is_empty(),
+                "{screen:?} has no conversation header",
+            );
+            assert_eq!(badge.mark, Color::NONE);
+        }
+
+        for missing in [None, Some("")] {
+            let badge = performer_badge(Screen::Conversation, missing);
+            assert!(badge.name.is_empty(), "{missing:?} records no performer");
+            assert_eq!(badge.mark, Color::NONE);
+        }
+    }
+
+    /// A tight header drops the badge whole: it is placed only when the mark,
+    /// its gap and the name all clear the right group's left edge.
+    #[test]
+    fn performer_badge_is_omitted_when_the_header_is_tight() {
+        use super::{
+            PERFORMER_BADGE_GAP, PERFORMER_MARK_NAME_GAP, PERFORMER_MARK_SIZE,
+            performer_badge_layout,
+        };
+
+        let title_right = 120.0;
+        let name_width = 60.0;
+
+        let roomy =
+            performer_badge_layout(title_right, name_width, 400.0).expect("room to spare");
+        assert_eq!(roomy.mark_x, title_right + PERFORMER_BADGE_GAP);
+        assert_eq!(
+            roomy.name_x,
+            roomy.mark_x + PERFORMER_MARK_SIZE + PERFORMER_MARK_NAME_GAP,
+        );
+
+        // Exactly enough room still places it; one pixel less does not.
+        let needed = roomy.name_x + name_width + PERFORMER_BADGE_GAP;
+        assert!(performer_badge_layout(title_right, name_width, needed).is_some());
+        assert!(
+            performer_badge_layout(title_right, name_width, needed - 1.0).is_none(),
+            "the badge must not creep into the right group",
+        );
+
+        // A header narrower than the title alone never places it.
+        assert!(performer_badge_layout(title_right, name_width, title_right).is_none());
+    }
 
     /// The dock says so while an agent may drive the app, and stops saying so
     /// when the latch is released.
@@ -2323,6 +2572,37 @@ pub fn update_model_badge(
     }
 }
 
+/// Resolve the active context's performer for the North dock's conversation
+/// header.
+///
+/// `ContextInfo::performer` is the only source: the model name and the context
+/// label are different facts and are never substituted. The badge is rewritten
+/// whenever the screen, the active context, or the context list changes, so a
+/// switch to a context without performer metadata clears the mark and name
+/// instead of leaving the previous identity on screen.
+pub fn update_performer_badge(
+    screen: Res<State<crate::ui::screen::Screen>>,
+    drift_state: Res<DriftState>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    mut dock: ResMut<DockState>,
+) {
+    if !screen.is_changed() && !drift_state.is_changed() && !doc_cache.is_changed() {
+        return;
+    }
+
+    let performer = doc_cache.active_id().and_then(|active_id| {
+        drift_state
+            .contexts
+            .iter()
+            .find(|ctx| ctx.id == active_id)
+            .and_then(|ctx| ctx.performer.as_deref())
+    });
+    let want = performer_badge(*screen.get(), performer);
+    if dock.performer.name != want.name || dock.performer.mark != want.mark {
+        dock.performer = want;
+    }
+}
+
 /// Shorten a model name for display (e.g. "claude-opus-4-6" -> "opus-4.6").
 fn shorten_model_name(model: &str) -> String {
     let m = model.strip_prefix("claude-").unwrap_or(model);
@@ -2741,6 +3021,7 @@ impl Plugin for DockPlugin {
                     update_hints,
                     update_event_pulse,
                     update_model_badge,
+                    update_performer_badge,
                     update_context_usage_badge,
                     update_block_activity,
                     update_background_jobs,
