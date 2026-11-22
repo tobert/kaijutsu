@@ -6294,8 +6294,9 @@ mod tests {
             assert!(instructions.contains(&format!("we are {name},")), "name={name}: {instructions}");
             let handoff = blocks.iter().find(|b| b.kind == kaijutsu_types::BlockKind::Notification
                 && b.content.contains("name-specific-history")).expect("performer's handoff");
-            let advice = handoff.content.lines().find(|line| line.trim_start().starts_with("kj handoff note"))
-                .expect("handoff command").trim();
+            // The advice is shown in backticks; the test runs the command inside them.
+            let advice = handoff.content.lines().find(|line| line.trim_start().trim_start_matches('`').starts_with("kj handoff note"))
+                .expect("handoff command").trim().trim_matches('`');
             let shell = crate::runtime::embedded_kaish::EmbeddedKaish::for_context(
                 &d,
                 "handoff-advice",
