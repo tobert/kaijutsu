@@ -52,12 +52,12 @@ case "$who" in
   "")
     who="your character"
     notes="$(kj handoff tail --window $window || true)"
-    note_cmd="kj handoff note 'what you did, what is next'"
+    note_cmd="`kj handoff note 'what you did, what is next'`"
     ;;
   *)
     notes="$(kj handoff tail --window "$window" "$who" || true)"
     # Resolve by context so a name is passed as a value, never shell source.
-    note_cmd="kj handoff note --for \"\$(kj context info $KJ_CONTEXT --json | jq -r .performer_name)\" 'what you did, what is next'"
+    note_cmd="`kj handoff note --for \"\$(kj context info '$KJ_CONTEXT' --json | jq -r .performer_name)\" 'what you did, what is next'`"
     ;;
 esac
 

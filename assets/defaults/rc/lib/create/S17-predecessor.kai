@@ -23,7 +23,7 @@ prev="$(kj context info --json | jq -r '.env.ROTATED_FROM | tostring')"
 
 case "$prev" in
   null|"")
-    echo "predecessor: none (kj context rotate sets ROTATED_FROM to carry a tail)"
+    echo "predecessor: none (`kj context rotate` sets ROTATED_FROM to carry a tail)"
     exit 0
     ;;
 esac
@@ -50,7 +50,7 @@ stamp="$(date -u --iso-8601=seconds)"
 
 content="=== Rotated from context '$prev' (auto-injected at create) ===
 No handoff brief came with this rotation, so what follows is a transcript excerpt, not a task list: the predecessor's last 12 prose blocks, each cut at 400 bytes, read $stamp. If nothing in it says who is waiting on you, ask the person what is next.
-Read more with: kj block list -c '$prev'   then   kj block read -c '$prev' '<id>'
+Read more with: `kj block list -c '$prev'`   then   `kj block read -c '$prev' '<id>'`
 The predecessor's handoff note, if it left one, is in the handoff block above.
 
 $tail"

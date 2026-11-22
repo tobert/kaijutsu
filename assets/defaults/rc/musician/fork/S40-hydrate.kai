@@ -30,7 +30,7 @@
 set -e
 case "$KJ_FORK_INFO" in
   *'"kind":"full"'*)
-    echo "fork: full clone — hydration window left unset (full history stays live; arm + 'kj context hydrate' to window it)"
+    echo "fork: full clone — hydration window left unset (full history stays live; arm + `kj context hydrate` to window it)"
     ;;
   *)
     kj context hydrate --window 16

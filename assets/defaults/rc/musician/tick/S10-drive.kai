@@ -85,6 +85,6 @@ if [[ "$uncovered" = "repeat" ]] && [[ "$phrases" -gt 1 ]]; then
   done
 fi
 if [[ -n "$listen_failed" ]]; then
-  echo "tick: drove without listening; kj audio render --track $KJ_LISTEN failed: $listen_failed"
+  echo "tick: drove without listening; `kj audio render --track '$KJ_LISTEN'` failed: $listen_failed"
   exit 1
 fi
