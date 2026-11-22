@@ -60,6 +60,13 @@ fi
 out="$out
 $line"
 
+# A rotation names its predecessor, like a colleague handing over the desk.
+prev="$(jq -n -r --argjson i "$info" '$i | (.env.ROTATED_FROM // empty) | .[0:8]' || true)"
+if test -n "$prev"; then
+  out="$out
+You are taking over from '$prev'."
+fi
+
 if test -n "$cwd"; then
   out="$out
 You are working in $cwd."
@@ -68,7 +75,7 @@ else
 You have no working directory, so your shell starts where the kernel runs."
 fi
 
-# Asks wait kernel-wide, oldest first; count the pending ones.
+# Asks wait kernel-wide, not per reviewer; count the pending ones and say so.
 asks="unknown"
 set +e
 raw_asks="$(kj ledger list --json)"
@@ -99,7 +106,7 @@ case "$workers" in
   *) workers_text="$workers workers" ;;
 esac
 out="$out
-Waiting on you: $asks_text, $workers_text."
+Asks pending on this kernel: $asks_text. Workers answering to you: $workers_text."
 
 # Named routes, from the optional companion file.
 routes=""

@@ -4549,6 +4549,21 @@ esac
         (cards, errors, ctx)
     }
 
+    /// A rotated context is told it is taking over, and from whom; a new one is not.
+    #[test]
+    fn the_arrival_card_says_when_a_context_is_taking_over() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let caller = console_caller(&d);
+            let (cards, errors, _) = arrival_card_for(&d, &caller, "senpai", "successor", &["--env", "ROTATED_FROM=01a20519931b738faa5688b49c1725a0"]).await;
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(cards[0].content.contains("You are taking over from '01a20519'."), "{}", cards[0].content);
+            let (cards, _, _) = arrival_card_for(&d, &caller, "senpai", "fresh", &[]).await;
+            assert!(!cards[0].content.contains("taking over"), "{}", cards[0].content);
+        });
+    }
+
     /// A senpai and a kohai each get one card in a NOTIFICATION block that
     /// names the label, the senpai, the reviewer, and the cwd; the run leaves
     /// no Error block, and the card stays out of the cached system prompt.
@@ -4564,7 +4579,7 @@ esac
             assert_eq!(cards.len(), 1, "{cards:#?}");
             let text = &cards[0].content;
             assert_eq!(cards[0].role, Role::System);
-            for needle in ["'lead'", "You answer to", "reviews your asks", "/work", "Waiting on you: no asks, no workers"] {
+            for needle in ["'lead'", "You answer to", "reviews your asks", "/work", "Asks pending on this kernel: no asks. Workers answering to you: no workers."] {
                 assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
             }
             assert!(text.lines().count() <= 10, "{text}");
