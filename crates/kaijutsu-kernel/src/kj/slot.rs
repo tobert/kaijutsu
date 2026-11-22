@@ -155,6 +155,14 @@ pub(super) enum CharacterModelCommand {
         /// it. A context copies this when it is made or rotated
         #[arg(long = "reasoning-summary", value_parser = crate::kernel_db::REASONING_SUMMARIES)]
         reasoning_summary: Option<String>,
+        /// Whether the ChatGPT plan route replays a `phase` on assistant
+        /// messages: `commentary` before a tool call, `final_answer` on a
+        /// finished turn's last message. Without it, or `off`, no `phase` is
+        /// sent. Other backends ignore it. Setting the model without
+        /// `--replay-phase` clears it. A context copies this when it is made
+        /// or rotated
+        #[arg(long = "replay-phase", value_parser = crate::kernel_db::REPLAY_PHASES)]
+        replay_phase: Option<String>,
     },
     /// Remove the character's model. Role slots stay. Contexts keep the
     /// slots they copied until they are rotated.
@@ -204,6 +212,7 @@ pub(super) fn model_data(
         "preview_kib": m.preview_kib,
         "verbosity": m.verbosity,
         "reasoning_summary": m.reasoning_summary,
+        "replay_phase": m.replay_phase,
     })
 }
 
@@ -225,6 +234,9 @@ pub(super) fn model_summary(
     }
     if let Some(v) = &m.reasoning_summary {
         knobs.push(format!("reasoning_summary={v}"));
+    }
+    if let Some(v) = &m.replay_phase {
+        knobs.push(format!("replay_phase={v}"));
     }
     if knobs.is_empty() {
         format!("{backend}/{} (no parameters set)", m.model)
@@ -280,6 +292,7 @@ impl KjDispatcher {
                 preview_kib,
                 verbosity,
                 reasoning_summary,
+                replay_phase,
             } => {
                 let (backend, model) = match split_backend_model(&model) {
                     Ok(pair) => pair,
@@ -325,6 +338,7 @@ impl KjDispatcher {
                     preview_kib: preview_kib.map(i64::from),
                     verbosity,
                     reasoning_summary,
+                    replay_phase,
                 }) {
                     return KjResult::Err(format!("kj character model set: {e}"));
                 }
@@ -632,13 +646,15 @@ mod tests {
     #[tokio::test]
     async fn response_shape_settings_round_trip() {
         let d = seeded().await;
-        let set = argv(&["character", "model", "set", "house", "deepseek/deepseek-flash", "--verbosity", "medium", "--reasoning-summary", "concise"]);
+        let set = argv(&["character", "model", "set", "house", "deepseek/deepseek-flash", "--verbosity", "medium", "--reasoning-summary", "concise", "--replay-phase", "on"]);
         let r = d.dispatch(&set, &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
 
         match d.dispatch(&argv(&["character", "model", "show", "house"]), &test_caller()).await {
             KjResult::Ok { message, data: Some(v), .. } => {
                 assert!(message.contains("verbosity=medium") && message.contains("reasoning_summary=concise"), "{message}");
+                assert!(message.contains("replay_phase=on"), "{message}");
+                assert_eq!(v["replay_phase"], "on");
                 assert_eq!((v["verbosity"].as_str(), v["reasoning_summary"].as_str()), (Some("medium"), Some("concise")));
             }
             other => panic!("{other:?}"),
@@ -648,6 +664,7 @@ mod tests {
                 assert!(message.contains("verbosity=medium"), "{message}");
                 assert_eq!(v["model"]["verbosity"], "medium");
                 assert_eq!(v["model"]["reasoning_summary"], "concise");
+                assert_eq!(v["model"]["replay_phase"], "on");
             }
             other => panic!("{other:?}"),
         }
@@ -659,17 +676,19 @@ mod tests {
             db.write_context_character(context, performer, None, None).unwrap();
             let slot = db.context_slot(context, crate::model_resolution::MODEL).unwrap().expect("a model slot");
             assert_eq!((slot.verbosity.as_deref(), slot.reasoning_summary.as_deref()), (Some("medium"), Some("concise")));
+            assert_eq!(slot.replay_phase.as_deref(), Some("on"));
             let distill = db.context_slot(context, crate::model_resolution::DISTILL).unwrap().expect("a distill slot");
-            assert_eq!((distill.verbosity, distill.reasoning_summary), (None, None), "a one-shot copy carries neither");
+            assert_eq!((distill.verbosity, distill.reasoning_summary, distill.replay_phase), (None, None, None), "a one-shot copy carries none");
             let model = crate::model_resolution::context_model(&db, context).unwrap().into_model().unwrap();
             crate::llm::apply_tunables(crate::llm::BuildOpts::new("m", 1), &model.tunables)
         };
         assert_eq!((opts.verbosity.as_deref(), opts.reasoning_summary.as_deref()), (Some("medium"), Some("concise")));
+        assert_eq!(opts.replay_phase.as_deref(), Some("on"));
 
         let again = argv(&["character", "model", "set", "house", "deepseek/deepseek-flash"]);
         assert!(d.dispatch(&again, &test_caller()).await.is_ok());
         match d.dispatch(&argv(&["character", "model", "show", "house"]), &test_caller()).await {
-            KjResult::Ok { data: Some(v), .. } => assert!(v["verbosity"].is_null() && v["reasoning_summary"].is_null(), "{v}"),
+            KjResult::Ok { data: Some(v), .. } => assert!(v["verbosity"].is_null() && v["reasoning_summary"].is_null() && v["replay_phase"].is_null(), "{v}"),
             other => panic!("{other:?}"),
         }
     }
@@ -684,6 +703,7 @@ mod tests {
         for (flag, bad, accepted) in [
             ("--verbosity", "loud", ["low", "medium", "high"].as_slice()),
             ("--reasoning-summary", "full", ["none", "auto", "concise", "detailed"].as_slice()),
+            ("--replay-phase", "yes", ["on", "off"].as_slice()),
         ] {
             let r = d.dispatch(&argv(&["character", "model", "set", "house", "deepseek/deepseek-flash", flag, bad]), &test_caller()).await;
             match r {
@@ -1340,7 +1360,7 @@ mod tests {
                 thinking_budget: None,
                 thinking_style: None,
                 decide: Some("/config/rc/musician/programs/bass-bars.json".into()),
-                preview_kib: None, verbosity: None, reasoning_summary: None,
+                preview_kib: None, verbosity: None, reasoning_summary: None, replay_phase: None,
             })
             .unwrap();
             let ctx = kaijutsu_types::ContextId::new();

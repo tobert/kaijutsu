@@ -101,7 +101,7 @@ pub use tracks::{PersistedTrack, PersistedAttachment};
 pub use documents::{DocumentRow, DocSnapshotRow};
 pub use lineage::ContextEdgeRow;
 pub use llm_backends::{BackendRow, BackendModelRow, ModelTunablesRow, ModelAliasRow, EmbeddingConfigRow, embedding_refusal};
-pub use llm_characters::{CharacterRow, CharacterSlotRow, CharacterModelRow, REASONING_SUMMARIES, VERBOSITIES};
+pub use llm_characters::{CharacterRow, CharacterSlotRow, CharacterModelRow, REASONING_SUMMARIES, REPLAY_PHASES, VERBOSITIES};
 pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};

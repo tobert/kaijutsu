@@ -66,7 +66,7 @@ fn old() -> Old {
         db.set_character_model(&CharacterModelRow {
             principal_id, backend_id: backend, model: "m".into(), max_tokens: Some(512), temperature: None,
             top_p: None, effort: None, thinking_budget: None, thinking_style: None,
-            decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
+            decide: None, preview_kib: None, verbosity: None, reasoning_summary: None, replay_phase: None,
         }).unwrap();
         principal_id
     };

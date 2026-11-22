@@ -370,3 +370,33 @@ fn setting_a_senpai_clears_the_notes_about_it_and_keeps_the_others() {
     assert!(left.contains(&("senpai_assigned".to_string(), Some(other.context_id))), "another context keeps its notes");
     assert!(left.contains(&("dropped".to_string(), Some(other.context_id))));
 }
+
+/// Each column the fold copies is looked for on its own: an old
+/// `context_slots` that gained `verbosity` but not `reasoning_summary` or
+/// `replay_phase` still folds, with NULL for the missing ones.
+///
+/// Falsified by a fold that assumes one column implies another, which fails
+/// on a column the old table lacks.
+#[test]
+fn a_partly_altered_slots_table_still_folds() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         CREATE TABLE context_slots (
+             context_id BLOB, role TEXT, backend_id BLOB, model TEXT, max_tokens INTEGER,
+             context_window INTEGER, temperature REAL, top_p REAL, effort TEXT,
+             thinking_budget INTEGER, thinking_style TEXT, decide TEXT, preview_kib INTEGER,
+             verbosity TEXT);
+         INSERT INTO context_slots (context_id, role, backend_id, model, verbosity)
+             VALUES (x'01', 'model', x'02', 'm', 'low');",
+    )
+    .unwrap();
+    let have = ["decide", "preview_kib", "verbosity"];
+    conn.execute_batch(&fold_context_slots_sql(&|name| have.contains(&name))).unwrap();
+    let row: (Option<String>, Option<String>, Option<String>) = conn
+        .query_row("SELECT verbosity, reasoning_summary, replay_phase FROM context_slots", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(row, (Some("low".into()), None, None));
+}

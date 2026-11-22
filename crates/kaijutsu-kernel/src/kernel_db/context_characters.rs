@@ -97,6 +97,8 @@ pub struct ContextSlotRow {
     pub verbosity: Option<String>,
     /// The reasoning summary the ChatGPT plan route asks for.
     pub reasoning_summary: Option<String>,
+    /// Whether the ChatGPT plan route replays a derived `phase`.
+    pub replay_phase: Option<String>,
 }
 
 /// The settings only a character's model carries, which its `model` slot
@@ -107,6 +109,7 @@ pub(super) struct ModelOnly {
     pub(super) preview_kib: Option<i64>,
     pub(super) verbosity: Option<String>,
     pub(super) reasoning_summary: Option<String>,
+    pub(super) replay_phase: Option<String>,
 }
 
 /// One line of `context_character_migration_report`.
@@ -186,8 +189,8 @@ pub(super) fn insert_slot(conn: &Connection, context_id: ContextId, role: &str, 
     conn.execute(
         "INSERT INTO context_slots (context_id, role, backend_id, model, max_tokens, context_window,
                                     temperature, top_p, effort, thinking_budget, thinking_style, decide,
-                                    preview_kib, verbosity, reasoning_summary)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                    preview_kib, verbosity, reasoning_summary, replay_phase)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             blob_param(context_id.as_bytes()),
             role,
@@ -204,6 +207,7 @@ pub(super) fn insert_slot(conn: &Connection, context_id: ContextId, role: &str, 
             slot.model_only.preview_kib,
             slot.model_only.verbosity,
             slot.model_only.reasoning_summary,
+            slot.model_only.replay_phase,
         ],
     )?;
     Ok(())
@@ -241,12 +245,13 @@ fn row_to_slot(row: &rusqlite::Row<'_>) -> SqliteResult<ContextSlotRow> {
         preview_kib: row.get(12)?,
         verbosity: row.get(13)?,
         reasoning_summary: row.get(14)?,
+        replay_phase: row.get(15)?,
     })
 }
 
 const SLOT_COLS: &str = "context_id, role, backend_id, model, max_tokens, context_window, \
                          temperature, top_p, effort, thinking_budget, thinking_style, decide, preview_kib, \
-                         verbosity, reasoning_summary";
+                         verbosity, reasoning_summary, replay_phase";
 
 /// Give `child` a copy of `source`'s performance: the same performer and
 /// persona and every slot verbatim, with `source` as its senpai. A source with
@@ -297,10 +302,10 @@ pub(super) fn copy_character_into(conn: &Connection, source: ContextId, child: C
     conn.execute(
         "INSERT INTO context_slots (context_id, role, backend_id, model, max_tokens, context_window,
                                     temperature, top_p, effort, thinking_budget, thinking_style, decide,
-                                    preview_kib, verbosity, reasoning_summary)
+                                    preview_kib, verbosity, reasoning_summary, replay_phase)
          SELECT ?2, role, backend_id, model, max_tokens, context_window,
                 temperature, top_p, effort, thinking_budget, thinking_style, decide, preview_kib,
-                verbosity, reasoning_summary
+                verbosity, reasoning_summary, replay_phase
          FROM context_slots WHERE context_id = ?1",
         params![blob_param(source.as_bytes()), blob_param(child.as_bytes())],
     )?;
@@ -443,6 +448,7 @@ impl KernelDb {
                 preview_kib: model.preview_kib,
                 verbosity: model.verbosity.clone(),
                 reasoning_summary: model.reasoning_summary.clone(),
+                replay_phase: model.replay_phase.clone(),
             };
             self.copy_one_slot(context_id, MODEL, &subject, model.backend_id, &model.model, tunables.clone(), model_only)?;
             if !slots.iter().any(|slot| slot.role == DISTILL) {

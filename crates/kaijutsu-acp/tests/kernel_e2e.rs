@@ -669,7 +669,7 @@ fn deleting_a_session_archives_its_context_and_its_judge_shadow() {
             .expect("a council-server backend");
         db.set_character_model(&kaijutsu_kernel::kernel_db::CharacterModelRow {
             principal_id: judge, backend_id: nagaya.backend_id, model: "gemma".into(), max_tokens: None,
-            temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
+            temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None, preview_kib: None, verbosity: None, reasoning_summary: None, replay_phase: None,
         })
         .expect("give the judge its council server");
         db.note_senpai_intent(shadow, Some(seat)).expect("the shadow answers to the session");

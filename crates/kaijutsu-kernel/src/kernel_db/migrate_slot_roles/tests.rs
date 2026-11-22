@@ -150,7 +150,7 @@ fn a_character_s_type_slot_becomes_its_model_and_the_rest_are_reported() {
     r.db.set_character_model(&CharacterModelRow {
         principal_id: modeled, backend_id: r.deepseek, model: "kept".into(), max_tokens: Some(1000),
         temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
-        decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
+        decide: None, preview_kib: None, verbosity: None, reasoning_summary: None, replay_phase: None,
     }).unwrap();
     r.character_slot(modeled, "coder", r.deepseek, "ds-coder", Some(2000));
     let lead = r.character("kaijutsu-lead", None);

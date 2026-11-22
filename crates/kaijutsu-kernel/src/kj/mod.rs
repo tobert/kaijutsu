@@ -1166,7 +1166,7 @@ impl KjDispatcher {
             thinking_budget: slot.thinking_budget.and_then(|v| u64::try_from(v).ok()),
             thinking_style: slot.thinking_style.clone(),
             verbosity: None,
-            reasoning_summary: None,
+            reasoning_summary: None, replay_phase: None,
             decide: None,
         };
         let opts = crate::llm::apply_tunables(

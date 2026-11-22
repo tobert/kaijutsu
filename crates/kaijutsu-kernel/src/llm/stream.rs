@@ -416,6 +416,10 @@ pub struct BuildOpts {
     /// field, as Codex does); unset sends `auto`. Every other provider
     /// ignores it, warned once if set.
     pub reasoning_summary: Option<String>,
+    /// `on` | `off`. `on` replays a `phase` on assistant messages, derived
+    /// from their position in the turn. Only the ChatGPT plan route sends
+    /// it; unset is off. Every other provider ignores it, warned once if set.
+    pub replay_phase: Option<String>,
     /// VFS path of a decision program. Only a `council` backend takes it: its
     /// turn is then assembled from council decisions, with no tokens sampled
     /// by the server. Every other provider refuses a turn that has one rather
@@ -458,7 +462,7 @@ impl BuildOpts {
             thinking_budget: None,
             thinking_style: None,
             verbosity: None,
-            reasoning_summary: None,
+            reasoning_summary: None, replay_phase: None,
             decide: None,
             vfs: None,
             tools: Vec::new(),
@@ -514,6 +518,11 @@ impl BuildOpts {
         self
     }
 
+    pub fn with_replay_phase(mut self, replay_phase: impl Into<String>) -> Self {
+        self.replay_phase = Some(replay_phase.into());
+        self
+    }
+
     pub fn with_thinking_budget(mut self, thinking_budget: u64) -> Self {
         self.thinking_budget = Some(thinking_budget);
         self
@@ -561,6 +570,7 @@ pub fn apply_tunables(mut opts: BuildOpts, tunables: &SlotTunables) -> BuildOpts
     opts.thinking_style = tunables.thinking_style.clone();
     opts.verbosity = tunables.verbosity.clone();
     opts.reasoning_summary = tunables.reasoning_summary.clone();
+    opts.replay_phase = tunables.replay_phase.clone();
     opts.decide = tunables.decide.clone();
     opts
 }
@@ -939,6 +949,7 @@ mod tests {
                 thinking_style: Some("auto".into()),
                 verbosity: Some("high".into()),
                 reasoning_summary: Some("concise".into()),
+                replay_phase: Some("on".into()),
                 decide: None,
             }
         }
@@ -954,6 +965,7 @@ mod tests {
             assert_eq!(opts.thinking_style.as_deref(), Some("auto"));
             assert_eq!(opts.verbosity.as_deref(), Some("high"));
             assert_eq!(opts.reasoning_summary.as_deref(), Some("concise"));
+            assert_eq!(opts.replay_phase.as_deref(), Some("on"));
         }
 
         #[test]
