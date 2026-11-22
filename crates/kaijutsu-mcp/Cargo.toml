@@ -31,7 +31,15 @@ clap.workspace = true
 hostname.workspace = true
 
 # MCP server
-rmcp = { workspace = true, features = ["server", "macros", "transport-io"] }
+rmcp = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+
+# Streamable HTTP service mode (UDS + optional loopback TCP)
+http.workspace = true
+tokio-util.workspace = true
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tower-service = "0.3"
 
 # Serialization
 serde = { workspace = true }
@@ -59,3 +67,4 @@ log = { workspace = true }
 # doc_task's unit tests implement DocSyncBackend for a fake backend, mirroring
 # the CasFetch test-double pattern in kaijutsu-client's sftp.rs.
 async-trait = { workspace = true }
+rmcp = { workspace = true, features = ["transport-streamable-http-client-unix-socket"] }

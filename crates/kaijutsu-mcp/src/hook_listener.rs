@@ -185,6 +185,13 @@ pub struct HookListener {
     /// that method's doc comment for why `session.end` alone must not
     /// archive.
     session_end_recorded: Mutex<bool>,
+    /// Resource subscription hub used to suppress hook drift injection when an
+    /// active MCP `subscriptions/listen` stream already covers drift for the
+    /// context.
+    subscriptions: crate::subscriptions::SubscriptionHub,
+    /// When true (service mode shared listener), accept hook events from any
+    /// `session_id` without enforcing single-host foreign-session refusal.
+    multi_session: bool,
 }
 
 /// Whether `incoming`, carried by a hook event named `event`, replaces the
@@ -246,7 +253,24 @@ impl HookListener {
             agent_name: Arc::new(Mutex::new(None)),
             pending_label_base: Mutex::new(None),
             session_end_recorded: Mutex::new(false),
+            subscriptions: crate::subscriptions::SubscriptionHub::new(),
+            multi_session: false,
         }
+    }
+
+    /// Attach a shared [`crate::subscriptions::SubscriptionHub`] to this listener.
+    pub fn with_subscriptions(
+        mut self,
+        subscriptions: crate::subscriptions::SubscriptionHub,
+    ) -> Self {
+        self.subscriptions = subscriptions;
+        self
+    }
+
+    /// Enable or disable multi-session mode (for shared service-mode `POST /hook`).
+    pub fn with_multi_session(mut self, multi_session: bool) -> Self {
+        self.multi_session = multi_session;
+        self
     }
 
     /// Create a listener backed by a remote connection.
@@ -283,6 +307,7 @@ impl HookListener {
         agent_name: Arc<Mutex<Option<String>>>,
         pending_label_base: Option<String>,
     ) -> Self {
+        let subscriptions = remote.subscriptions.clone();
         Self {
             local_store: None,
             shared_context_id,
@@ -293,6 +318,8 @@ impl HookListener {
             agent_name,
             pending_label_base: Mutex::new(pending_label_base),
             session_end_recorded: Mutex::new(false),
+            subscriptions,
+            multi_session: false,
         }
     }
 
@@ -422,6 +449,83 @@ impl HookListener {
         }
     }
 
+    /// Build a [`PingResponse`] describing this listener's current status.
+    pub async fn handle_ping(&self) -> PingResponse {
+        let pending = self.pending_drift_count().await;
+        let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
+        PingResponse {
+            status: "ok".to_string(),
+            pid: std::process::id(),
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string()),
+            context_name: self.context_id().map(|id| id.short()),
+            document_id: self.context_id().map(|id| id.to_hex()),
+            session_id,
+            pending_drifts: pending,
+        }
+    }
+
+    /// Process one parsed [`HookEvent`] with session checks, label
+    /// stabilization, and the hook path budget. Shared by the newline-JSON
+    /// Unix socket listener and the service-mode `POST /hook` endpoint.
+    pub async fn handle_event(&self, event: HookEvent) -> HookResponse {
+        if !self.multi_session {
+            // Capture session_id from hook events: the first id fills a void,
+            // and `session.start` renames (`/clear` starts a new session id in
+            // the same host process). See `should_adopt_session_id`.
+            if let Some(ref event_session_id) = event.session_id
+                && let Ok(mut guard) = self.session_id.lock()
+                && should_adopt_session_id(guard.as_deref(), &event.event, event_session_id)
+            {
+                tracing::info!(
+                    session_id = %event_session_id,
+                    replaced = ?guard.as_deref(),
+                    "Captured session ID from hook event"
+                );
+                *guard = Some(event_session_id.clone());
+            }
+
+            // Refuse an event that names another session, before it writes
+            // anything. Routing delivers only this host's events, so this fires
+            // only on a routing bug; say so loudly.
+            let stored = self.session_id.lock().ok().and_then(|g| g.clone());
+            if is_foreign_session(stored.as_deref(), event.session_id.as_deref()) {
+                tracing::warn!(
+                    event = %event.event,
+                    stored_session_id = ?stored,
+                    event_session_id = ?event.session_id,
+                    "refused a hook event from another session"
+                );
+                return HookResponse::allow();
+            }
+        } else if let Some(ref event_session_id) = event.session_id
+            && !event_session_id.trim().is_empty()
+            && let Ok(mut guard) = self.session_id.lock()
+            && guard.is_none()
+        {
+            *guard = Some(event_session_id.clone());
+        }
+
+        // Hook source is authoritative when startup agent detection was not
+        // available. SessionStart may also replace stale startup metadata.
+        if !event.source.is_empty()
+            && let Ok(mut guard) = self.agent_name.lock()
+            && (guard.is_none() || event.event == "session.start")
+        {
+            *guard = Some(event.source.clone());
+        }
+
+        let hook_work = async {
+            if let Some(sid) = self.session_id.lock().ok().and_then(|g| g.clone()) {
+                self.maybe_stabilize_label(&sid).await;
+            }
+            self.process_event(&event).await
+        };
+
+        with_hook_budget(tiers::HOOK_PATH, &event.event, hook_work).await
+    }
+
     /// Handle a single connection: read one JSON line, process, respond, close.
     async fn handle_connection(&self, stream: tokio::net::UnixStream) -> anyhow::Result<()> {
         let (reader, mut writer) = stream.into_split();
@@ -447,95 +551,14 @@ impl HookListener {
 
         // Handle ping — return status without creating blocks
         if event.event == "ping" {
-            let pending = self.pending_drift_count().await;
-            let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
-            let ping = PingResponse {
-                status: "ok".to_string(),
-                pid: std::process::id(),
-                cwd: std::env::current_dir()
-                    .ok()
-                    .map(|p| p.display().to_string()),
-                context_name: self.context_id().map(|id| id.short()),
-                document_id: self.context_id().map(|id| id.to_hex()),
-                session_id,
-                pending_drifts: pending,
-            };
+            let ping = self.handle_ping().await;
             let json = serde_json::to_string(&ping).unwrap_or_default();
             writer.write_all(json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
             return Ok(());
         }
 
-        // Capture session_id from hook events: the first id fills a void,
-        // and `session.start` renames (`/clear` starts a new session id in
-        // the same host process). See `should_adopt_session_id`.
-        if let Some(ref event_session_id) = event.session_id
-            && let Ok(mut guard) = self.session_id.lock()
-            && should_adopt_session_id(guard.as_deref(), &event.event, event_session_id)
-        {
-            tracing::info!(
-                session_id = %event_session_id,
-                replaced = ?guard.as_deref(),
-                "Captured session ID from hook event"
-            );
-            *guard = Some(event_session_id.clone());
-        }
-
-        // Refuse an event that names another session, before it writes
-        // anything. Routing delivers only this host's events, so this fires
-        // only on a routing bug; say so loudly.
-        let stored = self.session_id.lock().ok().and_then(|g| g.clone());
-        if is_foreign_session(stored.as_deref(), event.session_id.as_deref()) {
-            tracing::warn!(
-                event = %event.event,
-                stored_session_id = ?stored,
-                event_session_id = ?event.session_id,
-                "refused a hook event from another session"
-            );
-            let json = serde_json::to_string(&HookResponse::allow()).unwrap_or_default();
-            writer.write_all(json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            return Ok(());
-        }
-
-        // Hook source is authoritative when startup agent detection was not
-        // available. SessionStart may also replace stale startup metadata.
-        if !event.source.is_empty()
-            && let Ok(mut guard) = self.agent_name.lock()
-            && (guard.is_none() || event.event == "session.start")
-        {
-            *guard = Some(event.source.clone());
-        }
-
-        // Everything from here to the response is on the source agent's hook
-        // critical path, bounded by `tiers::HOOK_PATH`, which fits under every
-        // host's ceiling.
-        //
-        // Not hypothetical headroom. Every RPC on this path carries the
-        // request tier, and authoring a tool pair is three of them
-        // (reserve, result, complete) on top of `maybe_stabilize_label`'s —
-        // so a slow or reconnecting kernel can hold the hook far past the
-        // source agent's patience.
-        //
-        // Degrading here is consistent with what this path already promises
-        // for *failure*: the mirror is ambient, so its slowness must not
-        // block the user's action any more than its errors do. We return the
-        // permissive response and say what happened in `context` rather than
-        // going silent.
-        let hook_work = async {
-            // Stabilize the placeholder label onto a source-session-stable one
-            // now that we (may) know the true session id — BEFORE authoring
-            // this event's own block, so a relaunch-reattach switch lands it in
-            // the right context. One-shot per process (`pending_label_base`'s
-            // `Mutex::take`); a no-op on every event after the first that finds
-            // a session id.
-            if let Some(sid) = self.session_id.lock().ok().and_then(|g| g.clone()) {
-                self.maybe_stabilize_label(&sid).await;
-            }
-            self.process_event(&event).await
-        };
-
-        let response = with_hook_budget(tiers::HOOK_PATH, &event.event, hook_work).await;
+        let response = self.handle_event(event).await;
 
         let json = serde_json::to_string(&response).unwrap_or_default();
         writer.write_all(json.as_bytes()).await?;
@@ -1190,11 +1213,34 @@ impl HookListener {
     }
 
     async fn maybe_inject_drift(&self) -> HookResponse {
-        let Some(ref remote) = self.remote else {
-            return HookResponse::allow();
-        };
         let Some(ctx_id) = self.context_id() else {
             return HookResponse::allow();
+        };
+
+        if self.subscriptions.has_drift_subscriber(ctx_id) {
+            tracing::debug!(
+                context = %ctx_id.short(),
+                "Skipping hook drift injection; active MCP subscription covers drift"
+            );
+            return HookResponse::allow();
+        }
+
+        let Some(ref remote) = self.remote else {
+            let local_drifts = self.subscriptions.drain_local_drifts(ctx_id);
+            if local_drifts.is_empty() {
+                return HookResponse::allow();
+            }
+            let context: String = local_drifts
+                .iter()
+                .map(|d| {
+                    let src = ContextId::parse(&d.source_ctx)
+                        .map(|id| id.short())
+                        .unwrap_or_else(|_| d.source_ctx.clone());
+                    format!("[Drift from {src}]: {}", d.content)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            return HookResponse::allow_with_context(context);
         };
 
         // Check for drifts targeted at our context
@@ -1324,7 +1370,7 @@ fn list_hook_sockets_in(dir: &Path) -> Vec<PathBuf> {
 /// Runtime directory for hook transport. Command-hook hosts sometimes pass a
 /// minimal environment, so on Linux recover the conventional user runtime
 /// directory without requiring a shell wrapper to export XDG_RUNTIME_DIR.
-fn hook_runtime_dir() -> Option<PathBuf> {
+pub(crate) fn hook_runtime_dir() -> Option<PathBuf> {
     if let Some(path) = dirs::runtime_dir() { return Some(path); }
     #[cfg(target_os = "linux")]
     {
@@ -2303,6 +2349,48 @@ mod tests {
         assert!(
             matches!(verdict, ExistingSocket::Stale),
             "a path that was never bound (or already vanished) has nothing left to steal"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_inject_drift_suppresses_when_drift_subscriber_active() {
+        let (listener, _store, ctx_id) = local_listener_with_context();
+        let hub = crate::subscriptions::SubscriptionHub::new();
+        let listener = listener.with_subscriptions(hub.clone());
+
+        let src_ctx = ContextId::new();
+        hub.push_local_drift(
+            ctx_id,
+            crate::subscriptions::DriftRecord {
+                id: 1,
+                source_ctx: src_ctx.to_hex(),
+                target_ctx: ctx_id.to_hex(),
+                content: "important drift".to_string(),
+                source_model: "test-model".to_string(),
+                drift_kind: "push".to_string(),
+                created_at: 100,
+            },
+        );
+
+        // Active drift subscriber suppresses hook injection and leaves the drift queued.
+        let guard = hub.register_subscriber(vec![
+            crate::subscriptions::SubscriptionUri::Drift(ctx_id),
+        ]);
+        let suppressed = listener.maybe_inject_drift().await;
+        assert_eq!(
+            suppressed.context, None,
+            "hook drift injection must be suppressed while a drift subscriber is active"
+        );
+
+        // Dropping the subscriber restores hook fallback delivery.
+        drop(guard);
+        let injected = listener.maybe_inject_drift().await;
+        let ctx_text = injected
+            .context
+            .expect("drift should be injected once no subscriber is active");
+        assert!(
+            ctx_text.contains("important drift"),
+            "expected drift content in hook context, got: {ctx_text}"
         );
     }
 }

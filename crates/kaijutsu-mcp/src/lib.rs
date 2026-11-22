@@ -20,6 +20,7 @@ pub mod hook_listener;
 pub mod hook_adapter;
 pub mod hook_types;
 mod models;
+pub mod service;
 pub mod subscriptions;
 mod tree;
 
@@ -3186,7 +3187,7 @@ impl ServerHandler for KaijutsuMcp {
                                     );
                                 }
                             }
-                            targeted
+                            let mut remote_drifts: Vec<DriftRecord> = targeted
                                 .into_iter()
                                 .map(|d| DriftRecord {
                                     id: d.id,
@@ -3197,7 +3198,9 @@ impl ServerHandler for KaijutsuMcp {
                                     drift_kind: drift_kind_wire(d.drift_kind).to_string(),
                                     created_at: d.created_at,
                                 })
-                                .collect()
+                                .collect();
+                            remote_drifts.extend(self.subscriptions.drain_local_drifts(ctx_id));
+                            remote_drifts
                         }
                         None => self.subscriptions.drain_local_drifts(ctx_id),
                     };

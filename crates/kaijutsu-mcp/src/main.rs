@@ -19,6 +19,7 @@
 //! declaration means that cannot happen; `serve` is now a loud parse error
 //! rather than a quiet wrong mode.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rmcp::{ServiceExt, transport::stdio};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kaijutsu_client::{KeyArgs, KeySource};
@@ -35,6 +37,9 @@ use kaijutsu_mcp::hook_types::short_session_suffix;
 use kaijutsu_mcp::hook_listener::{
     HookListener, default_socket_path, hook_client_socket_path, send_hook_event,
     sweep_stale_sockets,
+};
+use kaijutsu_mcp::service::{
+    HookRouter, ServiceConfig, default_service_socket_path, send_hook_http_uds,
 };
 use kaijutsu_types::timeout::tiers;
 
@@ -115,6 +120,16 @@ struct ServeArgs {
     /// registration refuses.
     #[arg(long)]
     character: Option<String>,
+
+    /// Run in Streamable HTTP service mode on this Unix domain socket path
+    /// (serves `/mcp`, `POST /hook`, and `GET /health`).
+    #[arg(long)]
+    listen_unix: Option<PathBuf>,
+
+    /// Run in Streamable HTTP service mode on this loopback TCP address
+    /// (e.g. `127.0.0.1:8787`, serves `/mcp`, `POST /hook`, and `GET /health`).
+    #[arg(long)]
+    listen_http: Option<SocketAddr>,
 }
 
 /// Hook client arguments.
@@ -126,7 +141,8 @@ struct HookArgs {
 
     /// Socket path to connect to.
     /// Default: $XDG_RUNTIME_DIR/kaijutsu/hook-{pid}.sock, where pid is
-    /// $CLAUDE_PID or else this process's parent.
+    /// $CLAUDE_PID or else this process's parent, falling back to
+    /// $XDG_RUNTIME_DIR/kaijutsu/mcp.sock if running in service mode.
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -136,7 +152,12 @@ struct HookArgs {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum NativeHookSource { Claude, Codex }
+enum NativeHookSource {
+    Claude,
+    Codex,
+    #[value(alias = "agy")]
+    Antigravity,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -222,6 +243,50 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             tracing::info!("Starting with in-memory store");
             (KaijutsuMcp::new(), None)
         };
+
+        if args.listen_unix.is_some() || args.listen_http.is_some() {
+            if let Some(gate) = gate {
+                gate.settle();
+            }
+            let listener = match mcp.backend() {
+                kaijutsu_mcp::Backend::Local(store) => {
+                    let doc_ids = store.list_ids();
+                    let ctx_id = doc_ids
+                        .first()
+                        .copied()
+                        .unwrap_or_else(kaijutsu_types::ContextId::new);
+                    Arc::new(
+                        HookListener::local(store.clone(), ctx_id)
+                            .with_subscriptions(mcp.subscriptions().clone())
+                            .with_multi_session(true),
+                    )
+                }
+                kaijutsu_mcp::Backend::Remote(remote) => Arc::new(
+                    HookListener::remote_with_agent(
+                        remote.clone(),
+                        Arc::clone(&remote.shared_context_id),
+                        Arc::clone(mcp.session_id_arc()),
+                        Arc::clone(mcp.agent_name_arc()),
+                        None,
+                    )
+                    .with_multi_session(true),
+                ),
+            };
+            let hook_router = Arc::new(HookRouter::new(listener));
+            let cancel = CancellationToken::new();
+            let signal_ct = cancel.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("Received Ctrl+C; shutting down service");
+                signal_ct.cancel();
+            });
+            let config = ServiceConfig {
+                listen_unix: args.listen_unix,
+                listen_http: args.listen_http,
+                cancellation_token: cancel,
+            };
+            return kaijutsu_mcp::service::serve(mcp, hook_router, config).await;
+        }
 
         let socket_path = args.hook_socket.clone().or_else(default_socket_path);
         let owns_socket = Arc::new(AtomicBool::new(false));
@@ -431,7 +496,10 @@ async fn start_hook_socket(
             let ctx_id = doc_ids.first()
                 .copied()
                 .unwrap_or_else(kaijutsu_types::ContextId::new);
-            Arc::new(HookListener::local(store.clone(), ctx_id))
+            Arc::new(
+                HookListener::local(store.clone(), ctx_id)
+                    .with_subscriptions(mcp.subscriptions().clone()),
+            )
         }
         kaijutsu_mcp::Backend::Remote(remote) => {
             // shared_context_id is updated by register_session when a context is joined
@@ -484,10 +552,17 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
         Ok(value) => value,
         Err(_) => return Ok(()),
     };
-    let native_event = native.get("hook_event_name").and_then(|v| v.as_str()).map(String::from);
+    let native_event = native
+        .get("hook_event_name")
+        .or_else(|| native.get("hookEventName"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let normalized = match args.source {
         Some(NativeHookSource::Claude) => kaijutsu_mcp::hook_adapter::HookSource::Claude.adapt(native),
         Some(NativeHookSource::Codex) => kaijutsu_mcp::hook_adapter::HookSource::Codex.adapt(native),
+        Some(NativeHookSource::Antigravity) => {
+            kaijutsu_mcp::hook_adapter::HookSource::Antigravity.adapt(native)
+        }
         None => serde_json::from_value(native).ok(),
     };
     let Some(event) = normalized else {
@@ -501,16 +576,23 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Deliver only to our own host's listener (`hook_client_socket_path`).
-    // One deadline covers send and reply, held under the host's hook
-    // timeout: a listener that accepts and then stalls must cost this much,
-    // not a hook error in every session.
+    // Deliver to this host's hook socket, or fall back to the Streamable HTTP
+    // service UDS (`mcp.sock`) when no per-host hook socket is active.
+    // One deadline covers send and reply, held under the host's hook timeout.
     let deadline = tiers::HOOK_CLIENT;
-    let Some(socket_path) = hook_client_socket_path(args.socket.clone()) else {
+    let (socket_path, use_http) = resolve_hook_transport(args.socket.clone());
+    let Some(socket_path) = socket_path else {
         tracing::debug!("No hook socket for this host, failing open");
         return Ok(());
     };
-    let sent = match tokio::time::timeout(deadline, send_hook_event(&socket_path, &compact)).await {
+    let send_fut = async {
+        if use_http {
+            send_hook_http_uds(&socket_path, &compact).await
+        } else {
+            send_hook_event(&socket_path, &compact).await
+        }
+    };
+    let sent = match tokio::time::timeout(deadline, send_fut).await {
         Ok(sent) => sent,
         Err(_) => {
             eprintln!("kaijutsu: hook listener did not answer within {deadline:?}; not blocking");
@@ -535,6 +617,9 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
                         let source = match source {
                             NativeHookSource::Claude => kaijutsu_mcp::hook_adapter::HookSource::Claude,
                             NativeHookSource::Codex => kaijutsu_mcp::hook_adapter::HookSource::Codex,
+                            NativeHookSource::Antigravity => {
+                                kaijutsu_mcp::hook_adapter::HookSource::Antigravity
+                            }
                         };
                         if let Some(output) = source.response(native_event, &parsed) { print!("{output}"); }
                     } else { print!("{response}"); }
@@ -554,6 +639,29 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Choose the hook socket path and whether to speak HTTP (`POST /hook`) or
+/// legacy newline-delimited JSON.
+fn resolve_hook_transport(explicit: Option<PathBuf>) -> (Option<PathBuf>, bool) {
+    if let Some(path) = explicit {
+        let is_service = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "mcp.sock");
+        return (Some(path), is_service);
+    }
+    if let Some(legacy) = hook_client_socket_path(None)
+        && legacy.exists()
+    {
+        return (Some(legacy), false);
+    }
+    if let Some(service_sock) = default_service_socket_path()
+        && service_sock.exists()
+    {
+        return (Some(service_sock), true);
+    }
+    (hook_client_socket_path(None), false)
 }
 
 /// Basenames `ssh` itself tries automatically when no `-i` is given — the
@@ -662,6 +770,7 @@ fn agent_label_prefix(agent: Option<&str>) -> &'static str {
     match agent {
         Some("claude-code") => "cc",
         Some("codex") => "codex",
+        Some("antigravity") => "agy",
         _ => "mcp",
     }
 }
