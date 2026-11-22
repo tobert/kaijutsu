@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS approval_drift_blocks (
     block_id TEXT NOT NULL
 );
 
+-- The refused turn a refusal ask is about, recorded with it. An answer lifts
+-- the hold of this turn only.
+CREATE TABLE IF NOT EXISTS approval_refusal_turns (
+    request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    turn_id BLOB NOT NULL
+);
+
 -- Completion delivery is independent of the single-use execution claim.
 CREATE TABLE IF NOT EXISTS execution_notifications (
     kind TEXT NOT NULL CHECK (kind IN ('approval', 'shell')),

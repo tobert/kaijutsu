@@ -70,7 +70,8 @@ impl Kernel {
         match self.kernel_db().lock().last_turn_was_refused(context) {
             Ok(false) => Ok(()),
             Ok(true) => Err("the provider declined this context's last request, and sending it again would likely be declined too; \
-                             a person's prompt continues it, and `kj context rotate` starts fresh from a handoff".to_string()),
+                             its reviewer can allow the refusal ask (`kj ledger list`), a person's prompt continues it, \
+                             and `kj context rotate` starts fresh from a handoff".to_string()),
             Err(error) => Err(format!("could not read the context's last turn: {error}")),
         }
     }

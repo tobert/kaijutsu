@@ -31,6 +31,14 @@ pub(crate) fn record_approval_drift_block(conn: &Connection, request: &str, bloc
     Ok(())
 }
 
+/// Record the refused turn a refusal ask answers for, in the ask's
+/// transaction.
+pub(crate) fn record_approval_refusal_turn(conn: &Connection, request: &str, turn: kaijutsu_types::TurnId) -> KernelDbResult<()> {
+    conn.execute("INSERT INTO approval_refusal_turns(request_id, turn_id) VALUES (?1, ?2)",
+        rusqlite::params![request, super::blob_param(turn.as_bytes())])?;
+    Ok(())
+}
+
 /// What ending a turn's hold did to its ask (`KernelDb::end_held_ask`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldAskEnd {
@@ -324,6 +332,15 @@ impl KernelDb {
     pub(crate) fn approval_for_drift_block(&self, block: &BlockId) -> KernelDbResult<Option<String>> {
         Ok(self.conn.query_row("SELECT request_id FROM approval_drift_blocks WHERE block_id=?1",
             [block.to_key()], |row| row.get(0)).optional()?)
+    }
+
+    /// The refused turn recorded with a refusal ask.
+    pub(crate) fn approval_refusal_turn(&self, request: &str) -> KernelDbResult<Option<kaijutsu_types::TurnId>> {
+        let bytes: Option<Vec<u8>> = self.conn.query_row("SELECT turn_id FROM approval_refusal_turns WHERE request_id=?1",
+            [request], |row| row.get(0)).optional()?;
+        bytes.map(|bytes| kaijutsu_types::TurnId::try_from_slice(&bytes)
+            .ok_or_else(|| KernelDbError::Validation(format!("ask {request} records a malformed turn id"))))
+            .transpose()
     }
 
     /// The held drift block recorded with a drift ask.
