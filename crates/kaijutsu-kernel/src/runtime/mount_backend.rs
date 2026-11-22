@@ -653,7 +653,19 @@ impl KernelBackend for MountBackend {
         self.mount_table
             .rename(from, to)
             .await
-            .map_err(vfs_to_backend)
+            .map_err(vfs_to_backend)?;
+        // The destination's name now holds the source's content. A moved file
+        // carries the generation stamp it arrived with — its mtime, for a host
+        // file — which can be *lower* than the stamp of the content it just
+        // displaced, so the cache's "the stamp advanced" test cannot see the
+        // replacement. Mark the destination for the in-place reload instead:
+        // only a clean entry is marked (an unsaved buffer keeps its text), and
+        // the entry, its block, and any editor pin survive. The source needs
+        // nothing — its name is gone, and the cache rechecks a vanished path.
+        if let Ok(key) = self.cache_key(to) {
+            self.file_cache.recheck_disk_on_next_read(&key);
+        }
+        Ok(())
     }
 
     async fn read_link(&self, path: &Path) -> BackendResult<PathBuf> {
@@ -1033,6 +1045,45 @@ mod tests {
         (backend, file_cache, db, faults)
     }
 
+    /// A writable MountBackend over a real host directory, with its file cache
+    /// exposed. Host files derive their generation from mtime, which is exactly
+    /// the stamp a rename moves from one name to another.
+    async fn local_mount_backend(dir: &Path) -> (MountBackend, Arc<FileDocumentCache>) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-local-rename").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount(dir.to_str().unwrap(), LocalBackend::new(dir)).await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
+        ));
+        let backend = MountBackend::new(mount_table, docs, file_cache.clone(), PrincipalId::system());
+        (backend, file_cache)
+    }
+
+    /// The cache key a path is stored under, spelled the way `MountBackend`
+    /// spells it.
+    fn cache_key(path: &Path) -> String {
+        resolve_str(Path::new("/"), &path.to_string_lossy()).expect("a cache key")
+    }
+
+    /// Set a file's mtime. A test that cares which of two files carries the
+    /// newer stamp sets it here, instead of trusting two `write`s to land in
+    /// different mtime ticks.
+    fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open the file for a mtime change")
+            .set_modified(mtime)
+            .expect("set the mtime");
+    }
+
     /// A write, append, or patch whose flush fails takes its text back out
     /// of the cache: no swap marker is left to recover it as unsaved work,
     /// and the next write is not refused as an unacknowledged swap.
@@ -1370,6 +1421,122 @@ mod tests {
             String::from_utf8(via_relative_key).unwrap(),
             "fn main() { /* edited */ }"
         );
+    }
+
+    /// A shell `mv` over a cached destination serves what was moved onto it.
+    ///
+    /// The moved file carries the stamp it arrived with — its mtime — which can
+    /// sit *below* the stamp of the content it displaced, so the cache's "the
+    /// stamp advanced" test cannot see the replacement and would keep serving
+    /// the old destination bytes (`docs/issues.md`, "2.2 File Caching").
+    #[tokio::test]
+    async fn renaming_an_older_file_over_a_cached_destination_serves_the_moved_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (backend, _cache) = local_mount_backend(dir).await;
+        let src = dir.join("older.txt");
+        let dst = dir.join("newer.txt");
+
+        backend.write(&src, b"moved in", WriteMode::Overwrite).await.unwrap();
+        set_mtime(&src, std::time::SystemTime::now() - std::time::Duration::from_secs(120));
+        backend.write(&dst, b"was here", WriteMode::Overwrite).await.unwrap();
+        assert_eq!(backend.read(&dst, None).await.unwrap(), b"was here", "the destination is cached first");
+
+        backend.rename(&src, &dst).await.unwrap();
+
+        assert_eq!(
+            backend.read(&dst, None).await.unwrap(),
+            b"moved in",
+            "the destination must serve what was renamed onto it"
+        );
+        assert!(
+            matches!(backend.read(&src, None).await, Err(BackendError::NotFound(_))),
+            "the old name is gone, not a cached copy of the moved file"
+        );
+    }
+
+    /// The same with the two stamps *equal*: a rename that leaves the
+    /// destination's generation exactly where the cache recorded it is
+    /// invisible to a `>` comparison, and must still serve the moved bytes.
+    #[tokio::test]
+    async fn renaming_over_a_cached_destination_at_the_same_stamp_serves_the_moved_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (backend, _cache) = local_mount_backend(dir).await;
+        let src = dir.join("source.txt");
+        let dst = dir.join("destination.txt");
+
+        backend.write(&src, b"moved in", WriteMode::Overwrite).await.unwrap();
+        backend.write(&dst, b"was here", WriteMode::Overwrite).await.unwrap();
+        assert_eq!(backend.read(&dst, None).await.unwrap(), b"was here", "the destination is cached first");
+        let dst_stamp = std::fs::metadata(&dst).unwrap().modified().unwrap();
+        set_mtime(&src, dst_stamp);
+
+        backend.rename(&src, &dst).await.unwrap();
+
+        assert_eq!(
+            backend.read(&dst, None).await.unwrap(),
+            b"moved in",
+            "an unchanged stamp is still a replaced file"
+        );
+    }
+
+    /// A destination holding unsaved work keeps it. The moved content is what
+    /// disk holds; the buffer is not on disk, and the W12 `:w` guard — not a
+    /// rename in another surface — owns the decision to overwrite it.
+    #[tokio::test]
+    async fn renaming_over_a_dirty_destination_keeps_its_unsaved_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (backend, cache) = local_mount_backend(dir).await;
+        let src = dir.join("source.txt");
+        let dst = dir.join("destination.txt");
+
+        backend.write(&src, b"moved in", WriteMode::Overwrite).await.unwrap();
+        backend.write(&dst, b"was here", WriteMode::Overwrite).await.unwrap();
+        assert_eq!(backend.read(&dst, None).await.unwrap(), b"was here", "the destination is cached first");
+        let key = cache_key(&dst);
+        cache
+            .create_or_replace(&key, "unsaved edit", PrincipalId::system())
+            .await
+            .unwrap();
+        cache.mark_dirty(&key).unwrap();
+
+        backend.rename(&src, &dst).await.unwrap();
+
+        assert_eq!(
+            backend.read(&dst, None).await.unwrap(),
+            b"unsaved edit",
+            "a rename must never re-read an unsaved buffer away"
+        );
+    }
+
+    /// A clean destination an editor session pins: the rename must not drop the
+    /// entry (the pin protects it), and the read that follows still serves the
+    /// moved content — the entry reloads in place rather than being evicted.
+    #[tokio::test]
+    async fn renaming_over_a_pinned_destination_keeps_the_pin_and_serves_the_moved_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (backend, cache) = local_mount_backend(dir).await;
+        let src = dir.join("source.txt");
+        let dst = dir.join("destination.txt");
+
+        backend.write(&src, b"moved in", WriteMode::Overwrite).await.unwrap();
+        backend.write(&dst, b"was here", WriteMode::Overwrite).await.unwrap();
+        assert_eq!(backend.read(&dst, None).await.unwrap(), b"was here", "the destination is cached first");
+        let key = cache_key(&dst);
+        cache.pin(&key, 7).unwrap();
+
+        backend.rename(&src, &dst).await.unwrap();
+
+        assert_eq!(
+            backend.read(&dst, None).await.unwrap(),
+            b"moved in",
+            "a pinned destination still serves what was renamed onto it"
+        );
+        let refusal = cache.invalidate(&key).expect_err("the session still holds the pin");
+        assert!(refusal.contains(&key), "the refusal names the path: {refusal}");
     }
 
     /// On a host mount, `stat` follows a link to a directory and a recursive

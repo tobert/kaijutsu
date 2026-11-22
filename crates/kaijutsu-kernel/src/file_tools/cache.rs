@@ -128,6 +128,14 @@ struct CachedFileDoc {
     /// Consumed by the vi editor's W12 `:w` guard and swap-recovery
     /// announcement (docs/file-buffers.md).
     disk_changed_since_load: bool,
+    /// A clean entry whose backing file was replaced in a way the
+    /// `loaded_generation` stamp cannot show: an older file renamed over this
+    /// path writes a *lower* stamp, and a lower stamp is not "greater", so the
+    /// staleness test alone would keep serving the previous content. Set by
+    /// [`recheck_disk_on_next_read`](FileDocumentCache::recheck_disk_on_next_read),
+    /// cleared by the in-place reload or by a flush that makes the buffer
+    /// disk's content.
+    needs_reload: bool,
     /// This entry was restored from a `dirty_file_buffers` row on a cold
     /// cache instead of being reconciled against disk — it holds unsaved
     /// work from before a kernel restart. Set by `try_get_or_load`'s
@@ -273,6 +281,7 @@ impl FileDocumentCache {
             entry.loaded_generation = generation;
             entry.dirty = false;
             entry.disk_changed_since_load = false;
+            entry.needs_reload = false;
             // A reconciled entry is disk, plain and simple — never a pending
             // swap. (Unreachable with `swap_recovered: true` today, since a
             // recovered swap is inserted `dirty: true` and this branch only
@@ -377,10 +386,10 @@ impl FileDocumentCache {
             let mut cache = self.cache.write();
             cache.get_mut(&ctx_id).map(|e| {
                 e.last_access = Instant::now();
-                (e.context_id, e.block_id, e.dirty, e.loaded_generation)
+                (e.context_id, e.block_id, e.dirty, e.loaded_generation, e.needs_reload)
             })
         };
-        if let Some((cid, bid, dirty, loaded_generation)) = cached {
+        if let Some((cid, bid, dirty, loaded_generation, needs_reload)) = cached {
             let disk_attr = self.vfs.getattr(vfs_path).await.ok();
             let disk_generation = disk_attr.as_ref().map(|a| a.generation);
             let stale =
@@ -413,7 +422,7 @@ impl FileDocumentCache {
             // missing file is its normal state, not news.
             let missing = loaded_generation.is_some() && disk_attr.is_none();
             let symlink = disk_attr.is_some_and(|attr| attr.kind.is_symlink());
-            if !stale && !symlink && !missing {
+            if !stale && !symlink && !missing && !needs_reload {
                 return Ok((cid, bid));
             }
             match self.reload_block_from_disk(ctx_id, &bid, path).await {
@@ -562,6 +571,7 @@ impl FileDocumentCache {
                             last_access: Instant::now(),
                             loaded_generation: row.loaded_generation,
                             disk_changed_since_load: false,
+                            needs_reload: false,
                             swap_recovered: true,
                             pinned_by: Vec::new(),
                             marks: 0,
@@ -599,6 +609,7 @@ impl FileDocumentCache {
                     last_access: Instant::now(),
                     loaded_generation,
                     disk_changed_since_load: false,
+                    needs_reload: false,
                     swap_recovered: false,
                     pinned_by: Vec::new(),
                     marks: 0,
@@ -876,6 +887,7 @@ impl FileDocumentCache {
                     if let Some(generation) = stamp {
                         entry.loaded_generation = generation;
                         entry.disk_changed_since_load = false;
+                        entry.needs_reload = false;
                     }
                     if entry.marks == marks {
                         entry.dirty = false;
@@ -928,6 +940,32 @@ impl FileDocumentCache {
         let generation = self.vfs.getattr(std::path::Path::new(path)).await.ok().map(|a| a.generation);
         self.settle_clean(path, marks, Some(generation))?;
         Ok(true)
+    }
+
+    /// Have the next read of `path` re-read its backing file before serving.
+    ///
+    /// For a file replaced under its own name in a way the generation stamp
+    /// cannot show: a moved file carries the generation it arrived with, which
+    /// for a host file is its mtime — so renaming an older file over `path`
+    /// leaves a *lower* stamp, and the staleness test only looks for a greater
+    /// one. The entry is kept — block, pin, and bookkeeping all survive — and
+    /// the next read runs the same in-place reload a generation-advanced entry
+    /// does.
+    ///
+    /// A dirty entry is left alone: unsaved text is never re-read away, and the
+    /// W12 `:w` guard owns that case. A path with no entry is left alone too;
+    /// its next read loads from disk.
+    ///
+    /// Cannot fail, so a caller may run it after a mutation has already
+    /// succeeded — `MountBackend::rename` does.
+    pub fn recheck_disk_on_next_read(&self, path: &str) {
+        let ctx_id = file_context_id(path);
+        let mut cache = self.cache.write();
+        if let Some(entry) = cache.get_mut(&ctx_id)
+            && !entry.dirty
+        {
+            entry.needs_reload = true;
+        }
     }
 
     /// Read `path`'s buffer before a write changes it, for
@@ -1215,6 +1253,7 @@ impl FileDocumentCache {
                     // Not yet on disk; the next flush stamps the real generation.
                     loaded_generation: None,
                     disk_changed_since_load: false,
+                    needs_reload: false,
                     swap_recovered: false,
                     pinned_by: Vec::new(),
                     marks: 0,
