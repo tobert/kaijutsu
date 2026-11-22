@@ -650,6 +650,14 @@ impl KernelBackend for MountBackend {
 
     async fn rename(&self, from: &Path, to: &Path) -> BackendResult<()> {
         self.deny_if_read_only("rename", from)?;
+        // Marked before the await as well as after it: a read that runs while
+        // the rename is in flight and sees the moved file reloads it, instead
+        // of serving the old text until the rename returns. A failed rename
+        // costs one extra reload.
+        let key = self.cache_key(to).ok();
+        if let Some(key) = &key {
+            self.file_cache.recheck_disk_on_next_read(key);
+        }
         self.mount_table
             .rename(from, to)
             .await
@@ -662,8 +670,8 @@ impl KernelBackend for MountBackend {
         // only a clean entry is marked (an unsaved buffer keeps its text), and
         // the entry, its block, and any editor pin survive. The source needs
         // nothing — its name is gone, and the cache rechecks a vanished path.
-        if let Ok(key) = self.cache_key(to) {
-            self.file_cache.recheck_disk_on_next_read(&key);
+        if let Some(key) = &key {
+            self.file_cache.recheck_disk_on_next_read(key);
         }
         Ok(())
     }
