@@ -991,6 +991,12 @@ CREATE TABLE IF NOT EXISTS council_programs (
     CHECK ((unread_cause IS NULL) = (program_decision_id IS NOT NULL))
 );
 
+-- The submission list excludes a program's own decision by probing this
+-- table's `program_decision_id`, so that direction needs an index of its
+-- own: the primary key covers only `(decision_id, seq)`.
+CREATE INDEX IF NOT EXISTS idx_council_programs_program_decision
+    ON council_programs(program_decision_id);
+
 -- One row per guardian decision that parsed (`docs/approval-identity.md`,
 -- "The guardian"): the model's own verdict, risk level, user authorization,
 -- and rationale, hanging off the decision row that records the gate's
@@ -1848,6 +1854,46 @@ mod tests {
         let head: Option<String> =
             conn.query_row("SELECT house_rules_head FROM council_decisions", [], |row| row.get(0)).unwrap();
         assert_eq!(head, None);
+    }
+
+    /// A database created before the index existed gains it on the next
+    /// `migrate()`, over the rows it already holds. The submission list's
+    /// anti-join probes `council_programs` by `program_decision_id`, which the
+    /// primary key's `decision_id` prefix does not cover.
+    #[test]
+    fn migrate_adds_the_program_decision_index_to_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // The shape a database migrated before the index existed keeps: its
+        // rows, and no index over them.
+        conn.execute_batch("DROP INDEX IF EXISTS idx_council_programs_program_decision").unwrap();
+        conn.execute_batch(
+            "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                deadline_ms, outcome, miss_cause, control_text_hits, queue_ms, ms)
+             VALUES (X'01', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                'miss', 'down', 0, 0, 0);
+             INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                deadline_ms, outcome, miss_cause, control_text_hits, queue_ms, ms)
+             VALUES (X'04', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                'allow', NULL, 0, 0, 0);
+             INSERT INTO council_programs (decision_id, seq, statement_idx, command, language, unread_cause,
+                program_decision_id)
+             VALUES (X'01', 0, 0, 'python3 x.py', 'python', NULL, X'04');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let has_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_council_programs_program_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1, "the program-decision index must follow an existing database");
+        let programs: i64 = conn.query_row("SELECT COUNT(*) FROM council_programs", [], |row| row.get(0)).unwrap();
+        assert_eq!(programs, 1, "the index build keeps the program rows it covers");
     }
 
     /// A database whose `council_decisions` predates `seat_bump` gains it,

@@ -415,12 +415,11 @@ pub struct SubmissionFilter {
     pub limit: u32,
 }
 
-/// Shell decisions, newest first. A program's own decision is part of its
-/// submission and is not listed. A submission is bumped when the gate
-/// refused it as a bump, which it records as `seat_bump`; a decision left
-/// without an ask by a gate fault is not a bump.
-pub fn list_council_submissions(conn: &Connection, filter: &SubmissionFilter) -> Result<Vec<CouncilSubmission>> {
-    let sql = "SELECT d.decision_id, d.context_id, d.created_at, d.submission_digest, d.outcome,
+/// [`list_council_submissions`]'s statement, named so a test can plan the
+/// text the reader runs. The anti-join probes `council_programs` by
+/// `program_decision_id`, so it reaches those rows through
+/// `idx_council_programs_program_decision`.
+const SUBMISSIONS_SQL: &str = "SELECT d.decision_id, d.context_id, d.created_at, d.submission_digest, d.outcome,
                 d.seat_bump IS NOT NULL, d.seat_bump,
                 (SELECT option FROM council_pooled
                   WHERE decision_id = d.decision_id AND question_id = 'undo'
@@ -433,8 +432,14 @@ pub fn list_council_submissions(conn: &Connection, filter: &SubmissionFilter) ->
             AND (?2 IS NULL OR d.created_at >= ?2)
           ORDER BY d.created_at DESC, d.decision_id DESC
           LIMIT ?3";
+
+/// Shell decisions, newest first. A program's own decision is part of its
+/// submission and is not listed. A submission is bumped when the gate
+/// refused it as a bump, which it records as `seat_bump`; a decision left
+/// without an ask by a gate fault is not a bump.
+pub fn list_council_submissions(conn: &Connection, filter: &SubmissionFilter) -> Result<Vec<CouncilSubmission>> {
     let rows = conn
-        .prepare(sql)?
+        .prepare(SUBMISSIONS_SQL)?
         .query_map(params![filter.context_id, filter.since_ms, filter.limit], |row| {
             let outcome: String = row.get(4)?;
             let bumped: bool = row.get(5)?;
@@ -1133,6 +1138,24 @@ mod tests {
         let all = list_council_submissions(&conn, &SubmissionFilter { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(all.len(), 1, "{all:?}");
         assert_eq!(all[0].flavor.as_deref(), Some("originals=changes"));
+    }
+
+    /// The submission list's anti-join probes `council_programs` by
+    /// `program_decision_id`, so it reads those rows through the index:
+    /// without one SQLite scans every program row once per candidate
+    /// submission.
+    #[test]
+    fn the_submission_list_probes_programs_through_an_index() {
+        let conn = open_memory();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {SUBMISSIONS_SQL}")).unwrap();
+        let plan = stmt
+            .query_map(params![None::<Vec<u8>>, None::<i64>, 10u32], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("idx_council_programs_program_decision"), "{plan}");
+        assert!(!plan.contains("SCAN p"), "the anti-join must not scan council_programs: {plan}");
     }
 
     /// `seat_bump` is a refusal: never on a decision an ask links, never empty.
