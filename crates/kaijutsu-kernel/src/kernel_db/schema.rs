@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS context_slots (
     preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0),
     verbosity       TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high')),
     reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed')),
+    replay_phase    TEXT CHECK (replay_phase IS NULL OR replay_phase IN ('on', 'off')),
     PRIMARY KEY (context_id, role)
 );
 
@@ -860,7 +861,10 @@ CREATE TABLE IF NOT EXISTS character_models (
     -- The ChatGPT plan route's `text.verbosity` and reasoning summary; NULL
     -- sends no `text` field and asks for `auto`.
     verbosity       TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high')),
-    reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed'))
+    reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed')),
+    -- Whether the plan route replays a derived `phase` on assistant
+    -- messages; NULL is off.
+    replay_phase    TEXT CHECK (replay_phase IS NULL OR replay_phase IN ('on', 'off'))
 );
 CREATE INDEX IF NOT EXISTS idx_character_models_backend ON character_models(backend_id);
 

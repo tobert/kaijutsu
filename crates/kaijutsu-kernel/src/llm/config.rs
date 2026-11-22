@@ -478,6 +478,9 @@ pub struct SlotTunables {
     /// Reasoning summary (`none`|`auto`|`concise`|`detailed`), sent by the
     /// ChatGPT plan route.
     pub reasoning_summary: Option<String>,
+    /// `on` replays a derived `phase` on assistant messages; the ChatGPT
+    /// plan route sends it. Unset is off.
+    pub replay_phase: Option<String>,
     /// VFS path of a decision program. A model slot's turns on a council
     /// backend are then assembled from council decisions.
     pub decide: Option<String>,

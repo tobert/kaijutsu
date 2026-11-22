@@ -406,7 +406,7 @@ mod tests {
             thinking_budget: None,
             thinking_style: None,
             verbosity: None,
-            reasoning_summary: None,
+            reasoning_summary: None, replay_phase: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
             controls: Vec::new(),

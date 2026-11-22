@@ -111,12 +111,14 @@ impl Client {
     /// more if the first token is refused.
     pub async fn stream(&self, opts: BuildOpts, messages: Vec<Message>) -> LlmResult<openai::responses::Stream> {
         let token = self.credentials.bearer(&self.backend, None).await?;
+        let model = opts.model.clone();
         let websockets = (self.transport == Transport::WebSocket).then_some(&self.websockets);
         match self.base.stream_responses(opts.clone(), messages.clone(), &token, websockets).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => Ok(stream.observed_as(self.provider_name(), &model)),
             Err(openai::responses::OpenError::Unauthorized(_)) => {
                 let token = self.credentials.bearer(&self.backend, Some(&token)).await?;
-                self.base.stream_responses(opts, messages, &token, websockets).await.map_err(|e| e.into_llm())
+                let stream = self.base.stream_responses(opts, messages, &token, websockets).await.map_err(|e| e.into_llm())?;
+                Ok(stream.observed_as(self.provider_name(), &model))
             }
             Err(e) => Err(e.into_llm()),
         }

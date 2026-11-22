@@ -22,24 +22,27 @@ CREATE TABLE context_slots_fold (
     preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0),
     verbosity       TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high')),
     reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed')),
+    replay_phase    TEXT CHECK (replay_phase IS NULL OR replay_phase IN ('on', 'off')),
     PRIMARY KEY (context_id, role)
 );
 ";
 
 /// Copies the rows of the old `context_slots` into [`CONTEXT_SLOTS_FOLDED`]
-/// and swaps it in. `decide`, `preview_kib`, `verbosity` and
-/// `reasoning_summary` are copied when the old table has them.
-fn fold_context_slots_sql(old_has_decide: bool, old_has_preview: bool, old_has_shape: bool) -> String {
-    let decide = if old_has_decide { "decide" } else { "NULL" };
-    let preview = if old_has_preview { "preview_kib" } else { "NULL" };
-    let (verbosity, summary) = if old_has_shape { ("verbosity", "reasoning_summary") } else { ("NULL", "NULL") };
+/// and swaps it in. Each column added after the fold's first form (`decide`,
+/// `preview_kib`, `verbosity`, `reasoning_summary`, `replay_phase`) is copied
+/// when the old table has it, and is NULL when it does not; `has_column`
+/// answers for the old table, one column at a time.
+fn fold_context_slots_sql(has_column: &dyn Fn(&str) -> bool) -> String {
+    let copy = |name: &'static str| if has_column(name) { name } else { "NULL" };
+    let (decide, preview, verbosity, summary, replay) =
+        (copy("decide"), copy("preview_kib"), copy("verbosity"), copy("reasoning_summary"), copy("replay_phase"));
     format!(
         "{CONTEXT_SLOTS_FOLDED}
 INSERT INTO context_slots_fold
     (context_id, role, backend_id, model, max_tokens, context_window, temperature, top_p, effort,
-     thinking_budget, thinking_style, decide, preview_kib, verbosity, reasoning_summary)
+     thinking_budget, thinking_style, decide, preview_kib, verbosity, reasoning_summary, replay_phase)
 SELECT context_id, role, backend_id, model, max_tokens, context_window, temperature, top_p, effort,
-       thinking_budget, thinking_style, {decide}, {preview}, {verbosity}, {summary} FROM context_slots;
+       thinking_budget, thinking_style, {decide}, {preview}, {verbosity}, {summary}, {replay} FROM context_slots;
 DROP TABLE context_slots;
 ALTER TABLE context_slots_fold RENAME TO context_slots;
 "
@@ -254,10 +257,13 @@ impl KernelDb {
             |r| r.get(0),
         )?;
         if slots_reference_old_table {
-            let old_has_decide = Self::has_column(&tx, "context_slots", "decide")?;
-            let old_has_preview = Self::has_column(&tx, "context_slots", "preview_kib")?;
-            let old_has_shape = Self::has_column(&tx, "context_slots", "verbosity")?;
-            tx.execute_batch(&fold_context_slots_sql(old_has_decide, old_has_preview, old_has_shape))?;
+            let mut present = std::collections::HashSet::new();
+            for name in ["decide", "preview_kib", "verbosity", "reasoning_summary", "replay_phase"] {
+                if Self::has_column(&tx, "context_slots", name)? {
+                    present.insert(name);
+                }
+            }
+            tx.execute_batch(&fold_context_slots_sql(&|name| present.contains(name)))?;
         }
         tx.execute("DROP TABLE context_characters", [])?;
         {

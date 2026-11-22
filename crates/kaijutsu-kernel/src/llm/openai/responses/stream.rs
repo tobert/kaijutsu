@@ -61,11 +61,38 @@ pub struct StateMachine {
     usage: Option<Value>,
     ended: bool,
     failed: bool,
+    /// The backend and model the response comes from, for what the server
+    /// reports about itself.
+    origin: (String, String),
 }
 
 impl StateMachine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Name the backend and model this response comes from.
+    pub fn observed_as(mut self, backend: &str, model: &str) -> Self {
+        self.origin = (backend.to_string(), model.to_string());
+        self
+    }
+
+    /// Log a `phase` the server put on a message, once per backend, model
+    /// and value.
+    fn note_server_phase(&self, phase: &str) {
+        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String, String)>>> =
+            std::sync::OnceLock::new();
+        let key = (self.origin.0.clone(), self.origin.1.clone(), phase.to_string());
+        let fresh = SEEN.get_or_init(Default::default).lock().expect("phase dedupe mutex poisoned").insert(key);
+        if fresh {
+            tracing::info!(
+                target: "llm.server_phase",
+                backend = %self.origin.0,
+                model = %self.origin.1,
+                phase,
+                "the server put a phase on a message"
+            );
+        }
     }
 
     /// Whether the response ended in an error.
@@ -238,7 +265,12 @@ impl StateMachine {
                 self.phase = Phase::None;
                 self.summary_index = None;
             }
-            "message" => self.close_open(out),
+            "message" => {
+                if let Some(phase) = item.get("phase").and_then(Value::as_str) {
+                    self.note_server_phase(phase);
+                }
+                self.close_open(out)
+            }
             "function_call" => {
                 self.close_open(out);
                 let field = |name| item.get(name).and_then(Value::as_str).unwrap_or("").to_string();
@@ -391,6 +423,42 @@ mod tests {
 
     fn completed() -> Value {
         json!({ "type": "response.completed", "response": { "status": "completed", "usage": usage() } })
+    }
+
+    /// A `phase` the server puts on a message item is logged once per
+    /// backend, model and value, under `llm.server_phase`, with no message
+    /// text. It tells whether the route emits `phase` at all.
+    ///
+    /// Falsified by no log for a message with a phase, a repeat that logs
+    /// again, text in the log, or a log for a message without one.
+    #[test]
+    fn a_server_phase_is_logged_once_per_value() {
+        let (log, _guard) = crate::test_logs::capture_logs();
+        let message = |phase: Option<&str>| {
+            let mut item = json!({ "type": "message", "content": [{ "type": "output_text", "text": "SECRET-WORDS" }] });
+            if let Some(phase) = phase {
+                item["phase"] = json!(phase);
+            }
+            json!({ "type": "response.output_item.done", "item": item })
+        };
+        let drive = |backend: &str, model: &str, phase: Option<&str>| {
+            let mut machine = StateMachine::new().observed_as(backend, model);
+            machine.step(message(phase));
+        };
+        drive("phase-b", "phase-m", None);
+        assert!(!log.text().contains("llm.server_phase"), "no phase, no log: {}", log.text());
+        drive("phase-b", "phase-m", Some("commentary"));
+        let first = log.text();
+        assert_eq!(first.matches("llm.server_phase").count(), 1, "{first}");
+        for expected in ["commentary", "phase-b", "phase-m"] {
+            assert!(first.contains(expected), "{expected} missing from: {first}");
+        }
+        assert!(!first.contains("SECRET-WORDS"), "no message text: {first}");
+        drive("phase-b", "phase-m", Some("commentary"));
+        assert_eq!(log.text().matches("llm.server_phase").count(), 1, "a repeat is not logged again");
+        drive("phase-b", "phase-m", Some("final_answer"));
+        drive("phase-b", "phase-other", Some("commentary"));
+        assert_eq!(log.text().matches("llm.server_phase").count(), 3, "a new value or model logs");
     }
 
     /// A metadata event with content is logged, since the server may say what

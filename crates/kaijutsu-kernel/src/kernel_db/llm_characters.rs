@@ -94,12 +94,18 @@ pub struct CharacterModelRow {
     /// Reasoning summary the ChatGPT plan route asks for: `none`, `auto`,
     /// `concise` or `detailed`. `None` asks for `auto`.
     pub reasoning_summary: Option<String>,
+    /// Whether the ChatGPT plan route replays a `phase` on assistant
+    /// messages, derived from their position in the turn: `on` or `off`.
+    /// `None` is `off`.
+    pub replay_phase: Option<String>,
 }
 
 /// The values `verbosity` takes.
 pub const VERBOSITIES: [&str; 3] = ["low", "medium", "high"];
 /// The values `reasoning_summary` takes.
 pub const REASONING_SUMMARIES: [&str; 4] = ["none", "auto", "concise", "detailed"];
+/// The values `replay_phase` takes.
+pub const REPLAY_PHASES: [&str; 2] = ["on", "off"];
 
 /// Refuse a setting outside `accepted`, naming the accepted values.
 fn validate_choice(name: &str, value: Option<&str>, accepted: &[&str]) -> KernelDbResult<()> {
@@ -131,7 +137,7 @@ pub(super) fn row_to_character_slot(row: &rusqlite::Row<'_>) -> SqliteResult<Cha
 
 pub(super) const CHARACTER_MODEL_COLS: &str = "principal_id, backend_id, model, max_tokens, temperature, \
                                     top_p, effort, thinking_budget, thinking_style, decide, preview_kib, \
-                                    verbosity, reasoning_summary";
+                                    verbosity, reasoning_summary, replay_phase";
 
 pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterModelRow> {
     Ok(CharacterModelRow {
@@ -148,6 +154,7 @@ pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<Ch
         preview_kib: row.get(10)?,
         verbosity: row.get(11)?,
         reasoning_summary: row.get(12)?,
+        replay_phase: row.get(13)?,
     })
 }
 
@@ -275,6 +282,7 @@ impl KernelDb {
         validate_decide(row.decide.as_deref())?;
         validate_choice("verbosity", row.verbosity.as_deref(), &VERBOSITIES)?;
         validate_choice("reasoning_summary", row.reasoning_summary.as_deref(), &REASONING_SUMMARIES)?;
+        validate_choice("replay_phase", row.replay_phase.as_deref(), &REPLAY_PHASES)?;
         if let Some(kib) = row.preview_kib {
             use crate::runtime::embedded_kaish::PreviewLimit;
             let (min, max) = (PreviewLimit::MIN_KIB as i64, PreviewLimit::MAX_KIB as i64);
@@ -285,7 +293,7 @@ impl KernelDb {
         self.conn.execute(
             &format!(
                 "INSERT INTO character_models ({CHARACTER_MODEL_COLS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(principal_id) DO UPDATE SET
                      backend_id = excluded.backend_id,
                      model = excluded.model,
@@ -298,7 +306,8 @@ impl KernelDb {
                      decide = excluded.decide,
                      preview_kib = excluded.preview_kib,
                      verbosity = excluded.verbosity,
-                     reasoning_summary = excluded.reasoning_summary"
+                     reasoning_summary = excluded.reasoning_summary,
+                     replay_phase = excluded.replay_phase"
             ),
             params![
                 blob_param(row.principal_id.as_bytes()),
@@ -314,6 +323,7 @@ impl KernelDb {
                 row.preview_kib,
                 row.verbosity,
                 row.reasoning_summary,
+                row.replay_phase,
             ],
         )?;
         Ok(())

@@ -173,6 +173,13 @@ impl Stream {
         }
     }
 
+    /// Name the backend and model this stream comes from, for what the
+    /// server reports about itself.
+    pub fn observed_as(mut self, backend: &str, model: &str) -> Self {
+        self.state = std::mem::take(&mut self.state).observed_as(backend, model);
+        self
+    }
+
     /// Poll for the next event. Returns `None` once exhausted.
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         loop {

@@ -630,7 +630,7 @@ fn bind_seat(
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
+            decide: None, preview_kib: None, verbosity: None, reasoning_summary: None, replay_phase: None,
         })
         .unwrap();
     }
@@ -656,7 +656,7 @@ fn bind_judge(db: &crate::kernel_db::KernelDb, gate_server: &str, spec: &SlotSpe
         effort: None,
         thinking_budget: None,
         thinking_style: None,
-        decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
+        decide: None, preview_kib: None, verbosity: None, reasoning_summary: None, replay_phase: None,
     })
     .unwrap();
     judge

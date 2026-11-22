@@ -347,7 +347,7 @@ impl KjDispatcher {
                     effort: None,
                     thinking_budget: None,
                     thinking_style: None,
-                    decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
+                    decide: None, preview_kib: None, verbosity: None, reasoning_summary: None, replay_phase: None,
                 })
             {
                 return KjResult::Err(format!(

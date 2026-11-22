@@ -76,7 +76,9 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
         }
     }
 
-    tag_phases(&mut input, &plain);
+    if opts.replay_phase.as_deref() == Some("on") {
+        tag_phases(&mut input, &plain);
+    }
     warn_dropped(opts, backend_label);
 
     let mut body = json!({
@@ -366,7 +368,7 @@ mod tests {
             content: "denied".into(),
             is_error: true,
         }]);
-        let v = body(BuildOpts::new("m", 1), &[Message::user("go"), assistant, results]);
+        let v = body(BuildOpts::new("m", 1).with_replay_phase("on"), &[Message::user("go"), assistant, results]);
         let input = v["input"].as_array().unwrap();
         assert_eq!(input.len(), 5, "{v}");
         assert_eq!(input[1], json!({ "type": "reasoning", "summary": [{ "type": "summary_text", "text": "think" }], "encrypted_content": "ENC" }));
@@ -464,7 +466,7 @@ mod tests {
             Message::user("one"), call, result, blocks_message("done"),
             Message::user("two"), call2, result2,
         ];
-        let v = body(BuildOpts::new("m", 1), &history);
+        let v = body(BuildOpts::new("m", 1).with_replay_phase("on"), &history);
         assert_eq!(
             phases(&v),
             [Some("commentary".into()), Some("final_answer".into()), Some("commentary".into())],
@@ -473,6 +475,22 @@ mod tests {
         let first = v["input"].as_array().unwrap().iter().find(|i| i["type"] == "message" && i["role"] == "assistant").unwrap();
         assert_eq!(first["phase"], "commentary");
         assert!(first["content"][0].get("phase").is_none(), "phase sits on the item, not the part: {first}");
+    }
+
+    /// Unless a character turns `replay_phase` on, no assistant message
+    /// carries a `phase`, whatever its position: the request is as it was
+    /// before the setting existed.
+    ///
+    /// Falsified by a `phase` on any message when the setting is unset or off.
+    #[test]
+    fn no_phase_is_sent_unless_replay_phase_is_on() {
+        let [call, result] = calls("c1", "looking");
+        let history = [Message::user("one"), call, result, blocks_message("done"), Message::user("two")];
+        for opts in [BuildOpts::new("m", 1), BuildOpts::new("m", 1).with_replay_phase("off")] {
+            let v = body(opts, &history);
+            assert_eq!(phases(&v), [None, None], "{v}");
+            assert!(!v.to_string().contains("\"phase\""), "{v}");
+        }
     }
 
     /// A message that does not clearly fit goes without a phase: a second
@@ -484,13 +502,13 @@ mod tests {
     #[test]
     fn an_unclear_message_goes_without_a_phase() {
         let two = [Message::user("q"), blocks_message("first"), blocks_message("second"), Message::user("next")];
-        let v = body(BuildOpts::new("m", 1).with_system("sys"), &two);
+        let v = body(BuildOpts::new("m", 1).with_system("sys").with_replay_phase("on"), &two);
         assert_eq!(phases(&v), [None, Some("final_answer".into())], "{v}");
 
-        let open = body(BuildOpts::new("m", 1), &[Message::user("q"), blocks_message("so far")]);
+        let open = body(BuildOpts::new("m", 1).with_replay_phase("on"), &[Message::user("q"), blocks_message("so far")]);
         assert_eq!(phases(&open), [None], "{open}");
 
-        let legacy = body(BuildOpts::new("m", 1), &[Message::user("q"), Message::assistant("plain"), Message::user("n")]);
+        let legacy = body(BuildOpts::new("m", 1).with_replay_phase("on"), &[Message::user("q"), Message::assistant("plain"), Message::user("n")]);
         assert_eq!(phases(&legacy), [None], "{legacy}");
         assert_eq!(legacy["input"][1], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "plain" }] }));
 

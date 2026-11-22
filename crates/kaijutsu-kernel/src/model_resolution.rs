@@ -407,6 +407,7 @@ pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<Con
                     thinking_style: slot.thinking_style.clone(),
                     verbosity: slot.verbosity.clone(),
                     reasoning_summary: slot.reasoning_summary.clone(),
+                    replay_phase: slot.replay_phase.clone(),
                     decide: slot.decide.clone(),
                 },
             }))

@@ -221,11 +221,15 @@ pub(crate) fn should_warn_effort_dropped(backend: &str, model: &str, knob: &str,
 }
 
 /// Warn once for each response-shape setting (`verbosity`,
-/// `reasoning_summary`) that is set on a request to a provider that cannot
+/// `reasoning_summary`, `replay_phase`) that is set on a request to a provider that cannot
 /// send it. Only the ChatGPT plan route sends them. Returns the knobs warned
 /// for, so a test can see the dedupe.
 pub(crate) fn warn_response_shape_dropped(opts: &BuildOpts, backend_label: &str) -> Vec<&'static str> {
-    let knobs = [("verbosity", &opts.verbosity), ("reasoning_summary", &opts.reasoning_summary)];
+    let knobs = [
+        ("verbosity", &opts.verbosity),
+        ("reasoning_summary", &opts.reasoning_summary),
+        ("replay_phase", &opts.replay_phase),
+    ];
     let mut warned = Vec::new();
     for (knob, value) in knobs {
         if let Some(value) = value
@@ -1063,12 +1067,12 @@ mod tests {
         let history = [Message::user("hi")];
         for dialect in [Dialect::Generic, Dialect::HostedOpenAi] {
             let plain = super::build_request(&opts(), &history, false, dialect, "shape-test").unwrap();
-            let set = opts().with_verbosity("low").with_reasoning_summary("concise");
+            let set = opts().with_verbosity("low").with_reasoning_summary("concise").with_replay_phase("on");
             let shaped = super::build_request(&set, &history, false, dialect, "shape-test").unwrap();
             assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::to_value(&shaped).unwrap());
         }
-        let set = opts().with_verbosity("low").with_reasoning_summary("concise");
-        assert_eq!(warn_response_shape_dropped(&set, "shape-once"), ["verbosity", "reasoning_summary"]);
+        let set = opts().with_verbosity("low").with_reasoning_summary("concise").with_replay_phase("on");
+        assert_eq!(warn_response_shape_dropped(&set, "shape-once"), ["verbosity", "reasoning_summary", "replay_phase"]);
         assert!(warn_response_shape_dropped(&set, "shape-once").is_empty(), "warned once");
         assert!(warn_response_shape_dropped(&opts(), "shape-unset").is_empty(), "nothing set, nothing warned");
     }
