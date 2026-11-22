@@ -419,6 +419,15 @@ pub(crate) async fn evidence(
     let house = super::sync::house_rules(kernel, context, config.house_rules_tokens)
         .await
         .map_err(|why| format!("the {noun} could not read house rules ({why})"))?;
+    // A cut file is a rule the judge never saw: read all of it or do not judge.
+    if let Some(house) = &house
+        && house.text.len() as u64 > config.house_rules_tokens.saturating_mul(super::projection::HOUSE_RULES_BYTES_PER_TOKEN)
+    {
+        return Err(format!(
+            "the {noun} could not read all of house rules {}: it is longer than {} tokens; raise `[guardian] house_rules_tokens`",
+            house.path, config.house_rules_tokens
+        ));
+    }
     let budget = usize::try_from(config.transcript_tokens.saturating_mul(super::projection::HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
     let blocks = kernel
         .blocks()
@@ -818,6 +827,44 @@ mod tests {
         .expect("non-UTF-8 AGENTS.md must miss");
         assert!(err.contains("not valid UTF-8"), "{err}");
         assert!(!err.contains("None was found"), "{err}");
+    }
+
+    /// The guardian reads the whole `AGENTS.md` or does not judge: a rule past
+    /// a cut is a rule it never saw.
+    #[tokio::test]
+    async fn evidence_shows_the_whole_agents_md_or_misses() {
+        use crate::kj::test_helpers::{register_context, test_dispatcher_rc};
+        use crate::vfs::VfsOps;
+        let d = test_dispatcher_rc().await;
+        let ctx = register_context(&d, Some("guardian-whole-rules"), None, PrincipalId::new());
+        d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        d.kernel().vfs().mount("/work", crate::vfs::MemoryBackend::new()).await;
+        let rules = format!("{}\nLAST-RULE: push to main is fine here.\n", "A standing rule.\n".repeat(200));
+        d.kernel().vfs().write_all(std::path::Path::new("/work/AGENTS.md"), rules.as_bytes()).await.unwrap();
+        d.kernel().kernel_db().lock()
+            .upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: ctx, cwd: Some("/work".into()), updated_at: 0 })
+            .unwrap();
+        let ask = |tokens| {
+            let config = crate::kj::gate_policy::GuardianConfig { house_rules_tokens: tokens, ..Default::default() };
+            let (d, action) = (&d, serde_json::json!({"cmd": "ls"}));
+            async move { evidence(d.kernel(), &config, JudgeKind::Guardian, ctx, &action, &[]).await }
+        };
+
+        let cause = ask(500).await.err().expect("a file past the budget must miss, not be cut");
+        assert!(cause.contains("house_rules_tokens") && cause.contains("/work/AGENTS.md"), "{cause}");
+
+        let shown = ask(5000).await.expect("a file within the budget is read");
+        assert!(shown.prompt.contains("LAST-RULE: push to main is fine here."), "the last rule reaches the judge");
+    }
+
+    /// The default budget holds this repository's own `AGENTS.md`, so the
+    /// guardian judges a kaijutsu seat on every rule in it.
+    #[test]
+    fn the_default_budget_holds_this_repositorys_agents_md() {
+        let rules = include_str!("../../../../AGENTS.md");
+        let budget = crate::kj::gate_policy::GuardianConfig::default().house_rules_tokens
+            * super::super::projection::HOUSE_RULES_BYTES_PER_TOKEN;
+        assert!(rules.len() as u64 <= budget, "AGENTS.md is {} bytes; the default guardian budget is {budget}", rules.len());
     }
 
     #[test]

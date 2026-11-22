@@ -587,7 +587,8 @@ pub(crate) struct GuardianConfig {
     /// The budget for the context's transcript tail, estimated at four
     /// bytes a token.
     pub(crate) transcript_tokens: u64,
-    /// The budget for the workspace's `AGENTS.md`, estimated the same way.
+    /// The budget for the workspace's `AGENTS.md`, estimated the same way. A
+    /// file past it is a miss: the judge reads every rule or does not judge.
     pub(crate) house_rules_tokens: u64,
     /// The decisions judge allows when p(allow) reaches this, in (0, 1].
     pub(crate) allow_at: f64,
@@ -598,7 +599,7 @@ impl Default for GuardianConfig {
         GuardianConfig {
             deadline_ms: 30_000,
             transcript_tokens: 8_000,
-            house_rules_tokens: DEFAULT_HOUSE_RULES_TOKENS,
+            house_rules_tokens: DEFAULT_GUARDIAN_HOUSE_RULES_TOKENS,
             allow_at: 0.9,
         }
     }
@@ -695,6 +696,10 @@ fn default_require_agree() -> bool {
 
 /// The house-rules context's default budget, in tokens.
 pub(crate) const DEFAULT_HOUSE_RULES_TOKENS: u64 = 2000;
+
+/// The guardian's budget for `AGENTS.md`. It reads the whole file, so the
+/// budget is large; a file past it is a miss, not a cut.
+pub(crate) const DEFAULT_GUARDIAN_HOUSE_RULES_TOKENS: u64 = 30_000;
 
 /// The bumps one submission gets by default before it asks.
 pub(crate) const DEFAULT_BUMP_LIMIT: u64 = 3;

@@ -108,7 +108,7 @@
 #   [guardian]                              # optional; these are the defaults
 #   deadline_ms = 30000                     # integer > 0; bounds the model call
 #   transcript_tokens = 8000                # the transcript tail it reads, at four bytes a token
-#   house_rules_tokens = 2000               # the workspace's AGENTS.md it reads
+#   house_rules_tokens = 30000              # the AGENTS.md it reads, whole; a longer file is a miss, not a cut
 #
 #   [rc.kohai.guardian]
 #   enabled = true
