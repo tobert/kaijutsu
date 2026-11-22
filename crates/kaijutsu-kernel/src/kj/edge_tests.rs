@@ -64,7 +64,7 @@ async fn context_info_names_the_senpai_its_holder_the_root_and_the_reviewer() {
     assert!(shown.is_ok(), "{}", shown.message());
     let text = shown.message();
     assert!(text.contains("Performer: coder"), "{text}");
-    assert!(text.contains(&format!("Senpai: banto-seat ({}), banto", h.seat.short())), "{text}");
+    assert!(text.contains(&format!("Senpai: banto-seat ({}), played by banto", h.seat.short())), "{text}");
     assert!(text.contains("Lineage root: amy"), "{text}");
     assert!(text.contains("Reviewer: banto (senpai)"), "{text}");
     assert_eq!(text.matches("Senpai:").count(), 1, "one senpai line: {text}");
@@ -468,7 +468,7 @@ async fn the_edge_verbs_read_the_edge_of_the_context_they_name() {
     };
 
     let shown = d.dispatch(&[s("context"), s("info"), s("lane-fork")], &caller(h.coder, h.lane)).await;
-    assert!(shown.message().contains(&format!("Senpai: lane ({}), coder", h.lane.short())), "{}", shown.message());
+    assert!(shown.message().contains(&format!("Senpai: lane ({}), played by coder", h.lane.short())), "{}", shown.message());
     let listed = d.dispatch(&[s("context"), s("list"), s("--senpai"), s("lane")], &caller(h.coder, h.lane)).await;
     assert_eq!(data(&listed), serde_json::json!(["lane-fork"]), "{}", listed.message());
     let none = d.dispatch(&[s("context"), s("list"), s("--senpai"), s("lane-fork")], &caller(h.coder, h.lane)).await;

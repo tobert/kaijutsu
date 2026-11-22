@@ -6,7 +6,7 @@ use kaijutsu_types::{BlockId, ContentType, ContextId, ContextState, PrincipalId}
 use crate::kernel_db::{ContextRow, ContextShellRow, DemoteOutcome, GovernedAct, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
 
 use super::format::{
-    ContextBound, format_context_info, format_context_table, format_context_tree, format_fork_lineage,
+    ContextBound, format_context_table, format_context_tree, format_fork_lineage,
 };
 use super::refs::{parse_context_ref, resolve_context_ref};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
@@ -101,13 +101,19 @@ enum ContextCommand {
         #[arg(long, value_name = "CONTEXT", conflicts_with = "tree")]
         senpai: Option<String>,
     },
-    /// Show a context's metadata (default: current), including the model its
-    /// `model` slot gives it, or why it has none. For a context with a
-    /// character it also shows the senpai it answers to, the lineage root,
-    /// who reviews an ask its character raises, and any migration note.
+    /// Show a context's metadata (default: current), also as `show`: its
+    /// identity (short and full id), every slot with its settings and who
+    /// judges its gate asks, its state (turn in flight, held by a refusal,
+    /// pending asks), the contexts that answer to it, its lineage (senpai,
+    /// reviewer, predecessor, and what its rc scripts changed since the
+    /// predecessor), its loadout, its rc run and track, its environment, and
+    /// its usage and cost. A section with nothing to say is left out. The
+    /// JSON record carries every field. `kj context current` prints only
+    /// the current context's label and id.
+    #[command(visible_alias = "show")]
     Info {
-        /// Context to show. Defaults to the current context. Ids and
-        /// labels come from `kj context list`.
+        /// Context to show. Defaults to the current context. Accepts `.`,
+        /// `.senpai`, a label, or an id as `kj context list` prints it.
         context: Option<String>,
     },
     /// List a context's model turns, newest first: who performed each, which
@@ -134,7 +140,6 @@ enum ContextCommand {
         context: Option<String>,
     },
     /// Print the current context.
-    #[command(alias = "show")]
     Current,
     /// Switch the session to another context.
     #[command(alias = "sw")]
@@ -221,7 +226,7 @@ enum ContextCommand {
     /// no context that answers to the predecessor. The senpai's
     /// character, the lineage root, or the context's own character may
     /// rotate. Rotating a character's handoff log points the character at the
-    /// successor.
+    /// successor. The output ends with both contexts' full ids on one line.
     Rotate {
         /// Context to rotate. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
@@ -794,444 +799,52 @@ impl KjDispatcher {
     }
 
     async fn context_info(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
-        // All KernelDb reads happen in this block, which ends before the
-        // `.await` below — `parking_lot::MutexGuard` is `!Send` in this
-        // workspace (the `send_guard` feature isn't enabled), so it must not
-        // be held across an await point.
-        let (
-            row,
-            children_count,
-            drift_from,
-            drift_to,
-            is_current,
-            trace_id,
-            shell,
-            env_vars,
-            egress_hosts,
-            usage,
-            turn_totals,
-            tool_uses,
-            workspace_paths,
-            workspace_label,
-            bound_model,
-            performer_name,
-        ) = {
+        // The row and the facts that need `await` come first; the sections
+        // then run synchronously under one database lock, which must not be
+        // held across an await (`parking_lot::MutexGuard` is `!Send` here).
+        let row = {
             let db = self.kernel_db().lock();
-
-            // Resolve target context (default: current)
             let target_id = match super::refs::resolve_context_arg(context, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context info: {e}")),
             };
-
-            let row = match db.get_context(target_id) {
+            match db.get_context(target_id) {
                 Ok(Some(r)) => r,
                 Ok(None) => return KjResult::Err("kj context info: not found".to_string()),
                 Err(e) => return KjResult::Err(format!("kj context info: {e}")),
-            };
-
-            // Count live children: the contexts forked from this one
-            let children_count = db
-                .fork_children(target_id)
-                .map(|children| children.len())
-                .unwrap_or(0);
-
-            // Count drift edges (both directions)
-            let drift_from = db
-                .edges_from(target_id)
-                .map(|edges| edges.len())
-                .unwrap_or(0);
-            let drift_to = db
-                .edges_to(target_id)
-                .map(|edges| edges.len())
-                .unwrap_or(0);
-
-            let is_current = Some(target_id) == caller.context_id;
-            // Long-running OTel trace id lives on the in-memory drift handle, not
-            // the persisted row — look it up so the umbrella trace is pasteable.
-            let trace_id = self.drift_router().read().trace_id_for_context(target_id);
-
-            // Shell config — captured into the structured record below as well.
-            let shell = db.get_context_shell(target_id).ok().flatten();
-
-            // Env vars
-            let env_vars = db.get_context_env(target_id).unwrap_or_default();
-
-            // Egress hosts (docs/egress.md). A read failure is an error, never
-            // "none": an empty list claims this context reaches nothing.
-            let egress_hosts = match db.list_context_egress(target_id) {
-                Ok(hosts) => hosts,
-                Err(e) => return KjResult::Err(format!("kj context info: {e}")),
-            };
-
-            // Token usage — a SNAPSHOT of the last completed LLM call ("how
-            // full is this context right now"), not a running total; see
-            // `ContextUsageRow`. `None` for a context that has never
-            // completed a call — shown as absence, never a fabricated zero.
-            let usage = db.get_context_usage(target_id).ok().flatten();
-
-            // Spend: the provider's raw counts summed over every turn. A
-            // failed read is an error, never zero.
-            let turn_totals = match db.context_turn_totals(target_id) {
-                Ok(totals) => totals,
-                Err(e) => return KjResult::Err(format!("kj context info: turn totals: {e}")),
-            };
-            let tool_uses = match db.context_tool_use_totals(target_id) {
-                Ok(uses) => uses,
-                Err(e) => return KjResult::Err(format!("kj context info: tool uses: {e}")),
-            };
-
-            // Workspace paths
-            let workspace_paths = db.context_workspace_paths(target_id).ok().flatten();
-            let workspace_label = row
-                .workspace_id
-                .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
-                .map(|ws| ws.label);
-
-            // The context's `model` slot, or why it has
-            // none. A binding that cannot be read is an error, not "none".
-            let bound_model = match crate::model_resolution::context_model(&db, target_id) {
-                Ok(found) => found,
-                Err(e) => return KjResult::Err(format!("kj context info: model binding: {e}")),
-            };
-
-            // Resolve the performer's name for live and archived contexts.
-            // Retirement preserves both the sheet and this relationship.
-            let performer_name = row
-                .performer
-                .and_then(|pid| db.get_character(pid).ok().flatten())
-                .map(|c| c.name);
-
-            (
-                row,
-                children_count,
-                drift_from,
-                drift_to,
-                is_current,
-                trace_id,
-                shell,
-                env_vars,
-                egress_hosts,
-                usage,
-                turn_totals,
-                tool_uses,
-                workspace_paths,
-                workspace_label,
-                bound_model,
-                performer_name,
-            )
-        };
-
-        // Context-window denominator: the context slot's window, resolved
-        // kernel-side (never shipped to the client as raw inputs to derive).
-        // `None` when the slot holds none: the two fields below MUST both be
-        // `null` in that case, never a guessed denominator standing in for
-        // one. The percentage itself comes from `context_used_pct`, the ONE
-        // percentage-math site, shared with the wire's `contextUsedPct`
-        // (`ContextHandleInfo` / `kaijutsu-server/src/rpc.rs::list_contexts`)
-        // so the two surfaces can never disagree.
-        let (resolved_backend, resolved_model, bound_window) = match &bound_model {
-            crate::model_resolution::ContextModelLookup::Model(m) => {
-                (Some(m.backend.clone()), Some(m.model.clone()), m.context_window.map(|w| (m.backend.clone(), m.model.clone(), w)))
             }
-            crate::model_resolution::ContextModelLookup::None(_) => (None, None, None),
         };
-        let (context_window, context_used_pct) = match &usage {
-            Some(u) => {
-                // The window belongs to the bound model: usage recorded on
-                // another model has no window here.
-                let window = bound_window
-                    .as_ref()
-                    .filter(|(backend, model, _)| *backend == u.provider && *model == u.model)
-                    .map(|(_, _, w)| *w);
-                let pct = crate::kernel_db::context_used_pct(u, window);
-                (window, pct)
-            }
-            None => (None, None),
-        };
-
         let cost = match self.context_cost(row.context_id).await {
             Ok(cost) => cost,
             Err(e) => return KjResult::Err(format!("kj context info: {e}")),
         };
-
-        // A list that cannot be read is an error, never "none": an empty list
-        // claims the next turn runs the plain model.
-        let controls = match self.kernel_db().lock().list_context_controls(row.context_id) {
-            Ok(controls) => controls,
-            Err(e) => return KjResult::Err(format!("kj context info: {e}")),
-        };
-
-        let mut info = format_context_info(
-            &row,
-            children_count,
-            drift_from + drift_to,
-            is_current,
-            trace_id,
-        );
-
-        match &bound_model {
-            crate::model_resolution::ContextModelLookup::Model(m) => {
-                info.push_str(&format!("\nModel:    {}/{}", m.backend, m.model));
-            }
-            crate::model_resolution::ContextModelLookup::None(none) => match none.notice() {
-                Some(line) => info.push_str(&format!("\nModel:    {line}")),
-                None => info.push_str("\nModel:    (the client brings its own)"),
-            },
-        }
-
-        // The document version a client hydrates against (`docs/change-feed.md`).
-        // Absent when the document is not resident in this kernel.
-        let version = self.blocks.version(row.context_id).ok();
-        if let Some(v) = version {
-            info.push_str(&format!("\nVersion: {v}"));
-        }
-
-        if let Some(ref s) = shell
-            && let Some(cwd) = &s.cwd
-        {
-            info.push_str(&format!("\nCwd:     {cwd}"));
-        }
-
-        if !env_vars.is_empty() {
-            info.push_str("\nEnv:");
-            for v in &env_vars {
-                info.push_str(&format!("\n  {}={}", v.key, v.value));
-            }
-        }
-
-        // Always shown, unlike Env above — an explicit "none" tells the
-        // reader this context reaches nothing rather than leaving them to
-        // wonder whether the field was simply omitted (`docs/egress.md`).
-        if egress_hosts.is_empty() {
-            info.push_str("\nEgress:  none");
-        } else {
-            info.push_str("\nEgress:");
-            for h in &egress_hosts {
-                info.push_str(&format!("\n  {h}"));
-            }
-        }
-
-        if !controls.is_empty() {
-            info.push_str("\nControl:");
-            for (position, item) in controls.iter().enumerate() {
-                info.push_str(&format!("\n  {position}  {}", super::context_control::describe_item(item)));
-            }
-        }
-
-        if let Some(ref u) = usage {
-            info.push_str(&format!(
-                "\nTokens:  {} in + {} out = {} (cache read {}, write {}; {}/{})",
-                u.input_tokens,
-                u.output_tokens,
-                u.input_tokens + u.output_tokens,
-                u.cache_read_tokens,
-                u.cache_write_tokens,
-                u.provider,
-                u.model,
-            ));
-            match (context_window, context_used_pct) {
-                (Some(w), Some(pct)) => {
-                    info.push_str(&format!(" — {w} window, {pct:.1}% used"));
-                }
-                _ => info.push_str(" — window unknown"),
-            }
-        }
-
-        info.push_str(&format!(
-            "\nTurns:   {} ({} calls): {} in, {} out, cache read {}, write {}, reasoning {}",
-            turn_totals.turns,
-            turn_totals.llm_calls,
-            turn_totals.input_tokens,
-            turn_totals.output_tokens,
-            turn_totals.cache_read_tokens,
-            turn_totals.cache_write_tokens,
-            turn_totals.reasoning_tokens,
-        ));
-        if !tool_uses.is_empty() {
-            info.push_str(&format!("\nTools:   {}", describe_tool_uses(&tool_uses)));
-        }
-        if let Some(cost) = &cost {
-            info.push_str(&format!("\nCost:    {}", describe_cost(cost)));
-        }
-
-        if let Some(paths) = workspace_paths.as_ref().filter(|p| !p.is_empty()) {
-            let ws_label = workspace_label.clone().unwrap_or_else(|| "?".into());
-            info.push_str(&format!("\nWorkspace: {ws_label}"));
-            for p in paths {
-                let ro = if p.read_only { " (ro)" } else { "" };
-                info.push_str(&format!("\n  {}{ro}", p.path));
-            }
-        }
-
-        info.push_str(&format!("\nPerformer: {}", performer_name.as_deref().unwrap_or("none")));
         // A context with no performer still routes its asks: the gate climbs
-        // the senpai chain with the caller as the actor, so route for nobody in particular.
+        // the senpai chain with the system as the actor.
         let review = match row.performer {
             Some(_) => self.kernel().resolve_context_review(row.context_id).await,
             None => self.kernel().resolve_context_review_for(row.context_id, PrincipalId::system()).await,
         };
-        let (effective_review, reviewer_error) = match review {
-            Ok(review) => (Some(review), None),
-            Err(error) => {
-                info.push_str(&format!("\nReviewer error: {error}"));
-                (None, Some(error))
-            }
-        };
-        let reviewer_name = effective_review.as_ref().map(|review| review.reviewer.name.clone());
-        if let Some(review) = effective_review.as_ref() {
-            info.push_str(&format!("\nReviewer: {} ({})", review.reviewer.name, review.source.as_str()));
-        }
-        // The context this one answers to, with its character. Only a root
-        // console has no senpai.
-        let edge = {
-            let db = self.kernel_db().lock();
-            let found = (|| -> Result<_, String> {
-                let senpai = match row.senpai_ctx {
-                    Some(id) => Some(db.get_context(id).map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("senpai {} has no row", id.short()))?),
-                    None => None,
-                };
-                let root = db.lineage_root(row.context_id).map(|root| (root, db.name_for(root))).map_err(|e| e.to_string());
-                let note = db.senpai_migration_report().map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|(c, _, _)| *c == row.context_id)
-                    .map(|(_, _, note)| note);
-                Ok(Some((senpai, root, note)))
-            })();
-            match found {
-                Ok(edge) => edge,
-                Err(error) => return KjResult::Err(format!("kj context info: senpai lookup: {error}")),
-            }
-        };
-        if let Some((senpai, root, note)) = &edge {
-            let db = self.kernel_db().lock();
-            if let Some(senpai) = senpai {
-                info.push_str(&format!("\nSenpai: {}", context_line(&db, senpai)));
-            }
-            match root {
-                Ok((_, name)) => info.push_str(&format!("\nLineage root: {name}")),
-                Err(reason) => info.push_str(&format!("\nLineage root: none ({reason})")),
-            }
-            if let Some(note) = note {
-                info.push_str(&format!("\nMigration note: {note}"));
-            }
-        }
-        // What the context-character migration did not carry over for this
-        // context. Setting the senpai again clears the ones about the senpai.
-        let character_notes: Vec<(String, String)> = match self.kernel_db().lock().context_character_migration_report() {
-            Ok(notes) => notes.into_iter()
-                .filter(|n| n.context_id == Some(row.context_id))
-                .map(|n| (n.kind, n.note))
-                .collect(),
-            Err(error) => return KjResult::Err(format!("kj context info: migration notes: {error}")),
-        };
-        for (kind, note) in &character_notes {
-            info.push_str(&format!("\nCharacter migration note ({kind}): {note}"));
-        }
+        let gate = super::gate_policy::load_config(self.kernel().vfs(), self.kernel_db()).await;
+        // The long-running OTel trace id lives on the in-memory drift handle,
+        // not the persisted row.
+        let trace_id = self.drift_router().read().trace_id_for_context(row.context_id);
 
-        // Structured record: full ids and the same fields the text view
-        // surfaces, so `kaish-last` round-trips and per-field jq queries work.
-        let mut record = serde_json::json!({
-            "context_id": row.context_id.to_hex(),
-            "label": row.label,
-            "context_state": format!("{:?}", row.context_state),
-            // Advisory: the registering client's self-reported hostname
-            // (`null` when unknown — old client, or a creation path with
-            // nothing to report). See `ContextRow::origin_host`'s doc
-            // comment.
-            "origin_host": row.origin_host,
-            "trace_id": trace_id.map(crate::kj::format::hex32),
-            "forked_from": row.forked_from.map(|id| id.to_hex()),
-            "fork_kind": row.fork_kind.as_ref().map(|k| format!("{k:?}")),
-            "children_count": children_count,
-            "version": version,
-            "drift_count": drift_from + drift_to,
-            "is_current": is_current,
-            "workspace_id": row.workspace_id.map(|id| id.to_hex()),
-            "workspace_label": workspace_label,
-            "preset_id": row.preset_id.map(|id| id.to_hex()),
-            // The character whose performance this context is, and its
-            // kernel-owned name — `null` together when nobody plays it (a
-            // score context, a file document, a pre-character row). See
-            // `ContextRow::performer`'s doc comment.
-            "performer": row.performer.map(|id| id.to_hex()),
-            "performer_name": performer_name,
-            // The context's `model` slot. Both
-            // `resolved_backend` and `resolved_model` are `null` together
-            // when the context has no `model` slot; `model_absent`
-            // then says why. An honest absence, never a fallback.
-            "resolved_backend": resolved_backend,
-            "resolved_model": resolved_model,
-            "model_absent": match &bound_model {
-                crate::model_resolution::ContextModelLookup::None(none) => none.notice(),
-                _ => None,
-            },
-            "cwd": shell.as_ref().and_then(|s| s.cwd.clone()),
-            "env": env_vars.iter()
-                .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
-                .collect::<serde_json::Map<_, _>>(),
-            // `docs/egress.md` — the hosts this context's curl may reach.
-            // Always present (an empty array is the honest "none", never
-            // omitted).
-            "egress": egress_hosts,
-            "control": super::context_control::items_json(&controls),
-            // `null` when this context has never completed an LLM call —
-            // honest absence, not a fabricated zero. `context_window` /
-            // `context_used_pct` are resolved kernel-side (never derived
-            // client-side, per the thin-client convention) via
-            // the context slot's window; both are `null` together whenever
-            // the slot holds none — never a fabricated denominator standing
-            // in for an unknown one.
-            "usage": usage.as_ref().map(|u| serde_json::json!({
-                "provider": u.provider,
-                "model": u.model,
-                "input_tokens": u.input_tokens,
-                "output_tokens": u.output_tokens,
-                "total_tokens": u.input_tokens + u.output_tokens,
-                "cache_read_tokens": u.cache_read_tokens,
-                "cache_write_tokens": u.cache_write_tokens,
-                "reasoning_tokens": u.reasoning_tokens,
-                "updated_at_ms": u.updated_at,
-                "context_window": context_window,
-                "context_used_pct": context_used_pct,
-            })),
-        });
-        record["tool_uses"] = tool_uses_json(&tool_uses);
-        record["turns"] = serde_json::json!({
-            "turns": turn_totals.turns,
-            "llm_calls": turn_totals.llm_calls,
-            "input_tokens": turn_totals.input_tokens,
-            "output_tokens": turn_totals.output_tokens,
-            "cache_read_tokens": turn_totals.cache_read_tokens,
-            "cache_write_tokens": turn_totals.cache_write_tokens,
-            "reasoning_tokens": turn_totals.reasoning_tokens,
-        });
-        // `micros` is null when no call could be priced: an unknown cost is
-        // not a zero one.
-        record["cost"] = serde_json::json!(cost.as_ref().map(|c| serde_json::json!({
-            "micros": (c.priced_calls > 0).then_some(c.micros),
-            "priced_calls": c.priced_calls,
-            "unpriced_calls": c.unpriced_calls,
-        })));
-        record["reviewer_id"] = serde_json::json!(effective_review.as_ref().map(|review| review.reviewer.principal_id.to_hex()));
-        record["reviewer_name"] = serde_json::json!(reviewer_name);
-        record["review_source"] = serde_json::json!(effective_review.as_ref().map(|review| review.source.as_str()));
-        record["reviewer_error"] = serde_json::json!(reviewer_error);
-        {
-            let db = self.kernel_db().lock();
-            let senpai = edge.as_ref().and_then(|(senpai, _, _)| senpai.as_ref());
-            record["senpai"] = serde_json::json!(senpai.map(|senpai| context_json(&db, senpai)));
-            let root = edge.as_ref().and_then(|(_, root, _)| root.as_ref().ok());
-            record["lineage_root"] = serde_json::json!(root.map(|(id, name)| serde_json::json!({ "id": id.to_hex(), "name": name })));
-            record["lineage_root_error"] = serde_json::json!(edge.as_ref().and_then(|(_, root, _)| root.as_ref().err()));
-            record["migration_note"] = serde_json::json!(edge.as_ref().and_then(|(_, _, note)| note.as_ref()));
-            record["character_migration_notes"] = serde_json::json!(
-                character_notes.iter().map(|(kind, note)| serde_json::json!({ "kind": kind, "note": note })).collect::<Vec<_>>()
-            );
+        let db = self.kernel_db().lock();
+        let view = super::context_info::InfoView {
+            db: &db,
+            kernel: self.kernel(),
+            blocks: self.block_store(),
+            row: &row,
+            caller,
+            trace_id,
+            review: &review,
+            cost: cost.as_ref(),
+            gate: &gate,
+        };
+        match super::context_info::build(&view, super::context_info::REGISTRY) {
+            Ok((text, record)) => KjResult::ok_with_data(text, record),
+            Err(e) => KjResult::Err(format!("kj context info: {e}")),
         }
-
-        KjResult::ok_with_data(info, record)
     }
 
     /// `kj context turns`: a context's recorded model turns, newest first.
@@ -3043,6 +2656,11 @@ impl KjDispatcher {
         }
 
         let mut msg = format!("rotated {name}: {} archived, {} replaces it", predecessor.context_id.short(), successor_id.short());
+        msg.push_str(&format!(
+            "\nfull ids: predecessor {} successor {}",
+            predecessor.context_id.to_hex(),
+            successor_id.to_hex()
+        ));
         if moved > 0 {
             msg.push_str(" (the character's handoff log now points at it)");
         }
@@ -3563,11 +3181,11 @@ fn resolve_senpai_arg(
     if arg.is_empty() {
         return Err("--senpai needs a context".to_string());
     }
-    match super::refs::parse_context_ref(arg) {
-        super::refs::ContextRef::Query(query) if include_archived => {
-            db.resolve_context_including_archived(&query).map_err(|e| e.to_string())
-        }
-        other => super::refs::resolve_context_ref(&other, caller, db),
+    let reference = super::refs::parse_context_ref(arg);
+    if include_archived {
+        super::refs::resolve_context_ref_including_archived(&reference, caller, db)
+    } else {
+        super::refs::resolve_context_ref(&reference, caller, db)
     }
 }
 
@@ -3787,18 +3405,18 @@ impl Classify for ContextCommand {
 }
 
 /// Provider-billed tool uses as `web_search 3, web_extractor 1`.
-fn describe_tool_uses(uses: &[(String, i64)]) -> String {
+pub(super) fn describe_tool_uses(uses: &[(String, i64)]) -> String {
     uses.iter().map(|(tool, calls)| format!("{tool} {calls}")).collect::<Vec<_>>().join(", ")
 }
 
 /// Provider-billed tool uses as a JSON object of tool name to call count.
-fn tool_uses_json(uses: &[(String, i64)]) -> serde_json::Value {
+pub(super) fn tool_uses_json(uses: &[(String, i64)]) -> serde_json::Value {
     serde_json::Value::Object(uses.iter().map(|(tool, calls)| (tool.clone(), serde_json::json!(calls))).collect())
 }
 
 /// How `kj context info` writes a context's cost. Calls with no price are
 /// said plainly: the amount is then a floor, or wholly unknown.
-fn describe_cost(cost: &crate::pricing::ContextCost) -> String {
+pub(super) fn describe_cost(cost: &crate::pricing::ContextCost) -> String {
     let priced = |n: u64| if n == 1 { "1 call priced".to_string() } else { format!("{n} calls priced") };
     // Counts model calls and provider-billed tool uses alike.
     let unpriced = |n: u64| if n == 1 { "1 call has no price".to_string() } else { format!("{n} calls have no price") };
@@ -4048,6 +3666,27 @@ mod tests {
         assert_eq!(indent("kid-a"), indent("kid-b"), "{}", result.message());
         assert_eq!(indent("newcomer"), indent("parent"), "{}", result.message());
         assert!(lines[4].1.starts_with('*'), "the caller's row is marked: {}", result.message());
+    }
+
+    /// `kj context show` is `kj context info`, so it takes a context like
+    /// `kj character show` does, and `current` still prints the current one.
+    #[tokio::test]
+    async fn context_show_is_info_and_current_still_prints_the_current_context() {
+        let d = test_dispatcher().await;
+        let ctx_id = register_context(&d, Some("showme"), None, PrincipalId::new());
+        let c = caller_with_context(ctx_id);
+        let shown = d.dispatch(&[s("context"), s("show"), s(".")], &c).await;
+        assert!(shown.is_ok(), "{}", shown.message());
+        let info = d.dispatch(&[s("context"), s("info"), s(".")], &c).await;
+        assert_eq!(shown.message(), info.message());
+        let KjResult::Ok { data: Some(data), .. } = &shown else { panic!("show carries the info record: {shown:?}") };
+        assert_eq!(data["context_id"], ctx_id.to_hex());
+        let by_label = d.dispatch(&[s("context"), s("show"), s("showme")], &c).await;
+        assert!(by_label.is_ok(), "{}", by_label.message());
+        let current = d.dispatch(&[s("context"), s("current")], &c).await;
+        assert!(current.is_ok(), "{}", current.message());
+        assert!(current.message().contains("showme"), "{}", current.message());
+        assert!(!current.message().contains("Created:"), "`current` is not the info text: {}", current.message());
     }
 
     #[tokio::test]
@@ -5906,6 +5545,27 @@ mod tests {
     #[test]
     fn rotate_without_a_successor_loadout_leaves_the_predecessor_live() {
         crate::on_rc_thread(rotate_without_a_successor_loadout_leaves_the_predecessor_live_body);
+    }
+
+    /// The rotation's output ends with both full ids on one line, and the
+    /// successor's `info` names the predecessor by the same full id, saying
+    /// the rc scripts were not compared when the seat has no run record.
+    async fn rotate_prints_the_full_ids_and_info_names_the_predecessor_body() {
+        let f = rotation_fixture().await;
+        let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let successor = successor_of(&rotated);
+        let last = rotated.message().lines().last().unwrap().to_string();
+        assert_eq!(last, format!("full ids: predecessor {} successor {}", f.seat.to_hex(), successor.to_hex()));
+        let info = f.d.dispatch(&[s("context"), s("info"), successor.to_hex()], &rotation_caller(successor, f.banto)).await;
+        assert!(info.is_ok(), "{}", info.message());
+        assert!(info.message().contains(&format!("(full {})", f.seat.to_hex())), "{}", info.message());
+        assert!(info.message().contains("Rc changes since the predecessor: not compared (no run record)"), "{}", info.message());
+    }
+
+    #[test]
+    fn rotate_prints_the_full_ids_and_info_names_the_predecessor() {
+        crate::on_rc_thread(rotate_prints_the_full_ids_and_info_names_the_predecessor_body);
     }
 
     #[test]
@@ -10015,7 +9675,7 @@ mod tests {
         }
         let info = d.dispatch(&[s("context"), s("info"), s("lane-fork")], &caller_with_context(lane)).await;
         assert!(info.is_ok(), "{}", info.message());
-        assert!(info.message().contains(&format!("Senpai: lane ({}), coder", lane.short())), "{}", info.message());
+        assert!(info.message().contains(&format!("Senpai: lane ({}), played by coder", lane.short())), "{}", info.message());
         let KjResult::Ok { data: Some(data), .. } = &info else { panic!("expected data") };
         assert_eq!(data["performer_name"], "coder");
         assert_eq!(data["senpai"]["character"], "coder");

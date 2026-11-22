@@ -27,6 +27,7 @@ pub mod cp;
 pub mod config;
 pub mod context;
 mod context_control;
+mod context_info;
 pub mod council;
 pub mod watch;
 pub mod db;
