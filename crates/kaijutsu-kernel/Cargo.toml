@@ -202,7 +202,10 @@ rustix = { version = "1", features = ["fs", "process"] }
 # "test-util" gives `#[tokio::test(start_paused = true)]` — how the MIDI
 # exchange's deadline tests assert a multi-second timeout instantly instead of
 # actually sleeping through it.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "net"] }
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Enable the cross-crate test-only helpers (e.g. push_committed_for_test) for the
