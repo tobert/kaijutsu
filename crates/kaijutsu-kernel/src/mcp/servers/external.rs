@@ -17,15 +17,15 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock,
     ElicitRequestParams, ElicitResult, ElicitationAction, ProgressNotificationParam,
     ProtocolVersion, ReadResourceRequestParams, RequestMetaObject, ResourceContents,
-    SubscribeRequestParams, UnsubscribeRequestParams,
+    SubscribeRequestParams, SubscriptionFilter, UnsubscribeRequestParams,
 };
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kept for now, see the
 // `enable_roots` comment on `BrokerClientHandler::new` below.
 #[allow(deprecated)]
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
-use rmcp::service::{NotificationContext, RequestContext, RunningService};
+use rmcp::service::{NotificationContext, Peer, RequestContext, RunningService};
 use rmcp::transport::TokioChildProcess;
-use rmcp::{ClientHandler, RoleClient};
+use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -44,23 +44,20 @@ use super::super::types::{
 /// `_meta` namespace per §5.4.
 const META_NAMESPACE: &str = "io.kaijutsu.v1";
 
-/// Transport kind for external MCP connections. Replaces the type that used
-/// to live in the removed `mcp_pool` module.
+/// Default request URI used for `UnixSocket` transport when `url` is omitted.
+pub const DEFAULT_UNIX_SOCKET_URL: &str = "http://localhost/mcp";
+
+/// Transport kind for external MCP connections.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum McpTransport {
     #[default]
     Stdio,
     StreamableHttp,
+    UnixSocket,
 }
 
 /// Connection config for an external MCP server. Superset of what
 /// `rmcp::serve_client` needs; broker config loading populates this.
-///
-/// There used to be a documented `fork` field here (mcp.toml's header
-/// comment described "share"/"instance"/"exclude" fork behavior) — it was
-/// never implemented. Rather than leave documented-but-nonexistent config,
-/// the doc comment was deleted alongside rebuilding the loader
-/// (`mcp/toml.rs`); see that module's doc comment for the reasoning.
 #[derive(Clone, Debug, Default)]
 pub struct McpServerConfig {
     pub name: String,
@@ -70,16 +67,14 @@ pub struct McpServerConfig {
     pub cwd: Option<String>,
     pub transport: McpTransport,
     pub url: Option<String>,
-    /// Extra HTTP headers sent with every request, for `StreamableHttp` only.
-    /// Values are already resolved (`mcp/toml.rs`), so a credential reaches
-    /// here as the string to send, never as the source it came from.
+    /// Unix domain socket path for `UnixSocket` transport.
+    pub socket: Option<String>,
+    /// Extra HTTP headers sent with every request, for `StreamableHttp` and
+    /// `UnixSocket` transports. Values are resolved at config load time.
     pub headers: HashMap<String, String>,
     /// Per-server `InstancePolicy::call_timeout` override, sourced from
-    /// mcp.toml's `call_timeout_ms` (component 3, `docs/external-mcp.md`). `None`
-    /// means "use the kernel-wide `TimeoutPolicy::mcp_call_timeout_default`"
-    /// (`InstancePolicy::for_kernel`'s existing behavior). A long-running
-    /// consult (kaibo routinely runs 5-15 minutes) needs this — the kernel
-    /// default of 120s would otherwise cut every such call off.
+    /// mcp.toml's `call_timeout_ms`. `None` falls back to
+    /// `TimeoutPolicy::mcp_call_timeout_default`.
     pub call_timeout: Option<std::time::Duration>,
 }
 
@@ -315,6 +310,41 @@ fn http_transport(
     Ok(rmcp::transport::StreamableHttpClientTransport::from_config(transport_config))
 }
 
+/// Build the streamable-HTTP-over-Unix-socket transport for one server: its
+/// socket path, request URI (defaulting to [`DEFAULT_UNIX_SOCKET_URL`]), and
+/// [`http_headers`].
+#[cfg(unix)]
+fn unix_socket_transport(
+    config: &McpServerConfig,
+) -> McpResult<
+    rmcp::transport::StreamableHttpClientTransport<rmcp::transport::UnixSocketHttpClient>,
+> {
+    let socket = config
+        .socket
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "@")
+        .ok_or_else(|| {
+            McpError::Protocol("UnixSocket transport requires a non-empty socket path".to_string())
+        })?;
+    let url = config
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(DEFAULT_UNIX_SOCKET_URL);
+    let headers = http_headers(config)?;
+    let transport_config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
+            .custom_headers(headers);
+    Ok(
+        rmcp::transport::StreamableHttpClientTransport::from_unix_socket_with_config(
+            socket,
+            transport_config,
+        ),
+    )
+}
+
 /// Propagate PATH and other essential host env vars onto the child command —
 /// matches legacy `mcp_pool::propagate_host_env`.
 fn propagate_host_env(cmd: &mut Command) {
@@ -367,12 +397,59 @@ fn harden_child_command(cmd: &mut Command) {
     }
 }
 
+/// Lifecycle mode for external MCP client connections: probe `server/discover`
+/// for `2026-07-28` first, falling back to legacy `initialize` on `2025-11-25`.
+fn client_lifecycle_mode() -> ClientLifecycleMode {
+    ClientLifecycleMode::Auto {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        legacy_version: Some(ProtocolVersion::V_2025_11_25),
+    }
+}
+
+/// Active background task driving one `subscriptions/listen` stream.
+struct SubscriptionHandle {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Returns true when the connected peer negotiated a protocol version that
+/// uses `subscriptions/listen` instead of legacy `resources/subscribe`.
+fn uses_subscriptions_listen(peer: &Peer<RoleClient>) -> bool {
+    peer.peer_info()
+        .is_some_and(|info| info.protocol_version >= ProtocolVersion::V_2026_07_28)
+}
+
+/// Forward a notification delivered on a `subscriptions/listen` stream onto
+/// the server's broker-visible broadcast channel.
+fn forward_subscription_notification(
+    tx: &broadcast::Sender<ServerNotification>,
+    notif: rmcp::model::ServerNotification,
+) {
+    match notif {
+        rmcp::model::ServerNotification::ResourceUpdatedNotification(n) => {
+            let _ = tx.send(ServerNotification::ResourceUpdated { uri: n.params.uri });
+        }
+        rmcp::model::ServerNotification::ToolListChangedNotification(_) => {
+            let _ = tx.send(ServerNotification::ToolsChanged);
+        }
+        rmcp::model::ServerNotification::PromptListChangedNotification(_) => {
+            let _ = tx.send(ServerNotification::PromptsChanged);
+        }
+        rmcp::model::ServerNotification::ResourceListChangedNotification(_) => {
+            tracing::debug!("MCP resource list changed notification received");
+        }
+        _ => {}
+    }
+}
+
 pub struct ExternalMcpServer {
     instance_id: InstanceId,
     config: McpServerConfig,
     service: PlRwLock<Option<RunningService<RoleClient, BrokerClientHandler>>>,
     tools_cache: PlRwLock<Vec<KernelTool>>,
     notif_tx: broadcast::Sender<ServerNotification>,
+    /// Active `subscriptions/listen` tasks keyed by resource URI.
+    subscriptions: PlRwLock<HashMap<String, SubscriptionHandle>>,
     /// Set to `true` when a transport error occurs. Cleared on successful
     /// reconnect. Drives `health()`.
     down: AtomicBool,
@@ -418,15 +495,33 @@ impl ExternalMcpServer {
                     harden_child_command(&mut cmd);
                     let transport = TokioChildProcess::new(cmd)
                         .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
-                    rmcp::serve_client(handler, transport)
+                    handler
+                        .serve_with_lifecycle(transport, client_lifecycle_mode())
                         .await
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
                 McpTransport::StreamableHttp => {
                     let transport = http_transport(&config)?;
-                    rmcp::serve_client(handler, transport)
+                    handler
+                        .serve_with_lifecycle(transport, client_lifecycle_mode())
                         .await
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
+                }
+                McpTransport::UnixSocket => {
+                    #[cfg(unix)]
+                    {
+                        let transport = unix_socket_transport(&config)?;
+                        handler
+                            .serve_with_lifecycle(transport, client_lifecycle_mode())
+                            .await
+                            .map_err(|e| McpError::Protocol(format!("init: {e}")))?
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Err(McpError::Protocol(
+                            "UnixSocket transport is only supported on Unix platforms".to_string(),
+                        ));
+                    }
                 }
             };
             let tools = service
@@ -462,6 +557,7 @@ impl ExternalMcpServer {
             service: PlRwLock::new(Some(service)),
             tools_cache: PlRwLock::new(kernel_tools),
             notif_tx,
+            subscriptions: PlRwLock::new(HashMap::new()),
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
             images: None,
@@ -479,10 +575,22 @@ impl ExternalMcpServer {
         *self.down_reason.write() = Some(reason.into());
     }
 
-    /// Tear down the current service and spin up a fresh one. Intended for
-    /// post-failure recovery; Phase 1 does not invoke this automatically.
+    /// Cancel and await all active `subscriptions/listen` tasks.
+    async fn cancel_all_subscriptions(&self) {
+        let handles: Vec<SubscriptionHandle> = {
+            let mut guard = self.subscriptions.write();
+            guard.drain().map(|(_, h)| h).collect()
+        };
+        for handle in handles {
+            handle.cancel.cancel();
+            let _ = handle.task.await;
+        }
+    }
+
+    /// Tear down the current service and spin up a fresh one.
     /// Bounded by `connect_timeout` like `connect()`.
     pub async fn reconnect(&self, connect_timeout: std::time::Duration) -> McpResult<()> {
+        self.cancel_all_subscriptions().await;
         // Drop the old service first so the subprocess fully exits.
         let _ = self.service.write().take();
 
@@ -502,15 +610,33 @@ impl ExternalMcpServer {
                     harden_child_command(&mut cmd);
                     let transport = TokioChildProcess::new(cmd)
                         .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
-                    rmcp::serve_client(handler, transport)
+                    handler
+                        .serve_with_lifecycle(transport, client_lifecycle_mode())
                         .await
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
                 McpTransport::StreamableHttp => {
                     let transport = http_transport(&self.config)?;
-                    rmcp::serve_client(handler, transport)
+                    handler
+                        .serve_with_lifecycle(transport, client_lifecycle_mode())
                         .await
                         .map_err(|e| McpError::Protocol(format!("init: {e}")))?
+                }
+                McpTransport::UnixSocket => {
+                    #[cfg(unix)]
+                    {
+                        let transport = unix_socket_transport(&self.config)?;
+                        handler
+                            .serve_with_lifecycle(transport, client_lifecycle_mode())
+                            .await
+                            .map_err(|e| McpError::Protocol(format!("init: {e}")))?
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Err(McpError::Protocol(
+                            "UnixSocket transport is only supported on Unix platforms".to_string(),
+                        ));
+                    }
                 }
             };
             // Refresh tool cache — list_changed may have fired during the outage.
@@ -955,11 +1081,6 @@ impl McpServerLike for ExternalMcpServer {
         Ok(KernelReadResource { contents })
     }
 
-    // resources/subscribe is legacy-only per SEP-2577 (superseded by
-    // `Peer::listen` / `subscriptions/listen` for peers on protocol version
-    // 2026-07-28) — but that's a real subscription-model migration, not a
-    // drop-in swap, and out of scope for this dependency bump. Kept for now.
-    #[allow(deprecated)]
     async fn subscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
         if self.down.load(Ordering::Relaxed) {
             return Err(self.instance_down_error());
@@ -971,18 +1092,79 @@ impl McpServerLike for ExternalMcpServer {
                 None => return Err(self.instance_down_error()),
             }
         };
-        let params = SubscribeRequestParams::new(uri);
-        peer.subscribe(params).await.map_err(|e| {
-            map_rmcp_service_error(e, &self.instance_id, |reason| {
-                self.mark_down(reason);
-            })
-        })?;
+
+        if uses_subscriptions_listen(&peer) {
+            {
+                let guard = self.subscriptions.read();
+                if let Some(existing) = guard.get(uri)
+                    && !existing.task.is_finished()
+                {
+                    return Ok(());
+                }
+            }
+
+            let filter = SubscriptionFilter::builder()
+                .resource_subscription(uri)
+                .build();
+            let mut sub = peer.listen(filter).await.map_err(|e| {
+                map_rmcp_service_error(e, &self.instance_id, |reason| {
+                    self.mark_down(reason);
+                })
+            })?;
+
+            let cancel = CancellationToken::new();
+            let task_cancel = cancel.clone();
+            let tx = self.notif_tx.clone();
+            let uri_for_log = uri.to_string();
+            let task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = task_cancel.cancelled() => {
+                            let _ = sub.cancel().await;
+                            break;
+                        }
+                        item = sub.next() => {
+                            match item {
+                                Ok(Some(notif)) => forward_subscription_notification(&tx, notif),
+                                Ok(None) => break,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        uri = %uri_for_log,
+                                        "subscriptions/listen stream error: {err}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let displaced = self
+                .subscriptions
+                .write()
+                .insert(uri.to_string(), SubscriptionHandle { cancel, task });
+            if let Some(old) = displaced {
+                old.cancel.cancel();
+                let _ = old.task.await;
+            }
+            return Ok(());
+        }
+
+        // Legacy protocol versions (< 2026-07-28) use resources/subscribe.
+        #[allow(deprecated)]
+        {
+            let params = SubscribeRequestParams::new(uri);
+            peer.subscribe(params).await.map_err(|e| {
+                map_rmcp_service_error(e, &self.instance_id, |reason| {
+                    self.mark_down(reason);
+                })
+            })?;
+        }
         Ok(())
     }
 
-    // resources/unsubscribe is likewise legacy-only per SEP-2577 — see the
-    // `subscribe` comment above.
-    #[allow(deprecated)]
     async fn unsubscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
         if self.down.load(Ordering::Relaxed) {
             return Err(self.instance_down_error());
@@ -994,12 +1176,26 @@ impl McpServerLike for ExternalMcpServer {
                 None => return Err(self.instance_down_error()),
             }
         };
-        let params = UnsubscribeRequestParams::new(uri);
-        peer.unsubscribe(params).await.map_err(|e| {
-            map_rmcp_service_error(e, &self.instance_id, |reason| {
-                self.mark_down(reason);
-            })
-        })?;
+
+        if uses_subscriptions_listen(&peer) {
+            let removed = self.subscriptions.write().remove(uri);
+            if let Some(handle) = removed {
+                handle.cancel.cancel();
+                let _ = handle.task.await;
+            }
+            return Ok(());
+        }
+
+        // Legacy protocol versions (< 2026-07-28) use resources/unsubscribe.
+        #[allow(deprecated)]
+        {
+            let params = UnsubscribeRequestParams::new(uri);
+            peer.unsubscribe(params).await.map_err(|e| {
+                map_rmcp_service_error(e, &self.instance_id, |reason| {
+                    self.mark_down(reason);
+                })
+            })?;
+        }
         Ok(())
     }
 
@@ -1021,6 +1217,7 @@ impl McpServerLike for ExternalMcpServer {
     }
 
     async fn shutdown(&self) -> McpResult<()> {
+        self.cancel_all_subscriptions().await;
         // Drop the guard before awaiting — parking_lot guards aren't Send.
         let service = { self.service.write().take() };
         if let Some(service) = service {
@@ -1054,6 +1251,7 @@ mod tests {
             service: PlRwLock::new(None),
             tools_cache: PlRwLock::new(Vec::new()),
             notif_tx: tx,
+            subscriptions: PlRwLock::new(HashMap::new()),
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
             images: None,
@@ -1504,5 +1702,387 @@ mod tests {
 
         // Clean up so we don't leak a live `sleep 5` past this test.
         let _ = transport.graceful_shutdown().await;
+    }
+
+    // ---- 2026-07-28 subscriptions/listen --------------------------------
+
+    #[derive(Clone)]
+    struct SubscriptionTestServer {
+        update_tx: tokio::sync::broadcast::Sender<String>,
+        cancelled_tx: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl rmcp::ServerHandler for SubscriptionTestServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            let mut info = rmcp::model::ServerConfig::default();
+            info.protocol_version = ProtocolVersion::V_2026_07_28;
+            info.capabilities = rmcp::model::ServerCapabilities::builder()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .enable_resources_list_changed()
+                .build();
+            info
+        }
+
+        fn accepted_subscription_filter(
+            &self,
+            requested: &rmcp::model::SubscriptionFilter,
+        ) -> Option<rmcp::model::SubscriptionFilter> {
+            Some(requested.clone())
+        }
+
+        fn listen(
+            &self,
+            context: rmcp::service::SubscriptionContext,
+        ) -> impl std::future::Future<Output = Result<(), rmcp::ErrorData>> + Send + '_ {
+            let mut rx = self.update_tx.subscribe();
+            let cancelled = self.cancelled_tx.clone();
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = context.cancelled() => {
+                            cancelled.notify_one();
+                            break;
+                        }
+                        Ok(uri) = rx.recv() => {
+                            let _ = context.sink().notify_resource_updated(uri).await;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_uses_subscriptions_listen_on_2026_07_28() {
+        let (update_tx, _) = tokio::sync::broadcast::channel::<String>(16);
+        let cancelled = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server_handler = SubscriptionTestServer {
+            update_tx: update_tx.clone(),
+            cancelled_tx: cancelled.clone(),
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn(async move {
+            let running = rmcp::serve_server(server_handler, server_io)
+                .await
+                .expect("serve_server");
+            let _ = running.waiting().await;
+        });
+
+        let (notif_tx, _) = broadcast::channel(64);
+        let handler = BrokerClientHandler::new(notif_tx.clone());
+        let running_client = handler
+            .serve_with_lifecycle(client_io, client_lifecycle_mode())
+            .await
+            .expect("serve_with_lifecycle");
+
+        let external = ExternalMcpServer {
+            instance_id: InstanceId::new("test.sub"),
+            config: McpServerConfig {
+                name: "sub".into(),
+                ..Default::default()
+            },
+            service: PlRwLock::new(Some(running_client)),
+            tools_cache: PlRwLock::new(Vec::new()),
+            notif_tx,
+            subscriptions: PlRwLock::new(HashMap::new()),
+            down: AtomicBool::new(false),
+            down_reason: PlRwLock::new(None),
+            images: None,
+        };
+
+        let mut rx = external.notifications();
+        let ctx = CallContext::test();
+        external
+            .subscribe("kaijutsu://contexts/abc/drift", &ctx)
+            .await
+            .expect("subscribe must succeed over subscriptions/listen on 2026-07-28");
+
+        update_tx
+            .send("kaijutsu://contexts/abc/drift".to_string())
+            .expect("send update");
+
+        let notif = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for ResourceUpdated")
+            .expect("broadcast recv");
+        match notif {
+            ServerNotification::ResourceUpdated { uri } => {
+                assert_eq!(uri, "kaijutsu://contexts/abc/drift");
+            }
+            other => panic!("expected ResourceUpdated, got {other:?}"),
+        }
+
+        external
+            .unsubscribe("kaijutsu://contexts/abc/drift", &ctx)
+            .await
+            .expect("unsubscribe must cancel listen stream");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancelled.notified())
+            .await
+            .expect("server must observe cancellation after unsubscribe");
+
+        external.shutdown().await.expect("shutdown");
+        server_task.abort();
+    }
+
+    #[derive(Clone)]
+    struct LegacySubscriptionServer {
+        subscribed: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        unsubscribed: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl rmcp::ServerHandler for LegacySubscriptionServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            let mut info = rmcp::model::ServerConfig::default();
+            info.protocol_version = ProtocolVersion::V_2025_11_25;
+            info.capabilities = rmcp::model::ServerCapabilities::builder()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .build();
+            info
+        }
+
+        #[allow(deprecated)]
+        fn subscribe(
+            &self,
+            request: SubscribeRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<(), rmcp::ErrorData>> + Send + '_ {
+            self.subscribed.lock().push(request.uri);
+            std::future::ready(Ok(()))
+        }
+
+        #[allow(deprecated)]
+        fn unsubscribe(
+            &self,
+            request: UnsubscribeRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<(), rmcp::ErrorData>> + Send + '_ {
+            self.unsubscribed.lock().push(request.uri);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_uses_legacy_resources_subscribe_before_2026_07_28() {
+        let subscribed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let unsubscribed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let server_handler = LegacySubscriptionServer {
+            subscribed: subscribed.clone(),
+            unsubscribed: unsubscribed.clone(),
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn(async move {
+            let running = rmcp::serve_server(server_handler, server_io)
+                .await
+                .expect("serve_server");
+            let _ = running.waiting().await;
+        });
+
+        let (notif_tx, _) = broadcast::channel(64);
+        let handler = BrokerClientHandler::new(notif_tx.clone());
+        let running_client = handler
+            .serve_with_lifecycle(client_io, ClientLifecycleMode::Initialize)
+            .await
+            .expect("legacy initialize");
+
+        let external = ExternalMcpServer {
+            instance_id: InstanceId::new("test.legacy_sub"),
+            config: McpServerConfig {
+                name: "legacy_sub".into(),
+                ..Default::default()
+            },
+            service: PlRwLock::new(Some(running_client)),
+            tools_cache: PlRwLock::new(Vec::new()),
+            notif_tx,
+            subscriptions: PlRwLock::new(HashMap::new()),
+            down: AtomicBool::new(false),
+            down_reason: PlRwLock::new(None),
+            images: None,
+        };
+
+        let ctx = CallContext::test();
+        external
+            .subscribe("file:///legacy", &ctx)
+            .await
+            .expect("legacy subscribe must succeed");
+        external
+            .unsubscribe("file:///legacy", &ctx)
+            .await
+            .expect("legacy unsubscribe must succeed");
+
+        assert_eq!(subscribed.lock().as_slice(), &["file:///legacy"]);
+        assert_eq!(unsubscribed.lock().as_slice(), &["file:///legacy"]);
+
+        external.shutdown().await.expect("shutdown");
+        server_task.abort();
+    }
+
+    // ---- UnixSocket transport -------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_transport_requires_a_socket_path() {
+        let missing = McpServerConfig {
+            name: "uds".into(),
+            transport: McpTransport::UnixSocket,
+            ..Default::default()
+        };
+        assert!(unix_socket_transport(&missing).is_err());
+
+        let bare_at = McpServerConfig {
+            name: "uds".into(),
+            transport: McpTransport::UnixSocket,
+            socket: Some("@".into()),
+            ..Default::default()
+        };
+        assert!(unix_socket_transport(&bare_at).is_err());
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct UnixEchoServer;
+
+    #[cfg(unix)]
+    impl rmcp::ServerHandler for UnixEchoServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            let mut info = rmcp::model::ServerConfig::default();
+            info.protocol_version = ProtocolVersion::V_2026_07_28;
+            info.capabilities = rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build();
+            info
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, rmcp::ErrorData>>
+        + Send
+        + '_ {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "msg": { "type": "string" }
+                },
+                "required": ["msg"]
+            });
+            let schema_map = schema.as_object().cloned().unwrap();
+            let tool = rmcp::model::Tool::new("echo", "Echo back msg", schema_map);
+            std::future::ready(Ok(rmcp::model::ListToolsResult::with_all_items(vec![tool])))
+        }
+
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>
+        + Send
+        + '_ {
+            let msg = request
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("msg"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            std::future::ready(Ok(CallToolResult::success(vec![ContentBlock::text(
+                format!("echo:{msg}"),
+            )])
+            .into()))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_connect_lists_and_calls_tools() {
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = dir.path().join("mcp.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind unix socket");
+
+        let seen_header = std::sync::Arc::new(parking_lot::Mutex::new(None::<String>));
+        let seen_header_srv = seen_header.clone();
+
+        let mcp_service = std::sync::Arc::new(StreamableHttpService::new(
+            || Ok(UnixEchoServer),
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default(),
+        ));
+
+        let server_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let svc = mcp_service.clone();
+                let header_slot = seen_header_srv.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let hyper_svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let svc = svc.clone();
+                            let header_slot = header_slot.clone();
+                            async move {
+                                if let Some(v) = req.headers().get("x-test-client")
+                                    && let Ok(s) = v.to_str()
+                                {
+                                    *header_slot.lock() = Some(s.to_string());
+                                }
+                                Ok::<_, std::convert::Infallible>(svc.handle(req).await)
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, hyper_svc)
+                        .await;
+                });
+            }
+        });
+
+        let config = McpServerConfig {
+            name: "unix-echo".into(),
+            transport: McpTransport::UnixSocket,
+            socket: Some(sock_path.to_str().unwrap().to_string()),
+            headers: HashMap::from([("x-test-client".to_string(), "kaijutsu-test".to_string())]),
+            ..Default::default()
+        };
+
+        let external = ExternalMcpServer::connect(
+            config,
+            InstanceId::new("external.unix_echo"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("connect over UnixSocket");
+
+        let ctx = CallContext::test();
+        let tools = external.list_tools(&ctx).await.expect("list_tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+
+        let result = external
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new("external.unix_echo"),
+                    tool: "echo".to_string(),
+                    arguments: serde_json::json!({ "msg": "hello-uds" }),
+                },
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("call_tool over UnixSocket");
+        assert!(!result.is_error);
+        assert_eq!(texts(&result), vec!["echo:hello-uds"]);
+        assert_eq!(seen_header.lock().as_deref(), Some("kaijutsu-test"));
+
+        external.shutdown().await.expect("shutdown");
+        server_task.abort();
     }
 }

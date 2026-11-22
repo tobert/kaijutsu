@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 
-use super::servers::external::{McpServerConfig, McpTransport};
+use super::servers::external::{DEFAULT_UNIX_SOCKET_URL, McpServerConfig, McpTransport};
 use crate::secret_source::{read_secret_env, read_secret_file};
 
 /// Outcome of parsing `mcp.toml`: the servers that parsed clean, plus a
@@ -123,6 +123,9 @@ mod toml_types {
         pub url: Option<String>,
 
         #[serde(default)]
+        pub socket: Option<String>,
+
+        #[serde(default)]
         pub call_timeout_ms: Option<u64>,
     }
 }
@@ -160,9 +163,10 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
         let transport = match srv.transport.as_str() {
             "stdio" => McpTransport::Stdio,
             "streamable_http" => McpTransport::StreamableHttp,
+            "unix_socket" => McpTransport::UnixSocket,
             other => {
                 let reason = format!(
-                    "unrecognized transport '{other}' (expected 'stdio' or 'streamable_http')"
+                    "unrecognized transport '{other}' (expected 'stdio', 'streamable_http', or 'unix_socket')"
                 );
                 warnings.push(format!("server '{name}': {reason} — skipped"));
                 invalid.push(InvalidServer { name: name.clone(), reason });
@@ -190,17 +194,41 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
                     continue;
                 }
             }
+            McpTransport::UnixSocket => {
+                let socket = srv.socket.as_deref().unwrap_or("").trim();
+                if socket.is_empty() || socket == "@" {
+                    let reason = "unix_socket transport requires a non-empty 'socket'".to_string();
+                    warnings.push(format!("server '{name}': {reason} — skipped"));
+                    invalid.push(InvalidServer { name: name.clone(), reason });
+                    continue;
+                }
+            }
         }
 
         // A field the chosen transport cannot use is a mistake to report, not
-        // a value to drop: `env` never reaches an HTTP request, and `headers`
-        // never reaches a child process.
+        // a value to drop: `env` and `command` never reach an HTTP/socket
+        // server, `headers` never reaches a child process, and `socket` only
+        // applies to `unix_socket`.
         let misplaced = match transport {
             McpTransport::Stdio if !srv.headers.is_empty() => {
-                Some("'headers' applies to streamable_http only; a child process gets 'env'")
+                Some("'headers' applies to streamable_http and unix_socket only; a child process gets 'env'")
+            }
+            McpTransport::Stdio if srv.socket.is_some() => {
+                Some("'socket' applies to unix_socket only")
             }
             McpTransport::StreamableHttp if !srv.env.is_empty() => {
                 Some("'env' applies to stdio only; an HTTP server gets 'headers'")
+            }
+            McpTransport::StreamableHttp if srv.socket.is_some() => {
+                Some("'socket' applies to unix_socket only")
+            }
+            McpTransport::UnixSocket if !srv.env.is_empty() => {
+                Some("'env' applies to stdio only; a unix_socket server gets 'headers'")
+            }
+            McpTransport::UnixSocket
+                if srv.command.as_deref().is_some_and(|c| !c.trim().is_empty()) =>
+            {
+                Some("'command' applies to stdio only; unix_socket connects to an existing socket")
             }
             _ => None,
         };
@@ -222,6 +250,18 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
             }
         };
 
+        let url = match transport {
+            McpTransport::UnixSocket => Some(
+                srv.url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or(DEFAULT_UNIX_SOCKET_URL)
+                    .to_string(),
+            ),
+            _ => srv.url.clone(),
+        };
+
         servers.push(McpServerConfig {
             name: name.clone(),
             command: srv.command.clone().unwrap_or_default(),
@@ -229,7 +269,8 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
             env,
             cwd: srv.cwd.clone(),
             transport,
-            url: srv.url.clone(),
+            url,
+            socket: srv.socket.as_deref().map(|s| s.trim().to_string()),
             headers,
             call_timeout: srv.call_timeout_ms.map(std::time::Duration::from_millis),
         });
@@ -601,7 +642,7 @@ mod tests {
         )
         .unwrap();
         assert!(load.servers.is_empty());
-        assert!(load.invalid[0].reason.contains("streamable_http only"), "{}", load.invalid[0].reason);
+        assert!(load.invalid[0].reason.contains("streamable_http and unix_socket only"), "{}", load.invalid[0].reason);
     }
 
     #[test]
@@ -631,7 +672,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(load.invalid[0].reason.contains("streamable_http only"), "{}", load.invalid[0].reason);
+        assert!(load.invalid[0].reason.contains("streamable_http and unix_socket only"), "{}", load.invalid[0].reason);
     }
 
     #[test]
@@ -853,5 +894,109 @@ command = "/bin/m"
         let load = load_mcp_config_toml(toml).unwrap();
         let names: Vec<&str> = load.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mango", "zebra"]);
+    }
+
+    // ---- unix_socket transport ------------------------------------------
+
+    #[test]
+    fn unix_socket_server_parses_with_default_url() {
+        let toml = r##"
+[servers.local]
+transport = "unix_socket"
+socket = "/run/user/1000/kaijutsu-mcp.sock"
+"##;
+        let load = load_mcp_config_toml(toml).unwrap();
+        assert!(load.invalid.is_empty(), "{:?}", load.invalid);
+        assert_eq!(load.servers.len(), 1);
+        let s = &load.servers[0];
+        assert_eq!(s.name, "local");
+        assert_eq!(s.transport, McpTransport::UnixSocket);
+        assert_eq!(s.socket.as_deref(), Some("/run/user/1000/kaijutsu-mcp.sock"));
+        assert_eq!(s.url.as_deref(), Some("http://localhost/mcp"));
+    }
+
+    #[test]
+    fn unix_socket_server_accepts_custom_url_and_headers() {
+        let toml = r##"
+[servers.local]
+transport = "unix_socket"
+socket = "/tmp/mcp.sock"
+url = "http://mcp.local/custom"
+headers.x-token = "abc"
+"##;
+        let load = load_mcp_config_toml(toml).unwrap();
+        assert!(load.invalid.is_empty(), "{:?}", load.invalid);
+        assert_eq!(load.servers.len(), 1);
+        let s = &load.servers[0];
+        assert_eq!(s.transport, McpTransport::UnixSocket);
+        assert_eq!(s.socket.as_deref(), Some("/tmp/mcp.sock"));
+        assert_eq!(s.url.as_deref(), Some("http://mcp.local/custom"));
+        assert_eq!(s.headers.get("x-token").map(String::as_str), Some("abc"));
+    }
+
+    #[test]
+    fn unix_socket_without_socket_is_a_warning() {
+        let toml = r##"
+[servers.broken]
+transport = "unix_socket"
+"##;
+        let load = load_mcp_config_toml(toml).unwrap();
+        assert!(load.servers.is_empty());
+        assert_eq!(load.invalid.len(), 1);
+        assert_eq!(load.invalid[0].name, "broken");
+        assert!(load.invalid[0].reason.contains("socket"), "{}", load.invalid[0].reason);
+    }
+
+    #[test]
+    fn unix_socket_rejects_env_and_command() {
+        let with_env = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            transport = "unix_socket"
+            socket = "/tmp/a.sock"
+            env.FOO = "bar"
+            "#,
+        )
+        .unwrap();
+        assert!(with_env.servers.is_empty());
+        assert!(with_env.invalid[0].reason.contains("stdio only"), "{}", with_env.invalid[0].reason);
+
+        let with_cmd = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            transport = "unix_socket"
+            socket = "/tmp/a.sock"
+            command = "/bin/a"
+            "#,
+        )
+        .unwrap();
+        assert!(with_cmd.servers.is_empty());
+        assert!(with_cmd.invalid[0].reason.contains("command"), "{}", with_cmd.invalid[0].reason);
+    }
+
+    #[test]
+    fn socket_on_stdio_or_http_is_rejected() {
+        let on_stdio = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            command = "/bin/a"
+            socket = "/tmp/a.sock"
+            "#,
+        )
+        .unwrap();
+        assert!(on_stdio.servers.is_empty());
+        assert!(on_stdio.invalid[0].reason.contains("unix_socket only"), "{}", on_stdio.invalid[0].reason);
+
+        let on_http = load_mcp_config_toml(
+            r#"
+            [servers.a]
+            transport = "streamable_http"
+            url = "http://localhost:8080/mcp"
+            socket = "/tmp/a.sock"
+            "#,
+        )
+        .unwrap();
+        assert!(on_http.servers.is_empty());
+        assert!(on_http.invalid[0].reason.contains("unix_socket only"), "{}", on_http.invalid[0].reason);
     }
 }

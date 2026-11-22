@@ -405,6 +405,7 @@ async fn connect(
         cwd: None,
         transport: McpTransport::Stdio,
         url: None,
+        socket: None,
         headers: HashMap::new(),
         call_timeout: None,
     };
