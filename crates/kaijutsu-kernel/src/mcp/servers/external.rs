@@ -9,28 +9,32 @@
 //!   `ServerNotification` on the broker-visible broadcast channel (nothing
 //!   subscribes yet — D-32)
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock,
-    ElicitRequestParams, ElicitResult, ElicitationAction, ProgressNotificationParam,
-    ProtocolVersion, ReadResourceRequestParams, RequestMetaObject, ResourceContents,
-    SubscribeRequestParams, SubscriptionFilter, UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ClientCapabilities,
+    ClientConfig, ContentBlock, CreateTaskResult, DEFAULT_MRTR_MAX_ROUNDS, ElicitRequestParams,
+    ElicitResult, ElicitationAction, GetTaskParams, InputRequest, InputRequests, InputResponses,
+    ProgressNotificationParam, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
+    ResourceContents, SubscribeRequestParams, SubscriptionFilter, TaskPayload,
+    UnsubscribeRequestParams, UpdateTaskParams,
 };
-// Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kept for now, see the
-// `enable_roots` comment on `BrokerClientHandler::new` below.
+// Logging and roots are deprecated by SEP-2577 (rmcp 1.8.0+) — kept for now,
+// see the `enable_roots` comment on `BrokerClientHandler::with_responder`.
 #[allow(deprecated)]
-use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
+use rmcp::model::{ListRootsResult, LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::{NotificationContext, Peer, RequestContext, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-
-use std::collections::HashMap;
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
@@ -78,6 +82,19 @@ pub struct McpServerConfig {
     pub call_timeout: Option<std::time::Duration>,
 }
 
+/// Async callback that answers MCP elicitation requests for an external server.
+///
+/// Used for legacy `elicitation/create` requests, `2026-07-28` MRTR
+/// `input_required` rounds, and in-task `inputRequests` surfaced via
+/// `tasks/get`.
+pub type ElicitationResponder = Arc<
+    dyn Fn(
+            ElicitRequestParams,
+        ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, rmcp::ErrorData>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Minimal `ClientHandler` that translates rmcp notifications onto a
 /// broadcast channel of `ServerNotification`. Phase 1 subscribers: none
 /// (D-32). Unlike the legacy `KaijutsuClientHandler`, this one carries no
@@ -86,34 +103,82 @@ pub struct McpServerConfig {
 struct BrokerClientHandler {
     info: ClientConfig,
     tx: broadcast::Sender<ServerNotification>,
+    elicitation_responder: Arc<PlRwLock<Option<ElicitationResponder>>>,
 }
 
 impl BrokerClientHandler {
-    // Roots is deprecated by SEP-2577 (rmcp 1.8.0+) with no replacement
-    // capability — the MCP spec is dropping client-side roots/sampling
-    // wholesale, not superseding them. Kaibo/bevy_brp still negotiate against
-    // it today, so keep advertising it rather than silently withdrawing a
-    // capability older or unmigrated peers may still probe for; revisit when
-    // rmcp actually removes the API.
-    #[allow(deprecated)]
+    #[cfg(test)]
     fn new(tx: broadcast::Sender<ServerNotification>) -> Self {
+        Self::with_responder(tx, Arc::new(PlRwLock::new(None)))
+    }
+
+    // Roots is deprecated by SEP-2577 (rmcp 1.8.0+) with no replacement
+    // capability — keep advertising it for peers that still probe for it.
+    #[allow(deprecated)]
+    fn with_responder(
+        tx: broadcast::Sender<ServerNotification>,
+        elicitation_responder: Arc<PlRwLock<Option<ElicitationResponder>>>,
+    ) -> Self {
         let mut info = ClientConfig::default();
-        // Advertise the newest protocol this rmcp knows, not `ProtocolVersion::
-        // default()`. `default()` is `LATEST`, which is *not* the newest known
-        // version — rmcp pins `LATEST = V_2025_11_25` while `KNOWN_VERSIONS`
-        // tops out at `V_2026_07_28` (rmcp 3.4). Taking the
-        // default silently negotiated every external server (kaibo, bevy_brp)
-        // down to 2025-11-25 and dropped the version-gated fields with it.
-        // Bump this deliberately when rmcp learns a newer version.
+        // Advertise the newest protocol this rmcp knows rather than
+        // `ProtocolVersion::default()`, which pins an older version.
         info.protocol_version = ProtocolVersion::V_2026_07_28;
         info.client_info.name = "kaijutsu".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
         info.capabilities = ClientCapabilities::builder()
             .enable_roots()
             .enable_roots_list_changed()
+            .enable_elicitation()
+            .enable_tasks()
             .build();
-        Self { info, tx }
+        Self {
+            info,
+            tx,
+            elicitation_responder,
+        }
     }
+}
+
+/// Emit an observable `ServerNotification::Elicitation`, then delegate to the
+/// configured [`ElicitationResponder`] or decline with a warning when none is set.
+async fn handle_elicitation(
+    tx: &broadcast::Sender<ServerNotification>,
+    responder: &PlRwLock<Option<ElicitationResponder>>,
+    request: ElicitRequestParams,
+) -> Result<ElicitResult, rmcp::ErrorData> {
+    let (message, schema) = match &request {
+        ElicitRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } => (
+            message.clone(),
+            serde_json::to_value(requested_schema).ok(),
+        ),
+        ElicitRequestParams::UrlElicitationParams {
+            message,
+            url,
+            elicitation_id,
+            ..
+        } => (
+            format!("{message} (url mode: {url}, id {elicitation_id})"),
+            None,
+        ),
+        other => (format!("unrecognized elicitation mode: {other:?}"), None),
+    };
+
+    let _ = tx.send(ServerNotification::Elicitation(ElicitationRequest {
+        message: std::borrow::Cow::Owned(message.clone()),
+        schema,
+    }));
+
+    let handler = responder.read().clone();
+    if let Some(handler) = handler {
+        return handler(request).await;
+    }
+
+    tracing::warn!("MCP elicitation declined (no responder configured): {message}");
+    Ok(ElicitResult::new(ElicitationAction::Decline))
 }
 
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+); see the `enable_roots`
@@ -178,59 +243,19 @@ impl ClientHandler for BrokerClientHandler {
         }
     }
 
-    /// Answer an `elicitation/create` from an external server.
+    /// Handle `elicitation/create` from an external server.
     ///
-    /// We still **decline** — nothing in the kernel can collect an answer yet
-    /// (that is slice 1b in `docs/issues.md`, a design pass: where a pending
-    /// elicitation lives, how an answer routes back, timeout behaviour). What
-    /// this override changes is that the decline is no longer *invisible*.
-    ///
-    /// rmcp's trait default declines silently, so an external server asking a
-    /// question got a "no" that nobody — human, sibling context, or log —
-    /// ever saw. CLAUDE.md: silent fallbacks are often a mistake. We now emit
-    /// the reserved `ServerNotification::Elicitation` (D-25) and warn, so the
-    /// request is at least observable and we can find out whether kaibo or
-    /// bevy_brp ever actually send one.
+    /// Emits `ServerNotification::Elicitation` on `self.tx`, then delegates to
+    /// the configured [`ElicitationResponder`] or declines with a warning when
+    /// none is registered.
     fn create_elicitation(
         &self,
         request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<ElicitResult, rmcp::ErrorData>> + Send + '_ {
         let tx = self.tx.clone();
-        async move {
-            let (message, schema) = match &request {
-                ElicitRequestParams::FormElicitationParams {
-                    message,
-                    requested_schema,
-                    ..
-                } => (
-                    message.clone(),
-                    serde_json::to_value(requested_schema).ok(),
-                ),
-                ElicitRequestParams::UrlElicitationParams {
-                    message,
-                    url,
-                    elicitation_id,
-                    ..
-                } => (
-                    format!("{message} (url mode: {url}, id {elicitation_id})"),
-                    None,
-                ),
-                // `ElicitRequestParams` is #[non_exhaustive]: a mode added by a
-                // future spec must still be seen rather than silently declined.
-                other => (format!("unrecognized elicitation mode: {other:?}"), None),
-            };
-
-            tracing::warn!(
-                "MCP elicitation declined (no collector wired yet): {message}"
-            );
-            let _ = tx.send(ServerNotification::Elicitation(ElicitationRequest {
-                message: std::borrow::Cow::Owned(message),
-                schema,
-            }));
-
-            Ok(ElicitResult::new(ElicitationAction::Decline))
-        }
+        let responder = self.elicitation_responder.clone();
+        async move { handle_elicitation(&tx, &responder, request).await }
     }
 
     fn on_tool_list_changed(
@@ -458,6 +483,8 @@ pub struct ExternalMcpServer {
     /// Where this server's images go ([`Self::with_images`]). Without one an
     /// image is refused, never passed on as base64 text.
     images: Option<ImageStore>,
+    /// Optional async responder for elicitation requests (legacy, MRTR, and tasks).
+    elicitation_responder: Arc<PlRwLock<Option<ElicitationResponder>>>,
 }
 
 use super::block::ImageStore;
@@ -478,7 +505,9 @@ impl ExternalMcpServer {
         connect_timeout: std::time::Duration,
     ) -> McpResult<Self> {
         let (notif_tx, _) = broadcast::channel(256);
-        let handler = BrokerClientHandler::new(notif_tx.clone());
+        let elicitation_responder = Arc::new(PlRwLock::new(None));
+        let handler =
+            BrokerClientHandler::with_responder(notif_tx.clone(), elicitation_responder.clone());
 
         let init = async {
             let service = match config.transport {
@@ -561,6 +590,7 @@ impl ExternalMcpServer {
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
             images: None,
+            elicitation_responder,
         })
     }
 
@@ -568,6 +598,17 @@ impl ExternalMcpServer {
     pub fn with_images(mut self, images: ImageStore) -> Self {
         self.images = Some(images);
         self
+    }
+
+    /// Attach an async responder for MCP elicitation requests.
+    pub fn with_elicitation_responder(self, responder: ElicitationResponder) -> Self {
+        *self.elicitation_responder.write() = Some(responder);
+        self
+    }
+
+    /// Replace or clear the elicitation responder at runtime.
+    pub fn set_elicitation_responder(&self, responder: Option<ElicitationResponder>) {
+        *self.elicitation_responder.write() = responder;
     }
 
     fn mark_down(&self, reason: impl Into<String>) {
@@ -594,7 +635,10 @@ impl ExternalMcpServer {
         // Drop the old service first so the subprocess fully exits.
         let _ = self.service.write().take();
 
-        let handler = BrokerClientHandler::new(self.notif_tx.clone());
+        let handler = BrokerClientHandler::with_responder(
+            self.notif_tx.clone(),
+            self.elicitation_responder.clone(),
+        );
         let init = async {
             let new_service = match self.config.transport {
                 McpTransport::Stdio => {
@@ -918,6 +962,167 @@ fn attach_line(image: ImagePayload<'_>, attach: &mut impl FnMut(&str, &[u8]) -> 
     }
 }
 
+/// Bounds for SEP-2663 `tasks/get` polling intervals.
+const MIN_TASK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const MAX_TASK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const DEFAULT_TASK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn clamp_task_poll_interval(poll_interval_ms: Option<u64>) -> std::time::Duration {
+    poll_interval_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_TASK_POLL_INTERVAL)
+        .clamp(MIN_TASK_POLL_INTERVAL, MAX_TASK_POLL_INTERVAL)
+}
+
+impl ExternalMcpServer {
+    /// Fulfill server-initiated input requests (MRTR `input_required` or
+    /// SEP-2663 `TaskPayload::InputRequired`).
+    async fn fulfill_input_requests(
+        &self,
+        requests: InputRequests,
+        cancel: &CancellationToken,
+    ) -> McpResult<InputResponses> {
+        let mut responses = InputResponses::new();
+        for (key, request) in requests {
+            let value = match request {
+                InputRequest::Elicitation(elicit_req) => {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(McpError::Cancelled),
+                        res = handle_elicitation(
+                            &self.notif_tx,
+                            &self.elicitation_responder,
+                            elicit_req.params,
+                        ) => res.map_err(|e| McpError::Protocol(format!("elicitation failed: {e}")))?,
+                    };
+                    serde_json::to_value(result).map_err(|e| {
+                        McpError::Protocol(format!("failed to serialize elicitation result: {e}"))
+                    })?
+                }
+                #[allow(deprecated)]
+                InputRequest::ListRoots(_) => {
+                    serde_json::to_value(ListRootsResult::default()).map_err(|e| {
+                        McpError::Protocol(format!("failed to serialize roots result: {e}"))
+                    })?
+                }
+                InputRequest::CreateMessage(_) => return Err(McpError::Unsupported),
+                _ => return Err(McpError::Unsupported),
+            };
+            responses.insert(key, value);
+        }
+        Ok(responses)
+    }
+
+    /// Poll a SEP-2663 task via `tasks/get` until it reaches a terminal state,
+    /// fulfilling in-task `inputRequests` via `tasks/update` and forwarding
+    /// cancellation via `tasks/cancel`.
+    async fn poll_task_to_completion(
+        &self,
+        peer: &Peer<RoleClient>,
+        create_task: CreateTaskResult,
+        cancel: &CancellationToken,
+        progress_token: String,
+    ) -> McpResult<CallToolResult> {
+        let task_id = create_task.task.task_id;
+        let mut poll_interval = clamp_task_poll_interval(create_task.task.poll_interval_ms);
+        let mut last_status_message = create_task.task.status_message;
+        if let Some(msg) = &last_status_message {
+            let _ = self.notif_tx.send(ServerNotification::Progress {
+                token: progress_token.clone(),
+                progress: 0.0,
+                total: None,
+                message: Some(msg.clone()),
+            });
+        }
+
+        let mut poll_immediately = create_task.task.status.is_terminal();
+        loop {
+            if !poll_immediately {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let _ = peer.cancel_task(CancelTaskParams::new(&task_id)).await;
+                        return Err(McpError::Cancelled);
+                    }
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+            }
+            poll_immediately = false;
+
+            let get_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = peer.cancel_task(CancelTaskParams::new(&task_id)).await;
+                    return Err(McpError::Cancelled);
+                }
+                res = peer.get_task(GetTaskParams::new(&task_id)) => {
+                    res.map_err(|e| map_rmcp_service_error(e, &self.instance_id, |m| self.mark_down(m)))?
+                }
+            };
+
+            poll_interval = clamp_task_poll_interval(get_result.task.task.poll_interval_ms);
+            if get_result.task.task.status_message != last_status_message {
+                last_status_message = get_result.task.task.status_message.clone();
+                if let Some(msg) = &last_status_message {
+                    let _ = self.notif_tx.send(ServerNotification::Progress {
+                        token: progress_token.clone(),
+                        progress: 0.0,
+                        total: None,
+                        message: Some(msg.clone()),
+                    });
+                }
+            }
+
+            match get_result.task.payload {
+                TaskPayload::Working => continue,
+                TaskPayload::InputRequired { input_requests } => {
+                    let responses = match self.fulfill_input_requests(input_requests, cancel).await {
+                        Ok(responses) => responses,
+                        Err(McpError::Cancelled) => {
+                            let _ = peer.cancel_task(CancelTaskParams::new(&task_id)).await;
+                            return Err(McpError::Cancelled);
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            let _ = peer.cancel_task(CancelTaskParams::new(&task_id)).await;
+                            return Err(McpError::Cancelled);
+                        }
+                        res = peer.update_task(UpdateTaskParams::new(&task_id, responses)) => {
+                            res.map_err(|e| map_rmcp_service_error(e, &self.instance_id, |m| self.mark_down(m)))?;
+                        }
+                    }
+                }
+                TaskPayload::Completed { result } => {
+                    let call_result: CallToolResult =
+                        serde_json::from_value(serde_json::Value::Object(result)).map_err(|e| {
+                            McpError::Protocol(format!(
+                                "invalid CallToolResult in completed task {task_id}: {e}"
+                            ))
+                        })?;
+                    return Ok(call_result);
+                }
+                TaskPayload::Failed { error } => {
+                    let msg = error
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| serde_json::Value::Object(error).to_string());
+                    return Err(McpError::Protocol(format!("task {task_id} failed: {msg}")));
+                }
+                TaskPayload::Cancelled => return Err(McpError::Cancelled),
+                _ => {
+                    return Err(McpError::Protocol(format!(
+                        "unrecognized task payload for task {task_id}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl McpServerLike for ExternalMcpServer {
     fn instance_id(&self) -> &InstanceId {
@@ -932,7 +1137,7 @@ impl McpServerLike for ExternalMcpServer {
         &self,
         params: KernelCallParams,
         ctx: &CallContext,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
         if self.down.load(Ordering::Relaxed) {
             let reason = self
@@ -951,7 +1156,15 @@ impl McpServerLike for ExternalMcpServer {
         if let serde_json::Value::Object(map) = params.arguments.clone() {
             req = req.with_arguments(map);
         }
-        req.meta = Some(self.build_meta(ctx));
+        let meta = self.build_meta(ctx);
+        let progress_token = meta
+            .get_progress_token()
+            .map(|t| match t.0 {
+                rmcp::model::NumberOrString::String(s) => s.to_string(),
+                rmcp::model::NumberOrString::Number(n) => n.to_string(),
+            })
+            .unwrap_or_else(|| format!("kaijutsu/{}", self.instance_id));
+        req.meta = Some(meta);
 
         // Snapshot the peer inside a short-lived scope so the parking_lot
         // guard (non-Send) doesn't cross the await.
@@ -968,14 +1181,68 @@ impl McpServerLike for ExternalMcpServer {
             }
         };
 
-        // Route through the shared classifier rather than marking down on any
-        // error: `call_tool` used to treat every failure as an instance-health
-        // signal, which is wrong for per-call outcomes (see
-        // `map_rmcp_service_error`).
-        let result = peer
-            .call_tool(req)
-            .await
-            .map_err(|e| map_rmcp_service_error(e, &self.instance_id, |m| self.mark_down(m)))?;
+        let mut state_only_rounds = 0usize;
+        let mut result = None;
+        for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
+            let response = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(McpError::Cancelled),
+                res = peer.call_tool_once(req.clone()) => {
+                    res.map_err(|e| map_rmcp_service_error(e, &self.instance_id, |m| self.mark_down(m)))?
+                }
+            };
+            match response {
+                CallToolResponse::Complete(call_result) => {
+                    result = Some(call_result);
+                    break;
+                }
+                CallToolResponse::InputRequired(input_required) => {
+                    let had_input_requests = input_required
+                        .input_requests
+                        .as_ref()
+                        .is_some_and(|r| !r.is_empty());
+                    if !had_input_requests && input_required.request_state.is_none() {
+                        return Err(McpError::Protocol(
+                            "input_required response carried neither inputRequests nor requestState"
+                                .to_string(),
+                        ));
+                    }
+                    let responses = self
+                        .fulfill_input_requests(
+                            input_required.input_requests.unwrap_or_default(),
+                            &cancel,
+                        )
+                        .await?;
+                    if had_input_requests {
+                        state_only_rounds = 0;
+                    } else {
+                        let millis =
+                            (50u64.saturating_mul(1_u64 << state_only_rounds.min(3))).min(250);
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(McpError::Cancelled),
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(millis)) => {}
+                        }
+                        state_only_rounds += 1;
+                    }
+                    req.input_responses = (!responses.is_empty()).then_some(responses);
+                    req.request_state = input_required.request_state;
+                }
+                CallToolResponse::Task(create_task) => {
+                    result = Some(
+                        self.poll_task_to_completion(&peer, create_task, &cancel, progress_token)
+                            .await?,
+                    );
+                    break;
+                }
+                _ => return Err(McpError::Unsupported),
+            }
+        }
+        let result = result.ok_or_else(|| {
+            McpError::Protocol(format!(
+                "server kept requesting input beyond {DEFAULT_MRTR_MAX_ROUNDS} MRTR rounds"
+            ))
+        })?;
 
         Ok(translate_result(result, |mime, bytes| match &self.images {
             Some(images) => images.attach(ctx.context_id, ctx.actor_id, mime, bytes),
@@ -1255,6 +1522,7 @@ mod tests {
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
             images: None,
+            elicitation_responder: Arc::new(PlRwLock::new(None)),
         }
     }
 
@@ -1791,6 +2059,7 @@ mod tests {
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
             images: None,
+            elicitation_responder: Arc::new(PlRwLock::new(None)),
         };
 
         let mut rx = external.notifications();
@@ -1903,6 +2172,7 @@ mod tests {
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
             images: None,
+            elicitation_responder: Arc::new(PlRwLock::new(None)),
         };
 
         let ctx = CallContext::test();
@@ -2081,6 +2351,454 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(texts(&result), vec!["echo:hello-uds"]);
         assert_eq!(seen_header.lock().as_deref(), Some("kaijutsu-test"));
+
+        external.shutdown().await.expect("shutdown");
+        server_task.abort();
+    }
+
+    // ---- Elicitation, MRTR, and SEP-2663 Tasks --------------------------
+
+    #[test]
+    fn client_advertises_elicitation_and_tasks_capabilities() {
+        let (tx, _) = broadcast::channel(4);
+        let handler = BrokerClientHandler::new(tx);
+        let caps = handler.get_info().capabilities;
+        assert!(
+            caps.elicitation.is_some(),
+            "client must advertise elicitation capability"
+        );
+        assert!(
+            caps.supports_tasks(),
+            "client must advertise io.modelcontextprotocol/tasks extension"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct MrtrTestServer;
+
+    impl rmcp::ServerHandler for MrtrTestServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            let mut info = rmcp::model::ServerConfig::default();
+            info.protocol_version = ProtocolVersion::V_2026_07_28;
+            info.capabilities = rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build();
+            info
+        }
+
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>
+        + Send
+        + '_ {
+            async move {
+                if let Some(responses) = request.input_responses {
+                    assert_eq!(request.request_state.as_deref(), Some("mrtr-round-1"));
+                    let raw = responses
+                        .get("ask_name")
+                        .cloned()
+                        .expect("expected ask_name response");
+                    let elicit: ElicitResult =
+                        serde_json::from_value(raw).expect("parse ElicitResult");
+                    assert_eq!(elicit.action, ElicitationAction::Accept);
+                    let name = elicit
+                        .content
+                        .as_ref()
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "hello:{name}"
+                    ))])
+                    .into());
+                }
+
+                let schema = rmcp::model::ElicitationSchema::builder()
+                    .required_string("name")
+                    .build()
+                    .expect("valid schema");
+                let mut requests = rmcp::model::InputRequests::new();
+                requests.insert(
+                    "ask_name".to_string(),
+                    rmcp::model::InputRequest::Elicitation(rmcp::model::ElicitRequest::new(
+                        ElicitRequestParams::FormElicitationParams {
+                            meta: None,
+                            message: "Enter your name".to_string(),
+                            requested_schema: schema,
+                        },
+                    )),
+                );
+                Ok(rmcp::model::InputRequiredResult::new(
+                    Some(requests),
+                    Some("mrtr-round-1".to_string()),
+                )
+                .into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mrtr_elicitation_round_trip_on_2026_07_28() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn(async move {
+            let running = rmcp::serve_server(MrtrTestServer, server_io)
+                .await
+                .expect("serve_server");
+            let _ = running.waiting().await;
+        });
+
+        let (notif_tx, _) = broadcast::channel(64);
+        let handler = BrokerClientHandler::new(notif_tx.clone());
+        let running_client = handler
+            .serve_with_lifecycle(client_io, client_lifecycle_mode())
+            .await
+            .expect("serve_with_lifecycle");
+
+        let external = ExternalMcpServer {
+            instance_id: InstanceId::new("test.mrtr"),
+            config: McpServerConfig {
+                name: "mrtr".into(),
+                ..Default::default()
+            },
+            service: PlRwLock::new(Some(running_client)),
+            tools_cache: PlRwLock::new(Vec::new()),
+            notif_tx,
+            subscriptions: PlRwLock::new(HashMap::new()),
+            down: AtomicBool::new(false),
+            down_reason: PlRwLock::new(None),
+            images: None,
+            elicitation_responder: Arc::new(PlRwLock::new(None)),
+        }
+        .with_elicitation_responder(Arc::new(|req| {
+            Box::pin(async move {
+                match req {
+                    ElicitRequestParams::FormElicitationParams { message, .. } => {
+                        assert_eq!(message, "Enter your name");
+                    }
+                    other => panic!("unexpected elicitation params: {other:?}"),
+                }
+                Ok(ElicitResult::new(ElicitationAction::Accept)
+                    .with_content(serde_json::json!({ "name": "Amy" })))
+            })
+        }));
+
+        let mut notif_rx = external.notifications();
+        let result = external
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new("test.mrtr"),
+                    tool: "greet".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("MRTR call_tool must succeed");
+
+        assert!(!result.is_error);
+        assert_eq!(texts(&result), vec!["hello:Amy"]);
+
+        let notif = tokio::time::timeout(std::time::Duration::from_secs(2), notif_rx.recv())
+            .await
+            .expect("timed out waiting for Elicitation notification")
+            .expect("broadcast recv");
+        match notif {
+            ServerNotification::Elicitation(req) => {
+                assert_eq!(req.message, "Enter your name");
+                assert!(req.schema.is_some());
+            }
+            other => panic!("expected Elicitation notification, got {other:?}"),
+        }
+
+        external.shutdown().await.expect("shutdown");
+        server_task.abort();
+    }
+
+    #[derive(Clone)]
+    struct TaskTestServer {
+        tasks: rmcp::task_manager::TaskManager,
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    impl TaskTestServer {
+        fn new() -> Self {
+            Self {
+                tasks: rmcp::task_manager::TaskManager::new(),
+                started: Arc::new(tokio::sync::Notify::new()),
+                cancelled: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl rmcp::ServerHandler for TaskTestServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            let mut info = rmcp::model::ServerConfig::default();
+            info.protocol_version = ProtocolVersion::V_2026_07_28;
+            info.capabilities = rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build();
+            info
+        }
+
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>
+        + Send
+        + '_ {
+            let tasks = self.tasks.clone();
+            let started = self.started.clone();
+            let cancelled = self.cancelled.clone();
+            async move {
+                let options = rmcp::task_manager::TaskOptions::new()
+                    .with_poll_interval_ms(50)
+                    .with_status_message("queued");
+                let task = match request.name.as_ref() {
+                    "elicit_task" => tasks.spawn(options, |task_ctx| {
+                        Box::pin(async move {
+                            task_ctx.set_status_message("awaiting confirmation");
+                            let schema = rmcp::model::ElicitationSchema::builder()
+                                .required_string("answer")
+                                .build()
+                                .expect("valid schema");
+                            let reply = task_ctx
+                                .request_input(
+                                    "confirm_1",
+                                    rmcp::model::InputRequest::Elicitation(
+                                        rmcp::model::ElicitRequest::new(
+                                            ElicitRequestParams::FormElicitationParams {
+                                                meta: None,
+                                                message: "Confirm action?".to_string(),
+                                                requested_schema: schema,
+                                            },
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                            let elicit: ElicitResult = serde_json::from_value(reply)
+                                .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
+                            let answer = elicit
+                                .content
+                                .as_ref()
+                                .and_then(|v| v.get("answer"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("none");
+                            task_ctx.set_status_message("completing");
+                            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                                "task-done:{answer}"
+                            ))]))
+                        })
+                    }),
+                    "hang_task" => tasks.spawn(options, move |task_ctx| {
+                        Box::pin(async move {
+                            started.notify_one();
+                            task_ctx.cancelled().await;
+                            cancelled.notify_one();
+                            Err(rmcp::task_manager::TaskExit::Cancelled)
+                        })
+                    }),
+                    other => {
+                        return Err(rmcp::ErrorData::invalid_params(
+                            format!("unknown tool: {other}"),
+                            None,
+                        ));
+                    }
+                };
+                Ok(rmcp::model::CreateTaskResult::new(task).into())
+            }
+        }
+
+        fn get_task(
+            &self,
+            request: rmcp::model::GetTaskParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<rmcp::model::GetTaskResult, rmcp::ErrorData>>
+        + Send
+        + '_ {
+            let res = self
+                .tasks
+                .get_task(&request.task_id)
+                .map(rmcp::model::GetTaskResult::new);
+            std::future::ready(res)
+        }
+
+        fn update_task(
+            &self,
+            request: rmcp::model::UpdateTaskParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<(), rmcp::ErrorData>> + Send + '_ {
+            let res = self
+                .tasks
+                .update_task(&request.task_id, request.input_responses);
+            std::future::ready(res)
+        }
+
+        fn cancel_task(
+            &self,
+            request: rmcp::model::CancelTaskParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<(), rmcp::ErrorData>> + Send + '_ {
+            let res = self.tasks.cancel_task(&request.task_id);
+            std::future::ready(res)
+        }
+    }
+
+    #[tokio::test]
+    async fn task_round_trip_polls_to_completion_and_handles_in_task_elicitation() {
+        let server_handler = TaskTestServer::new();
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn(async move {
+            let running = rmcp::serve_server(server_handler, server_io)
+                .await
+                .expect("serve_server");
+            let _ = running.waiting().await;
+        });
+
+        let (notif_tx, _) = broadcast::channel(64);
+        let handler = BrokerClientHandler::new(notif_tx.clone());
+        let running_client = handler
+            .serve_with_lifecycle(client_io, client_lifecycle_mode())
+            .await
+            .expect("serve_with_lifecycle");
+
+        let external = ExternalMcpServer {
+            instance_id: InstanceId::new("test.task"),
+            config: McpServerConfig {
+                name: "task".into(),
+                ..Default::default()
+            },
+            service: PlRwLock::new(Some(running_client)),
+            tools_cache: PlRwLock::new(Vec::new()),
+            notif_tx,
+            subscriptions: PlRwLock::new(HashMap::new()),
+            down: AtomicBool::new(false),
+            down_reason: PlRwLock::new(None),
+            images: None,
+            elicitation_responder: Arc::new(PlRwLock::new(None)),
+        }
+        .with_elicitation_responder(Arc::new(|_req| {
+            Box::pin(async {
+                Ok(ElicitResult::new(ElicitationAction::Accept)
+                    .with_content(serde_json::json!({ "answer": "confirmed" })))
+            })
+        }));
+
+        let mut notif_rx = external.notifications();
+        let result = external
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new("test.task"),
+                    tool: "elicit_task".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("task call_tool must poll to completion");
+
+        assert!(!result.is_error);
+        assert_eq!(texts(&result), vec!["task-done:confirmed"]);
+
+        let mut saw_progress = false;
+        let mut saw_elicitation = false;
+        while let Ok(notif) = notif_rx.try_recv() {
+            match notif {
+                ServerNotification::Progress { message, .. } if message.is_some() => {
+                    saw_progress = true;
+                }
+                ServerNotification::Elicitation(req) if req.message == "Confirm action?" => {
+                    saw_elicitation = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_progress, "expected task status Progress notification");
+        assert!(saw_elicitation, "expected in-task Elicitation notification");
+
+        external.shutdown().await.expect("shutdown");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn task_cancellation_sends_tasks_cancel_and_returns_cancelled() {
+        let server_handler = TaskTestServer::new();
+        let started = server_handler.started.clone();
+        let cancelled = server_handler.cancelled.clone();
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn(async move {
+            let running = rmcp::serve_server(server_handler, server_io)
+                .await
+                .expect("serve_server");
+            let _ = running.waiting().await;
+        });
+
+        let (notif_tx, _) = broadcast::channel(64);
+        let handler = BrokerClientHandler::new(notif_tx.clone());
+        let running_client = handler
+            .serve_with_lifecycle(client_io, client_lifecycle_mode())
+            .await
+            .expect("serve_with_lifecycle");
+
+        let external = Arc::new(ExternalMcpServer {
+            instance_id: InstanceId::new("test.cancel"),
+            config: McpServerConfig {
+                name: "cancel".into(),
+                ..Default::default()
+            },
+            service: PlRwLock::new(Some(running_client)),
+            tools_cache: PlRwLock::new(Vec::new()),
+            notif_tx,
+            subscriptions: PlRwLock::new(HashMap::new()),
+            down: AtomicBool::new(false),
+            down_reason: PlRwLock::new(None),
+            images: None,
+            elicitation_responder: Arc::new(PlRwLock::new(None)),
+        });
+
+        let cancel = CancellationToken::new();
+        let call_cancel = cancel.clone();
+        let external_for_call = external.clone();
+        let call_handle = tokio::spawn(async move {
+            external_for_call
+                .call_tool(
+                    KernelCallParams {
+                        instance: InstanceId::new("test.cancel"),
+                        tool: "hang_task".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    &CallContext::test(),
+                    call_cancel,
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("server task should start");
+
+        cancel.cancel();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), call_handle)
+            .await
+            .expect("call_tool should exit promptly on cancel")
+            .expect("join call_tool")
+            .expect_err("cancelled task must return Err");
+        assert!(
+            matches!(err, McpError::Cancelled),
+            "expected McpError::Cancelled, got {err:?}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancelled.notified())
+            .await
+            .expect("server task must observe tasks/cancel");
 
         external.shutdown().await.expect("shutdown");
         server_task.abort();
