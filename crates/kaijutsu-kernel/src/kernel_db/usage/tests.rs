@@ -329,3 +329,26 @@ fn turn_tool_uses_fail_loudly_and_all_or_nothing() {
     assert!(matches!(db.add_turn_tool_uses(start.turn_id, &[("web_search", 1)]), Err(KernelDbError::NotFound(_))));
     assert!(db.turn_tool_uses(start.turn_id).unwrap().is_empty());
 }
+
+/// A context is held against drives and wakes while its latest turn was
+/// refused by the provider; a newer turn, a person's prompt for one, lifts it.
+#[test]
+fn a_context_is_refused_only_while_its_latest_turn_was() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let ctx = make_context_row(Some("refusal-hold"));
+    insert_context_with_doc(&db, &ctx, ws_id);
+    assert!(!db.last_turn_was_refused(ctx.context_id).unwrap(), "no turns, nothing refused");
+
+    let refused = TurnStart { started_at: 1_000, ..turn_start(ctx.context_id) };
+    db.begin_turn(&refused).unwrap();
+    assert!(!db.last_turn_was_refused(ctx.context_id).unwrap(), "a running turn is not a refusal");
+    db.finish_turn(refused.turn_id, 1_500, "refused").unwrap();
+    assert!(db.last_turn_was_refused(ctx.context_id).unwrap());
+
+    let next = TurnStart { started_at: 2_000, ..turn_start(ctx.context_id) };
+    db.begin_turn(&next).unwrap();
+    assert!(!db.last_turn_was_refused(ctx.context_id).unwrap(), "a newer turn lifts the hold");
+    db.finish_turn(next.turn_id, 2_500, "failed").unwrap();
+    assert!(!db.last_turn_was_refused(ctx.context_id).unwrap(), "an ordinary failure is not a refusal");
+}

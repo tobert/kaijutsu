@@ -21,9 +21,17 @@ case "$KJ_DONE_STATUS" in
   "refused") said="refused the task" ;;
   "ended") said="ended its turn without calling done" ;;
   "failed") said="failed to run" ;;
+  "declined") said="was declined by the provider" ;;
   *) said="ended its turn ($KJ_DONE_STATUS)" ;;
 esac
-kj drift push .senpai "=== kohai $label $said ===
+if [[ "$KJ_DONE_STATUS" == "declined" ]]; then
+  # The provider declined its request. Driving it again would be declined too,
+  # so no invitation to repeat the work, and the kernel holds a drive anyway.
+  kj drift push .senpai "=== kohai $label $said ===
+The request got no reply. $label stays paused until a person prompts it."
+else
+  kj drift push .senpai "=== kohai $label $said ===
 $KJ_DONE_FEEDBACK
 $label is still live. To keep it going: kj drive $label --prompt '<what next>'"
+fi
 kj drive .senpai --if-idle

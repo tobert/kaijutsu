@@ -331,6 +331,18 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
+    /// Whether the context's latest turn ended because the provider refused
+    /// its request (stop reason `refused`). A newer turn, such as a person's
+    /// prompt, replaces it, so the answer is `false` as soon as one starts.
+    pub fn last_turn_was_refused(&self, context_id: ContextId) -> KernelDbResult<bool> {
+        let latest: Option<Option<String>> = self.conn.query_row(
+            "SELECT stop_reason FROM turns WHERE context_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            params![blob_param(context_id.as_bytes())],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(matches!(latest, Some(Some(reason)) if reason == "refused"))
+    }
+
     /// Close a turn with how it ended. Fails when the turn has no row or has
     /// already ended.
     pub fn finish_turn(&self, turn_id: TurnId, ended_at: i64, stop_reason: &str) -> KernelDbResult<()> {

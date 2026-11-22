@@ -126,6 +126,13 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj drive: {refusal}"));
         }
 
+        // A context whose latest turn the provider declined is not driven: the
+        // same request would be declined again. Checked before anything is
+        // reserved or written.
+        if let Err(why) = self.kernel().refusal_hold(target) {
+            return KjResult::Err(format!("kj drive: {why}"));
+        }
+
         // A wake leaves a busy context alone before it writes anything. The
         // admission below settles the race with a turn that starts meanwhile.
         if parsed.if_idle && self.kernel().turn_in_flight(target) {
@@ -993,6 +1000,30 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A drive into a context whose latest turn the provider refused says so
+    /// before it writes a seed or reserves anything.
+    #[tokio::test]
+    async fn drive_refuses_a_context_the_provider_declined_before_writing_a_seed() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("declined"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        {
+            let db = d.kernel_db().lock();
+            let turn = crate::TurnStart { turn_id: kaijutsu_types::TurnId::new(), context_id: ctx, performer: principal,
+                role: "coder".into(), provider: "mock".into(), model: "mock".into(), started_at: 1_000 };
+            db.begin_turn(&turn).unwrap();
+            db.finish_turn(turn.turn_id, 1_100, "refused").unwrap();
+        }
+        let mut observer = d.kernel().turn_flows().subscribe("turn.requested");
+        let before = d.block_store().block_snapshots(ctx).unwrap().len();
+        let result = d.dispatch(&[s("drive"), s("--prompt"), s("try again")], &caller_with_context(ctx)).await;
+        assert!(!result.is_ok(), "a refused context must not be driven");
+        assert!(result.message().contains("declined") && result.message().contains("prompt"), "{}", result.message());
+        assert_eq!(d.block_store().block_snapshots(ctx).unwrap().len(), before, "no seed was written");
+        assert!(observer.try_recv().is_none(), "no turn was requested");
     }
 
     #[tokio::test]

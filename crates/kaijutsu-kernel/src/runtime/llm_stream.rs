@@ -2634,6 +2634,7 @@ async fn process_llm_stream(
     record_continuation_yield(&kernel_db, context_id, continuation_epoch);
     match outcome {
         Ok(mut event) => {
+            let refused = turn_lease.refused();
             let cleanup_error = match cleanup {
                 Err(error) => Some(format!("Model turn block cleanup failed: {error}")),
                 Ok(count) if count > 0 && matches!(event, TurnFlow::Completed { reason, .. } if reason.output_is_complete()) =>
@@ -2650,7 +2651,7 @@ async fn process_llm_stream(
             }
             // Close the turn's record with how it ended. A write that fails
             // turns the ending into a failure that says so.
-            if records_turn && let Some(mut error) = finish_turn_record(&kernel_db, &event) {
+            if records_turn && let Some(mut error) = finish_turn_record(&kernel_db, &event, refused) {
                 if let TurnFlow::Failed { error: original, .. } = &event {
                     error = format!("{original}; {error}");
                 }
@@ -2672,10 +2673,10 @@ async fn process_llm_stream(
             // notice when no other turn holds it.
             let idle = if mailbox.is_none() { session.try_lock() } else { None };
             if can_record_diagnostic && let Some(mailbox) = mailbox.as_deref().or(idle.as_deref()) {
-                record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event);
+                record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event, refused);
             }
             drop(idle);
-            let ending = crate::rc::DoneInfo::from_ending(&event, origin, turn_lease.take_done());
+            let ending = crate::rc::DoneInfo::from_ending(&event, origin, turn_lease.take_done(), turn_lease.refused());
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
             if let Some(ending) = ending {
@@ -2696,12 +2697,12 @@ async fn process_llm_stream(
             let event = TurnFlow::Failed {
                 turn_id, context_id, principal_id: user_principal_id, error: error.into(), origin,
             };
-            if records_turn && let Some(record) = finish_turn_record(&kernel_db, &event) {
+            if records_turn && let Some(record) = finish_turn_record(&kernel_db, &event, false) {
                 tracing::error!(%context_id, "{record}");
             }
             if can_record_diagnostic && let Some(mailbox) = mailbox.as_deref()
                 && std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                    record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event))).is_err() {
+                    record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event, false))).is_err() {
                 tracing::error!(%context_id, "recording the turn-end notice after a panic also panicked");
             }
             turn_lease.finish(&event).await;
@@ -2713,9 +2714,10 @@ async fn process_llm_stream(
 
 /// Close the turn's `turns` row with how `event` ended it. Returns the
 /// message of a failed write, for the caller to turn into the turn's failure.
-fn finish_turn_record(kernel_db: &parking_lot::Mutex<KernelDb>, event: &TurnFlow) -> Option<String> {
+fn finish_turn_record(kernel_db: &parking_lot::Mutex<KernelDb>, event: &TurnFlow, refused: bool) -> Option<String> {
     let (turn_id, stop_reason) = match event {
         TurnFlow::Completed { turn_id, reason, .. } => (*turn_id, reason.as_str()),
+        TurnFlow::Failed { turn_id, .. } if refused => (*turn_id, "refused"),
         TurnFlow::Failed { turn_id, .. } => (*turn_id, "failed"),
         _ => unreachable!("only terminal events close a turn"),
     };
@@ -2725,11 +2727,38 @@ fn finish_turn_record(kernel_db: &parking_lot::Mutex<KernelDb>, event: &TurnFlow
         .map(|error| format!("Could not write the turn record: {error}"))
 }
 
+/// A refusal repeats for the same request, so the turn that met one stops.
+/// Its error block stays in the log for people and leaves the model's
+/// history, and the context's continuation closes to automatic resume. A
+/// drive or wake is held separately, by [`Kernel::refusal_hold`], which reads
+/// the turn's `refused` stop reason until a person's prompt starts a newer
+/// turn. A write fault is logged; the turn already ended.
+fn settle_refusal(
+    documents: &SharedBlockStore,
+    kernel_db: &parking_lot::Mutex<KernelDb>,
+    context_id: ContextId,
+    error_block: &kaijutsu_types::BlockId,
+) {
+    if let Err(error) = documents.set_ephemeral(context_id, error_block, true) {
+        tracing::error!(%context_id, %error, "could not keep the refusal's error block out of the model's history");
+    }
+    if let Err(error) = kernel_db.lock().record_continuation_interrupt(
+        context_id, PrincipalId::system(), kaijutsu_types::now_millis() as i64)
+    {
+        tracing::error!(%context_id, %error, "could not close the continuation after a refusal");
+    }
+}
+
 /// The notice a turn that ended without a complete reply leaves for the
 /// next one, or `None` for a turn that finished. It is short, says no reply
-/// was given, and asks the model not to pick the turn up unprompted.
-fn turn_end_notice(event: &TurnFlow) -> Option<String> {
+/// was given, and asks the model not to pick the turn up unprompted. After a
+/// refusal ([`settle_refusal`]) it says only that the provider declined the
+/// request and that the next message carries on from the last result.
+fn turn_end_notice(event: &TurnFlow, refused: bool) -> Option<String> {
     const TAIL: &str = "It gave no complete reply; do not resume it unless asked.";
+    if refused && matches!(event, TurnFlow::Failed { .. }) {
+        return Some("(The previous request got no reply because the provider declined it. Continue from the last result.)".into());
+    }
     match event {
         TurnFlow::Completed { reason: TurnStopReason::Cancelled { .. }, .. } =>
             Some(format!("(The previous turn was interrupted before it finished. {TAIL})")),
@@ -2754,8 +2783,9 @@ fn record_turn_end(
     start: &kaijutsu_types::BlockId,
     mailbox: &crate::llm::ConversationMailbox,
     event: &TurnFlow,
+    refused: bool,
 ) {
-    let Some(notice) = turn_end_notice(event) else { return };
+    let Some(notice) = turn_end_notice(event, refused) else { return };
     let anchor = documents.block_snapshots(context_id).map(|blocks| {
         let from = blocks.iter().position(|b| b.id == *start).map_or(0, |i| i + 1);
         let cut = blocks[from..].iter().position(|b| b.role == Role::User && !mailbox.has_seen(&b.id))
@@ -3559,26 +3589,37 @@ async fn run_llm_stream(
                         );
                     }
                     tracing::error!("LLM stream error: {}", err);
+                    // What people read, and what the failure event carries: the
+                    // provider's own words for a refusal, without the code the
+                    // kernel keeps for its log.
+                    let refusal = err.kind.is_refusal();
+                    let shown = if refusal { err.message.clone() } else { err.to_string() };
                     let payload = kaijutsu_types::ErrorPayload {
                         category: kaijutsu_types::ErrorCategory::Stream,
                         severity: kaijutsu_types::ErrorSeverity::Error,
                         code: None,
-                        detail: Some(err.to_string()),
+                        detail: Some(shown.clone()),
                         span: None,
                         source_kind: None,
                     };
-                    let _ = documents.insert_error_block_as(
+                    let error_block = documents.insert_error_block_as(
                         context_id,
                         &last_block_id,
                         &payload,
                         payload.summary_line(),
                         Some(PrincipalId::system()),
                     );
+                    if refusal {
+                        if let Ok(error_block) = &error_block {
+                            settle_refusal(&documents, &kernel_db, context_id, error_block);
+                        }
+                        turn_lease.record_refusal();
+                    }
                     // The outer owner settles open blocks before publishing failure.
                     return Ok(TurnFlow::Failed {
                         turn_id, context_id,
                         principal_id: user_principal_id,
-                        error: format!("LLM stream error: {err}"),
+                        error: format!("LLM stream error: {shown}"),
                         origin,
                     });
                 }
@@ -9692,6 +9733,100 @@ mod lifetime_tests {
             }
             kernel.shutdown_runtime_worker().await.unwrap();
         }
+    }
+
+    /// A provider's refusal reaches a person as a plain stream error in the
+    /// provider's own words, and reaches the model only as a neutral notice
+    /// that lets the next message carry on. The error block stays in the log
+    /// and out of the model's history.
+    #[tokio::test]
+    async fn a_refusal_shows_people_the_providers_words_and_tells_the_model_only_to_carry_on() {
+        let refusal = StreamEvent::Error(crate::llm::StreamError::new(
+            crate::llm::StreamErrorKind::Unknown("cyber_policy".into()), "This content was flagged for possible risk."));
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![vec![refusal], text_reply("carrying on")])
+            .recording_sent_messages();
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut failed = kernel.turn_flows().subscribe("turn.failed");
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), failed.recv()).await.unwrap().unwrap();
+
+        let blocks = kernel.blocks().block_snapshots(context).unwrap();
+        let error = blocks.iter().find(|b| b.kind == BlockKind::Error).expect("the refusal leaves an error block");
+        assert!(error.content.starts_with("stream error: ") && error.content.contains("flagged for possible risk"), "{}", error.content);
+        assert!(!error.content.contains("cyber_policy"), "the code stays out of what a model could read: {}", error.content);
+        assert!(error.ephemeral, "the error stays visible to people and out of the model's history");
+
+        let history = rehydrated(&kernel, context);
+        let model_sees = serde_json::to_string(&history).unwrap();
+        assert!(!model_sees.contains("cyber_policy") && !model_sees.contains("flagged"), "{model_sees}");
+        assert_eq!(history.last().unwrap().as_text(),
+            Some("(The previous request got no reply because the provider declined it. Continue from the last result.)"));
+
+        // The next message continues without ceremony.
+        submit_text(&kernel, context, call.principal_id, "next").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let sent = sent.lock().clone();
+        assert_eq!(user_text(sent[1].last().unwrap()), Some("next"), "{:#?}", sent[1]);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// While a context's latest turn was refused, a drive or wake is not
+    /// admitted: repeating the request would be declined again. A person's
+    /// prompt starts a newer turn and lifts the hold.
+    #[tokio::test]
+    async fn a_refused_context_is_held_against_drives_until_a_person_prompts() {
+        let refusal = StreamEvent::Error(crate::llm::StreamError::new(
+            crate::llm::StreamErrorKind::Unknown("cyber_policy".into()), "declined"));
+        let (mock, _sent) = MockClient::new("").with_scripted_stream(vec![vec![refusal], text_reply("carrying on")])
+            .recording_sent_messages();
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let mut failed = kernel.turn_flows().subscribe("turn.failed");
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), failed.recv()).await.unwrap().unwrap();
+        assert!(kernel.kernel_db().lock().last_turn_was_refused(context).unwrap(), "the refused turn is on record");
+
+        let drive = || crate::runtime::turn_request::TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, continuation_epoch: None, score: None,
+        };
+        let error = kernel.request_turn(drive()).expect_err("a refused context is not driven");
+        assert!(error.contains("declined") && error.contains("prompt"), "{error}");
+
+        submit_text(&kernel, context, call.principal_id, "next").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(!kernel.kernel_db().lock().last_turn_was_refused(context).unwrap(), "a person's prompt lifts the hold");
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A refusal repeats for the same request, so the turn that met one stops:
+    /// no completion or drift resumes the context on its own until a new
+    /// explicit drive or prompt opens a new epoch.
+    #[tokio::test]
+    async fn a_refusal_closes_the_continuation_to_automatic_resume() {
+        let (kernel, context, after, _call) = fixture(None).await;
+        let now = kaijutsu_types::now_millis() as i64;
+        let epoch = {
+            let db = kernel.kernel_db().lock();
+            let origin = db.begin_continuation(context, now).unwrap();
+            let epoch = db.continuation_epoch(context).unwrap().expect("an open epoch");
+            let _ = origin;
+            db.record_continuation_request(context, epoch, now).unwrap();
+            db.record_continuation_yield(context, epoch, now).unwrap();
+            assert!(db.automatic_resume_allowed(context, epoch, now, 30 * 60 * 1000).unwrap(), "a yielded epoch resumes on its own");
+            epoch
+        };
+        let error = kernel.blocks().insert_error_block_as(context, &after,
+            &kaijutsu_types::ErrorPayload { category: kaijutsu_types::ErrorCategory::Stream, severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None, detail: Some("declined".into()), span: None, source_kind: None }, "stream error: declined", Some(PrincipalId::system())).unwrap();
+
+        settle_refusal(&kernel.blocks().clone(), kernel.kernel_db(), context, &error);
+
+        assert!(!kernel.kernel_db().lock().automatic_resume_allowed(context, epoch, now, 30 * 60 * 1000).unwrap(),
+            "a refused context is not resumed on its own");
+        let block = kernel.blocks().block_snapshots(context).unwrap().into_iter().find(|b| b.id == error).unwrap();
+        assert!(block.ephemeral && !crate::llm::hydrate::is_history_eligible(&block), "the error is out of the model's history");
     }
 
     #[tokio::test]

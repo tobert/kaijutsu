@@ -185,7 +185,7 @@ pub struct DoneReport {
 pub struct DoneInfo {
     pub turn_id: kaijutsu_types::TurnId,
     /// The model's reported status, else `ended`, `max_tokens`,
-    /// `max_iterations`, or `failed`.
+    /// `max_iterations`, `declined`, or `failed`.
     pub status: String,
     /// The model's feedback, or the failure's message; empty otherwise.
     pub feedback: String,
@@ -195,10 +195,15 @@ pub struct DoneInfo {
 impl DoneInfo {
     /// The facts for a turn's last event, or `None` when the verb should not
     /// fire: a turn a person prompted, and a cancelled turn.
+    ///
+    /// `refused` says the provider declined the turn's request: it reports
+    /// `declined` with no feedback, so the provider's words stay out of the
+    /// context that hears of it.
     pub fn from_ending(
         event: &crate::flows::TurnFlow,
         origin: crate::flows::TurnOrigin,
         report: Option<DoneReport>,
+        refused: bool,
     ) -> Option<Self> {
         use crate::flows::{TurnFlow, TurnOrigin, TurnStopReason};
         if origin != TurnOrigin::Autonomous {
@@ -215,6 +220,9 @@ impl DoneInfo {
                 };
                 Some(Self { turn_id: *turn_id, status, feedback, output_block: *output_block_id })
             }
+            TurnFlow::Failed { turn_id, .. } if refused => Some(Self {
+                turn_id: *turn_id, status: "declined".to_string(), feedback: String::new(), output_block: None,
+            }),
             TurnFlow::Failed { turn_id, error, .. } => Some(Self {
                 turn_id: *turn_id, status: "failed".to_string(), feedback: error.to_string(), output_block: None,
             }),

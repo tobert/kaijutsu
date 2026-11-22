@@ -80,6 +80,8 @@ pub struct TurnLease {
     interrupt: Arc<ContextInterruptState>,
     /// What the model reported when its `done` call ended the turn.
     done: parking_lot::Mutex<Option<crate::rc::DoneReport>>,
+    /// Whether the provider refused this turn's request on policy grounds.
+    refused: std::sync::atomic::AtomicBool,
 }
 
 impl TurnLease {
@@ -108,6 +110,16 @@ impl TurnLease {
     }
     pub(crate) fn interrupt(&self) -> Arc<ContextInterruptState> { self.interrupt.clone() }
     pub(crate) fn context(&self) -> ContextId { self.context }
+    /// Note that the provider refused this turn's request.
+    pub(super) fn record_refusal(&self) {
+        self.refused.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::record_refusal`] was called.
+    pub(super) fn refused(&self) -> bool {
+        self.refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Keep the report of the `done` call that ended this turn, for the
     /// `done` rc verb.
     pub(super) fn record_done(&self, report: crate::rc::DoneReport) {
@@ -187,7 +199,7 @@ impl TurnState {
         active.entry(context).or_default().insert(id, ActiveTurn {
             began: std::time::Instant::now(), interrupt: interrupt.clone(), origin: None,
         });
-        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt, done: Default::default() })
+        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt, done: Default::default(), refused: Default::default() })
     }
 
     pub fn active_count(&self, context: ContextId) -> usize {

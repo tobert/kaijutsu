@@ -86,8 +86,9 @@ The kernel runs `/config/rc/<rc_dir>/<verb>/SXX-name.kai` in lexical order
 The kernel fires `done` once for each autonomous turn that ends, with
 `KJ_DONE_STATUS` set to how it ended: the model's own report from the `done`
 tool (`done`, `blocked`, `gave_up`, `refused`, with its feedback in
-`KJ_DONE_FEEDBACK`), or `ended`, `max_tokens`, `max_iterations`, or `failed`
-when the turn stopped without one. A turn that never started because startup
+`KJ_DONE_FEEDBACK`), or `ended`, `max_tokens`, `max_iterations`, `declined` (the
+provider refused the request; no feedback, so its words stay out of the
+context that hears of it), or `failed` when the turn stopped without one. A turn that never started because startup
 failed reports `failed`. A cancelled turn and a turn a person prompted fire
 nothing. The context stays live, so a senpai that finds the work going well
 drives it again with `kj drive <kohai> --prompt …`. The kohai seed pushes the

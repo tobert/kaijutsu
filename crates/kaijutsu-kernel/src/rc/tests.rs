@@ -3662,7 +3662,7 @@ esac
     fn done_info_names_how_an_autonomous_turn_ended() {
         use crate::flows::{TurnFlow, TurnOrigin::Autonomous, TurnStopReason};
         let report = DoneReport { status: "blocked".into(), feedback: "needs the API key".into() };
-        let info = DoneInfo::from_ending(&ended(TurnStopReason::EndTurn, Autonomous), Autonomous, Some(report)).expect("fires");
+        let info = DoneInfo::from_ending(&ended(TurnStopReason::EndTurn, Autonomous), Autonomous, Some(report), false).expect("fires");
         let vars = info.vars();
         assert_eq!(vars["KJ_DONE_STATUS"], "blocked");
         assert_eq!(vars["KJ_DONE_FEEDBACK"], "needs the API key");
@@ -3671,7 +3671,7 @@ esac
 
         for (reason, status) in [(TurnStopReason::EndTurn, "ended"), (TurnStopReason::MaxTokens, "max_tokens"),
             (TurnStopReason::MaxIterations, "max_iterations")] {
-            let info = DoneInfo::from_ending(&ended(reason, Autonomous), Autonomous, None).expect("fires");
+            let info = DoneInfo::from_ending(&ended(reason, Autonomous), Autonomous, None, false).expect("fires");
             assert_eq!(info.vars()["KJ_DONE_STATUS"], status);
             assert_eq!(info.vars()["KJ_DONE_FEEDBACK"], "");
         }
@@ -3680,9 +3680,23 @@ esac
             turn_id: kaijutsu_types::TurnId::new(), context_id: ContextId::new(), principal_id: PrincipalId::new(),
             error: "provider returned 500".into(), origin: Autonomous,
         };
-        let info = DoneInfo::from_ending(&failed, Autonomous, None).expect("a failure is reported");
+        let info = DoneInfo::from_ending(&failed, Autonomous, None, false).expect("a failure is reported");
         assert_eq!(info.vars()["KJ_DONE_STATUS"], "failed");
         assert_eq!(info.vars()["KJ_DONE_FEEDBACK"], "provider returned 500");
+    }
+
+    /// A turn the provider refused reports `declined` and carries none of the
+    /// provider's words, so the refusal text stays out of the senpai's history.
+    #[test]
+    fn done_info_reports_a_refusal_without_the_providers_words() {
+        use crate::flows::{TurnFlow, TurnOrigin::Autonomous};
+        let failed = TurnFlow::Failed {
+            turn_id: kaijutsu_types::TurnId::new(), context_id: ContextId::new(), principal_id: PrincipalId::new(),
+            error: "LLM stream error: This content was flagged for possible risk.".into(), origin: Autonomous,
+        };
+        let info = DoneInfo::from_ending(&failed, Autonomous, None, true).expect("a refusal is reported");
+        assert_eq!(info.vars()["KJ_DONE_STATUS"], "declined");
+        assert_eq!(info.vars()["KJ_DONE_FEEDBACK"], "", "no provider text");
     }
 
     /// A cancelled turn, and a turn a person prompted, end quietly: whoever
@@ -3691,16 +3705,27 @@ esac
     fn done_info_is_silent_for_a_cancel_and_for_an_interactive_turn() {
         use crate::flows::{TurnOrigin::{Autonomous, Interactive}, TurnStopReason};
         for immediate in [true, false] {
-            assert!(DoneInfo::from_ending(&ended(TurnStopReason::Cancelled { immediate }, Autonomous), Autonomous, None).is_none());
+            assert!(DoneInfo::from_ending(&ended(TurnStopReason::Cancelled { immediate }, Autonomous), Autonomous, None, false).is_none());
         }
         assert!(DoneInfo::from_ending(&ended(TurnStopReason::EndTurn, Interactive), Interactive,
-            Some(DoneReport { status: "done".into(), feedback: "x".into() })).is_none());
+            Some(DoneReport { status: "done".into(), feedback: "x".into() }), false).is_none());
     }
 
     /// A kohai under a senpai, created from the shipped rc, whose mock model
     /// calls `done`. Returns the senpai and the kohai's label.
     async fn kohai_that_calls_done(d: &std::sync::Arc<KjDispatcher>, status: &str) -> (ContextId, &'static str) {
-        use crate::llm::{MockClient, Provider, StreamEvent};
+        use crate::llm::StreamEvent;
+        let stop = |reason: &str| StreamEvent::Done { stop_reason: Some(reason.into()), input_tokens: None, output_tokens: None, extra: None };
+        kohai_with_script(d, vec![vec![
+            StreamEvent::ToolUse { id: "call_done".into(), name: "done".into(),
+                input: serde_json::json!({"status": status, "feedback": "fixed the build"}), signature: None },
+            stop("tool_use"),
+        ]]).await
+    }
+
+    /// Like [`kohai_that_calls_done`], with the kohai's model replying as `script` says.
+    async fn kohai_with_script(d: &std::sync::Arc<KjDispatcher>, script: Vec<Vec<crate::llm::StreamEvent>>) -> (ContextId, &'static str) {
+        use crate::llm::{MockClient, Provider};
         d.set_self_arc();
         d.kernel().broker().set_kj_dispatcher(d).await;
         let console = console_caller(d);
@@ -3717,12 +3742,7 @@ esac
         args.extend(["--senpai".to_string(), "mid".to_string()]);
         let r = d.dispatch(&args, &console).await;
         assert!(r.is_ok(), "create the kohai: {}", r.message());
-        let stop = |reason: &str| StreamEvent::Done { stop_reason: Some(reason.into()), input_tokens: None, output_tokens: None, extra: None };
-        let mock = MockClient::new("").with_scripted_stream(vec![vec![
-            StreamEvent::ToolUse { id: "call_done".into(), name: "done".into(),
-                input: serde_json::json!({"status": status, "feedback": "fixed the build"}), signature: None },
-            stop("tool_use"),
-        ]]);
+        let mock = MockClient::new("").with_scripted_stream(script);
         d.kernel().llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
         let _ = d.kernel().broker().register(std::sync::Arc::new(crate::mcp::servers::BuiltinTurnServer::new()),
             crate::mcp::InstancePolicy::for_kernel(d.kernel())).await;
@@ -3779,6 +3799,24 @@ esac
             let note = senpai_hears(&d, mid).await;
             let note = note.expect("the senpai's log never heard the kohai");
             assert!(note.starts_with("=== kohai kh is blocked ==="), "{note}");
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+        });
+    }
+
+    /// A kohai whose request the provider refused tells its senpai so, in
+    /// plain words and without the provider's text, and does not invite a
+    /// repeat of the same work.
+    #[test]
+    fn a_kohai_the_provider_declined_tells_its_senpai_without_the_providers_words() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            let refusal = crate::llm::StreamEvent::Error(crate::llm::StreamError::new(
+                crate::llm::StreamErrorKind::Unknown("cyber_policy".into()), "This content was flagged for possible risk."));
+            let (mid, _) = kohai_with_script(&d, vec![vec![refusal]]).await;
+            let note = senpai_hears(&d, mid).await.expect("the senpai's log never heard the kohai");
+            assert!(note.starts_with("=== kohai kh was declined by the provider ==="), "{note}");
+            assert!(!note.contains("flagged") && !note.contains("cyber_policy"), "{note}");
+            assert!(!note.contains("To keep it going"), "no invitation to repeat the work: {note}");
             d.kernel().shutdown_runtime_worker().await.unwrap();
         });
     }

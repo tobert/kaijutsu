@@ -62,11 +62,25 @@ impl Kernel {
         self.admit_turn(request, slot, admission, true)
     }
 
+    /// `Err` when the provider declined the context's latest turn. A drive or
+    /// wake would send the same request again and be declined again, so none
+    /// runs until a person's prompt starts a newer turn. A failure to read
+    /// the turn record also refuses: the hold is never skipped on a guess.
+    pub(crate) fn refusal_hold(&self, context: ContextId) -> Result<(), String> {
+        match self.kernel_db().lock().last_turn_was_refused(context) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("the provider declined this context's last request, and sending it again would likely be declined too; \
+                             a person's prompt continues it, and `kj context rotate` starts fresh from a handoff".to_string()),
+            Err(error) => Err(format!("could not read the context's last turn: {error}")),
+        }
+    }
+
     fn admit_turn(
         self: &Arc<Self>, request: TurnRequest, slot: crate::runtime::RuntimeSlot,
         admission: super::admission::ContextAdmission, idle_only: bool,
     ) -> Result<TurnAdmission, String> {
         assert_eq!(admission.context(), request.context_id, "admission belongs to its request");
+        self.refusal_hold(request.context_id)?;
         // The lease begins under the database guard, as the admission mint
         // does in `prompt::submit`, so both stay ordered against archive.
         let mut lease = {
@@ -268,7 +282,7 @@ pub(super) fn report_failure(kernel: &Arc<Kernel>, turn_id: TurnId, request: &Tu
     };
     // A turn that never started still ends the way a running one does, so the
     // `done` verb hears of it.
-    let ending = crate::rc::DoneInfo::from_ending(&failed, origin, None);
+    let ending = crate::rc::DoneInfo::from_ending(&failed, origin, None, false);
     kernel.turn_flows().publish(failed);
     if let Some(ending) = ending {
         let (kernel, context) = (kernel.clone(), request.context_id);
