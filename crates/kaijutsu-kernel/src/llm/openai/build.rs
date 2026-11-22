@@ -169,6 +169,8 @@ pub fn build_request(
         None => resolve_effort(opts.effort.as_deref(), dialect, backend_label, &opts.model),
     };
 
+    warn_response_shape_dropped(opts, backend_label);
+
     if alibaba.is_none()
         && let Some(budget) = opts.thinking_budget
         && should_warn_effort_dropped(backend_label, &opts.model, "thinking_budget", &budget.to_string())
@@ -216,6 +218,30 @@ pub(crate) fn should_warn_effort_dropped(backend: &str, model: &str, knob: &str,
     let set = WARNED_INERT_TUNABLE_DROPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     let key = (backend.to_string(), model.to_string(), knob.to_string(), value.to_string());
     set.lock().expect("dedupe mutex poisoned").insert(key)
+}
+
+/// Warn once for each response-shape setting (`verbosity`,
+/// `reasoning_summary`) that is set on a request to a provider that cannot
+/// send it. Only the ChatGPT plan route sends them. Returns the knobs warned
+/// for, so a test can see the dedupe.
+pub(crate) fn warn_response_shape_dropped(opts: &BuildOpts, backend_label: &str) -> Vec<&'static str> {
+    let knobs = [("verbosity", &opts.verbosity), ("reasoning_summary", &opts.reasoning_summary)];
+    let mut warned = Vec::new();
+    for (knob, value) in knobs {
+        if let Some(value) = value
+            && should_warn_effort_dropped(backend_label, &opts.model, knob, value)
+        {
+            tracing::warn!(
+                backend = backend_label,
+                model = %opts.model,
+                knob,
+                value = %value,
+                "only the ChatGPT plan route sends {knob}; dropped"
+            );
+            warned.push(knob);
+        }
+    }
+    warned
 }
 
 /// Resolve `effort` into the `(reasoning_effort, thinking)` wire pair for
@@ -1024,5 +1050,26 @@ mod tests {
             let req = build_request(&o, &[Message::user("hi")], false, true);
             assert_eq!(req.top_p, Some(0.85));
         }
+    }
+
+    /// `verbosity` and `reasoning_summary` are plan-route settings: another
+    /// provider builds the same request with or without them, and warns once
+    /// per value for each one set.
+    ///
+    /// Falsified by a request that differs, an error, or a warning that
+    /// repeats or is missing.
+    #[test]
+    fn response_shape_settings_are_ignored_and_warned_once() {
+        let history = [Message::user("hi")];
+        for dialect in [Dialect::Generic, Dialect::HostedOpenAi] {
+            let plain = super::build_request(&opts(), &history, false, dialect, "shape-test").unwrap();
+            let set = opts().with_verbosity("low").with_reasoning_summary("concise");
+            let shaped = super::build_request(&set, &history, false, dialect, "shape-test").unwrap();
+            assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::to_value(&shaped).unwrap());
+        }
+        let set = opts().with_verbosity("low").with_reasoning_summary("concise");
+        assert_eq!(warn_response_shape_dropped(&set, "shape-once"), ["verbosity", "reasoning_summary"]);
+        assert!(warn_response_shape_dropped(&set, "shape-once").is_empty(), "warned once");
+        assert!(warn_response_shape_dropped(&opts(), "shape-unset").is_empty(), "nothing set, nothing warned");
     }
 }

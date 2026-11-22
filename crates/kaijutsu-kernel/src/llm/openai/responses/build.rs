@@ -15,6 +15,9 @@
 //!   history goes in `input`; only the WebSocket transport ([`super::ws`])
 //!   replaces it with `previous_response_id` and the new items.
 //!
+//! `text.verbosity` and `reasoning.summary` follow the character's settings:
+//! unset, the request has no `text` field and asks for summary `auto`.
+//!
 //! The binding's `max_tokens`, `temperature`, `top_p` and `thinking_budget`
 //! therefore have no sink here; an explicitly set sampling knob or budget is
 //! warned once per backend, model and value.
@@ -59,14 +62,21 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
     if let Some(system) = &opts.system {
         input.push(text_message("developer", "input_text", system));
     }
+    let mut plain = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
         match msg.role {
             Role::User => translate_user(msg, &mut input),
-            Role::Assistant => translate_assistant(msg, &mut input, i > turn_start),
+            Role::Assistant => {
+                if matches!(msg.content, MessageContent::Text(_)) {
+                    plain.push(input.len());
+                }
+                translate_assistant(msg, &mut input, i > turn_start)
+            }
             Role::System => input.push(text_message("developer", "input_text", &plain_text(&msg.content))),
         }
     }
 
+    tag_phases(&mut input, &plain);
     warn_dropped(opts, backend_label);
 
     let mut body = json!({
@@ -75,8 +85,16 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
         "store": false,
         "stream": true,
         "include": ["reasoning.encrypted_content"],
-        "reasoning": { "summary": "auto" },
+        "reasoning": {},
     });
+    // `none` leaves the summary out, as Codex does; unset asks for `auto`.
+    match opts.reasoning_summary.as_deref().unwrap_or("auto") {
+        "none" => {}
+        summary => body["reasoning"]["summary"] = Value::String(summary.into()),
+    }
+    if let Some(verbosity) = &opts.verbosity {
+        body["text"] = json!({ "verbosity": verbosity });
+    }
     if let Some(session) = cache_session(opts) {
         body["prompt_cache_key"] = Value::String(session);
     }
@@ -102,6 +120,40 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
         body["parallel_tool_calls"] = Value::Bool(true);
     }
     body
+}
+
+/// Set `phase` on assistant message items, derived from position. A turn is
+/// the items from one user message to the next. A message with a
+/// `function_call` after it in its turn is `commentary`. The last message of
+/// a turn that a later user message closed, with no `function_call` after
+/// it, is `final_answer`. Any other message keeps no `phase`: a turn still
+/// open at the end of the input has no known final answer. Items listed in
+/// `plain` (text-only history, which has no structure to read) are skipped.
+fn tag_phases(input: &mut [Value], plain: &[usize]) {
+    let is_user = |item: &Value| item["type"] == "message" && item["role"] == "user";
+    let mut start = 0;
+    while start < input.len() {
+        let end = input[start + 1..].iter().position(is_user).map_or(input.len(), |p| start + 1 + p);
+        let closed = end < input.len();
+        let turn = &mut input[start..end];
+        let tagged = |i: usize, item: &Value| {
+            item["type"] == "message" && item["role"] == "assistant" && !plain.contains(&(start + i))
+        };
+        let last_call = turn.iter().rposition(|item| item["type"] == "function_call");
+        let last_message = turn.iter().enumerate().rposition(|(i, item)| tagged(i, item));
+        for i in 0..turn.len() {
+            if !tagged(i, &turn[i]) {
+                continue;
+            }
+            let item = &mut turn[i];
+            if last_call.is_some_and(|call| i < call) {
+                item["phase"] = Value::String("commentary".into());
+            } else if closed && Some(i) == last_message {
+                item["phase"] = Value::String("final_answer".into());
+            }
+        }
+        start = end;
+    }
 }
 
 /// Whether `msg` starts a turn: a user message with more than tool results.
@@ -318,7 +370,7 @@ mod tests {
         let input = v["input"].as_array().unwrap();
         assert_eq!(input.len(), 5, "{v}");
         assert_eq!(input[1], json!({ "type": "reasoning", "summary": [{ "type": "summary_text", "text": "think" }], "encrypted_content": "ENC" }));
-        assert_eq!(input[2], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "looking" }] }));
+        assert_eq!(input[2], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "looking" }], "phase": "commentary" }));
         assert_eq!(input[3], json!({ "type": "function_call", "call_id": "call_1", "name": "ls", "arguments": "{\"path\":\"/\"}" }));
         assert_eq!(input[4], json!({ "type": "function_call_output", "call_id": "call_1", "output": "[tool error]\ndenied" }));
     }
@@ -370,5 +422,103 @@ mod tests {
         let parts = &v["input"][0]["content"];
         assert_eq!(parts[0], json!({ "type": "input_image", "image_url": "data:image/png;base64,AAAA" }));
         assert!(parts[1]["text"].as_str().unwrap().contains("bytes were not found"), "{v}");
+    }
+
+    fn phases(v: &Value) -> Vec<Option<String>> {
+        v["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "message" && i["role"] == "assistant")
+            .map(|i| i.get("phase").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    }
+
+    fn calls(id: &str, lead_in: &str) -> [Message; 2] {
+        [
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text { text: lead_in.into() },
+                    ContentBlock::ToolUse { id: id.into(), name: "ls".into(), input: json!({}), signature: None },
+                ]),
+                turn_scoped: false,
+            },
+            Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: id.into(), content: "ok".into(), is_error: false }]),
+        ]
+    }
+
+    fn blocks_message(text: &str) -> Message {
+        Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]), turn_scoped: false }
+    }
+
+    /// Narration before a tool call is `commentary`, and the last message of a
+    /// finished turn is `final_answer`, in this turn and in earlier ones.
+    ///
+    /// Falsified by a message with no `phase`, or with the wrong one.
+    #[test]
+    fn replayed_assistant_messages_carry_a_derived_phase() {
+        let [call, result] = calls("c1", "looking");
+        let [call2, result2] = calls("c2", "again");
+        let history = [
+            Message::user("one"), call, result, blocks_message("done"),
+            Message::user("two"), call2, result2,
+        ];
+        let v = body(BuildOpts::new("m", 1), &history);
+        assert_eq!(
+            phases(&v),
+            [Some("commentary".into()), Some("final_answer".into()), Some("commentary".into())],
+            "{v}"
+        );
+        let first = v["input"].as_array().unwrap().iter().find(|i| i["type"] == "message" && i["role"] == "assistant").unwrap();
+        assert_eq!(first["phase"], "commentary");
+        assert!(first["content"][0].get("phase").is_none(), "phase sits on the item, not the part: {first}");
+    }
+
+    /// A message that does not clearly fit goes without a phase: a second
+    /// message in a turn with no tool call after it, a message still open at
+    /// the end of the input, and legacy text-only messages. User and
+    /// developer messages never carry one.
+    ///
+    /// Falsified by a `phase` on any of them.
+    #[test]
+    fn an_unclear_message_goes_without_a_phase() {
+        let two = [Message::user("q"), blocks_message("first"), blocks_message("second"), Message::user("next")];
+        let v = body(BuildOpts::new("m", 1).with_system("sys"), &two);
+        assert_eq!(phases(&v), [None, Some("final_answer".into())], "{v}");
+
+        let open = body(BuildOpts::new("m", 1), &[Message::user("q"), blocks_message("so far")]);
+        assert_eq!(phases(&open), [None], "{open}");
+
+        let legacy = body(BuildOpts::new("m", 1), &[Message::user("q"), Message::assistant("plain"), Message::user("n")]);
+        assert_eq!(phases(&legacy), [None], "{legacy}");
+        assert_eq!(legacy["input"][1], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "plain" }] }));
+
+        for item in v["input"].as_array().unwrap() {
+            if item["role"] != "assistant" {
+                assert!(item.get("phase").is_none(), "{item}");
+            }
+        }
+    }
+
+    /// With neither setting, the request is as it always was: summary `auto`
+    /// and no `text` field. A verbosity rides as `text.verbosity`; a summary
+    /// replaces `auto`, and `none` leaves the field out, as Codex does.
+    ///
+    /// Falsified by a `text` field with nothing set, an ignored setting, or
+    /// `"summary": "none"` on the wire.
+    #[test]
+    fn verbosity_and_reasoning_summary_shape_the_request() {
+        let plain = body(BuildOpts::new("m", 1), &[Message::user("a")]);
+        assert_eq!(plain["reasoning"], json!({ "summary": "auto" }));
+        assert!(plain.get("text").is_none(), "{plain}");
+
+        let v = body(BuildOpts::new("m", 1).with_verbosity("medium").with_reasoning_summary("detailed").with_effort("low"), &[Message::user("a")]);
+        assert_eq!(v["text"], json!({ "verbosity": "medium" }));
+        assert_eq!(v["reasoning"], json!({ "summary": "detailed", "effort": "low" }));
+
+        let quiet = body(BuildOpts::new("m", 1).with_reasoning_summary("none").with_effort("low"), &[Message::user("a")]);
+        assert_eq!(quiet["reasoning"], json!({ "effort": "low" }), "{quiet}");
+        assert!(quiet.get("text").is_none(), "{quiet}");
     }
 }

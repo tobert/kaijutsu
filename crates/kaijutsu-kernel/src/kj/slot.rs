@@ -143,6 +143,18 @@ pub(super) enum CharacterModelCommand {
         /// copies this when it is made or rotated
         #[arg(long = "preview-kib", value_parser = clap::value_parser!(u32).range(PREVIEW_KIB_RANGE))]
         preview_kib: Option<u32>,
+        /// Answer length the ChatGPT plan route asks for (`text.verbosity`).
+        /// Without it the request carries no length setting. Other backends
+        /// ignore it. Setting the model without `--verbosity` clears it. A
+        /// context copies this when it is made or rotated
+        #[arg(long, value_parser = crate::kernel_db::VERBOSITIES)]
+        verbosity: Option<String>,
+        /// Reasoning summary the ChatGPT plan route asks for. Without it the
+        /// route asks for `auto`; `none` asks for no summary. Other backends
+        /// ignore it. Setting the model without `--reasoning-summary` clears
+        /// it. A context copies this when it is made or rotated
+        #[arg(long = "reasoning-summary", value_parser = crate::kernel_db::REASONING_SUMMARIES)]
+        reasoning_summary: Option<String>,
     },
     /// Remove the character's model. Role slots stay. Contexts keep the
     /// slots they copied until they are rotated.
@@ -190,6 +202,8 @@ pub(super) fn model_data(
         "thinking_style": m.thinking_style,
         "decide": m.decide,
         "preview_kib": m.preview_kib,
+        "verbosity": m.verbosity,
+        "reasoning_summary": m.reasoning_summary,
     })
 }
 
@@ -205,6 +219,12 @@ pub(super) fn model_summary(
     }
     if let Some(kib) = m.preview_kib {
         knobs.push(format!("preview_kib={kib}"));
+    }
+    if let Some(v) = &m.verbosity {
+        knobs.push(format!("verbosity={v}"));
+    }
+    if let Some(v) = &m.reasoning_summary {
+        knobs.push(format!("reasoning_summary={v}"));
     }
     if knobs.is_empty() {
         format!("{backend}/{} (no parameters set)", m.model)
@@ -258,6 +278,8 @@ impl KjDispatcher {
                 thinking_style,
                 decide,
                 preview_kib,
+                verbosity,
+                reasoning_summary,
             } => {
                 let (backend, model) = match split_backend_model(&model) {
                     Ok(pair) => pair,
@@ -301,6 +323,8 @@ impl KjDispatcher {
                     thinking_style,
                     decide,
                     preview_kib: preview_kib.map(i64::from),
+                    verbosity,
+                    reasoning_summary,
                 }) {
                     return KjResult::Err(format!("kj character model set: {e}"));
                 }
@@ -595,6 +619,86 @@ mod tests {
         let r = d.dispatch(&argv(&["backend", "set", "nagaya", "--kind", "council", "--base-url", "http://nagaya:8091", "--key-optional"]), &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
         d
+    }
+
+    /// `--verbosity` and `--reasoning-summary` round-trip through `kj
+    /// character model set`, `kj character model show` and `kj character
+    /// show`, reach the model slot a context copies, and reach the request
+    /// options of that context's turns. Setting the model again without
+    /// them clears them.
+    ///
+    /// Falsified by a value lost at the row, the show output, the context
+    /// copy, or the request options.
+    #[tokio::test]
+    async fn response_shape_settings_round_trip() {
+        let d = seeded().await;
+        let set = argv(&["character", "model", "set", "house", "deepseek/deepseek-flash", "--verbosity", "medium", "--reasoning-summary", "concise"]);
+        let r = d.dispatch(&set, &test_caller()).await;
+        assert!(r.is_ok(), "{}", r.message());
+
+        match d.dispatch(&argv(&["character", "model", "show", "house"]), &test_caller()).await {
+            KjResult::Ok { message, data: Some(v), .. } => {
+                assert!(message.contains("verbosity=medium") && message.contains("reasoning_summary=concise"), "{message}");
+                assert_eq!((v["verbosity"].as_str(), v["reasoning_summary"].as_str()), (Some("medium"), Some("concise")));
+            }
+            other => panic!("{other:?}"),
+        }
+        match d.dispatch(&argv(&["character", "show", "house"]), &test_caller()).await {
+            KjResult::Ok { message, data: Some(v), .. } => {
+                assert!(message.contains("verbosity=medium"), "{message}");
+                assert_eq!(v["model"]["verbosity"], "medium");
+                assert_eq!(v["model"]["reasoning_summary"], "concise");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let context = super::super::test_helpers::register_context(&d, Some("shaped"), None, kaijutsu_types::PrincipalId::new());
+        let opts = {
+            let db = d.kernel_db().lock();
+            let performer = db.get_character_by_name("house").unwrap().unwrap().principal_id;
+            db.write_context_character(context, performer, None, None).unwrap();
+            let slot = db.context_slot(context, crate::model_resolution::MODEL).unwrap().expect("a model slot");
+            assert_eq!((slot.verbosity.as_deref(), slot.reasoning_summary.as_deref()), (Some("medium"), Some("concise")));
+            let distill = db.context_slot(context, crate::model_resolution::DISTILL).unwrap().expect("a distill slot");
+            assert_eq!((distill.verbosity, distill.reasoning_summary), (None, None), "a one-shot copy carries neither");
+            let model = crate::model_resolution::context_model(&db, context).unwrap().into_model().unwrap();
+            crate::llm::apply_tunables(crate::llm::BuildOpts::new("m", 1), &model.tunables)
+        };
+        assert_eq!((opts.verbosity.as_deref(), opts.reasoning_summary.as_deref()), (Some("medium"), Some("concise")));
+
+        let again = argv(&["character", "model", "set", "house", "deepseek/deepseek-flash"]);
+        assert!(d.dispatch(&again, &test_caller()).await.is_ok());
+        match d.dispatch(&argv(&["character", "model", "show", "house"]), &test_caller()).await {
+            KjResult::Ok { data: Some(v), .. } => assert!(v["verbosity"].is_null() && v["reasoning_summary"].is_null(), "{v}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A value outside the accepted set is refused, and the error names the
+    /// accepted values; the model stays as it was.
+    ///
+    /// Falsified by an accepted bad value or an error without the choices.
+    #[tokio::test]
+    async fn an_invalid_response_shape_value_is_refused_naming_the_choices() {
+        let d = seeded().await;
+        for (flag, bad, accepted) in [
+            ("--verbosity", "loud", ["low", "medium", "high"].as_slice()),
+            ("--reasoning-summary", "full", ["none", "auto", "concise", "detailed"].as_slice()),
+        ] {
+            let r = d.dispatch(&argv(&["character", "model", "set", "house", "deepseek/deepseek-flash", flag, bad]), &test_caller()).await;
+            match r {
+                KjResult::Err(m) => {
+                    assert!(m.contains(bad), "{m}");
+                    for a in accepted {
+                        assert!(m.contains(a), "{flag}: the error names {a}: {m}");
+                    }
+                }
+                other => panic!("{flag} {bad} must be refused: {other:?}"),
+            }
+        }
+        let db = d.kernel_db().lock();
+        let principal = db.get_character_by_name("house").unwrap().unwrap().principal_id;
+        assert!(db.get_character_model(principal).unwrap().is_none(), "a refused set writes nothing");
     }
 
     #[tokio::test]
@@ -1236,7 +1340,7 @@ mod tests {
                 thinking_budget: None,
                 thinking_style: None,
                 decide: Some("/config/rc/musician/programs/bass-bars.json".into()),
-                preview_kib: None,
+                preview_kib: None, verbosity: None, reasoning_summary: None,
             })
             .unwrap();
             let ctx = kaijutsu_types::ContextId::new();

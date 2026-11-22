@@ -20,23 +20,26 @@ CREATE TABLE context_slots_fold (
     thinking_style  TEXT,
     decide          TEXT CHECK (decide IS NULL OR decide != ''),
     preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0),
+    verbosity       TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high')),
+    reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed')),
     PRIMARY KEY (context_id, role)
 );
 ";
 
 /// Copies the rows of the old `context_slots` into [`CONTEXT_SLOTS_FOLDED`]
-/// and swaps it in. `decide` and `preview_kib` are copied when the old table
-/// has them.
-fn fold_context_slots_sql(old_has_decide: bool, old_has_preview: bool) -> String {
+/// and swaps it in. `decide`, `preview_kib`, `verbosity` and
+/// `reasoning_summary` are copied when the old table has them.
+fn fold_context_slots_sql(old_has_decide: bool, old_has_preview: bool, old_has_shape: bool) -> String {
     let decide = if old_has_decide { "decide" } else { "NULL" };
     let preview = if old_has_preview { "preview_kib" } else { "NULL" };
+    let (verbosity, summary) = if old_has_shape { ("verbosity", "reasoning_summary") } else { ("NULL", "NULL") };
     format!(
         "{CONTEXT_SLOTS_FOLDED}
 INSERT INTO context_slots_fold
     (context_id, role, backend_id, model, max_tokens, context_window, temperature, top_p, effort,
-     thinking_budget, thinking_style, decide, preview_kib)
+     thinking_budget, thinking_style, decide, preview_kib, verbosity, reasoning_summary)
 SELECT context_id, role, backend_id, model, max_tokens, context_window, temperature, top_p, effort,
-       thinking_budget, thinking_style, {decide}, {preview} FROM context_slots;
+       thinking_budget, thinking_style, {decide}, {preview}, {verbosity}, {summary} FROM context_slots;
 DROP TABLE context_slots;
 ALTER TABLE context_slots_fold RENAME TO context_slots;
 "
@@ -253,7 +256,8 @@ impl KernelDb {
         if slots_reference_old_table {
             let old_has_decide = Self::has_column(&tx, "context_slots", "decide")?;
             let old_has_preview = Self::has_column(&tx, "context_slots", "preview_kib")?;
-            tx.execute_batch(&fold_context_slots_sql(old_has_decide, old_has_preview))?;
+            let old_has_shape = Self::has_column(&tx, "context_slots", "verbosity")?;
+            tx.execute_batch(&fold_context_slots_sql(old_has_decide, old_has_preview, old_has_shape))?;
         }
         tx.execute("DROP TABLE context_characters", [])?;
         {

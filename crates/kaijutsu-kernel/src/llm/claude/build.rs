@@ -197,6 +197,7 @@ pub fn build_request(
     streaming: bool,
     dialect: Dialect,
 ) -> Result<MessagesRequest, LlmError> {
+    crate::llm::openai::build::warn_response_shape_dropped(opts, "claude");
     let plan = plan_cache(&opts.cache_breakpoints);
 
     // Tools: a single cache_control on the last tool covers the whole

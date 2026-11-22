@@ -405,6 +405,8 @@ mod tests {
             effort: Some("none".into()),
             thinking_budget: None,
             thinking_style: None,
+            verbosity: None,
+            reasoning_summary: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
             controls: Vec::new(),

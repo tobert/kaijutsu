@@ -117,6 +117,10 @@ impl KernelDb {
             "ALTER TABLE backend_models ADD COLUMN embedding_profile TEXT",
             "ALTER TABLE character_models ADD COLUMN preview_kib INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0)",
             "ALTER TABLE context_slots ADD COLUMN preview_kib INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0)",
+            "ALTER TABLE character_models ADD COLUMN verbosity TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high'))",
+            "ALTER TABLE character_models ADD COLUMN reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed'))",
+            "ALTER TABLE context_slots ADD COLUMN verbosity TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high'))",
+            "ALTER TABLE context_slots ADD COLUMN reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed'))",
         ];
         for sql in alters {
             match conn.execute(sql, []) {

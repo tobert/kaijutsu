@@ -28,6 +28,7 @@ fn own_signature(signature: Option<&str>) -> Option<String> {
 
 /// Build a native Gemini `GenerateContentRequest` from `opts` and `messages`.
 pub fn build_request(opts: &BuildOpts, messages: &[Message]) -> LlmResult<GenerateContentRequest> {
+    crate::llm::openai::build::warn_response_shape_dropped(opts, "gemini");
     if !opts.cache_breakpoints.is_empty() {
         tracing::debug!(
             count = opts.cache_breakpoints.len(),

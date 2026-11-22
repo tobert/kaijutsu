@@ -407,6 +407,15 @@ pub struct BuildOpts {
     /// `claude::build::resolve_thinking`). Validated on Claude and Alibaba,
     /// where `"off"` turns thinking off; ignored elsewhere.
     pub thinking_style: Option<String>,
+    /// Answer length: `low` | `medium` | `high`. Only the ChatGPT plan route
+    /// sends it (`text.verbosity`); unset sends no `text` field. Every other
+    /// provider ignores it, warned once if set.
+    pub verbosity: Option<String>,
+    /// Reasoning summary: `none` | `auto` | `concise` | `detailed`. Only the
+    /// ChatGPT plan route sends it (`reasoning.summary`; `none` omits the
+    /// field, as Codex does); unset sends `auto`. Every other provider
+    /// ignores it, warned once if set.
+    pub reasoning_summary: Option<String>,
     /// VFS path of a decision program. Only a `council` backend takes it: its
     /// turn is then assembled from council decisions, with no tokens sampled
     /// by the server. Every other provider refuses a turn that has one rather
@@ -448,6 +457,8 @@ impl BuildOpts {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
+            verbosity: None,
+            reasoning_summary: None,
             decide: None,
             vfs: None,
             tools: Vec::new(),
@@ -490,6 +501,16 @@ impl BuildOpts {
 
     pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
         self.effort = Some(effort.into());
+        self
+    }
+
+    pub fn with_verbosity(mut self, verbosity: impl Into<String>) -> Self {
+        self.verbosity = Some(verbosity.into());
+        self
+    }
+
+    pub fn with_reasoning_summary(mut self, summary: impl Into<String>) -> Self {
+        self.reasoning_summary = Some(summary.into());
         self
     }
 
@@ -538,6 +559,8 @@ pub fn apply_tunables(mut opts: BuildOpts, tunables: &SlotTunables) -> BuildOpts
     opts.effort = tunables.effort.clone();
     opts.thinking_budget = tunables.thinking_budget;
     opts.thinking_style = tunables.thinking_style.clone();
+    opts.verbosity = tunables.verbosity.clone();
+    opts.reasoning_summary = tunables.reasoning_summary.clone();
     opts.decide = tunables.decide.clone();
     opts
 }
@@ -914,6 +937,8 @@ mod tests {
                 effort: Some("low".into()),
                 thinking_budget: Some(1000),
                 thinking_style: Some("auto".into()),
+                verbosity: Some("high".into()),
+                reasoning_summary: Some("concise".into()),
                 decide: None,
             }
         }
@@ -927,6 +952,8 @@ mod tests {
             assert_eq!(opts.effort.as_deref(), Some("low"));
             assert_eq!(opts.thinking_budget, Some(1000));
             assert_eq!(opts.thinking_style.as_deref(), Some("auto"));
+            assert_eq!(opts.verbosity.as_deref(), Some("high"));
+            assert_eq!(opts.reasoning_summary.as_deref(), Some("concise"));
         }
 
         #[test]

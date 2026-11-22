@@ -198,6 +198,8 @@ CREATE TABLE IF NOT EXISTS context_slots (
     thinking_style  TEXT,
     decide          TEXT CHECK (decide IS NULL OR decide != ''),
     preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0),
+    verbosity       TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high')),
+    reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed')),
     PRIMARY KEY (context_id, role)
 );
 
@@ -854,7 +856,11 @@ CREATE TABLE IF NOT EXISTS character_models (
     thinking_style  TEXT,
     decide          TEXT CHECK (decide IS NULL OR decide != ''),
     -- The shell output a model reads whole, in KiB; NULL is the kernel default.
-    preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0)
+    preview_kib     INTEGER CHECK (preview_kib IS NULL OR preview_kib > 0),
+    -- The ChatGPT plan route's `text.verbosity` and reasoning summary; NULL
+    -- sends no `text` field and asks for `auto`.
+    verbosity       TEXT CHECK (verbosity IS NULL OR verbosity IN ('low', 'medium', 'high')),
+    reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed'))
 );
 CREATE INDEX IF NOT EXISTS idx_character_models_backend ON character_models(backend_id);
 
