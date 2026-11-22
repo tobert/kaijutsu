@@ -3,16 +3,16 @@
 kj runs the kaijutsu kernel from the shell: contexts and their blocks, forks
 and drift between contexts, and models.
 
-Ask for more one level at a time:
+Get oriented with two reads, one per call: `kj context info` (who you are and
+your state) and `kj context list --senpai .` (who answers to you). Read help
+only for the verb you are about to use:
 
 - `kj <command> --help` lists a command's subcommands (`kj <command> help` is the same).
 - `kj <command> <subcommand> --help` lists its arguments and flags.
 
-A `<ctx>` argument takes `.` (the current context, the default), `.parent` (the
-context this one was forked from), `.senpai` (the context this one answers to),
-a chain of those steps in any order (`.parent.parent`, `.senpai.senpai`,
-`.parent.senpai`), a label (exact, then unique prefix), or a hex prefix of a
-context id. A step with nothing to follow is an error: a root console has no
+A `<ctx>` argument takes `.` (this context, the default), `.parent`, `.senpai`
+(the context this one answers to), a chain of those (`.parent.senpai`), a
+label, or a hex prefix of an id. Quote ids and labels. A root console has no
 senpai.
 
 ## Commands

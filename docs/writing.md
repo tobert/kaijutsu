@@ -125,6 +125,14 @@ Avoid incorrect examples. When one is necessary, put the correct form first and
 mark the error next to it:
 `kj block read 'abc12345#7'`; `kj block read abc12345#7 # error — kaish eats the #`.
 
+## Commands in examples
+
+Show a `kj` or kaish command the way kaish reads it: in backticks, with every id, label, path, and placeholder in single quotes.
+
+`kj block read -c '9d9b3c0b' 'abc12345#7'` and `kj drive '<ctx>' --prompt '<brief>'`.
+
+An id can be read as a number (kaish refuses a leading zero as one) or hold a character that is syntax (`#` starts a comment), so quote it every time, even where it would parse bare. Flags and `.`, `.parent`, `.senpai` need no quotes. Use double quotes only where a variable or substitution must expand. A hint a command prints for the next step follows the same form.
+
 ## Terms
 
 Terms that carry a guarantee. **This table is the source.** The list grows when
