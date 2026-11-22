@@ -402,19 +402,19 @@ pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
     Ok(rows)
 }
 
-/// Drift asks in `context_id` whose held drift is not settled yet: still
-/// open, or answered and not yet spent by the approval worker. Oldest
-/// first.
-pub fn list_unsettled_drift_asks(conn: &Connection, context_id: &[u8]) -> Result<Vec<String>> {
+/// Asks of `origin` in `context_id` that are not settled yet: still open, or
+/// answered and not yet spent by the approval worker. Oldest first. Meant for
+/// origins whose answer is acted on by the worker (`Drift`, `Refusal`).
+pub fn list_unsettled_asks(conn: &Connection, context_id: &[u8], origin: crate::types::Origin) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT request_id FROM approvals
-         WHERE origin = 'drift' AND context_id = ?1
+         WHERE origin = ?2 AND context_id = ?1
            AND (status IN ('pending', 'claimed')
                 OR ((status IN ('allowed', 'denied') OR (status = 'abandoned' AND decided_option = 'cancel'))
                     AND request_id NOT IN (SELECT request_id FROM approval_redemptions)))
          ORDER BY created_at ASC",
     )?;
-    let rows = stmt.query_map(params![context_id], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    let rows = stmt.query_map(params![context_id, origin.as_str()], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(rows)
 }
 

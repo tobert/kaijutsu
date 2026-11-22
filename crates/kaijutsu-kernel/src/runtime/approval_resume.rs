@@ -1142,6 +1142,18 @@ async fn run_delivery(
                 continue;
             }
 
+            // A refusal ask holds a context, not a caller: lift the hold or
+            // leave it, and wake nobody.
+            if row.origin == approval_ledger::types::Origin::Refusal {
+                let allowed = answer.status == crate::ApprovalStatus::Allowed;
+                match kernel.settle_refusal_answer(&answer.request_id, allowed) {
+                    Ok(()) => { woken.insert(answer.request_id.clone()); }
+                    Err(error) => tracing::error!(ask = %answer.request_id, %error, "gate-resume: could not settle a refusal answer"),
+                }
+                delivered_this_scan += 1;
+                continue;
+            }
+
             match kernel.kernel_db().lock().approval_pair_ready(&answer.request_id) {
                 Ok(true) => {}
                 Ok(false) => continue,

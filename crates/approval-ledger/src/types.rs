@@ -78,6 +78,9 @@ pub enum Origin {
     /// A drift into the console waits for its human; approval releases
     /// the held drift block and never executes source.
     Drift,
+    /// The provider declined a context's request; approval lifts the
+    /// hold and resumes the context, and never executes source.
+    Refusal,
 }
 
 impl Origin {
@@ -88,6 +91,7 @@ impl Origin {
             Self::ShellGate => "shell_gate",
             Self::KjVerb => "kj_verb",
             Self::Drift => "drift",
+            Self::Refusal => "refusal",
         }
     }
 }
@@ -837,7 +841,7 @@ mod tests {
         for v in [PairOwner::Turn, PairOwner::Session] {
             assert_eq!(PairOwner::from_str(v.as_str()).unwrap(), v);
         }
-        for v in [Origin::Hook, Origin::ShellGate, Origin::KjVerb, Origin::Drift] {
+        for v in [Origin::Hook, Origin::ShellGate, Origin::KjVerb, Origin::Drift, Origin::Refusal] {
             assert_eq!(Origin::from_str(v.as_str()).unwrap(), v);
         }
         for v in [

@@ -44,6 +44,7 @@ fn origin(origin: wire::AskOrigin) -> AskOrigin {
         wire::AskOrigin::ShellGate => AskOrigin::ShellGate,
         wire::AskOrigin::KjVerb => AskOrigin::KjVerb,
         wire::AskOrigin::Drift => AskOrigin::Drift,
+        wire::AskOrigin::Refusal => AskOrigin::Refusal,
     }
 }
 
@@ -54,6 +55,7 @@ fn wire_origin(origin: AskOrigin) -> wire::AskOrigin {
         AskOrigin::ShellGate => wire::AskOrigin::ShellGate,
         AskOrigin::KjVerb => wire::AskOrigin::KjVerb,
         AskOrigin::Drift => wire::AskOrigin::Drift,
+        AskOrigin::Refusal => wire::AskOrigin::Refusal,
     }
 }
 

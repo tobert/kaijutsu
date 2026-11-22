@@ -471,6 +471,8 @@ enum AskOrigin {
   kjVerb @3;
   # A drift into the ROOT console waits for its human; never runs source.
   drift @4;
+  # A refused context waits for its reviewer; an allow sends its work again.
+  refusal @5;
 }
 
 # A principal and the name its character sheet gives it now.

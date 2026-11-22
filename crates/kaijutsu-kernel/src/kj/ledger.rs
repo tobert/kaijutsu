@@ -122,6 +122,8 @@ enum OriginArg {
     KjVerb,
     /// A drift into the console waits for its human.
     Drift,
+    /// A refused context waits for its reviewer.
+    Refusal,
 }
 
 impl OriginArg {
@@ -132,6 +134,7 @@ impl OriginArg {
             Self::ShellGate => Origin::ShellGate,
             Self::KjVerb => Origin::KjVerb,
             Self::Drift => Origin::Drift,
+            Self::Refusal => Origin::Refusal,
         }
     }
 }
@@ -1704,10 +1707,10 @@ fn decide_ask_with_reason(
             Err(e) => return Err(refused(e)),
         };
         record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
-        if remember.is_some() && row.origin == Origin::Drift {
+        if remember.is_some() && matches!(row.origin, Origin::Drift | Origin::Refusal) {
             return Err(failure(AskAnswerFailureKind::Refused, format!(
-                "ask {request_id} holds a drift, and a drift is answered one at a time; no rule \
-                 was learned and the ask is still open. Answer it without --remember"
+                "ask {request_id} is a {} ask, answered one at a time; no rule \
+                 was learned and the ask is still open. Answer it without --remember", row.origin
             )));
         }
         if remember.is_some_and(|r| r.scope == RememberScope::Session) {

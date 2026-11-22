@@ -343,6 +343,18 @@ impl KernelDb {
         Ok(matches!(latest, Some(Some(reason)) if reason == "refused"))
     }
 
+    /// Lift the hold a refusal put on the context: its latest turn, when it
+    /// ended `refused`, is recorded `refusal_released` instead. The hold stays
+    /// lifted until a newer turn ends refused. Returns whether a hold was lifted.
+    pub fn release_refusal_hold(&self, context_id: ContextId) -> KernelDbResult<bool> {
+        Ok(self.conn.execute(
+            "UPDATE turns SET stop_reason = 'refusal_released'
+             WHERE stop_reason = 'refused' AND turn_id = (
+                 SELECT turn_id FROM turns WHERE context_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1)",
+            params![blob_param(context_id.as_bytes())],
+        )? != 0)
+    }
+
     /// Close a turn with how it ended. Fails when the turn has no row or has
     /// already ended.
     pub fn finish_turn(&self, turn_id: TurnId, ended_at: i64, stop_reason: &str) -> KernelDbResult<()> {

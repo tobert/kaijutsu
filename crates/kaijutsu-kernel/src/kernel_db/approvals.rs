@@ -92,6 +92,21 @@ impl KernelDb {
         Ok(approval_ledger::ask::load_ask_env(self.conn_for_ledger(), request_id)?)
     }
 
+    /// Withdraw the context's open refusal ask, because a newer turn replaced
+    /// the refusal it asked about. Returns how many asks it abandoned.
+    pub fn withdraw_refusal_asks(&self, context_id: ContextId) -> KernelDbResult<usize> {
+        let open = approval_ledger::ask::list_unsettled_asks(self.conn_for_ledger(), context_id.as_bytes(), approval_ledger::types::Origin::Refusal)?;
+        let mut withdrawn = 0;
+        for request_id in open {
+            match approval_ledger::decide::abandon(self.conn_for_ledger(), &request_id, Some("a newer turn started")) {
+                Ok(_) => withdrawn += 1,
+                Err(approval_ledger::error::LedgerError::AlreadyDecided { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(withdrawn)
+    }
+
     /// Open a new continuation epoch for an explicit model drive.
     pub fn begin_continuation(&self, context_id: ContextId, opened_at: i64) -> KernelDbResult<ContinuationOrigin> {
         if self.conn.is_autocommit() {
