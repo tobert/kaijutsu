@@ -571,6 +571,7 @@ impl App {
     /// (`run::Feeds`), and is stopped first.
     pub fn release(&mut self, id: ContextId) {
         self.views.remove(&id);
+        self.submitted.remove(&id);
         self.wrap.forget_context(id);
     }
 
@@ -1639,5 +1640,14 @@ mod tests {
         let aid = ContextId::new();
         let view = ContextView::new(ContextMirror::new(aid));
         assert_eq!(view.edge(), None);
+    }
+
+    #[test]
+    fn releasing_a_context_prunes_its_submitted_entry() {
+        let (mut app, a, _b) = app_with_two();
+        app.mark_submitted(BlockId::new(a, PrincipalId::new(), 7));
+        assert!(app.submitted.contains_key(&a));
+        app.release(a);
+        assert!(!app.submitted.contains_key(&a));
     }
 }
