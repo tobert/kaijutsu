@@ -171,13 +171,37 @@ pub(crate) fn is_turn_scoped_instruction(block: &BlockSnapshot) -> bool {
         && block.turn_scoped
 }
 
+/// A drift arrival as a user message: the body inside a `<drift>` element
+/// that names the sending context and the drift kind. A `</drift` in the
+/// body is written `&lt;/drift`, so the body cannot end the element early.
+pub(crate) fn drift_envelope(block: &BlockSnapshot) -> String {
+    let source = block.source_context.map_or_else(|| "unknown".to_string(), |id| id.short());
+    let kind = block.drift_kind.map_or("drift", |k| k.as_str());
+    let mut body = String::with_capacity(block.content.len());
+    let mut rest = block.content.as_str();
+    while let Some(at) = find_ascii_ci(rest, "</drift") {
+        body.push_str(&rest[..at]);
+        body.push_str("&lt;/");
+        rest = &rest[at + 2..];
+    }
+    body.push_str(rest);
+    format!("<drift from=\"context {source}\" kind=\"{kind}\">\n{body}\n</drift>")
+}
+
+/// The byte index of the first match of ASCII `needle` in `haystack`, ignoring
+/// ASCII case.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.as_bytes().windows(needle.len()).position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// How a message to the model from another player reaches it: a kernel
-/// instruction or a drift arrival. See `docs/conversation-session.md`,
-/// "Kernel instructions".
+/// instruction or a drift arrival.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum InstructionForm {
-    /// A system message at the block's point, which each provider sends as
-    /// system text or as user text (`Role::System`).
+    /// A kernel instruction is a system message at the block's point, which
+    /// each provider sends as system text or as user text (`Role::System`).
+    /// A drift arrival is a user message wrapped in a `<drift>` element
+    /// ([`drift_envelope`]): another context's text is data, not instruction.
     #[default]
     SystemText,
     /// A `get_system_messages` call joined to the reply before it, and its
@@ -564,20 +588,13 @@ impl HydrationState {
                     });
                 }
             }
-            (_, BlockKind::Drift) => {
-                // A drift arrival is another context's message, delivered
-                // with its provenance in the context's instruction form.
-                let source_label = block
-                    .source_context
-                    .map(|id| id.short())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let drift_kind = block.drift_kind.map(|k| k.as_str()).unwrap_or("drift");
-                let prefixed = format!(
-                    "[{} from context {}]\n\n{}",
-                    drift_kind, source_label, block.content
-                );
-                self.system_message(block, prefixed);
+            (_, BlockKind::Drift) if self.form == InstructionForm::SystemText => {
+                // A drift arrival is data from a peer, so it reaches the
+                // model as a user message, never at system authority. It
+                // follows an open tool batch's results.
+                self.push_after_open_batch(Message::user(drift_envelope(block)));
             }
+            (_, BlockKind::Drift) => self.system_message(block, String::new()),
             (_, BlockKind::Error) => {
                 // A result a model turn sent already carries this envelope.
                 if parent.is_some_and(|p| p.kind == BlockKind::ToolResult && p.model_content.is_some()) {

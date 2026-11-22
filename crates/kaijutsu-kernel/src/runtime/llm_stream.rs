@@ -9989,7 +9989,7 @@ mod lifetime_tests {
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
         assert!(mentions(&sent[1], "a sibling's finding"), "{:#?}", sent[1]);
-        assert_eq!(sent[1].last().unwrap().role, crate::llm::Role::System, "without the tool, a drift is system text");
+        assert_eq!(sent[1].last().unwrap().role, crate::llm::Role::User, "without the tool, a drift is a wrapped user message");
         let mut expected = sent[1].clone();
         expected.push(LlmMessage::assistant("ack"));
         assert_same_wire(&rehydrated(&kernel, context), &expected);
