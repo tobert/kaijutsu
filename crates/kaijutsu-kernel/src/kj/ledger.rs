@@ -423,8 +423,9 @@ enum LedgerCommand {
         /// m/h/d, e.g. 30m, 2h, 7d. No absolute timestamps.
         #[arg(long)]
         since: Option<String>,
-        /// Only runs for this context. Accepts `.` (current), a label, or
-        /// a hex id prefix — same resolution `kj context` commands use.
+        /// Only runs for this context, archived or not. Accepts `.`
+        /// (current), `.senpai`, a label, or an id as `kj context list`
+        /// prints it.
         #[arg(long)]
         context: Option<String>,
         /// Only runs for this rc lifecycle verb (create, fork, ...).
@@ -1226,7 +1227,7 @@ impl KjDispatcher {
         let (rows, total) = {
             let db = self.kernel_db.lock();
             let context_id = match context {
-                Some(c) => match refs::resolve_context_ref(&refs::parse_context_ref(c), caller, &db) {
+                Some(c) => match refs::resolve_context_ref_including_archived(&refs::parse_context_ref(c), caller, &db) {
                     Ok(id) => Some(id),
                     Err(e) => return KjResult::Err(format!("kj ledger runs: {e}")),
                 },
@@ -5188,6 +5189,37 @@ mod tests {
 
         let bad_verb = d.dispatch(&[s("ledger"), s("runs"), s("--verb"), s("nonsense")], &c).await;
         assert!(!bad_verb.is_ok(), "an unwired verb must be refused at parse time, not silently accepted");
+    }
+
+    /// `--context` takes any context reference `kj context list` prints: the
+    /// short id, a label, `.`. A run log is history, so an archived context
+    /// resolves too.
+    #[tokio::test]
+    async fn ledger_runs_context_accepts_short_id_label_and_archived_contexts() {
+        let d = test_dispatcher().await;
+        let live = crate::kj::test_helpers::register_context(&d, Some("runs-live"), None, kaijutsu_types::PrincipalId::new());
+        let old = crate::kj::test_helpers::register_context(&d, Some("runs-old"), None, kaijutsu_types::PrincipalId::new());
+        let c = crate::kj::test_helpers::caller_with_context(live);
+        let (run_live, run_old) = {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let run_live = approval_ledger::rc_runs::start_run(conn, live.as_bytes(), "coder", "create").unwrap();
+            let run_old = approval_ledger::rc_runs::start_run(conn, old.as_bytes(), "coder", "create").unwrap();
+            assert!(db.archive_context(old).unwrap());
+            (run_live, run_old)
+        };
+
+        for (reference, want) in [
+            (live.short(), &run_live),
+            ("runs-live".to_string(), &run_live),
+            (".".to_string(), &run_live),
+            (old.short(), &run_old),
+            ("runs-old".to_string(), &run_old),
+        ] {
+            let result = d.dispatch(&[s("ledger"), s("runs"), s("--context"), s(&reference)], &c).await;
+            assert!(result.is_ok(), "--context {reference}: {result:?}");
+            assert_eq!(data_ids(&result), vec![want.clone()], "--context {reference}");
+        }
     }
 
     /// The hard cut: `kj ledger delegation` is gone with the delegation table.

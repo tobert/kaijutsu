@@ -105,6 +105,20 @@ pub fn resolve_context_ref_from(
     }
 }
 
+/// [`resolve_context_ref`], and when a label or id prefix matches no live
+/// context, the archived ones too. For a verb that reads history, such as a
+/// run log, which outlives the context it names.
+pub fn resolve_context_ref_including_archived(
+    ctx_ref: &ContextRef,
+    caller: &KjCaller,
+    db: &KernelDb,
+) -> Result<ContextId, String> {
+    match ctx_ref {
+        ContextRef::Query(query) => db.resolve_context_including_archived(query).map_err(|e| e.to_string()),
+        other => resolve_context_ref(other, caller, db),
+    }
+}
+
 /// Resolve a context reference string, defaulting to `.` (current) if empty/None.
 pub fn resolve_context_arg(
     arg: Option<&str>,
