@@ -74,6 +74,7 @@ pub const KNOWN_AUTHORITIES: &[&str] = &[
     "exec",
     "editor",
     "system",
+    "senpai",
 ];
 
 /// Builtin broker instances that are the in-kernel **projection** of a facade,
@@ -235,6 +236,11 @@ pub enum Capability {
     /// boundary"). It is additional to a verb's own capability (`operator`,
     /// `drive`, ...), never a replacement, and `*` does not imply it.
     House,
+    /// Direct-kohai orchestration authority: lets a senpai seat create and
+    /// rotate its own context, drive and interrupt direct kohai, inspect the
+    /// ledger and character list, and see those verbs in `kj help` without
+    /// holding `house` or `operator`.
+    Senpai,
 }
 
 impl Capability {
@@ -255,6 +261,7 @@ impl Capability {
             Capability::Editor => "editor",
             Capability::System => "system",
             Capability::House => "house",
+            Capability::Senpai => "senpai",
             _ => return None,
         })
     }
@@ -273,6 +280,7 @@ impl Capability {
             "editor" => Capability::Editor,
             "system" => Capability::System,
             "house" => Capability::House,
+            "senpai" => Capability::Senpai,
             _ => return None,
         })
     }
@@ -412,7 +420,8 @@ impl ContextToolBinding {
             | Capability::Exec
             | Capability::Editor
             | Capability::System
-            | Capability::House => {
+            | Capability::House
+            | Capability::Senpai => {
                 cap.authority_name().is_some_and(|n| self.authorities.contains(n))
             }
         }
@@ -455,7 +464,8 @@ impl ContextToolBinding {
             | Capability::Exec
             | Capability::Editor
             | Capability::System
-            | Capability::House) => {
+            | Capability::House
+            | Capability::Senpai) => {
                 if let Some(n) = c.authority_name() {
                     self.authorities.insert(n.to_string());
                 }
@@ -508,7 +518,8 @@ impl ContextToolBinding {
             | Capability::Exec
             | Capability::Editor
             | Capability::System
-            | Capability::House => {
+            | Capability::House
+            | Capability::Senpai => {
                 if let Some(n) = cap.authority_name() {
                     self.authorities.remove(n);
                 }

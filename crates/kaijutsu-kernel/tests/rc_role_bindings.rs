@@ -600,7 +600,7 @@ async fn only_house_seats_hold_the_house_capability_body() {
     for (ty, ctx) in seats {
         let binding = h.kernel.broker().binding(&ctx).await
             .unwrap_or_else(|| panic!("{ty} rc must seed a binding"));
-        let house = !matches!(ty, "coder" | "kohai" | "toolie" | "musician");
+        let house = !matches!(ty, "senpai" | "coder" | "kohai" | "toolie" | "musician");
         assert_eq!(binding.allows(&Capability::House), house, "{ty}: house");
     }
 }
@@ -639,27 +639,35 @@ async fn coder_loadout_is_a_worker_loadout_body() {
     }
 }
 
-/// A senpai carries the operator loadout: house, operator, drive, system, admin,
-/// and the full shell/editor/file authorities.
+/// A senpai carries a narrow orchestration loadout: `senpai`, `drive`, `fork`,
+/// `drift`, `exec`, `editor`, file/tasks tools, and shell — without `house`,
+/// `operator`, `admin`, `config-write`, `transport`, `system`, or `builtin.block`.
 #[test]
-fn senpai_loadout_is_an_operator_loadout() {
+fn senpai_loadout_is_a_narrow_orchestration_loadout() {
     run_on_rc_stack(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build current-thread runtime")
-            .block_on(senpai_loadout_is_an_operator_loadout_body());
+            .block_on(senpai_loadout_is_a_narrow_orchestration_loadout_body());
     });
 }
 
-async fn senpai_loadout_is_an_operator_loadout_body() {
+async fn senpai_loadout_is_a_narrow_orchestration_loadout_body() {
     let h = harness().await;
     let ctx = create_typed(&h, "senpai-seat", "senpai").await;
     let binding = h.kernel.broker().binding(&ctx).await.expect("senpai rc must seed a binding");
-    for cap in [Capability::House, Capability::Operator, Capability::Drive, Capability::System,
-                Capability::Admin, Capability::Drift, Capability::Fork, Capability::Exec,
-                Capability::Editor, Capability::Facade("shell_write".into())] {
+    for cap in [Capability::Senpai, Capability::Drive, Capability::Drift, Capability::Fork,
+                Capability::Exec, Capability::Editor, Capability::Facade("shell_write".into()),
+                Capability::Instance(InstanceId::new("builtin.file")),
+                Capability::Instance(InstanceId::new("builtin.tasks"))] {
         assert!(binding.allows(&cap), "senpai should allow {cap:?}");
     }
-    assert!(binding.is_admin(), "senpai should hold binding-admin");
+    for cap in [Capability::House, Capability::Operator, Capability::System, Capability::Transport,
+                Capability::ConfigWrite, Capability::Admin,
+                Capability::Instance(InstanceId::new("builtin.block")),
+                Capability::Instance(InstanceId::new("builtin.bindings"))] {
+        assert!(!binding.allows(&cap), "senpai must not allow {cap:?}");
+    }
+    assert!(!binding.is_admin(), "senpai must not hold binding-admin");
 }

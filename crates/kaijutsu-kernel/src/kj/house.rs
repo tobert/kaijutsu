@@ -10,11 +10,18 @@
 //! Every top-level verb is in exactly one table. A test walks the verbs the
 //! command tree reflects, so a new verb fails until it is classified here.
 
-/// Top-level verbs that need the `house` capability.
+/// Top-level verbs that need the `house` capability (kernel administration).
 pub(crate) const HOUSE_VERBS: &[&str] = &[
-    "alias", "attach", "audio", "backend", "binding", "cc", "character", "config", "council", "cp",
-    "db", "doc", "drive", "embedding", "hook", "interrupt", "ledger", "mcp", "midi", "play", "policy",
+    "alias", "attach", "audio", "backend", "binding", "cc", "config", "council", "cp",
+    "db", "doc", "embedding", "hook", "mcp", "midi", "play", "policy",
     "preset", "price", "rc", "roster", "swap", "system", "transport",
+];
+
+/// Top-level verbs for direct-kohai orchestration: accessible to `senpai` and
+/// `house` seats (and `drive` is also reachable by a worker holding `drive`,
+/// such as a kohai waking `.senpai`).
+pub(crate) const SENPAI_VERBS: &[&str] = &[
+    "character", "drive", "interrupt", "ledger",
 ];
 
 /// Top-level verbs a worker context keeps. Read by the classification test,
@@ -36,20 +43,24 @@ fn canonical(word: &str) -> &str {
         .map_or(word, |(_, verb)| verb)
 }
 
-/// True if `word` names a house verb.
+/// True if `word` names a house-only verb.
 pub(crate) fn is_house_verb(word: &str) -> bool {
     HOUSE_VERBS.contains(&canonical(word))
 }
 
-/// `kj help` text without the house verbs' entries.
-///
-/// The `## Commands` section holds the command list in fenced blocks. An
-/// entry starts on an unindented line inside a fence and runs through the
-/// indented lines after it. A `### ` heading starts a group that runs to the
-/// next heading; a group whose entries are all dropped is dropped whole,
-/// heading and prose included. Text outside the `## Commands` section is
-/// kept as written.
-pub(crate) fn without_house_verbs(help: &str) -> String {
+/// True if `word` names a senpai orchestration verb.
+pub(crate) fn is_senpai_verb(word: &str) -> bool {
+    SENPAI_VERBS.contains(&canonical(word))
+}
+
+/// `kj help` text filtered for a seat's capabilities:
+/// - `has_house`: keeps all verbs.
+/// - `has_senpai` (without `has_house`): keeps worker + senpai verbs, drops house verbs.
+/// - neither: keeps worker verbs only, drops both house and senpai verbs.
+pub(crate) fn filter_help(help: &str, has_house: bool, has_senpai: bool) -> String {
+    if has_house {
+        return help.to_string();
+    }
     let mut out = String::with_capacity(help.len());
     let mut group = Group::default();
     let mut in_commands_section = false;
@@ -69,7 +80,7 @@ pub(crate) fn without_house_verbs(help: &str) -> String {
         } else if in_commands_section && in_fence {
             if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
                 let verb = line.split_whitespace().next().unwrap_or("");
-                dropping = is_house_verb(verb);
+                dropping = is_house_verb(verb) || (!has_senpai && is_senpai_verb(verb));
                 group.entries += 1;
                 group.kept += usize::from(!dropping);
             }
@@ -85,6 +96,12 @@ pub(crate) fn without_house_verbs(help: &str) -> String {
     }
     group.flush_into(&mut out);
     out
+}
+
+/// `kj help` text without house or senpai verbs (worker view).
+#[cfg(test)]
+pub(crate) fn without_house_verbs(help: &str) -> String {
+    filter_help(help, false, false)
 }
 
 /// One `### ` group of the command list, held until its end decides
@@ -139,6 +156,7 @@ mod tests {
     #[test]
     fn aliases_follow_their_verb() {
         assert!(!is_house_verb("ctx") && !is_house_verb("ws"));
-        assert!(is_house_verb("ledger"));
+        assert!(is_senpai_verb("ledger"));
+        assert!(is_house_verb("rc"));
     }
 }

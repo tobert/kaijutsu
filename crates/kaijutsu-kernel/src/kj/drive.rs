@@ -96,14 +96,22 @@ impl KjDispatcher {
             }
         };
 
-        // `drive` alone reaches this context and the one it answers to; the
-        // `operator` capability reaches any context. A privileged caller (the
-        // rc lifecycle) is the control plane and is not narrowed.
+        // `drive` alone reaches this context and the one it answers to;
+        // `senpai` also reaches direct kohai (contexts answering to this one);
+        // `operator` reaches any context. A privileged caller (the rc
+        // lifecycle) is the control plane and is not narrowed.
         if !caller.privileged && Some(target) != caller.context_id
             && self.require_cap(caller, crate::mcp::Capability::Operator, "drive").is_err()
         {
-            let senpai = caller.context_id.and_then(|own| self.kernel_db().lock().senpai_of(own).ok().flatten());
-            if senpai != Some(target) {
+            let db = self.kernel_db().lock();
+            let own_senpai = caller.context_id.and_then(|own| db.senpai_of(own).ok().flatten());
+            let target_senpai = db.senpai_of(target).ok().flatten();
+            drop(db);
+            let is_own_senpai = own_senpai == Some(target);
+            let is_direct_kohai = caller.context_id.is_some()
+                && target_senpai == caller.context_id
+                && self.require_cap(caller, crate::mcp::Capability::Senpai, "drive").is_ok();
+            if !is_own_senpai && !is_direct_kohai {
                 return KjResult::Err(format!(
                     "kj drive: this seat may drive itself and its senpai; context {} is neither \
                      (the `operator` capability reaches any context)",
@@ -825,6 +833,59 @@ mod tests {
         d.kernel_db().lock().upsert_context_binding(kohai, &binding).unwrap();
         let result = d.dispatch(&[s("drive"), s("other")], &c).await;
         assert!(result.is_ok(), "`operator` reaches any context: {}", result.message());
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A seat that holds `drive` + `senpai` (without `operator` or `house`)
+    /// may drive itself, its senpai, and any direct kohai that answers to it,
+    /// and no unrelated context.
+    #[tokio::test]
+    async fn drive_with_senpai_reaches_direct_kohai_but_not_unrelated() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let root = register_context(&d, Some("up"), None, principal);
+        let senpai = register_context(&d, Some("lead"), None, principal);
+        let kohai = register_context(&d, Some("worker"), None, principal);
+        let other = register_context(&d, Some("other"), None, principal);
+        for ctx in [root, senpai, kohai, other] {
+            seed_with_block(&d, ctx, principal);
+        }
+        d.kernel_db().lock().set_context_senpai(senpai, Some(root)).unwrap();
+        d.kernel_db().lock().set_context_senpai(kohai, Some(senpai)).unwrap();
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(crate::mcp::Capability::Drive);
+        binding.grant(crate::mcp::Capability::Senpai);
+        d.kernel_db().lock().upsert_context_binding(senpai, &binding).unwrap();
+        let c = caller_with_context(senpai);
+        let _sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        for reachable in [".", ".senpai", "worker"] {
+            let result = d.dispatch(&[s("drive"), s(reachable)], &c).await;
+            assert!(result.is_ok(), "{reachable} should be drivable by senpai: {}", result.message());
+        }
+        let result = d.dispatch(&[s("drive"), s("other")], &c).await;
+        assert!(!result.is_ok(), "senpai without operator must not drive an unrelated context");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A kohai holding `drive` (without `house` or `senpai`) can wake `.senpai`.
+    #[tokio::test]
+    async fn kohai_with_drive_can_drive_senpai_without_house_or_senpai() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let senpai = register_context(&d, Some("lead"), None, principal);
+        let kohai = register_context(&d, Some("worker"), None, principal);
+        for ctx in [senpai, kohai] {
+            seed_with_block(&d, ctx, principal);
+        }
+        d.kernel_db().lock().set_context_senpai(kohai, Some(senpai)).unwrap();
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(crate::mcp::Capability::Drive);
+        d.kernel_db().lock().upsert_context_binding(kohai, &binding).unwrap();
+        let _sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d.dispatch(&[s("drive"), s(".senpai")], &caller_with_context(kohai)).await;
+        assert!(result.is_ok(), "kohai with drive should drive .senpai without house: {}", result.message());
         d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 

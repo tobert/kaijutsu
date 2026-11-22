@@ -661,12 +661,16 @@ impl KjDispatcher {
         )) && let Err(denied) =
             self.require_cap(caller, crate::mcp::Capability::Operator, "context")
         {
+            let senpai_allowed = matches!(
+                parsed.command,
+                ContextCommand::Create { .. } | ContextCommand::Rotate { .. }
+            ) && self.require_cap(caller, crate::mcp::Capability::Senpai, "context").is_ok();
             let human = matches!(parsed.command, ContextCommand::Archive { .. } | ContextCommand::Rotate { .. })
                 && match self.caller_is_live_root(caller) {
                     Ok(human) => human,
                     Err(e) => return KjResult::Err(format!("kj context: {e}")),
                 };
-            if !human {
+            if !senpai_allowed && !human {
                 return denied;
             }
         }

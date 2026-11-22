@@ -401,6 +401,7 @@ pub(crate) fn cap_label(cap: &Capability) -> String {
         | Capability::ConfigWrite
         | Capability::System
         | Capability::House
+        | Capability::Senpai
         | Capability::Exec
         | Capability::Editor => cap
             .authority_name()

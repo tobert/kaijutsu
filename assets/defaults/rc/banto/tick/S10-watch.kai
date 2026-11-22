@@ -1,0 +1,97 @@
+# banto: inference-free supervisor tick with adaptive backoff.
+#
+# Runs on the beat scheduler's OODA boundary (e.g. 60 BPM, wakeup 60 = 1 min).
+# Pure kaish probes run with zero LLM tokens and decide whether to wake banto:
+#   - Urgent signal (new pending ask, probe failure, or lost+found activity):
+#     reset backoff and wake immediately via `kj drive --if-idle`.
+#   - Routine sweep (no urgent signal): obey an exponential backoff starting at
+#     BANTO_BACKOFF_SECS (default 300s) and capped at BANTO_MAX_BACKOFF_SECS
+#     (default 3600s), with a floor of BANTO_MIN_SWEEP_SECS (default 3600s = 1h)
+#     between idle inference calls so commercial APIs stay cheap overnight.
+#     Set BANTO_IDLE_SWEEP=0 to suppress routine idle sweeps altogether.
+#
+# When banto is idle and bored, it may call `kj transport ooda off` or
+# `kj transport stop` to sleep until a person or incoming drift wakes it.
+set -e
+
+now="$(date '+%s')"
+info="$(kj context info --json)"
+last_inf="$(echo $info | jq -r '.env.BANTO_LAST_INFERENCE_EPOCH // "0"')"
+last_state="$(echo $info | jq -r '.env.BANTO_LAST_STATE // ""')"
+backoff="$(echo $info | jq -r '.env.BANTO_BACKOFF_SECS // "300"')"
+max_backoff="$(echo $info | jq -r '.env.BANTO_MAX_BACKOFF_SECS // "3600"')"
+min_sweep="$(echo $info | jq -r '.env.BANTO_MIN_SWEEP_SECS // "3600"')"
+idle_sweep="$(echo $info | jq -r '.env.BANTO_IDLE_SWEEP // "1"')"
+
+# -- probes: raw data, never exit nonzero on probe failure.
+urgent=0
+
+set +e
+raw_asks="$(kj ledger list --json)"
+rc_asks=$?
+set -e
+if [[ "$rc_asks" -ne 0 ]]; then
+  asks_count="ERR"
+  urgent=1
+else
+  asks_count="$(echo $raw_asks | jq -r 'length')"
+  if [[ "$asks_count" -gt 0 ]]; then
+    urgent=1
+  fi
+fi
+
+set +e
+raw_roster="$(kj context list --json)"
+rc_roster=$?
+set -e
+if [[ "$rc_roster" -ne 0 ]]; then
+  roster_count="ERR"
+  urgent=1
+else
+  roster_count="$(echo $raw_roster | jq -r 'length')"
+fi
+
+state_sig="asks=$asks_count:roster=$roster_count"
+changed=0
+if [[ "$state_sig" != "$last_state" ]]; then
+  changed=1
+  kj context set --env "BANTO_LAST_STATE=$state_sig"
+fi
+
+elapsed=$((now - last_inf))
+echo "banto tick: $state_sig changed=$changed urgent=$urgent elapsed=${elapsed}s backoff=${backoff}s"
+
+if [[ "$urgent" -eq 1 ]]; then
+  kj context set --env "BANTO_BACKOFF_SECS=300"
+  kj context set --env "BANTO_LAST_INFERENCE_EPOCH=$now"
+  echo "banto tick: urgent signal ($state_sig); waking if idle"
+  kj drive --if-idle
+  exit 0
+fi
+
+if [[ "$changed" -eq 1 ]]; then
+  # Activity detected: keep backoff short, still respect min_sweep for non-urgent changes.
+  next_backoff=300
+else
+  # Quiet: double backoff up to max_backoff.
+  next_backoff=$((backoff * 2))
+  if [[ "$next_backoff" -gt "$max_backoff" ]]; then
+    next_backoff="$max_backoff"
+  fi
+fi
+
+# Effective wait for a routine sweep is max(backoff, min_sweep).
+wait_secs="$backoff"
+if [[ "$min_sweep" -gt "$wait_secs" ]]; then
+  wait_secs="$min_sweep"
+fi
+
+if [[ "$idle_sweep" -eq 1 ]] && [[ "$elapsed" -ge "$wait_secs" ]]; then
+  kj context set --env "BANTO_BACKOFF_SECS=$next_backoff"
+  kj context set --env "BANTO_LAST_INFERENCE_EPOCH=$now"
+  echo "banto tick: routine sweep due (${elapsed}s >= ${wait_secs}s); waking if idle"
+  kj drive --if-idle
+else
+  kj context set --env "BANTO_BACKOFF_SECS=$next_backoff"
+  echo "banto tick: quiet (no inference; next backoff=${next_backoff}s)"
+fi

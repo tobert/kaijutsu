@@ -1,0 +1,10 @@
+# banto: wake immediately when a drift arrives (e.g. a request from senpai).
+# Resets the idle backoff counter so follow-up ticks stay responsive while work
+# is active, then drives banto if idle (a busy banto reads the drift after its
+# next tool round).
+set -e
+now="$(date '+%s')"
+kj context set --env "BANTO_IDLE_TICKS=0"
+kj context set --env "BANTO_BACKOFF_SECS=300"
+kj context set --env "BANTO_LAST_INFERENCE_EPOCH=$now"
+kj drive --if-idle

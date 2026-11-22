@@ -44,7 +44,7 @@ use kaijutsu_kernel::hyoushigi::{
     materialize_committed,
 };
 use kaijutsu_kernel::kernel_db::{
-    ContextRow, DEFAULT_HYDRATION_WINDOW, PersistedAttachment, PersistedTrack,
+    ContextRow, PersistedAttachment, PersistedTrack,
 };
 use kaijutsu_kernel::{ContentStore, Kernel, KjDispatcher};
 use kaijutsu_types::{
@@ -712,53 +712,9 @@ impl BeatScheduler {
         // sets one at musician-create time, but THIS path (`kj transport
         // attach` run by hand, or any other manual/API attach) bypasses that
         // lifecycle entirely — so it's the second birth-site of the same gap.
-        //
-        // Loud-but-not-fatal, matching the persist_track/persist_attachment
-        // write-throughs just above: a failed default shouldn't abort an
-        // otherwise-successful attach (the live binding is correct either
-        // way), but it must be visible, not silently swallowed. Never
-        // override an existing policy — an operator's explicit `kj context
-        // hydrate` or a create-rc window must win over this backstop default.
-        if let Some(db) = self.documents.db() {
-            // Read result copied out (`Option<(BlockId, u32)>`, `Copy`-ish) and
-            // the guard dropped via the `let` binding's temporary scope BEFORE
-            // this `match` runs — unlike `match db.lock().get_...() { }`, which
-            // would keep the scrutinee's temporary `MutexGuard` alive across the
-            // whole match (Rust's temporary-lifetime-extension rule for match
-            // scrutinees), including the `set_hydration_policy` arm's `db.lock()`
-            // below. `parking_lot::Mutex` isn't reentrant, so that shape
-            // self-deadlocks on the very first `Ok(None)` attach. Caught by
-            // actually running the tests, not just reading the diff.
-            let existing = db.lock().get_hydration_policy(context_id);
-            match existing {
-                Ok(Some(_)) => {
-                    // A policy already exists — leave it alone.
-                }
-                Ok(None) => match self.documents.last_block_id(context_id) {
-                    Some(marker) => {
-                        if let Err(e) =
-                            db.lock()
-                                .set_hydration_policy(context_id, marker, DEFAULT_HYDRATION_WINDOW)
-                        {
-                            log::warn!(
-                                "beat: failed to set default hydration window for {context_id}: \
-                                 {e}; the context may hydrate unbounded"
-                            );
-                        }
-                    }
-                    None => {
-                        // No blocks yet: nothing to anchor a marker on, and a
-                        // blockless context can't be driven anyway.
-                    }
-                },
-                Err(e) => {
-                    log::warn!(
-                        "beat: failed to read hydration policy for {context_id}: {e}; \
-                         skipping the default-window backstop (the context may hydrate unbounded)"
-                    );
-                }
-            }
-        }
+        // Hydration policy is opt-in (musicians set their own sliding window
+        // via rc `S30-hydrate.kai`); attaching to a track does not install a
+        // default tail window.
 
         Ok(())
     }
@@ -4645,7 +4601,7 @@ mod tests {
     /// own tail — the exact crash-loop this guards (an unwindowed gemma player
     /// hit 70k tokens against a 32k window, retrying every beat).
     #[tokio::test]
-    async fn attach_of_context_without_policy_sets_default_window() {
+    async fn attach_of_context_without_policy_leaves_policy_unset() {
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
         // Give the context at least one block — a real musician always has its
         // create-turn seed block first, and the guard needs a tail to anchor a
@@ -4664,17 +4620,11 @@ mod tests {
             .attach(track, ctx, Attachment::musician_default(), BeatPolicy::musician_default())
             .unwrap();
 
-        let (marker, window) = db
-            .lock()
-            .get_hydration_policy(ctx)
-            .unwrap()
-            .expect("attach must install the backstop default when none existed");
-        assert_eq!(
-            window,
-            kaijutsu_kernel::kernel_db::DEFAULT_HYDRATION_WINDOW,
-            "backstop uses the shared default window"
+        assert!(
+            db.lock().get_hydration_policy(ctx).unwrap().is_none(),
+            "attach must leave hydration policy unset when none existed (musicians set their own via rc)"
         );
-        assert_eq!(marker, tail, "backstop anchors the marker at the context's own tail");
+        let _ = tail;
     }
 
     /// Never override: an operator's explicit `kj context hydrate` (or a

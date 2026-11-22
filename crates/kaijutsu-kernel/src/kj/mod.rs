@@ -533,10 +533,14 @@ impl KjDispatcher {
             return KjResult::ok_ephemeral(self.help_for(caller), ContentType::Markdown);
         }
 
-        // House verbs are refused here, before any handler (or the
+        // House and senpai verbs are refused here, before any handler (or the
         // destructive-verb latch) runs.
         if house::is_house_verb(cmd) {
             if let Err(refusal) = self.require_house(caller, cmd) {
+                return refusal;
+            }
+        } else if house::is_senpai_verb(cmd) {
+            if let Err(refusal) = self.require_senpai_or_house(caller, cmd) {
                 return refusal;
             }
         }
@@ -776,16 +780,13 @@ impl KjDispatcher {
         }
     }
 
-    /// The `kj help` text for `caller`: the house verbs appear only for a
-    /// caller that holds the `house` capability.
+    /// The `kj help` text for `caller`: house seats see all verbs, senpai seats
+    /// see worker + senpai verbs, and workers see worker verbs only.
     fn help_for(&self, caller: &KjCaller) -> String {
         let full = include_str!("../../docs/help/kj.md");
-        match self.holds_house(caller) {
-            Ok(true) => full.to_string(),
-            // A loadout that cannot be read shows the narrow help, the same
-            // as a loadout without the grant.
-            Ok(false) | Err(_) => house::without_house_verbs(full),
-        }
+        let has_house = self.holds_house(caller).unwrap_or(false);
+        let has_senpai = has_house || self.holds_senpai(caller).unwrap_or(false);
+        house::filter_help(full, has_house, has_senpai)
     }
 
     /// Whether `caller` holds the `house` capability. A privileged caller
@@ -799,6 +800,15 @@ impl KjDispatcher {
     /// empty one is denied, as in [`Self::require_cap`]. A KernelDb read
     /// failure is an error, never a no.
     fn holds_house(&self, caller: &KjCaller) -> Result<bool, String> {
+        self.holds_seat_cap(caller, &crate::mcp::Capability::House)
+    }
+
+    /// Whether `caller` holds the `senpai` capability (or is privileged / root / bare shell).
+    fn holds_senpai(&self, caller: &KjCaller) -> Result<bool, String> {
+        self.holds_seat_cap(caller, &crate::mcp::Capability::Senpai)
+    }
+
+    fn holds_seat_cap(&self, caller: &KjCaller, cap: &crate::mcp::Capability) -> Result<bool, String> {
         if caller.privileged {
             return Ok(true);
         }
@@ -811,7 +821,7 @@ impl KjDispatcher {
             return Ok(true);
         }
         db.get_context_binding(ctx)
-            .map(|b| b.is_some_and(|b| b.allows(&crate::mcp::Capability::House)))
+            .map(|b| b.is_some_and(|b| b.allows(cap)))
             .map_err(|e| e.to_string())
     }
 
@@ -820,6 +830,34 @@ impl KjDispatcher {
     /// how to widen the loadout: a worker is not meant to go looking.
     fn require_house(&self, caller: &KjCaller, verb: &str) -> Result<(), KjResult> {
         match self.holds_house(caller) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(KjResult::Err(format!(
+                "kj {verb}: not part of this context's work. `kj help` lists the commands this context uses."
+            ))),
+            Err(e) => Err(KjResult::Err(format!(
+                "kj {verb}: authorization unavailable: {e}. The loadout could not be read, \
+                 so the verb is refused."
+            ))),
+        }
+    }
+
+    /// Refuse a senpai orchestration verb to a context without `senpai` or
+    /// `house`. For `drive`, a seat that explicitly holds `drive` (such as a
+    /// kohai waking `.senpai`) is also allowed through to `dispatch_drive`'s
+    /// own scope check.
+    fn require_senpai_or_house(&self, caller: &KjCaller, verb: &str) -> Result<(), KjResult> {
+        let allowed = match self.holds_house(caller) {
+            Ok(true) => Ok(true),
+            Ok(false) => match self.holds_senpai(caller) {
+                Ok(true) => Ok(true),
+                Ok(false) if verb == "drive" => {
+                    self.holds_seat_cap(caller, &crate::mcp::Capability::Drive)
+                }
+                other => other,
+            },
+            Err(e) => Err(e),
+        };
+        match allowed {
             Ok(true) => Ok(()),
             Ok(false) => Err(KjResult::Err(format!(
                 "kj {verb}: not part of this context's work. `kj help` lists the commands this context uses."
@@ -2511,24 +2549,24 @@ mod house_verb_tests {
         let mut doubled = Vec::new();
         for sub in kj_command().get_subcommands() {
             let name = sub.get_name();
-            let house = house::HOUSE_VERBS.contains(&name);
-            let worker = house::WORKER_VERBS.contains(&name);
-            if !house && !worker {
+            let count = usize::from(house::HOUSE_VERBS.contains(&name))
+                + usize::from(house::SENPAI_VERBS.contains(&name))
+                + usize::from(house::WORKER_VERBS.contains(&name));
+            if count == 0 {
                 missing.push(name.to_string());
-            }
-            if house && worker {
+            } else if count > 1 {
                 doubled.push(name.to_string());
             }
         }
-        assert!(missing.is_empty(), "verbs in neither house::HOUSE_VERBS nor house::WORKER_VERBS: {missing:?}");
-        assert!(doubled.is_empty(), "verbs in both lists: {doubled:?}");
+        assert!(missing.is_empty(), "verbs in none of HOUSE_VERBS, SENPAI_VERBS, WORKER_VERBS: {missing:?}");
+        assert!(doubled.is_empty(), "verbs in more than one list: {doubled:?}");
     }
 
     #[test]
     fn every_listed_verb_is_a_real_verb() {
         let cmd = kj_command();
         let real: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
-        for v in house::HOUSE_VERBS.iter().chain(house::WORKER_VERBS) {
+        for v in house::HOUSE_VERBS.iter().chain(house::SENPAI_VERBS).chain(house::WORKER_VERBS) {
             // `help` is answered before routing, so it has no clap subcommand.
             assert!(*v == "help" || real.contains(v), "{v} is listed but is not a kj verb");
         }
@@ -2711,6 +2749,33 @@ mod house_verb_tests {
         let listed = verbs_listed(d.dispatch(&[s("help")], &caller).await.message());
         for verb in house::HOUSE_VERBS.iter().chain(&["ledger", "rc", "binding"]) {
             assert!(listed.iter().any(|v| v == verb), "house help lacks {verb}: {listed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn senpai_seat_runs_senpai_verbs_and_is_refused_house_verbs() {
+        let d = test_dispatcher().await;
+        let mut binding = worker_binding();
+        binding.grant(Capability::Senpai);
+        binding.grant(Capability::Drive);
+        let caller = caller_bound(&d, "senpai", &binding);
+
+        for line in ["ledger list", "character list"] {
+            let result = d.dispatch(&line.split_whitespace().map(String::from).collect::<Vec<_>>(), &caller).await;
+            assert!(!result.message().contains(REFUSAL), "{line} was refused: {}", result.message());
+        }
+        for line in ["rc list", "binding show", "config list", "transport list"] {
+            let result = d.dispatch(&line.split_whitespace().map(String::from).collect::<Vec<_>>(), &caller).await;
+            assert!(matches!(result, KjResult::Err(_)), "{line}: expected refusal, got {result:?}");
+            assert!(result.message().contains(REFUSAL), "{line}: {}", result.message());
+        }
+
+        let listed = verbs_listed(d.dispatch(&[s("help")], &caller).await.message());
+        for kept in ["ledger", "character", "drive", "interrupt", "context", "drift"] {
+            assert!(listed.iter().any(|v| v == kept), "senpai help lacks {kept}: {listed:?}");
+        }
+        for hidden in ["rc", "binding", "config", "transport", "system", "backend"] {
+            assert!(!listed.iter().any(|v| v == hidden), "senpai help still lists house verb {hidden}");
         }
     }
 }

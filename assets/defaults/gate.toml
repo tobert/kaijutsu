@@ -156,6 +156,7 @@ allow = [
   "kj context create",     # banto creates its lanes, `kj context create coder --name <lane>`
   "kj fork",             # a fork copies this context's own performer
   "kj drive",            # runs a turn on a lane banto directs
+  "kj drift push",       # banto messages senpai and other contexts
   "kj price set",        # appends a price row; a correction is a later row
   "kj price set-tool",   # appends a tool price row; a correction is a later row
 ]
@@ -165,8 +166,7 @@ allow = [
   "kj context create",     # senpai creates its lanes, `kj context create kohai --name <lane>`
   "kj fork",             # a fork copies this context's own performer
   "kj drive",            # runs a turn on a lane senpai directs
-  "kj price set",        # appends a price row; a correction is a later row
-  "kj price set-tool",   # appends a tool price row; a correction is a later row
+  "kj drift push",       # senpai messages banto and its kohai
 ]
 
 [root]
