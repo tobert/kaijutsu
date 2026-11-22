@@ -207,6 +207,13 @@ impl FileDocumentCache {
     /// pick up external edits when a clean entry's file mtime has advanced.
     /// Only emits an edit when the content actually differs.
     ///
+    /// The disk read is an await point, so an editor can make the buffer dirty
+    /// meanwhile. `expected_marks` is the entry's mark count when the caller
+    /// decided to reload (`None` when the caller holds no entry, as on a cold
+    /// load). Under the cache lock and before any replacement, a reload checks
+    /// that the entry is still clean and still carries those marks; otherwise
+    /// it leaves the buffer as it is and returns `Ok`.
+    ///
     /// Error classification (matches [`try_get_or_load`](Self::try_get_or_load)):
     /// - VFS not-found / UTF-8 failure → [`CacheReadError::NotCached`] (benign:
     ///   file was removed or became binary; callers drop the cache entry)
@@ -217,6 +224,7 @@ impl FileDocumentCache {
         ctx_id: ContextId,
         block_id: &BlockId,
         path: &str,
+        expected_marks: Option<u64>,
     ) -> Result<(), CacheReadError> {
         let vfs_path = std::path::Path::new(path);
 
@@ -248,6 +256,29 @@ impl FileDocumentCache {
             }
         };
 
+        // Sampled before the lock: the lock is never held across an await.
+        // Taken after the read, so a disk change after it reads as newer than
+        // this stamp and the next read reloads again.
+        let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
+
+        // The clean check and the replacement are one step under the cache
+        // lock, so an editor edit cannot land between them. The lock is held
+        // across synchronous block-store calls only.
+        let mut cache = self.cache.write();
+        let still_ours = match (cache.get(&ctx_id), expected_marks) {
+            (Some(e), Some(marks)) => !e.dirty && e.marks == marks && e.block_id == *block_id,
+            (Some(e), None) => !e.dirty,
+            (None, Some(_)) => false,
+            (None, None) => true,
+        };
+        if !still_ours {
+            tracing::debug!(
+                path,
+                "reload from disk abandoned: the buffer changed while the disk was read"
+            );
+            return Ok(());
+        }
+
         // Fetch the existing block content so we can diff and apply a minimal
         // edit. A store error here is a real backend failure — propagate it
         // rather than defaulting to "" which would wipe the whole block.
@@ -275,8 +306,6 @@ impl FileDocumentCache {
                 })?;
         }
 
-        let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
-        let mut cache = self.cache.write();
         if let Some(entry) = cache.get_mut(&ctx_id) {
             entry.loaded_generation = generation;
             entry.dirty = false;
@@ -404,11 +433,21 @@ impl FileDocumentCache {
             let mut cache = self.cache.write();
             cache.get_mut(&ctx_id).map(|e| {
                 e.last_access = Instant::now();
-                (e.context_id, e.block_id, e.dirty, e.loaded_generation, e.needs_reload)
+                (e.context_id, e.block_id, e.dirty, e.loaded_generation, e.needs_reload, e.marks)
             })
         };
-        if let Some((cid, bid, dirty, loaded_generation, needs_reload)) = cached {
-            let disk_attr = self.vfs.getattr(vfs_path).await.ok();
+        if let Some((cid, bid, dirty, loaded_generation, needs_reload, marks)) = cached {
+            // Only a definite not-found means the file is gone. Any other
+            // failure (permission, transient I/O) says nothing about whether
+            // it exists, so it must not evict or reload a good entry.
+            let (disk_attr, getattr_failed) = match self.vfs.getattr(vfs_path).await {
+                Ok(attr) => (Some(attr), false),
+                Err(e) if e.is_not_found() => (None, false),
+                Err(e) => {
+                    tracing::warn!(path, error = %e, "getattr failed; serving the cached buffer");
+                    (None, true)
+                }
+            };
             let disk_generation = disk_attr.as_ref().map(|a| a.generation);
             let stale =
                 matches!((disk_generation, loaded_generation), (Some(d), Some(l)) if d > l);
@@ -438,12 +477,12 @@ impl FileDocumentCache {
             // real failure. An entry with no `loaded_generation` never saw disk
             // (a document created for a write that has not flushed yet), so a
             // missing file is its normal state, not news.
-            let missing = loaded_generation.is_some() && disk_attr.is_none();
+            let missing = loaded_generation.is_some() && disk_attr.is_none() && !getattr_failed;
             let symlink = disk_attr.is_some_and(|attr| attr.kind.is_symlink());
-            if !stale && !symlink && !missing && !needs_reload {
+            if getattr_failed || (!stale && !symlink && !missing && !needs_reload) {
                 return Ok((cid, bid));
             }
-            match self.reload_block_from_disk(ctx_id, &bid, path).await {
+            match self.reload_block_from_disk(ctx_id, &bid, path, Some(marks)).await {
                 Ok(()) => return Ok((cid, bid)),
                 Err(CacheReadError::NotCached) => {
                     // Benign: file was removed or became binary. Drop the
@@ -603,7 +642,7 @@ impl FileDocumentCache {
                 // duplicating it here; it re-reads disk (we already hold
                 // `text`), which is a known redundant read, not a
                 // correctness gap.
-                self.reload_block_from_disk(ctx_id, &existing_block_id, path)
+                self.reload_block_from_disk(ctx_id, &existing_block_id, path, None)
                     .await?;
                 existing_block_id
             }
@@ -1482,7 +1521,11 @@ mod tests {
     #[derive(Clone, Copy, PartialEq)]
     enum Pause {
         Getattr,
+        /// Hold the next `getattr`, then fail it with a non-not-found error.
+        GetattrFails,
         ReadFails,
+        /// Hold the next `read`, then let it succeed with the file's bytes.
+        ReadHeld,
     }
 
     impl PausedRead {
@@ -1529,6 +1572,11 @@ mod tests {
                 self.holding.notify_one();
                 self.release.notified().await;
             }
+            if self.take_pause(Pause::GetattrFails) {
+                self.holding.notify_one();
+                self.release.notified().await;
+                return Err(VfsError::PermissionDenied("injected getattr failure".into()));
+            }
             self.inner.getattr(path).await
         }
 
@@ -1537,6 +1585,10 @@ mod tests {
         }
 
         async fn read(&self, path: &Path, offset: u64, size: u32) -> VfsResult<Vec<u8>> {
+            if self.take_pause(Pause::ReadHeld) {
+                self.holding.notify_one();
+                self.release.notified().await;
+            }
             if self.take_pause(Pause::ReadFails) {
                 self.holding.notify_one();
                 self.release.notified().await;
@@ -2144,6 +2196,65 @@ mod tests {
         );
         cache.flush_one(path).await.expect("an unsaved edit must still reach disk");
         assert_eq!(vfs.read_all(p(path)).await.unwrap(), b"unsaved edit");
+    }
+
+    /// The success arm of the same race: the disk read succeeds after an
+    /// editor edited the buffer, and the reload must not replace that edit
+    /// with the disk text.
+    #[tokio::test]
+    async fn a_successful_recheck_that_lands_after_an_edit_keeps_the_unsaved_text() {
+        let (vfs, backend, cache) = paused_cache().await;
+        let path = "/tmp/race_succeeds.txt";
+        vfs.write_all(p(path), b"disk-v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "disk-v1");
+        vfs.write_all(p(path), b"disk-v2").await.unwrap();
+
+        backend.pause_next(Pause::ReadHeld);
+        let reading = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.try_read_content(path).await })
+        };
+        backend.holding().await;
+
+        cache.create_or_replace(path, "unsaved edit", PrincipalId::system()).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+
+        backend.release();
+        reading.await.unwrap().expect("the read serves the buffer");
+
+        assert_eq!(
+            cache.try_read_content(path).await.unwrap(),
+            "unsaved edit",
+            "a reload must not replace text that went dirty while it read disk"
+        );
+        cache.flush_one(path).await.expect("an unsaved edit must still reach disk");
+        assert_eq!(vfs.read_all(p(path)).await.unwrap(), b"unsaved edit");
+    }
+
+    /// A `getattr` failure that is not "no such file" says nothing about the
+    /// file's existence: the clean cached text is still served and the entry
+    /// stays.
+    #[tokio::test]
+    async fn a_getattr_failure_keeps_serving_the_cached_text() {
+        let (vfs, backend, cache) = paused_cache().await;
+        let path = "/tmp/getattr_fails.txt";
+        vfs.write_all(p(path), b"disk-v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "disk-v1");
+
+        backend.pause_next(Pause::GetattrFails);
+        let reading = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.try_read_content(path).await })
+        };
+        backend.holding().await;
+        // The reload, if one wrongly ran, would read this.
+        vfs.write_all(p(path), b"other-v2").await.unwrap();
+        backend.release();
+
+        assert_eq!(
+            reading.await.unwrap().expect("a transient getattr error is not a miss"),
+            "disk-v1"
+        );
     }
 
     #[test]
