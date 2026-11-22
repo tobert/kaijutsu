@@ -374,6 +374,24 @@ impl FileDocumentCache {
         String::from_utf8(bytes).map_err(|_| format!("cannot read {path} from disk: not UTF-8 text"))
     }
 
+    /// Drop the cached entry for `ctx_id` if it is still the clean, unpinned
+    /// entry a read started from.
+    ///
+    /// A reload awaits the VFS, so by the time it fails the entry may no longer
+    /// be what the read read: an editor can make the buffer dirty, or a session
+    /// can pin it. Unsaved text and a session's pin both outlive this call's
+    /// failure, so cleanup compares the block it read and the entry's current
+    /// state under the cache lock before removing anything.
+    fn evict_if_unchanged(&self, ctx_id: ContextId, block_id: &BlockId) {
+        let mut cache = self.cache.write();
+        let unchanged = cache
+            .get(&ctx_id)
+            .is_some_and(|e| e.block_id == *block_id && !e.dirty && e.pinned_by.is_empty());
+        if unchanged {
+            cache.remove(&ctx_id);
+        }
+    }
+
     /// Get the context_id and block_id for a path, loading from VFS on cache
     /// miss. Classifies errors at the source so callers can act on benign
     /// misses separately from real backend failures.
@@ -430,21 +448,21 @@ impl FileDocumentCache {
                 Err(CacheReadError::NotCached) => {
                     // Benign: file was removed or became binary. Drop the
                     // clean cache entry and surface NotCached so callers can
-                    // fall through to a raw VFS read. An entry an editor
-                    // session pins stays: the pin exists so a buffer is never
-                    // taken out from under an open session, and nothing serves
-                    // its text while the path is gone.
-                    let mut cache = self.cache.write();
-                    if cache.get(&ctx_id).is_some_and(|e| e.pinned_by.is_empty()) {
-                        cache.remove(&ctx_id);
-                    }
+                    // fall through to a raw VFS read — but only the entry this
+                    // call read: the reload awaited the VFS, so an editor may
+                    // have made the buffer dirty (or a session pinned it) in
+                    // the meantime, and that work outlives this read's miss.
+                    self.evict_if_unchanged(ctx_id, &bid);
                     return Err(CacheReadError::NotCached);
                 }
                 Err(CacheReadError::Backend(msg)) => {
                     // Real backend failure (store I/O, block missing from live
                     // document). Drop the now-inconsistent entry and surface the
-                    // error — callers must NOT fall through to empty bytes.
-                    self.cache.write().remove(&ctx_id);
+                    // error — callers must NOT fall through to empty bytes. Same
+                    // rule as the arm above: a buffer that went dirty (or got
+                    // pinned) while the reload awaited is not this read's to
+                    // discard.
+                    self.evict_if_unchanged(ctx_id, &bid);
                     return Err(CacheReadError::Backend(msg));
                 }
             }
@@ -1427,8 +1445,10 @@ mod tests {
 
     use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::vfs::backends::MemoryBackend;
-    use crate::vfs::VfsOps;
+    use crate::vfs::{DirEntry, FileAttr, SetAttr, StatFs, VfsError, VfsResult, VfsOps};
     use kaijutsu_types::PrincipalId;
+    use std::path::{Path, PathBuf};
+    use tokio::sync::Notify;
 
     /// A fresh temporary `KernelDb` for tests — `FileDocumentCache` requires
     /// one to back its durable swap-file marker (docs/file-buffers.md).
@@ -1447,6 +1467,153 @@ mod tests {
         vfs.mount("/tmp", MemoryBackend::new()).await;
         let cache = FileDocumentCache::new(blocks, vfs.clone(), tmp_db());
         (vfs, cache)
+    }
+
+    /// A memory backend whose next `getattr` or `read` can be held mid-flight,
+    /// so a test can change a buffer while a reload waits on the VFS. A held
+    /// read can also fail on release, to drive the reload's error arm.
+    struct PausedRead {
+        inner: MemoryBackend,
+        next_pause: Mutex<Option<Pause>>,
+        holding: Notify,
+        release: Notify,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pause {
+        Getattr,
+        ReadFails,
+    }
+
+    impl PausedRead {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                next_pause: Mutex::new(None),
+                holding: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+
+        /// Hold the next call of `pause`'s kind until [`release`](Self::release).
+        fn pause_next(&self, pause: Pause) {
+            *self.next_pause.lock() = Some(pause);
+        }
+
+        /// Resolve once the armed call is holding.
+        async fn holding(&self) {
+            self.holding.notified().await;
+        }
+
+        /// Let the held call finish.
+        fn release(&self) {
+            self.release.notify_one();
+        }
+
+        /// Consume the armed pause if it is for `wanted`.
+        fn take_pause(&self, wanted: Pause) -> bool {
+            let mut next = self.next_pause.lock();
+            if *next == Some(wanted) {
+                *next = None;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VfsOps for PausedRead {
+        async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
+            if self.take_pause(Pause::Getattr) {
+                self.holding.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.getattr(path).await
+        }
+
+        async fn readdir(&self, path: &Path) -> VfsResult<Vec<DirEntry>> {
+            self.inner.readdir(path).await
+        }
+
+        async fn read(&self, path: &Path, offset: u64, size: u32) -> VfsResult<Vec<u8>> {
+            if self.take_pause(Pause::ReadFails) {
+                self.holding.notify_one();
+                self.release.notified().await;
+                return Err(VfsError::other("injected read failure"));
+            }
+            self.inner.read(path, offset, size).await
+        }
+
+        async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
+            self.inner.readlink(path).await
+        }
+
+        async fn write(&self, path: &Path, offset: u64, data: &[u8]) -> VfsResult<u32> {
+            self.inner.write(path, offset, data).await
+        }
+
+        async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
+            self.inner.create(path, mode).await
+        }
+
+        async fn mkdir(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
+            self.inner.mkdir(path, mode).await
+        }
+
+        async fn unlink(&self, path: &Path) -> VfsResult<()> {
+            self.inner.unlink(path).await
+        }
+
+        async fn rmdir(&self, path: &Path) -> VfsResult<()> {
+            self.inner.rmdir(path).await
+        }
+
+        async fn rename(&self, from: &Path, to: &Path) -> VfsResult<()> {
+            self.inner.rename(from, to).await
+        }
+
+        async fn truncate(&self, path: &Path, size: u64) -> VfsResult<()> {
+            self.inner.truncate(path, size).await
+        }
+
+        async fn setattr(&self, path: &Path, attr: SetAttr) -> VfsResult<FileAttr> {
+            self.inner.setattr(path, attr).await
+        }
+
+        async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
+            self.inner.symlink(path, target).await
+        }
+
+        async fn link(&self, oldpath: &Path, newpath: &Path) -> VfsResult<FileAttr> {
+            self.inner.link(oldpath, newpath).await
+        }
+
+        fn read_only(&self) -> bool {
+            self.inner.read_only()
+        }
+
+        async fn statfs(&self) -> VfsResult<StatFs> {
+            self.inner.statfs().await
+        }
+
+        async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>> {
+            self.inner.real_path(path).await
+        }
+    }
+
+    /// A cache over a [`PausedRead`] backend, with both handles the test needs.
+    async fn paused_cache() -> (Arc<MountTable>, Arc<PausedRead>, Arc<FileDocumentCache>) {
+        let vfs = Arc::new(MountTable::new());
+        let backend = Arc::new(PausedRead::new());
+        let mounted: Arc<dyn VfsOps> = backend.clone();
+        vfs.mount_arc("/tmp", mounted).await;
+        let cache = Arc::new(FileDocumentCache::new(
+            shared_block_store(PrincipalId::system()),
+            vfs.clone(),
+            tmp_db(),
+        ));
+        (vfs, backend, cache)
     }
 
     /// An edit that lands while a flush is writing an older snapshot stays
@@ -1898,6 +2065,85 @@ mod tests {
             matches!(err, CacheReadError::Backend(_)),
             "a real VFS failure must not look like a miss: {err:?}"
         );
+    }
+
+    /// A recheck's disk read is an await point, so an editor can edit the
+    /// buffer while the read waits: the entry that was clean when the read
+    /// started may hold unsaved text by the time the read reports its path is
+    /// gone. The cleanup must not throw that text, or the running entry, away.
+    #[tokio::test]
+    async fn a_missing_path_read_that_lands_after_an_edit_keeps_the_unsaved_text() {
+        let (vfs, backend, cache) = paused_cache().await;
+        let path = "/tmp/race_gone.txt";
+        vfs.write_all(p(path), b"disk-v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "disk-v1");
+        vfs.unlink(p(path)).await.unwrap();
+
+        // The next `getattr` is this read's freshness check: hold it there.
+        backend.pause_next(Pause::Getattr);
+        let reading = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.try_read_content(path).await })
+        };
+        backend.holding().await;
+
+        // The editor edits while the read is in flight.
+        cache.create_or_replace(path, "unsaved edit", PrincipalId::system()).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+
+        backend.release();
+        let first = reading.await.unwrap();
+        assert!(
+            matches!(first, Err(CacheReadError::NotCached)),
+            "the read still reports the miss it started with: {first:?}"
+        );
+
+        // The live buffer survived: the same dirty entry, still flushable —
+        // not one that was dropped and later recovered as a cold swap.
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "unsaved edit");
+        assert!(
+            !cache.swap_recovered(path),
+            "the running buffer must survive the read, not become a cold swap"
+        );
+        cache.flush_one(path).await.expect("an unsaved edit must still reach disk");
+        assert_eq!(vfs.read_all(p(path)).await.unwrap(), b"unsaved edit");
+    }
+
+    /// The same race on the reload's error arm: the disk read fails after the
+    /// buffer changed, and that failure must not take the unsaved text with it.
+    #[tokio::test]
+    async fn a_failed_recheck_that_lands_after_an_edit_keeps_the_unsaved_text() {
+        let (vfs, backend, cache) = paused_cache().await;
+        let path = "/tmp/race_fails.txt";
+        vfs.write_all(p(path), b"disk-v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "disk-v1");
+        // A newer disk generation is what puts this read on the reload path.
+        vfs.write_all(p(path), b"disk-v2").await.unwrap();
+
+        backend.pause_next(Pause::ReadFails);
+        let reading = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.try_read_content(path).await })
+        };
+        backend.holding().await;
+
+        cache.create_or_replace(path, "unsaved edit", PrincipalId::system()).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+
+        backend.release();
+        let first = reading.await.unwrap();
+        assert!(
+            matches!(first, Err(CacheReadError::Backend(_))),
+            "a failed disk read is a real failure, not a miss: {first:?}"
+        );
+
+        assert_eq!(
+            cache.try_read_content(path).await.unwrap(),
+            "unsaved edit",
+            "the dirty buffer outranks a read that never saw disk"
+        );
+        cache.flush_one(path).await.expect("an unsaved edit must still reach disk");
+        assert_eq!(vfs.read_all(p(path)).await.unwrap(), b"unsaved edit");
     }
 
     #[test]
