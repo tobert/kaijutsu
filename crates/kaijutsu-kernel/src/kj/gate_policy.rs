@@ -3661,13 +3661,14 @@ uncovered = "allow"
         );
     }
 
-    /// Absent is today's behavior, and the shipped default leaves it absent.
+    /// The shipped default leaves the uncovered tier at ask for every seat
+    /// except mcp, the outside hand, which opens it in `[rc.mcp]`.
     #[test]
-    fn the_shipped_default_leaves_the_uncovered_tier_at_ask() {
+    fn the_shipped_default_opens_the_uncovered_tier_for_mcp_only() {
         let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
         let person = GatePerformer { name: "amy".into(), rc_dir: Some("person".into()), root: true };
-        let performers = [None, Some(dir("coder")), Some(dir("mcp")), Some(dir("banto")), Some(person)];
-        for performer in &performers {
+        let asking = [None, Some(dir("coder")), Some(dir("banto")), Some(person)];
+        for performer in &asking {
             assert_eq!(
                 cfg.uncovered_for(performer.as_ref()),
                 (UncoveredTier::Ask, Section::Global),
@@ -3679,6 +3680,13 @@ uncovered = "allow"
                 "{performer:?}"
             );
         }
+        assert_eq!(
+            cfg.uncovered_for(Some(&dir("mcp"))),
+            (UncoveredTier::Allow, Section::Rc("mcp".into()))
+        );
+        // Ask and deny keys still decide before the tier is reached.
+        assert!(matches!(first_verdict("git push", &cfg, Some("mcp")), PolicyVerdict::Ask(..)));
+        assert!(matches!(first_verdict("dd if=/dev/zero of=/dev/sda", &cfg, Some("mcp")), PolicyVerdict::Deny(..)));
         assert_eq!(config(EXAMPLE).uncovered_for(Some(&dir("coder"))), (UncoveredTier::Ask, Section::Global));
     }
 

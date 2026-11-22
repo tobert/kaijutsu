@@ -138,7 +138,13 @@ deny = [
   "kj context create",     # a toolie uses tools; lifecycle belongs to its parent
 ]
 
+# The mcp seat is the outside hand: an external agent (Claude Code) drives it
+# and Amy is the one at the keyboard. Statements no key covers run without an
+# ask. The ask and deny keys in [global] still fire (`git push`, `kj rc add`,
+# `dd`), a learned ledger rule still outranks this, and the shell-escape guard
+# does not see a statement the uncovered tier allows outright.
 [rc.mcp]
+uncovered = "allow"
 allow = [
   "kj context create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
