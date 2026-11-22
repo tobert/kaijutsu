@@ -23,6 +23,12 @@ pub struct HnswIndex {
 
 impl HnswIndex {
     /// Create or load an HNSW index.
+    ///
+    /// A dump the loader *reports* as an error is discarded and the index
+    /// starts fresh; the startup rebuild repairs the metadata rows. A dump
+    /// that makes `hnsw_rs` *panic* — it unwraps its own graph-header parse —
+    /// comes back as an `IndexError`, so a corrupt dump never reads as an
+    /// empty index and never unwinds into the caller.
     pub fn new(config: &IndexConfig) -> Result<Self, IndexError> {
         let data_dir = config.data_dir.clone();
 
@@ -44,8 +50,19 @@ impl HnswIndex {
             let hnsw_io_ptr: *const HnswIo = &*hnsw_io_box;
             let hnsw_io_ref: &'static HnswIo = unsafe { &*hnsw_io_ptr };
 
-            match hnsw_io_ref.load_hnsw_with_dist(DistCosine) {
-                Ok(loaded) => {
+            // hnsw_rs reports a dump it cannot parse by *panicking*, not by
+            // returning Err: `HnswIo::init` unwraps its own header parse
+            // (hnswio.rs, `load_description`), and the point readers unwrap and
+            // assert past that. A corrupt header must not read as "no index
+            // yet", so the unwind is caught here and returned as an error. The
+            // loader's own Err is the different case handled below: that dump
+            // is discarded and the index starts fresh.
+            let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hnsw_io_ref.load_hnsw_with_dist(DistCosine)
+            }));
+
+            match loaded {
+                Ok(Ok(loaded)) => {
                     // Load succeeded — the Hnsw borrows from HnswIo, so leak it now.
                     let hnsw_io: &'static HnswIo = Box::leak(hnsw_io_box);
 
@@ -80,13 +97,25 @@ impl HnswIndex {
                         _hnsw_io: Some(hnsw_io),
                     });
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Load failed — drop the Box normally, no leak.
                     drop(hnsw_io_box);
                     tracing::warn!(
                         error = %e,
                         "failed to load HNSW index, creating new"
                     );
+                }
+                Err(payload) => {
+                    // Load panicked — drop the Box normally, no leak.
+                    drop(hnsw_io_box);
+                    let reason = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    return Err(IndexError::Index(format!(
+                        "load hnsw: hnsw_rs panicked: {reason}"
+                    )));
                 }
             }
         }
@@ -518,6 +547,66 @@ mod tests {
                 .get_embedding(slot)
                 .unwrap_or_else(|_| panic!("slot {} missing after reload", slot));
         }
+    }
+
+    /// Regression: a corrupt graph header must reach the caller as an error,
+    /// not a panic and not a silently fresh index. hnsw_rs treats a dump it
+    /// cannot parse as a programmer error — `HnswIo::init` unwraps
+    /// `load_description` and the point readers assert — so nothing inside
+    /// the loader returns Err for it.
+    #[test]
+    fn test_garbage_graph_header_is_an_error_not_a_panic() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+
+        // Persist a real graph so the load path is entered (absent files skip
+        // it), then corrupt its header.
+        {
+            let mut index = HnswIndex::new(&config).unwrap();
+            index.insert(0, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            index.save().unwrap();
+        }
+        std::fs::write(dir.path().join("index.hnsw.graph"), b"garbage").unwrap();
+
+        let err = match HnswIndex::new(&config) {
+            Ok(_) => panic!("a corrupt graph header must be an error, not a fresh index"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("load hnsw"),
+            "the error must name the failed load: {msg}"
+        );
+    }
+
+    /// The loader's ordinary error path keeps its fallback: hnsw_rs returns
+    /// Err for a dump it can describe but not read (here a truncated data
+    /// file), and the index starts fresh so the startup rebuild can repair the
+    /// metadata rows. `tests::test_synthesis_survives_a_corrupt_graph` pins
+    /// the same fallback through `SemanticIndex`.
+    #[test]
+    fn test_loader_error_falls_back_to_new_index() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+
+        {
+            let mut index = HnswIndex::new(&config).unwrap();
+            index.insert(0, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            index.save().unwrap();
+        }
+        // A truncated data file fails the loader's header read, which hnsw_rs
+        // reports as Err rather than a panic.
+        std::fs::write(dir.path().join("index.hnsw.data"), b"").unwrap();
+
+        let mut index =
+            HnswIndex::new(&config).expect("an unreadable dump starts a fresh index");
+        assert_eq!(
+            index.graph_point_count(),
+            0,
+            "the discarded dump leaves a fresh, empty graph"
+        );
+        index.insert(0, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.get_embedding(0).unwrap(), vec![0.0, 1.0, 0.0, 0.0]);
     }
 
     /// Regression: hnsw_rs's dump refuses to serialize a graph with no

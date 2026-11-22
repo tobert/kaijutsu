@@ -153,14 +153,7 @@ impl MetadataStore {
             .map_err(|e| IndexError::Database(e.to_string()))?;
 
         match result {
-            Some(bytes) => {
-                if bytes.len() == 16 {
-                    let arr: [u8; 16] = bytes.try_into().unwrap();
-                    Ok(Some(ContextId::from_bytes(arr)))
-                } else {
-                    Ok(None)
-                }
-            }
+            Some(bytes) => decode_context_id(bytes).map(Some),
             None => Ok(None),
         }
     }
@@ -443,10 +436,7 @@ impl MetadataStore {
         let mut result = Vec::new();
         for row in rows {
             let (slot, bytes) = row.map_err(|e| IndexError::Database(e.to_string()))?;
-            if bytes.len() == 16 {
-                let arr: [u8; 16] = bytes.try_into().unwrap();
-                result.push((slot, ContextId::from_bytes(arr)));
-            }
+            result.push((slot, decode_context_id(bytes)?));
         }
 
         Ok(result)
@@ -469,10 +459,7 @@ impl MetadataStore {
         let mut ids = Vec::new();
         for row in rows {
             let bytes = row.map_err(|e| IndexError::Database(e.to_string()))?;
-            if bytes.len() == 16 {
-                let arr: [u8; 16] = bytes.try_into().unwrap();
-                ids.push(ContextId::from_bytes(arr));
-            }
+            ids.push(decode_context_id(bytes)?);
         }
 
         Ok(ids)
@@ -554,10 +541,7 @@ impl MetadataStore {
             let mut out = Vec::new();
             for row in rows {
                 let (slot, bytes) = row.map_err(|e| IndexError::Database(e.to_string()))?;
-                if bytes.len() == 16 {
-                    let arr: [u8; 16] = bytes.try_into().unwrap();
-                    out.push((slot, ContextId::from_bytes(arr)));
-                }
+                out.push((slot, decode_context_id(bytes)?));
             }
             out
         };
@@ -589,6 +573,21 @@ impl MetadataStore {
 
         Ok(evicted)
     }
+}
+
+/// Decode a `context_id` blob read from `index_entries`.
+///
+/// A blob that is not 16 bytes means the index is damaged. Report it: skipping
+/// the row would drop the context from search, rebuild, or eviction with no
+/// sign that anything was missing.
+fn decode_context_id(bytes: Vec<u8>) -> Result<ContextId, IndexError> {
+    let len = bytes.len();
+    let arr: [u8; 16] = bytes.try_into().map_err(|_| {
+        IndexError::Database(format!(
+            "index metadata holds a corrupt context_id blob: {len} bytes, expected 16"
+        ))
+    })?;
+    Ok(ContextId::from_bytes(arr))
 }
 
 /// Delete a context's rows from all three synthesis tables, within an
@@ -1008,5 +1007,77 @@ mod tests {
         let remaining = store.load_all_synthesis().unwrap();
         assert_eq!(remaining.len(), 1, "only ctx2's synthesis should survive eviction");
         assert_eq!(remaining[0].0, ctx2);
+    }
+
+    /// Write an `index_entries` row whose `context_id` blob cannot decode — the
+    /// shape a damaged `index_meta.db` leaves behind.
+    fn insert_corrupt_entry(store: &MetadataStore, slot: u32) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO index_entries \
+                 (context_id, hnsw_slot, content_hash, dimensions, model_name, embedded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![vec![0xABu8; 5], slot, "hash", 384i64, "model", now_millis()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_corrupt_context_id_blob_fails_reverse_lookup() {
+        let dir = TempDir::new().unwrap();
+        let store = MetadataStore::open(dir.path()).unwrap();
+        insert_corrupt_entry(&store, 0);
+
+        let error = store.get_context_id(0).unwrap_err().to_string();
+        assert!(
+            error.contains("corrupt"),
+            "a corrupt context_id blob must be reported, not read as an absent context: {error}"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_context_id_blob_fails_slot_listing() {
+        let dir = TempDir::new().unwrap();
+        let store = MetadataStore::open(dir.path()).unwrap();
+        insert_corrupt_entry(&store, 0);
+
+        let error = store.all_slots().unwrap_err().to_string();
+        assert!(
+            error.contains("corrupt"),
+            "rebuild must not silently drop a context it cannot decode: {error}"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_context_id_blob_fails_context_listing() {
+        let dir = TempDir::new().unwrap();
+        let store = MetadataStore::open(dir.path()).unwrap();
+        insert_corrupt_entry(&store, 0);
+
+        let error = store.all_context_ids().unwrap_err().to_string();
+        assert!(
+            error.contains("corrupt"),
+            "listing must not return a silently short set: {error}"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_context_id_blob_fails_eviction_without_deleting() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+        store.assign_slot(ContextId::new(), "h", "model", 384).unwrap();
+        insert_corrupt_entry(&store, 7);
+
+        let error = store.evict_oldest(2).unwrap_err().to_string();
+        assert!(
+            error.contains("corrupt"),
+            "eviction must report a row it cannot decode: {error}"
+        );
+        assert_eq!(
+            store.count().unwrap(),
+            2,
+            "a refused eviction must delete nothing"
+        );
     }
 }
