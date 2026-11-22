@@ -39,8 +39,7 @@ use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolRe
 pub enum DoneStatus {
     /// The task is complete and checked.
     Done,
-    /// The task needs something only someone else can give: an answer, an
-    /// approval, or access.
+    /// The task is blocked; the feedback says what it needs.
     Blocked,
     /// The task cannot be completed; the feedback says why.
     GaveUp,
@@ -64,10 +63,10 @@ impl DoneStatus {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DoneParams {
-    /// `done` when the task is complete and checked, `blocked` when it needs
-    /// something only someone else can give, `gave_up` when it cannot be
-    /// completed, `refused` when the task as given is unsafe or too
-    /// ambiguous to do safely without guessing.
+    /// `done` when the task is complete and checked, `blocked` when you are
+    /// blocked, `gave_up` when it cannot be completed, `refused` when the
+    /// task as given is unsafe or too ambiguous to do safely without
+    /// guessing.
     pub status: DoneStatus,
     /// "And remember, this is for posterity, so be honest. How do you
     /// feel?" Free-form, about 50 to 400 words.
@@ -77,6 +76,21 @@ pub struct DoneParams {
 pub struct BuiltinTurnServer {
     instance_id: InstanceId,
     notif_tx: broadcast::Sender<ServerNotification>,
+    /// Lets the description say who reads a context's report. Without it
+    /// the description names no reader.
+    kernel_db: Option<std::sync::Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>>,
+}
+
+/// Who reads a context's `done` report: the context it answers to, its
+/// senpai.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// The context has no senpai on record, or the senpai has no performer.
+    Unknown,
+    /// A model plays the senpai, which may have more for this context.
+    Senpai,
+    /// A person plays the senpai (a root console).
+    Person,
 }
 
 impl BuiltinTurnServer {
@@ -84,7 +98,39 @@ impl BuiltinTurnServer {
 
     pub fn new() -> Self {
         let (notif_tx, _) = broadcast::channel(1);
-        Self { instance_id: InstanceId::new(Self::INSTANCE), notif_tx }
+        Self { instance_id: InstanceId::new(Self::INSTANCE), notif_tx, kernel_db: None }
+    }
+
+    /// Name each context's reader in the description of `done`.
+    pub fn with_kernel_db(mut self, db: std::sync::Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>) -> Self {
+        self.kernel_db = Some(db);
+        self
+    }
+
+    fn reader(&self, context: kaijutsu_types::ContextId) -> Reader {
+        let Some(db) = &self.kernel_db else { return Reader::Unknown };
+        let db = db.lock();
+        let Ok(Some(senpai)) = db.senpai_of(context) else { return Reader::Unknown };
+        let performer = db.get_context(senpai).ok().flatten().and_then(|row| row.performer);
+        match performer.and_then(|p| db.get_character(p).ok().flatten()) {
+            Some(sheet) if sheet.root => Reader::Person,
+            Some(_) => Reader::Senpai,
+            None => Reader::Unknown,
+        }
+    }
+
+    fn done_description(reader: Reader) -> String {
+        let core = "End the task and report how it ended. Call it when the task is complete and \
+                    checked, when you are blocked, when you are giving up, or when you refuse a task \
+                    that is unsafe or too ambiguous to do safely. The turn ends after this call.";
+        match reader {
+            Reader::Unknown => core.to_string(),
+            Reader::Senpai => format!("{core} Your report goes to your senpai, who may have more for you."),
+            Reader::Person => format!(
+                "{core} A person reads your report, and a `done` is likely to get their attention. \
+                 Stopping to wait for a person is fine: call `done` with `blocked` and say what you need."
+            ),
+        }
     }
 }
 
@@ -100,18 +146,11 @@ impl McpServerLike for BuiltinTurnServer {
         &self.instance_id
     }
 
-    async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
+    async fn list_tools(&self, ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
         let mut tools = vec![KernelTool {
             instance: self.instance_id.clone(),
             name: crate::runtime::llm_stream::DONE_TOOL.to_string(),
-            description: Some(
-                "End the task and report how it ended. Call it when the task is complete and \
-                 checked, when you are blocked on something only someone else can give, when \
-                 you are giving up, or when you refuse a task that is unsafe or too ambiguous to \
-                 do safely. The turn ends after this call. When you work without a person \
-                 answering, a reply without a tool call does not end it."
-                    .to_string(),
-            ),
+            description: Some(Self::done_description(self.reader(ctx.context_id))),
             input_schema: tool_input_schema::<DoneParams>(),
         }];
         if crate::runtime::llm_stream::INSTRUCTION_FORM == crate::runtime::llm_stream::InstructionForm::SystemMessagesTool {
@@ -203,6 +242,74 @@ mod tests {
         assert!(schema.contains("\"feedback\"") && !schema.contains("\"summary\""), "{schema}");
         assert!(schema.contains("posterity") && schema.contains("words"), "{schema}");
         assert!(schema.contains("refused"), "{schema}");
+    }
+
+    fn done_description(tools: &[KernelTool]) -> String {
+        tools.iter().find(|t| t.name == "done").and_then(|t| t.description.clone()).expect("done is offered")
+    }
+
+    /// The description without a database handle is the shared text: it says
+    /// what `done` is for and no longer says a reply with no tool call fails to
+    /// end the turn, or glosses `blocked`.
+    #[tokio::test]
+    async fn the_description_has_no_stale_sentence_and_names_no_reader_without_a_database() {
+        let server = BuiltinTurnServer::new();
+        let text = done_description(&server.list_tools(&CallContext::test()).await.unwrap());
+        assert!(text.contains("blocked") && text.contains("turn ends"), "{text}");
+        assert!(!text.contains("reply without a tool call"), "{text}");
+        assert!(!text.contains("only someone else can give"), "{text}");
+        let schema = serde_json::to_string(&server.list_tools(&CallContext::test()).await.unwrap()[0].input_schema).unwrap();
+        assert!(!schema.contains("only someone else can give"), "the schema leaves `blocked` to its name: {schema}");
+        assert!(!text.contains("senpai") && !text.contains("person"), "no reader is named: {text}");
+    }
+
+    /// A context's report goes to its senpai, and the description says who
+    /// that is: a model senpai may have more work, a person's attention is
+    /// what a `done` is likely to get.
+    #[tokio::test]
+    async fn the_description_names_who_reads_the_report() {
+        use crate::kj::test_helpers::{register_context, test_dispatcher};
+        let d = test_dispatcher().await;
+        let model = kaijutsu_types::PrincipalId::new();
+        let person = kaijutsu_types::PrincipalId::new();
+        let character = |principal, name: &str, root| crate::kernel_db::CharacterRow {
+            rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, principal_id: principal,
+            name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root,
+        };
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&character(model, "model-senpai", false)).unwrap();
+            db.insert_character(&character(person, "person", true)).unwrap();
+        }
+        let console = register_context(&d, Some("console"), None, person);
+        let senpai = register_context(&d, Some("senpai"), None, model);
+        let kohai = register_context(&d, Some("kohai"), None, model);
+        let alone = register_context(&d, Some("alone"), None, model);
+        {
+            let db = d.kernel_db().lock();
+            db.update_performer(console, Some(person)).unwrap();
+            db.update_performer(senpai, Some(model)).unwrap();
+            db.set_context_senpai(senpai, Some(console)).unwrap();
+            db.set_context_senpai(kohai, Some(senpai)).unwrap();
+        }
+        let server = BuiltinTurnServer::new().with_kernel_db(d.kernel_db().clone());
+        let described = |context| {
+            let server = &server;
+            async move {
+                let mut ctx = CallContext::test();
+                ctx.context_id = context;
+                done_description(&server.list_tools(&ctx).await.unwrap())
+            }
+        };
+
+        let to_senpai = described(kohai).await;
+        assert!(to_senpai.contains("senpai") && !to_senpai.contains("person"), "{to_senpai}");
+        let to_person = described(senpai).await;
+        assert!(to_person.contains("person") && to_person.contains("blocked"), "{to_person}");
+        assert!(!to_person.contains("your senpai"), "{to_person}");
+        // A context with no senpai on record gets the shared text.
+        let neutral = described(alone).await;
+        assert!(!neutral.contains("senpai") && !neutral.contains("person"), "{neutral}");
     }
 
     /// In the `SystemMessagesTool` form every context offered `done` is also

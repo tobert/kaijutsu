@@ -3699,7 +3699,7 @@ esac
 
     /// A kohai under a senpai, created from the shipped rc, whose mock model
     /// calls `done`. Returns the senpai and the kohai's label.
-    async fn kohai_that_calls_done(d: &std::sync::Arc<KjDispatcher>) -> (ContextId, &'static str) {
+    async fn kohai_that_calls_done(d: &std::sync::Arc<KjDispatcher>, status: &str) -> (ContextId, &'static str) {
         use crate::llm::{MockClient, Provider, StreamEvent};
         d.set_self_arc();
         d.kernel().broker().set_kj_dispatcher(d).await;
@@ -3720,7 +3720,7 @@ esac
         let stop = |reason: &str| StreamEvent::Done { stop_reason: Some(reason.into()), input_tokens: None, output_tokens: None, extra: None };
         let mock = MockClient::new("").with_scripted_stream(vec![vec![
             StreamEvent::ToolUse { id: "call_done".into(), name: "done".into(),
-                input: serde_json::json!({"status": "done", "feedback": "fixed the build"}), signature: None },
+                input: serde_json::json!({"status": status, "feedback": "fixed the build"}), signature: None },
             stop("tool_use"),
         ]]);
         d.kernel().llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
@@ -3737,7 +3737,7 @@ esac
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let heard = d.block_store().block_snapshots(mid).unwrap().into_iter()
-                .find(|b| b.kind == kaijutsu_types::BlockKind::Drift && b.content.contains("finished: done"));
+                .find(|b| b.kind == kaijutsu_types::BlockKind::Drift && b.content.contains("kohai kh "));
             if let Some(block) = heard { return Some(block.content); }
             if std::time::Instant::now() > deadline { return None; }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3751,8 +3751,9 @@ esac
         crate::on_rc_thread(|| async {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             let mut requested = d.kernel().turn_flows().subscribe("turn.requested");
-            let (mid, label) = kohai_that_calls_done(&d).await;
+            let (mid, label) = kohai_that_calls_done(&d, "done").await;
             let note = senpai_hears(&d, mid).await.expect("the senpai's log never heard the kohai finish");
+            assert!(note.starts_with("=== kohai kh finished ==="), "{note}");
             assert!(note.contains("fixed the build") && note.contains(&format!("kj drive {label}")), "{note}");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             let woken = loop {
@@ -3764,6 +3765,20 @@ esac
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             };
             assert!(woken, "an idle senpai is driven");
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+        });
+    }
+
+    /// The heading says each ending in plain words, so a senpai does not read
+    /// a status token.
+    #[test]
+    fn a_kohai_that_is_blocked_says_so_in_plain_words() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            let (mid, _) = kohai_that_calls_done(&d, "blocked").await;
+            let note = senpai_hears(&d, mid).await;
+            let note = note.expect("the senpai's log never heard the kohai");
+            assert!(note.starts_with("=== kohai kh is blocked ==="), "{note}");
             d.kernel().shutdown_runtime_worker().await.unwrap();
         });
     }
@@ -3788,7 +3803,7 @@ esac
                     }
                 })
             };
-            let (mid, _) = kohai_that_calls_done(&d).await;
+            let (mid, _) = kohai_that_calls_done(&d, "done").await;
             let running = holder.await.unwrap();
             senpai_hears(&d, mid).await.expect("the senpai's log never heard the kohai finish");
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;

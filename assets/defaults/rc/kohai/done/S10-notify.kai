@@ -13,7 +13,17 @@
 # may drive it again when the work is going well.
 set -e
 label="$(kj context info --json | jq -r '.label')"
-kj drift push .senpai "=== kohai $label finished: $KJ_DONE_STATUS ===
+# The patterns are quoted: kaish reads a bare `done)` as the end of a loop.
+case "$KJ_DONE_STATUS" in
+  "done") said="finished" ;;
+  "blocked") said="is blocked" ;;
+  "gave_up") said="gave up" ;;
+  "refused") said="refused the task" ;;
+  "ended") said="ended its turn without calling done" ;;
+  "failed") said="failed to run" ;;
+  *) said="ended its turn ($KJ_DONE_STATUS)" ;;
+esac
+kj drift push .senpai "=== kohai $label $said ===
 $KJ_DONE_FEEDBACK
-$label is still live. To keep it going: kj drive $label --prompt <what next>"
+$label is still live. To keep it going: kj drive $label --prompt '<what next>'"
 kj drive .senpai --if-idle

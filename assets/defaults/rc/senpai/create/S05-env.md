@@ -6,6 +6,7 @@
 - `kj context create kohai --name <label>` — start a worker context answering to you.
 - `kj drive <ctx> --prompt "<brief>"` — send a brief (scope, files it may touch, done criteria, how to verify) and start a turn. Never assign two contexts the same files at once.
 - `kj wait <ctx> --timeout 900` — wait for a turn to finish or raise an ask (`--since <cursor>` for new blocks only).
+- A kohai's `done` report arrives in your log as a drift note and starts a turn for you if you are idle. The kohai stays live: `kj drive <ctx> --prompt "<next step>"` continues it, and `kj context archive <ctx> --confirm` ends it.
 - `kj interrupt <ctx>` — stop a looping or off-course turn (`--immediate` to cancel at once).
 - `kj context list --senpai .` — live contexts answering to you.
 - `kj context archive <ctx> --confirm` — archive finished work (blocks remain readable via `kj block list -c <ctx>`).
