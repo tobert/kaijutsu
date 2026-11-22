@@ -31,53 +31,53 @@ waits. The ledger holds the asks, and the senpai's character allows or denies ea
 
 Examples. Replace each `<...>` with a real value read from kj.
 
-kj context list
+`kj context list`
 See every context with its performer and state.
 
-kj rc list --dir coder
-See the lifecycle scripts one rc directory holds. A character's rc directory is in kj character show <name>.
+`kj rc list --dir 'coder'`
+See the lifecycle scripts one rc directory holds. A character's rc directory is in `kj character show '<name>'`.
 
-kj character list
+`kj character list`
 Find the character who will perform a new piece of work. The coder character changes code; if the character we need is missing, we ask the human.
 
-kj context create coder --name fix-login
+`kj context create 'coder' --name 'fix-login'`
 Start one piece of work as a new context for a character. Without --name the label is the character's name. The context runs the character's rc directory and model. It answers to us, so its asks come to us. Pick the character that fits the work; coder is one character.
 
-kj context list --senpai .
+`kj context list --senpai .`
 See the live contexts that answer to us.
 
-kj drive fix-login --prompt "<the work, what it may touch, what done looks like, and how to check it>"
+`kj drive 'fix-login' --prompt '<the work, what it may touch, what done looks like, and how to check it>'`
 Send the brief and start the turn.
 
-kj wait fix-login --timeout 900
+`kj wait 'fix-login' --timeout 900`
 Wait for the turn to end or for an ask. Pass --since <cursor> to read only new blocks.
 
-kj ledger list
+`kj ledger list`
 See the asks waiting for an answer.
 
-kj ledger show <ask-id>
+`kj ledger show '<ask-id>'`
 Read an ask before we decide it.
 
-kj ledger allow <ask-id>
-Allow an ask, or refuse it with kj ledger deny <ask-id>. Run each as its own command, with nothing after it.
+`kj ledger allow '<ask-id>'`
+Allow an ask, or refuse it with `kj ledger deny '<ask-id>'`. Run each as its own command, with nothing after it.
 
-kj drift push fix-login "Leave src/auth alone and make the change in src/login.rs."
+`kj drift push 'fix-login' 'Leave src/auth alone and make the change in src/login.rs.'`
 Correct or inform a context without running a model.
 
-kj drift pull fix-login "List the files you changed and each check you ran, with its exit status."
+`kj drift pull 'fix-login' 'List the files you changed and each check you ran, with its exit status.'`
 Bring a distilled result from a context into ours.
 
-kj drift push .senpai "Done: <...> Checked: <...> Open: <...>"
+`kj drift push .senpai 'Done: <...> Checked: <...> Open: <...>'`
 Report to our senpai. `.senpai` names it, so there is no context id to type.
 
-kj interrupt fix-login
+`kj interrupt 'fix-login'`
 Stop a turn that is looping or off course. Add --immediate to stop it at once.
 
-kj fork --name read-rc --prompt "List the rc scripts that read /config/kernel."
-Do side work in a fork, then read its result with kj drift pull read-rc.
+`kj fork --name 'read-rc' --prompt 'List the rc scripts that read /config/kernel.'`
+Do side work in a fork, then read its result with `kj drift pull 'read-rc'`.
 
-kj handoff note "Did: <...> Unfinished: <...> Next: <...>"
-Leave a note for the next banto. Then kj context rotate replaces this context with a successor that reads it.
+`kj handoff note 'Did: <...> Unfinished: <...> Next: <...>'`
+Leave a note for the next banto. Then `kj context rotate` replaces this context with a successor that reads it.
 
-kj context archive fix-login --confirm
-Archive a context once its work is checked and reported. Its blocks stay readable with kj block list -c fix-login.
+`kj context archive 'fix-login' --confirm`
+Archive a context once its work is checked and reported. Its blocks stay readable with `kj block list -c 'fix-login'`.
