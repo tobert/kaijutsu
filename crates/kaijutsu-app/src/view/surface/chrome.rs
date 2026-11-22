@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use bytemuck::{Pod, Zeroable};
-use kaijutsu_types::{BlockId, Role};
+use kaijutsu_types::BlockId;
 
 use crate::cell::block_border::{
     BlockBorderStyle, BorderAnimation, BorderContext, BorderKind, BorderPadding, apply_focus_style,
@@ -553,21 +553,19 @@ pub fn block_chrome_instance(
 /// where the label sits.
 ///
 /// The label itself is already drawn — `window::assemble_runs` emits it as a
-/// glyph run from [`HeaderLabelCache`] — so what parity needs here is the
-/// rule, its per-role color, and the gap, whose arithmetic is
+/// glyph run from [`HeaderLabelCache`], in the role's own color — so what
+/// parity needs here is the rule and the gap, whose arithmetic is
 /// `role_divider`'s and is not restated.
+///
+/// The rule is structure, so every role draws the same subdued chrome color.
+/// A full-width role-colored line would be the loudest thing in the
+/// transcript, and the label already carries the role.
 pub fn divider_instance(
-    role: Role,
     rect: [f32; 4],
     label_width: Option<f32>,
     theme: &Theme,
 ) -> ChromeInstance {
-    let color = match role {
-        Role::User => theme.fg,
-        Role::Model => theme.block_assistant,
-        Role::System => theme.fg_dim,
-        Role::Tool | Role::Asset => theme.block_tool_call,
-    };
+    let color = theme.border;
     // No label shaped yet (its metrics epoch just moved, or the atlas isn't
     // up): draw the rule unbroken rather than guessing a gap the label won't
     // land in.
@@ -751,7 +749,6 @@ pub fn collect_chrome_instances(
                 }
                 let label_width = headers.get(row.role, metrics_epoch).map(|l| l.width);
                 out.push(divider_instance(
-                    row.role,
                     [0.0, row.y_offset, container_width, row.height],
                     label_width,
                     theme,
@@ -809,7 +806,9 @@ mod tests {
     }
 
     use super::*;
-    use kaijutsu_types::{BlockKind, ContextId, ErrorCategory, ErrorSeverity, PrincipalId, Status};
+    use kaijutsu_types::{
+        BlockKind, ContextId, ErrorCategory, ErrorSeverity, PrincipalId, Role, Status,
+    };
 
     use crate::cell::block_border::BorderInputs;
 
@@ -1210,7 +1209,7 @@ mod tests {
     #[test]
     fn the_divider_gap_matches_role_divider() {
         let theme = Theme::default();
-        let inst = divider_instance(Role::User, [0.0, 100.0, 800.0, 20.0], Some(48.0), &theme);
+        let inst = divider_instance([0.0, 100.0, 800.0, 20.0], Some(48.0), &theme);
         let expected = role_divider::compute_role_divider_layout(
             48.0,
             theme.label_inset as f64,
@@ -1229,26 +1228,32 @@ mod tests {
     #[test]
     fn an_unshaped_label_leaves_the_rule_unbroken() {
         let theme = Theme::default();
-        let inst = divider_instance(Role::Model, [0.0, 0.0, 800.0, 20.0], None, &theme);
+        let inst = divider_instance([0.0, 0.0, 800.0, 20.0], None, &theme);
         assert_eq!(inst.label_gap, [0.0; 4]);
     }
 
+    /// The rule is chrome, not a role color: it takes the theme's structural
+    /// `border` token and never one of the text colors a label or a block
+    /// uses. Role identity stays in the label, which `shape_role_label` in
+    /// `shape_cache` shapes in the role's own color.
     #[test]
-    fn divider_color_follows_the_role() {
+    fn the_role_divider_rule_is_the_subdued_chrome_token() {
         let theme = Theme::default();
-        let rect = [0.0, 0.0, 800.0, 20.0];
-        assert_eq!(
-            divider_instance(Role::User, rect, None, &theme).color,
-            color_to_rgba8(theme.fg),
-        );
-        assert_eq!(
-            divider_instance(Role::Model, rect, None, &theme).color,
-            color_to_rgba8(theme.block_assistant),
-        );
-        assert_eq!(
-            divider_instance(Role::System, rect, None, &theme).color,
-            color_to_rgba8(theme.fg_dim),
-        );
+        let inst = divider_instance([0.0, 0.0, 800.0, 20.0], None, &theme);
+        assert_eq!(inst.color, color_to_rgba8(theme.border));
+        assert_eq!(inst.kind, CHROME_KIND_CENTER_LINE);
+        for (name, text) in [
+            ("fg", theme.fg),
+            ("fg_dim", theme.fg_dim),
+            ("block_assistant", theme.block_assistant),
+            ("block_tool_call", theme.block_tool_call),
+        ] {
+            assert_ne!(
+                inst.color,
+                color_to_rgba8(text),
+                "the rule must not borrow {name}",
+            );
+        }
     }
 
     // ---- collect ---------------------------------------------------------

@@ -159,7 +159,8 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Block text colors (per-block-type for semantic distinction)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Assistant message text color (light blue)
+    /// Assistant message text color — the user's same readable foreground,
+    /// kept as its own token so a theme can tint model replies.
     pub block_assistant: Color,
     /// Thinking block text color (dim gray for de-emphasis)
     pub block_thinking: Color,
@@ -579,7 +580,7 @@ impl Default for Theme {
             row_result: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
 
             // Block text colors
-            block_assistant: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
+            block_assistant: Color::srgb(0.925, 0.910, 0.968), // #ece8f7 — body text, the same as fg
             block_thinking: Color::srgb(0.435, 0.396, 0.573), // #6f6592 dim
             block_tool_call: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
             block_tool_result: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3 teal
@@ -1051,6 +1052,20 @@ mod tests {
             };
             assert_eq!(t.color_for(tone), expected, "{tone:?}");
         }
+    }
+
+    /// Model prose and the user's own text share one readable foreground. The
+    /// token stays separate from `fg` so a theme can tint model replies without
+    /// moving every line of the conversation.
+    #[test]
+    fn assistant_prose_matches_the_user_foreground() {
+        let t = Theme::default();
+        assert_eq!(t.block_assistant, t.fg, "assistant prose is body text");
+        assert_eq!(
+            t.color_for(BlockTone::Assistant),
+            t.color_for(BlockTone::User),
+            "the same body color through the tone resolver",
+        );
     }
 
     /// A human's own shell keeps the human's own color, end to end through
