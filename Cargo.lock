@@ -6906,6 +6906,10 @@ dependencies = [
  "dirs",
  "futures",
  "hostname",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "kaijutsu-agent-tools",
  "kaijutsu-client",
  "kaijutsu-kernel",
@@ -6919,6 +6923,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -10359,6 +10365,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hmac",
  "http",
  "http-body",
  "http-body-util",
@@ -10388,6 +10395,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
