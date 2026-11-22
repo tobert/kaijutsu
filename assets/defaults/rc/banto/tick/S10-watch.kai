@@ -2,13 +2,17 @@
 #
 # Runs on the beat scheduler's OODA boundary (e.g. 60 BPM, wakeup 60 = 1 min).
 # Pure kaish probes run with zero LLM tokens and decide whether to wake banto:
-#   - Urgent signal (new pending ask, probe failure, or lost+found activity):
+#   - Urgent signal (new pending ask or probe failure):
 #     reset backoff and wake immediately via `kj drive --if-idle`.
 #   - Routine sweep (no urgent signal): obey an exponential backoff starting at
 #     BANTO_BACKOFF_SECS (default 300s) and capped at BANTO_MAX_BACKOFF_SECS
-#     (default 3600s), with a floor of BANTO_MIN_SWEEP_SECS (default 3600s = 1h)
-#     between idle inference calls so commercial APIs stay cheap overnight.
-#     Set BANTO_IDLE_SWEEP=0 to suppress routine idle sweeps altogether.
+#     (default 3600s), with a floor of BANTO_MIN_SWEEP_SECS (default 3000s = 50m)
+#     between idle inference calls so commercial APIs stay cheap and 1h caches
+#     stay warm when active. Set BANTO_IDLE_SWEEP=0 to suppress idle sweeps.
+#
+# Every wake passes live token usage and context age in the prompt so banto can
+# judge when to rotate itself (`kj context rotate --handoff "..."`) without
+# putting volatile numbers in the cached system prompt.
 #
 # When banto is idle and bored, it may call `kj transport ooda off` or
 # `kj transport stop` to sleep until a person or incoming drift wakes it.
@@ -16,12 +20,25 @@ set -e
 
 now="$(date '+%s')"
 info="$(kj context info --json)"
+ctx_id="$(echo $info | jq -r '.context_id // ""')"
+used_tokens="$(echo $info | jq -r '.usage.total_tokens // 0')"
+used_pct="$(echo $info | jq -r '.usage.context_used_pct // empty')"
 last_inf="$(echo $info | jq -r '.env.BANTO_LAST_INFERENCE_EPOCH // "0"')"
 last_state="$(echo $info | jq -r '.env.BANTO_LAST_STATE // ""')"
 backoff="$(echo $info | jq -r '.env.BANTO_BACKOFF_SECS // "300"')"
 max_backoff="$(echo $info | jq -r '.env.BANTO_MAX_BACKOFF_SECS // "3600"')"
-min_sweep="$(echo $info | jq -r '.env.BANTO_MIN_SWEEP_SECS // "3600"')"
+min_sweep="$(echo $info | jq -r '.env.BANTO_MIN_SWEEP_SECS // "3000"')"
 idle_sweep="$(echo $info | jq -r '.env.BANTO_IDLE_SWEEP // "1"')"
+born_ctx="$(echo $info | jq -r '.env.BANTO_CTX_ID // ""')"
+born_epoch="$(echo $info | jq -r '.env.BANTO_BORN_EPOCH // ""')"
+
+# Track this context's own age (resets cleanly after a rotation).
+if [[ "$born_ctx" != "$ctx_id" ]] || [[ -z "$born_epoch" ]]; then
+  born_epoch="$now"
+  kj context set --env "BANTO_CTX_ID=$ctx_id"
+  kj context set --env "BANTO_BORN_EPOCH=$now"
+fi
+age_hrs=$(( (now - born_epoch) / 3600 ))
 
 # -- probes: raw data, never exit nonzero on probe failure.
 urgent=0
@@ -58,29 +75,32 @@ if [[ "$state_sig" != "$last_state" ]]; then
   kj context set --env "BANTO_LAST_STATE=$state_sig"
 fi
 
+if [[ -n "$used_pct" ]]; then
+  usage_note="tokens=${used_tokens} (${used_pct}%) age=${age_hrs}h"
+else
+  usage_note="tokens=${used_tokens} age=${age_hrs}h"
+fi
+
 elapsed=$((now - last_inf))
-echo "banto tick: $state_sig changed=$changed urgent=$urgent elapsed=${elapsed}s backoff=${backoff}s"
+echo "banto tick: $state_sig $usage_note changed=$changed urgent=$urgent elapsed=${elapsed}s backoff=${backoff}s"
 
 if [[ "$urgent" -eq 1 ]]; then
   kj context set --env "BANTO_BACKOFF_SECS=300"
   kj context set --env "BANTO_LAST_INFERENCE_EPOCH=$now"
   echo "banto tick: urgent signal ($state_sig); waking if idle"
-  kj drive --if-idle
+  kj drive --if-idle --prompt "tick (urgent): $state_sig | $usage_note"
   exit 0
 fi
 
 if [[ "$changed" -eq 1 ]]; then
-  # Activity detected: keep backoff short, still respect min_sweep for non-urgent changes.
   next_backoff=300
 else
-  # Quiet: double backoff up to max_backoff.
   next_backoff=$((backoff * 2))
   if [[ "$next_backoff" -gt "$max_backoff" ]]; then
     next_backoff="$max_backoff"
   fi
 fi
 
-# Effective wait for a routine sweep is max(backoff, min_sweep).
 wait_secs="$backoff"
 if [[ "$min_sweep" -gt "$wait_secs" ]]; then
   wait_secs="$min_sweep"
@@ -90,7 +110,7 @@ if [[ "$idle_sweep" -eq 1 ]] && [[ "$elapsed" -ge "$wait_secs" ]]; then
   kj context set --env "BANTO_BACKOFF_SECS=$next_backoff"
   kj context set --env "BANTO_LAST_INFERENCE_EPOCH=$now"
   echo "banto tick: routine sweep due (${elapsed}s >= ${wait_secs}s); waking if idle"
-  kj drive --if-idle
+  kj drive --if-idle --prompt "tick (sweep): $state_sig | $usage_note"
 else
   kj context set --env "BANTO_BACKOFF_SECS=$next_backoff"
   echo "banto tick: quiet (no inference; next backoff=${next_backoff}s)"

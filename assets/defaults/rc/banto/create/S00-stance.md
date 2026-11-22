@@ -62,9 +62,16 @@ asks go to our senpai, named above, and we report to our senpai with `kj drift
 push .senpai`. When one of our commands waits on an ask, we say the ask id and
 end our turn.
 
-When this context's history grows long, we leave a handoff note and rotate.
-Before we stop for any reason, we leave a handoff note: what we did, what is
-unfinished, and what is next. The next banto starts from that note and cannot
-ask us.
+Keep this context short — short contexts stay sharp and cheap, especially on
+local inference. Watch the token count and age reported on each check-in (or
+read `kj context info`), stay within a 24k–64k working window, and aim to
+rotate ourselves around 32k–42k tokens or at least once a day. Rotate in one
+step with `kj context rotate --handoff "<brief>"`: write a forward-looking
+brief for the next banto, not a transcript narrative. Include standing duties,
+verified facts (exact context IDs, file paths, and observed values), changes
+made and checked, dead ends not to repeat, and what is next. Anything older
+stays durable in the archive and can be pulled selectively with
+`kj block list -c <id>` or `kj search`. Before stopping for any reason, leave
+a handoff note too so the next banto never starts blind.
 
 頑張って

@@ -255,6 +255,12 @@ enum ContextCommand {
         /// (default 6, at least 1).
         #[arg(long, requires = "compact", value_parser = clap::value_parser!(u64).range(1..))]
         keep: Option<u64>,
+        /// Carry a handoff brief into the successor context as a system
+        /// notification and set `ROTATED_HANDOFF=1` (so create rc skips the
+        /// predecessor prose tail). Useful when a context rotates itself with
+        /// a focused brief for the next stretch instead of carrying history.
+        #[arg(long, conflicts_with_all = ["migrate", "drop", "compact", "keep"])]
+        handoff: Option<String>,
     },
     /// Archive a context, retaining its history. Requires --confirm. From
     /// the live senpai context you play, you may archive a direct kohai
@@ -723,9 +729,9 @@ impl KjDispatcher {
                 ))
                 .await
             }
-            ContextCommand::Rotate { context, migrate, drop, compact, keep } => {
+            ContextCommand::Rotate { context, migrate, drop, compact, keep, handoff } => {
                 let compact = compact.then(|| keep.map_or(DEFAULT_ROTATE_KEEP, |keep| keep as usize));
-                self.context_rotate(context.as_deref(), migrate.then_some(drop.as_slice()), compact, caller).await
+                self.context_rotate(context.as_deref(), migrate.then_some(drop.as_slice()), compact, handoff.as_deref(), caller).await
             }
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
             ContextCommand::Promote { context } => self.context_promote(&context, caller).await,
@@ -2545,6 +2551,43 @@ impl KjDispatcher {
     }
 
     /// Record in the successor what `kj context rotate --migrate` carried.
+    fn note_handoff(
+        &self,
+        predecessor: ContextId,
+        successor: ContextId,
+        handoff: &str,
+        name: &str,
+        author: PrincipalId,
+    ) -> Result<(), String> {
+        let store = self.block_store();
+        if store.get(successor).is_none() {
+            store
+                .create_document(successor, crate::block_store::DocumentKind::Conversation, None)
+                .map_err(|e| e.to_string())?;
+        }
+        let body = format!(
+            "=== Handoff from '{name}' ({}) ===\n{handoff}\n\n\
+             Read earlier blocks with: kj block list -c {}  or  kj search '<query>'",
+            predecessor.short(),
+            predecessor.to_hex(),
+        );
+        let after = store.last_block_id(successor);
+        store
+            .insert_block_as(
+                successor,
+                None,
+                after.as_ref(),
+                kaijutsu_types::Role::System,
+                kaijutsu_types::BlockKind::Notification,
+                body,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+                Some(author),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn note_migration(&self, predecessor: ContextId, successor: ContextId, report: &crate::blocks::DropReport, name: &str) -> Result<(), String> {
         let store = self.block_store();
         let mut note = format!(
@@ -2696,7 +2739,7 @@ impl KjDispatcher {
     /// A character's handoff log has no performer: its rotation
     /// points `characters.handoff_ctx` at the successor and checks no loadout.
     /// Any other context with no performer refuses.
-    async fn context_rotate(&self, ctx_ref: Option<&str>, migrate: Option<&[String]>, compact: Option<usize>, caller: &KjCaller) -> KjResult {
+    async fn context_rotate(&self, ctx_ref: Option<&str>, migrate: Option<&[String]>, compact: Option<usize>, handoff: Option<&str>, caller: &KjCaller) -> KjResult {
         let (predecessor, character, handoff_owner) = {
             let db = self.kernel_db().lock();
             let id = match super::refs::resolve_context_arg(ctx_ref, caller, &db) {
@@ -2844,6 +2887,11 @@ impl KjDispatcher {
                 } else {
                     db.delete_context_env(successor_id, "ROTATED_MIGRATED")?;
                 }
+                if handoff.is_some() {
+                    db.set_context_env(successor_id, "ROTATED_HANDOFF", "1")?;
+                } else {
+                    db.delete_context_env(successor_id, "ROTATED_HANDOFF")?;
+                }
                 if let Some(shell) = db.get_context_shell(predecessor.context_id)? {
                     db.upsert_context_shell(&ContextShellRow {
                         context_id: successor_id,
@@ -2911,6 +2959,14 @@ impl KjDispatcher {
             let successor = self.successor_fate(root_console, successor_id);
             return KjResult::Err(format!(
                 "kj context rotate: successor {successor_id} was created, but its rc create lifecycle could not settle; {successor}{name} stays live: {e}"
+            ));
+        }
+        if let Some(brief) = handoff
+            && let Err(e) = self.note_handoff(predecessor.context_id, successor_id, brief, &name, caller.actor_id)
+        {
+            let successor = self.successor_fate(root_console, successor_id);
+            return KjResult::Err(format!(
+                "kj context rotate: could not write the handoff brief in the successor {successor_id}; {successor}{name} stays live: {e}"
             ));
         }
         // A handoff log runs no tools, so it has no loadout to check.
@@ -5245,6 +5301,43 @@ mod tests {
     #[test]
     fn a_plain_rotation_after_a_migration_is_not_marked_migrated() {
         crate::on_rc_thread(a_plain_rotation_after_a_migration_is_not_marked_migrated_body);
+    }
+
+    /// `--handoff <text>` writes the brief into the successor as a system
+    /// notification, sets `ROTATED_HANDOFF=1`, and does not leak that env mark
+    /// to a subsequent plain rotation.
+    async fn rotate_handoff_writes_brief_sets_env_and_does_not_leak_body() {
+        let f = rotation_fixture().await;
+        let env_of = |ctx| -> std::collections::HashMap<String, String> {
+            f.d.kernel_db().lock().get_context_env(ctx).unwrap().into_iter().map(|e| (e.key, e.value)).collect()
+        };
+        let brief = "Objective: watch kernel.\nNext: check nagaya embeddings.";
+        let res = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--handoff"), s(brief)],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(res.is_ok(), "{}", res.message());
+        let first = f.d.kernel_db().lock().resolve_context("banto").unwrap();
+        assert_eq!(env_of(first).get("ROTATED_HANDOFF").map(String::as_str), Some("1"));
+
+        let blocks = f.d.block_store().get(first).expect("successor doc").doc.blocks_ordered();
+        let handoff_block = blocks.iter().find(|b| {
+            b.role == kaijutsu_types::Role::System
+                && b.kind == kaijutsu_types::BlockKind::Notification
+                && b.content.contains(brief)
+        });
+        assert!(handoff_block.is_some(), "successor should contain the handoff notification: {blocks:?}");
+
+        let plain = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(first, f.banto)).await;
+        assert!(plain.is_ok(), "{}", plain.message());
+        let second = f.d.kernel_db().lock().resolve_context("banto").unwrap();
+        assert_ne!(second, first);
+        assert_eq!(env_of(second).get("ROTATED_HANDOFF"), None, "a plain rotation must not inherit ROTATED_HANDOFF");
+    }
+
+    #[test]
+    fn rotate_handoff_writes_brief_sets_env_and_does_not_leak() {
+        crate::on_rc_thread(rotate_handoff_writes_brief_sets_env_and_does_not_leak_body);
     }
 
     /// Without `--migrate`, `--drop` has nothing to act on and is refused.

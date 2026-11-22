@@ -34,6 +34,12 @@ if test "$migrated" = "1"; then
   exit 0
 fi
 
+handoff="$(kj context info --json | jq -r '.env.ROTATED_HANDOFF | tostring')"
+if test "$handoff" = "1"; then
+  echo "predecessor: $prev left an explicit handoff brief, so no tail is injected"
+  exit 0
+fi
+
 tail="$(kj wait $prev --timeout 1 --max-blocks 12 --max-bytes 400 --include text || true)"
 
 if test -z "$tail"; then
