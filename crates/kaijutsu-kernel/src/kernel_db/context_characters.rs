@@ -93,6 +93,10 @@ pub struct ContextSlotRow {
     /// The shell output the slot's model reads whole, in KiB. `None` takes
     /// the kernel default.
     pub preview_kib: Option<i64>,
+    /// The `text.verbosity` the ChatGPT plan route sends.
+    pub verbosity: Option<String>,
+    /// The reasoning summary the ChatGPT plan route asks for.
+    pub reasoning_summary: Option<String>,
 }
 
 /// The settings only a character's model carries, which its `model` slot
@@ -101,6 +105,8 @@ pub struct ContextSlotRow {
 pub(super) struct ModelOnly {
     pub(super) decide: Option<String>,
     pub(super) preview_kib: Option<i64>,
+    pub(super) verbosity: Option<String>,
+    pub(super) reasoning_summary: Option<String>,
 }
 
 /// One line of `context_character_migration_report`.
@@ -180,8 +186,8 @@ pub(super) fn insert_slot(conn: &Connection, context_id: ContextId, role: &str, 
     conn.execute(
         "INSERT INTO context_slots (context_id, role, backend_id, model, max_tokens, context_window,
                                     temperature, top_p, effort, thinking_budget, thinking_style, decide,
-                                    preview_kib)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                    preview_kib, verbosity, reasoning_summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             blob_param(context_id.as_bytes()),
             role,
@@ -196,6 +202,8 @@ pub(super) fn insert_slot(conn: &Connection, context_id: ContextId, role: &str, 
             slot.thinking_style,
             slot.model_only.decide,
             slot.model_only.preview_kib,
+            slot.model_only.verbosity,
+            slot.model_only.reasoning_summary,
         ],
     )?;
     Ok(())
@@ -231,11 +239,14 @@ fn row_to_slot(row: &rusqlite::Row<'_>) -> SqliteResult<ContextSlotRow> {
         thinking_style: row.get(10)?,
         decide: row.get(11)?,
         preview_kib: row.get(12)?,
+        verbosity: row.get(13)?,
+        reasoning_summary: row.get(14)?,
     })
 }
 
 const SLOT_COLS: &str = "context_id, role, backend_id, model, max_tokens, context_window, \
-                         temperature, top_p, effort, thinking_budget, thinking_style, decide, preview_kib";
+                         temperature, top_p, effort, thinking_budget, thinking_style, decide, preview_kib, \
+                         verbosity, reasoning_summary";
 
 /// Give `child` a copy of `source`'s performance: the same performer and
 /// persona and every slot verbatim, with `source` as its senpai. A source with
@@ -286,9 +297,10 @@ pub(super) fn copy_character_into(conn: &Connection, source: ContextId, child: C
     conn.execute(
         "INSERT INTO context_slots (context_id, role, backend_id, model, max_tokens, context_window,
                                     temperature, top_p, effort, thinking_budget, thinking_style, decide,
-                                    preview_kib)
+                                    preview_kib, verbosity, reasoning_summary)
          SELECT ?2, role, backend_id, model, max_tokens, context_window,
-                temperature, top_p, effort, thinking_budget, thinking_style, decide, preview_kib
+                temperature, top_p, effort, thinking_budget, thinking_style, decide, preview_kib,
+                verbosity, reasoning_summary
          FROM context_slots WHERE context_id = ?1",
         params![blob_param(source.as_bytes()), blob_param(child.as_bytes())],
     )?;
@@ -423,9 +435,15 @@ impl KernelDb {
                 thinking_budget: model.thinking_budget,
                 thinking_style: model.thinking_style.clone(),
             };
-            // The decision program and the preview limit shape the chat turns;
-            // the `distill` copy is a one-shot and has neither.
-            let model_only = ModelOnly { decide: model.decide.clone(), preview_kib: model.preview_kib };
+            // The decision program, the preview limit and the response shape
+            // belong to the chat turns; the `distill` copy is a one-shot and
+            // has none of them.
+            let model_only = ModelOnly {
+                decide: model.decide.clone(),
+                preview_kib: model.preview_kib,
+                verbosity: model.verbosity.clone(),
+                reasoning_summary: model.reasoning_summary.clone(),
+            };
             self.copy_one_slot(context_id, MODEL, &subject, model.backend_id, &model.model, tunables.clone(), model_only)?;
             if !slots.iter().any(|slot| slot.role == DISTILL) {
                 self.copy_one_slot(context_id, DISTILL, &subject, model.backend_id, &model.model, tunables, ModelOnly::default())?;

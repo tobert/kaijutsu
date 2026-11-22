@@ -210,7 +210,7 @@ impl KernelDb {
                     effort: None,
                     thinking_budget: None,
                     thinking_style: None,
-                    decide: None, preview_kib: None,
+                    decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
                 })?;
                 continue;
             }

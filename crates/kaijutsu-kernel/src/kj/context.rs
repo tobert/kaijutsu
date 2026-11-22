@@ -4370,7 +4370,7 @@ mod tests {
         db.set_character_model(&crate::kernel_db::CharacterModelRow {
             principal_id: judge, backend_id: nagaya.backend_id, model: s("judge-model"),
             max_tokens: judge_max_tokens, temperature: None, top_p: None, effort: None,
-            thinking_budget: None, thinking_style: None, decide: None, preview_kib: None,
+            thinking_budget: None, thinking_style: None, decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
         }).unwrap();
         drop(db);
         let seat = crate::kj::test_helpers::register_rooted_context(&d, Some("banto-seat"), banto);
@@ -5926,7 +5926,7 @@ mod tests {
             let mock = db.get_backend_by_name("mock").unwrap().unwrap();
             db.set_character_model(&crate::kernel_db::CharacterModelRow {
                 principal_id: f.banto, backend_id: mock.backend_id, model: s("mock-banto-model"), max_tokens: Some(512),
-                temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None, preview_kib: None,
+                temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None, decide: None, preview_kib: None, verbosity: None, reasoning_summary: None,
             }).unwrap();
         }
         let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;

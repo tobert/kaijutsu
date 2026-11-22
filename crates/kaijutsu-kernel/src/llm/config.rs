@@ -473,6 +473,11 @@ pub struct SlotTunables {
     pub effort: Option<String>,
     pub thinking_budget: Option<u64>,
     pub thinking_style: Option<String>,
+    /// Answer length (`low`|`medium`|`high`), sent by the ChatGPT plan route.
+    pub verbosity: Option<String>,
+    /// Reasoning summary (`none`|`auto`|`concise`|`detailed`), sent by the
+    /// ChatGPT plan route.
+    pub reasoning_summary: Option<String>,
     /// VFS path of a decision program. A model slot's turns on a council
     /// backend are then assembled from council decisions.
     pub decide: Option<String>,

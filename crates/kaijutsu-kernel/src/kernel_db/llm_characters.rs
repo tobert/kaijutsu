@@ -88,6 +88,27 @@ pub struct CharacterModelRow {
     /// The shell output this model reads whole, in KiB, before the kernel
     /// cuts it to a preview. `None` takes the kernel default.
     pub preview_kib: Option<i64>,
+    /// Answer length the ChatGPT plan route sends as `text.verbosity`:
+    /// `low`, `medium` or `high`. `None` sends no `text` field.
+    pub verbosity: Option<String>,
+    /// Reasoning summary the ChatGPT plan route asks for: `none`, `auto`,
+    /// `concise` or `detailed`. `None` asks for `auto`.
+    pub reasoning_summary: Option<String>,
+}
+
+/// The values `verbosity` takes.
+pub const VERBOSITIES: [&str; 3] = ["low", "medium", "high"];
+/// The values `reasoning_summary` takes.
+pub const REASONING_SUMMARIES: [&str; 4] = ["none", "auto", "concise", "detailed"];
+
+/// Refuse a setting outside `accepted`, naming the accepted values.
+fn validate_choice(name: &str, value: Option<&str>, accepted: &[&str]) -> KernelDbResult<()> {
+    match value {
+        Some(v) if !accepted.contains(&v) => {
+            Err(KernelDbError::Validation(format!("{name} must be one of {} (got {v:?})", accepted.join(", "))))
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(super) const CHARACTER_SLOT_COLS: &str = "principal_id, role, backend_id, model, max_tokens, temperature, \
@@ -109,7 +130,8 @@ pub(super) fn row_to_character_slot(row: &rusqlite::Row<'_>) -> SqliteResult<Cha
 }
 
 pub(super) const CHARACTER_MODEL_COLS: &str = "principal_id, backend_id, model, max_tokens, temperature, \
-                                    top_p, effort, thinking_budget, thinking_style, decide, preview_kib";
+                                    top_p, effort, thinking_budget, thinking_style, decide, preview_kib, \
+                                    verbosity, reasoning_summary";
 
 pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterModelRow> {
     Ok(CharacterModelRow {
@@ -124,6 +146,8 @@ pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<Ch
         thinking_style: row.get(8)?,
         decide: row.get(9)?,
         preview_kib: row.get(10)?,
+        verbosity: row.get(11)?,
+        reasoning_summary: row.get(12)?,
     })
 }
 
@@ -249,6 +273,8 @@ impl KernelDb {
             row.thinking_style.as_deref(),
         )?;
         validate_decide(row.decide.as_deref())?;
+        validate_choice("verbosity", row.verbosity.as_deref(), &VERBOSITIES)?;
+        validate_choice("reasoning_summary", row.reasoning_summary.as_deref(), &REASONING_SUMMARIES)?;
         if let Some(kib) = row.preview_kib {
             use crate::runtime::embedded_kaish::PreviewLimit;
             let (min, max) = (PreviewLimit::MIN_KIB as i64, PreviewLimit::MAX_KIB as i64);
@@ -259,7 +285,7 @@ impl KernelDb {
         self.conn.execute(
             &format!(
                 "INSERT INTO character_models ({CHARACTER_MODEL_COLS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(principal_id) DO UPDATE SET
                      backend_id = excluded.backend_id,
                      model = excluded.model,
@@ -270,7 +296,9 @@ impl KernelDb {
                      thinking_budget = excluded.thinking_budget,
                      thinking_style = excluded.thinking_style,
                      decide = excluded.decide,
-                     preview_kib = excluded.preview_kib"
+                     preview_kib = excluded.preview_kib,
+                     verbosity = excluded.verbosity,
+                     reasoning_summary = excluded.reasoning_summary"
             ),
             params![
                 blob_param(row.principal_id.as_bytes()),
@@ -284,6 +312,8 @@ impl KernelDb {
                 row.thinking_style,
                 row.decide,
                 row.preview_kib,
+                row.verbosity,
+                row.reasoning_summary,
             ],
         )?;
         Ok(())

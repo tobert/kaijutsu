@@ -15,6 +15,9 @@
 //!   history goes in `input`; only the WebSocket transport ([`super::ws`])
 //!   replaces it with `previous_response_id` and the new items.
 //!
+//! `text.verbosity` and `reasoning.summary` follow the character's settings:
+//! unset, the request has no `text` field and asks for summary `auto`.
+//!
 //! The binding's `max_tokens`, `temperature`, `top_p` and `thinking_budget`
 //! therefore have no sink here; an explicitly set sampling knob or budget is
 //! warned once per backend, model and value.
@@ -82,8 +85,16 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], backend_label: &str
         "store": false,
         "stream": true,
         "include": ["reasoning.encrypted_content"],
-        "reasoning": { "summary": "auto" },
+        "reasoning": {},
     });
+    // `none` leaves the summary out, as Codex does; unset asks for `auto`.
+    match opts.reasoning_summary.as_deref().unwrap_or("auto") {
+        "none" => {}
+        summary => body["reasoning"]["summary"] = Value::String(summary.into()),
+    }
+    if let Some(verbosity) = &opts.verbosity {
+        body["text"] = json!({ "verbosity": verbosity });
+    }
     if let Some(session) = cache_session(opts) {
         body["prompt_cache_key"] = Value::String(session);
     }
@@ -488,5 +499,26 @@ mod tests {
                 assert!(item.get("phase").is_none(), "{item}");
             }
         }
+    }
+
+    /// With neither setting, the request is as it always was: summary `auto`
+    /// and no `text` field. A verbosity rides as `text.verbosity`; a summary
+    /// replaces `auto`, and `none` leaves the field out, as Codex does.
+    ///
+    /// Falsified by a `text` field with nothing set, an ignored setting, or
+    /// `"summary": "none"` on the wire.
+    #[test]
+    fn verbosity_and_reasoning_summary_shape_the_request() {
+        let plain = body(BuildOpts::new("m", 1), &[Message::user("a")]);
+        assert_eq!(plain["reasoning"], json!({ "summary": "auto" }));
+        assert!(plain.get("text").is_none(), "{plain}");
+
+        let v = body(BuildOpts::new("m", 1).with_verbosity("medium").with_reasoning_summary("detailed").with_effort("low"), &[Message::user("a")]);
+        assert_eq!(v["text"], json!({ "verbosity": "medium" }));
+        assert_eq!(v["reasoning"], json!({ "summary": "detailed", "effort": "low" }));
+
+        let quiet = body(BuildOpts::new("m", 1).with_reasoning_summary("none").with_effort("low"), &[Message::user("a")]);
+        assert_eq!(quiet["reasoning"], json!({ "effort": "low" }), "{quiet}");
+        assert!(quiet.get("text").is_none(), "{quiet}");
     }
 }
