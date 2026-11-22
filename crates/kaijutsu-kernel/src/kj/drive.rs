@@ -32,7 +32,14 @@ pub(crate) struct DriveArgs {
     /// Missed or invalid score output fallback.
     #[arg(long, requires = "score_at", value_parser = ["last-good", "skip"])]
     fallback: Option<String>,
-    /// Target context to drive (label or id); defaults to the current context.
+    /// Start the turn only when the context has none running. A busy context
+    /// is left alone and nothing is written, so a wake never stacks a second
+    /// turn on it.
+    #[arg(long)]
+    if_idle: bool,
+    /// Target context to drive (label or id; `.senpai` is the context this one
+    /// answers to). A seat without the `operator` capability may drive only
+    /// itself and its senpai. Defaults to the current context.
     target: Option<String>,
 }
 
@@ -89,10 +96,32 @@ impl KjDispatcher {
             }
         };
 
+        // `drive` alone reaches this context and the one it answers to; the
+        // `operator` capability reaches any context. A privileged caller (the
+        // rc lifecycle) is the control plane and is not narrowed.
+        if !caller.privileged && Some(target) != caller.context_id
+            && self.require_cap(caller, crate::mcp::Capability::Operator, "drive").is_err()
+        {
+            let senpai = caller.context_id.and_then(|own| self.kernel_db().lock().senpai_of(own).ok().flatten());
+            if senpai != Some(target) {
+                return KjResult::Err(format!(
+                    "kj drive: this seat may drive itself and its senpai; context {} is neither \
+                     (the `operator` capability reaches any context)",
+                    target.short()
+                ));
+            }
+        }
+
         // A context a person performs runs no model turns; refuse with the
         // turn's own text before the seed is written.
         if let Err(refusal) = crate::runtime::turn_identity::refuse_a_persons_context(&self.kernel_db().lock(), target) {
             return KjResult::Err(format!("kj drive: {refusal}"));
+        }
+
+        // A wake leaves a busy context alone before it writes anything. The
+        // admission below settles the race with a turn that starts meanwhile.
+        if parsed.if_idle && self.kernel().turn_in_flight(target) {
+            return Self::drive_busy(target);
         }
 
         // Reserve, then admit, before the seed block write below
@@ -186,12 +215,19 @@ impl KjDispatcher {
             None => tail,
         };
 
-        let (turn_id, work_id) = match self.kernel().request_turn_admitted(crate::runtime::turn_request::TurnRequest {
+        let request = crate::runtime::turn_request::TurnRequest {
             score,
             context_id: target, after_block_id: after, content: seed,
             principal_id: caller.actor_id, continuation_epoch: None,
-        }, slot, admission) {
+        };
+        let admitted = if parsed.if_idle {
+            self.kernel().request_turn_if_idle_admitted(request, slot, admission)
+        } else {
+            self.kernel().request_turn_admitted(request, slot, admission)
+        };
+        let (turn_id, work_id) = match admitted {
             Ok(crate::runtime::turn_request::TurnAdmission::Accepted { turn_id, work_id }) => (turn_id, work_id),
+            Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) if parsed.if_idle => return Self::drive_busy(target),
             Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) => unreachable!("explicit drive admits a turn"),
             Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),
         };
@@ -208,6 +244,16 @@ impl KjDispatcher {
                 "turn_id": turn_id,
                 "work_id": work_id,
             })),
+        }
+    }
+    /// The answer for `--if-idle` on a context with a turn running: success,
+    /// with nothing started.
+    fn drive_busy(target: kaijutsu_types::ContextId) -> KjResult {
+        KjResult::Ok {
+            message: format!("'{}' has a turn running; nothing started", target.short()),
+            content_type: ContentType::Plain,
+            ephemeral: false,
+            data: Some(serde_json::json!({ "context_id": target.to_hex(), "accepted": false, "busy": true })),
         }
     }
 }
@@ -738,6 +784,154 @@ mod tests {
         d.kernel_db().lock().upsert_context_binding(ctx, &binding).unwrap();
         let result = d.dispatch(&[s("drive")], &c).await;
         assert!(result.is_ok(), "drive with the `drive` cap should pass: {}", result.message());
+    }
+
+    /// A seat that holds `drive` without `operator` (a kohai) may drive itself
+    /// and the context it answers to, and no other context. `operator` reaches
+    /// any context.
+    #[tokio::test]
+    async fn drive_without_operator_reaches_only_itself_and_its_senpai() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let senpai = register_context(&d, Some("up"), None, principal);
+        let kohai = register_context(&d, Some("kohai"), None, principal);
+        let other = register_context(&d, Some("other"), None, principal);
+        for ctx in [senpai, kohai, other] {
+            seed_with_block(&d, ctx, principal);
+        }
+        d.kernel_db().lock().set_context_senpai(kohai, Some(senpai)).unwrap();
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(crate::mcp::Capability::AllInstances);
+        binding.grant(crate::mcp::Capability::AllFacades);
+        binding.grant(crate::mcp::Capability::House);
+        binding.grant(crate::mcp::Capability::Drive);
+        d.kernel_db().lock().upsert_context_binding(kohai, &binding).unwrap();
+        let c = caller_with_context(kohai);
+        let _sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        for reachable in [".senpai", "up", "."] {
+            let result = d.dispatch(&[s("drive"), s(reachable)], &c).await;
+            assert!(result.is_ok(), "{reachable} should be drivable: {}", result.message());
+        }
+        let result = d.dispatch(&[s("drive"), s("other")], &c).await;
+        assert!(!result.is_ok(), "a kohai must not drive a context that is not its senpai");
+        assert!(
+            result.message().contains("senpai") && result.message().contains("operator"),
+            "the refusal should say whom a seat may drive and what widens it: {}",
+            result.message()
+        );
+
+        binding.grant(crate::mcp::Capability::Operator);
+        d.kernel_db().lock().upsert_context_binding(kohai, &binding).unwrap();
+        let result = d.dispatch(&[s("drive"), s("other")], &c).await;
+        assert!(result.is_ok(), "`operator` reaches any context: {}", result.message());
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    fn accepted(result: &super::super::KjResult) -> bool {
+        let super::super::KjResult::Ok { data: Some(data), .. } = result else { panic!("no data: {result:?}") };
+        data["accepted"].as_bool().expect("accepted")
+    }
+
+    /// `--if-idle` starts a turn only when none is running, so a wake never
+    /// stacks a second turn on a busy context.
+    #[tokio::test]
+    async fn drive_if_idle_leaves_a_busy_context_alone() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("warm"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        let c = caller_with_context(ctx);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let running = d.kernel().turns().begin(ctx);
+        let before = d.block_store().block_snapshots(ctx).unwrap().len();
+        let result = d.dispatch(&[s("drive"), s("--if-idle"), s("--prompt"), s("status?")], &c).await;
+        assert!(result.is_ok(), "a busy context is not an error: {}", result.message());
+        assert!(result.message().contains("turn running"), "{}", result.message());
+        assert_eq!(accepted(&result), false);
+        assert!(sub.try_recv().is_none(), "no turn was requested");
+        assert_eq!(d.block_store().block_snapshots(ctx).unwrap().len(), before, "no seed was written");
+        assert_eq!(d.kernel().turns().active_count(ctx), 1, "no second turn started");
+
+        drop(running);
+        let result = d.dispatch(&[s("drive"), s("--if-idle")], &c).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert_eq!(accepted(&result), true);
+        assert!(sub.try_recv().is_some(), "an idle context takes the turn");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// An autonomous turn that ends by calling `done` runs the context's
+    /// `done` rc verb, which reads the model's report from `KJ_DONE_*`.
+    #[tokio::test]
+    async fn a_turn_that_ends_with_done_runs_the_done_verb_with_the_report() {
+        use crate::llm::{MockClient, Provider, StreamEvent};
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let principal = PrincipalId::new();
+        let judge = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None,
+            mcp_hub_ctx: None, principal_id: judge, name: s("drive-judge"), created_at: 1, retired_at: None, handoff_ctx: None,
+            root_ctx: None, root: false }).unwrap();
+        let ctx = register_context_with_model(&d, Some("worker"), None, principal, &["model"]);
+        seed_with_block(&d, ctx, principal);
+        d.kernel_db().lock().assign_test_review(ctx, Some(principal), Some(judge)).unwrap();
+        crate::kj::test_helpers::install_rc_script_file(&d, "/config/rc/coder/done/S10-note.kai",
+            "kj block create --role system --kind text --content \"verb:$KJ_DONE_STATUS:$KJ_DONE_FEEDBACK\"").await;
+        let stop = |reason: &str| StreamEvent::Done { stop_reason: Some(reason.into()), input_tokens: None, output_tokens: None, extra: None };
+        let mock = MockClient::new("").with_scripted_stream(vec![vec![
+            StreamEvent::ToolUse { id: s("call_done"), name: s("done"),
+                input: serde_json::json!({"status": "blocked", "feedback": "needs the key"}), signature: None },
+            stop("tool_use"),
+        ]]);
+        d.kernel().llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        d.kernel().broker().register(std::sync::Arc::new(crate::mcp::servers::BuiltinTurnServer::new()),
+            crate::mcp::InstancePolicy::for_kernel(d.kernel())).await.unwrap();
+        d.kernel().broker().set_binding(ctx, crate::mcp::ContextToolBinding::with_instances(
+            vec![crate::mcp::InstanceId::new(crate::mcp::servers::BuiltinTurnServer::INSTANCE)])).await.unwrap();
+
+        let result = d.dispatch(&[s("drive")], &caller_with_context(ctx)).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let blocks = d.block_store().block_snapshots(ctx).unwrap();
+            if blocks.iter().any(|b| b.content == "verb:blocked:needs the key") { break; }
+            assert!(std::time::Instant::now() < deadline, "the done verb never ran: {:#?}",
+                blocks.iter().map(|b| (b.role, b.kind, b.content.clone())).collect::<Vec<_>>());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A turn that fails before it starts still tells the `done` verb, so a
+    /// senpai hears about a kohai that never got going.
+    #[tokio::test]
+    async fn a_turn_that_fails_to_start_runs_the_done_verb_as_failed() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let principal = PrincipalId::new();
+        // No reviewer: the turn cannot start.
+        let ctx = register_context_with_model(&d, Some("orphan"), None, principal, &["model"]);
+        seed_with_block(&d, ctx, principal);
+        crate::kj::test_helpers::install_rc_script_file(&d, "/config/rc/coder/done/S10-note.kai",
+            "kj block create --role system --kind text --content \"verb:$KJ_DONE_STATUS\"").await;
+
+        let result = d.dispatch(&[s("drive")], &caller_with_context(ctx)).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let blocks = d.block_store().block_snapshots(ctx).unwrap();
+            if blocks.iter().any(|b| b.content == "verb:failed") { break; }
+            assert!(std::time::Instant::now() < deadline, "the done verb never ran: {:#?}",
+                blocks.iter().map(|b| (b.role, b.kind, b.content.clone())).collect::<Vec<_>>());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]

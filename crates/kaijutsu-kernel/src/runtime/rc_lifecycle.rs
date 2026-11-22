@@ -48,6 +48,34 @@ pub fn submit(
     })
 }
 
+/// Queue the `done` verb for a context whose autonomous turn just ended.
+/// The turn is already over, so nothing here may fail it: a context that
+/// cannot run the verb (no dispatcher, a full worker pool, archived) is
+/// logged and skipped.
+pub(crate) async fn fire_done(kernel: &Arc<crate::Kernel>, context: kaijutsu_types::ContextId, ending: crate::rc::DoneInfo) {
+    let Some(dispatcher) = kernel.broker().kj_dispatcher().await else {
+        tracing::debug!(%context, "no kj dispatcher is wired; the done verb is skipped");
+        return;
+    };
+    let slot = match kernel.reserve_runtime_slot() {
+        Ok(slot) => slot,
+        Err(error) => {
+            tracing::warn!(%context, "the done verb was not admitted: {error}");
+            return;
+        }
+    };
+    let admission = match kernel.admit_context(context) {
+        Ok(admission) => admission,
+        Err(error) => {
+            tracing::debug!(%context, "the done verb was not admitted: {error}");
+            return;
+        }
+    };
+    if let Err(error) = submit(dispatcher, admission, slot, crate::rc::VERB_DONE, ending.vars()) {
+        tracing::warn!(%context, "the done verb could not start: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

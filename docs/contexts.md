@@ -118,7 +118,10 @@ blocks:
 ## Orchestration and peers
 
 - **Driving and waiting.** `kj drive <ctx> [prompt]` starts one autonomous turn
-  on a target context. `kj wait [<ctx>] [--since <cursor>] [--timeout <secs>]`
+  on a target context. A seat that holds `drive` without `operator` (a kohai)
+  may drive only itself and its senpai (`.senpai`); `operator` reaches any
+  context. `--if-idle` starts the turn only when the target has none running,
+  and a busy target is left alone with nothing written. `kj wait [<ctx>] [--since <cursor>] [--timeout <secs>]`
   waits for accepted turns, a background shell `--operation`, an `--ask`
   decision, or a kaish `--job`, returning the newest blocks and a `cursor` for
   the next wait (`status: idle | ask | running`).

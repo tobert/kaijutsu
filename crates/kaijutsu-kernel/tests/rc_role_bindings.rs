@@ -606,8 +606,10 @@ async fn only_house_seats_hold_the_house_capability_body() {
 }
 
 /// A coder or kohai keeps the work authorities (drift, fork, exec, editor) and
-/// drops the ones that run the instrument: the kj verbs for context lifecycle,
-/// the beat, and self-driving belong to a house seat.
+/// drops the ones that run the instrument: the kj verbs for context lifecycle
+/// and the beat belong to a house seat. A kohai also holds `drive`, which
+/// without `operator` reaches only itself and its senpai (`kj drive`); a coder
+/// does not drive.
 #[test]
 fn coder_loadout_is_a_worker_loadout() {
     run_on_rc_stack(|| {
@@ -630,9 +632,10 @@ async fn coder_loadout_is_a_worker_loadout_body() {
             assert!(binding.allows(&cap), "{dir} should allow {cap:?}");
         }
         for cap in [Capability::House, Capability::Operator, Capability::Transport,
-                    Capability::Drive, Capability::System, Capability::ConfigWrite, Capability::Admin] {
+                    Capability::System, Capability::ConfigWrite, Capability::Admin] {
             assert!(!binding.allows(&cap), "{dir} must not allow {cap:?}");
         }
+        assert_eq!(binding.allows(&Capability::Drive), dir == "kohai", "{dir}: drive");
     }
 }
 

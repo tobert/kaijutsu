@@ -48,17 +48,36 @@ impl Kernel {
         self: &Arc<Self>, request: TurnRequest, slot: crate::runtime::RuntimeSlot,
         admission: super::admission::ContextAdmission,
     ) -> Result<TurnAdmission, String> {
+        let idle_only = request.continuation_epoch.is_some();
+        self.admit_turn(request, slot, admission, idle_only)
+    }
+
+    /// [`Self::request_turn_admitted`] for a wake: the turn starts only when
+    /// the context has none running, and a busy context answers
+    /// [`TurnAdmission::AlreadyActive`] with nothing queued.
+    pub(crate) fn request_turn_if_idle_admitted(
+        self: &Arc<Self>, request: TurnRequest, slot: crate::runtime::RuntimeSlot,
+        admission: super::admission::ContextAdmission,
+    ) -> Result<TurnAdmission, String> {
+        self.admit_turn(request, slot, admission, true)
+    }
+
+    fn admit_turn(
+        self: &Arc<Self>, request: TurnRequest, slot: crate::runtime::RuntimeSlot,
+        admission: super::admission::ContextAdmission, idle_only: bool,
+    ) -> Result<TurnAdmission, String> {
         assert_eq!(admission.context(), request.context_id, "admission belongs to its request");
         // The lease begins under the database guard, as the admission mint
         // does in `prompt::submit`, so both stay ordered against archive.
         let mut lease = {
             let _db = self.kernel_db().lock();
-            match request.continuation_epoch {
-                Some(_) => match self.turns().begin_if_idle(request.context_id) {
+            if idle_only {
+                match self.turns().begin_if_idle(request.context_id) {
                     Some(lease) => lease,
                     None => return Ok(TurnAdmission::AlreadyActive),
-                },
-                None => self.turns().begin(request.context_id),
+                }
+            } else {
+                self.turns().begin(request.context_id)
             }
         };
         let turn_id = lease.id();
@@ -228,7 +247,7 @@ pub(crate) fn watch_startup(
     });
 }
 
-pub(super) fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, origin: TurnOrigin, error: String) {
+pub(super) fn report_failure(kernel: &Arc<Kernel>, turn_id: TurnId, request: &TurnRequest, origin: TurnOrigin, error: String) {
     let payload = kaijutsu_types::ErrorPayload {
         category: kaijutsu_types::ErrorCategory::Stream,
         severity: kaijutsu_types::ErrorSeverity::Error,
@@ -242,11 +261,19 @@ pub(super) fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnReq
     ) {
         tracing::error!("failed to record rejected turn: {insert_error}");
     }
-    kernel.turn_flows().publish(TurnFlow::Failed {
+    let failed = TurnFlow::Failed {
         turn_id,
         context_id: request.context_id, principal_id: request.principal_id,
         error, origin,
-    });
+    };
+    // A turn that never started still ends the way a running one does, so the
+    // `done` verb hears of it.
+    let ending = crate::rc::DoneInfo::from_ending(&failed, origin, None);
+    kernel.turn_flows().publish(failed);
+    if let Some(ending) = ending {
+        let (kernel, context) = (kernel.clone(), request.context_id);
+        tokio::spawn(async move { super::rc_lifecycle::fire_done(&kernel, context, ending).await });
+    }
 }
 
 #[cfg(test)]

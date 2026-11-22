@@ -431,3 +431,12 @@ Feedback retains its original source anchor when available and retries missing a
 - **Error classification:** Catch-all HTTP statuses and JSON parse failures map to retriable `ApiError`, risking infinite retry loops on permanent failures.
 - **Lock contention & burst limits:** Concurrency limits and queue timeouts need tuning under heavy load, and SQLite locking across editor sessions and council megakernels stalls concurrent work.
 - **Deadlines and timeouts:** Endpoints give free slots regardless of elapsed caller deadlines; long-running shell calls need robust timeout policy enforcement.
+
+## The `done` verb and the senpai wake: what is left (2026-11-22)
+
+The `done` rc verb, `kj drive --if-idle`, and the rule that a seat holding `drive` without `operator` reaches only itself and its senpai are in (`rc/mod.rs`, `kj/drive.rs`, `docs/rc.md`, "The `done` verb"). Tested on the mock provider; not yet run on the live kernel. Open:
+
+- **Deploy.** A host made before this has no `kohai/done/S10-notify.kai`, and its `kohai/create/S10-binding.kai` lacks `drive`; `kaijutsu-server rc reseed` leaves a differing binding alone, so a live kohai needs `--force` or a hand edit, then a new context (a loadout is copied at create).
+- **A drive into a busy senpai can still leave a seed.** `kj drive --if-idle --prompt …` checks for a running turn before it writes the prompt, but a turn that starts between that check and admission leaves the prompt block in the log with no turn of its own. The atomic admission prevents a second turn.
+- **Whether the gate sees the script.** The `done` script runs `kj drift push` and `kj drive` as the system caller on the kohai's context. Check on the live kernel that neither waits on a gate ask or a drift ask.
+- **One verb call per turn, not per task.** A kohai that calls `done` and is driven again fires `done` again; a senpai that drives it in a loop sees one report per turn.

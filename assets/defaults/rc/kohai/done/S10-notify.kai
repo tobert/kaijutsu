@@ -1,0 +1,19 @@
+# kohai: tell the senpai how an autonomous turn ended, and wake it.
+#
+# The kernel fires `done` after a kohai's autonomous turn ends: when the model
+# calls `done` (KJ_DONE_STATUS is done, blocked, gave_up, or refused) and when
+# the turn stops another way (ended, max_tokens, max_iterations, failed).
+# A cancelled turn and a turn a person prompted fire nothing. KJ_DONE_FEEDBACK
+# holds the model's feedback, or the failure's message.
+#
+# The drift push lands in the senpai's log: a senpai mid-turn reads it after
+# its next tool round, and it reads as a system message. The drive then
+# starts a turn only when the senpai has none running (`--if-idle`), so a
+# busy senpai is never given a second turn. This kohai stays live: the senpai
+# may drive it again when the work is going well.
+set -e
+label="$(kj context info --json | jq -r '.label')"
+kj drift push .senpai "=== kohai $label finished: $KJ_DONE_STATUS ===
+$KJ_DONE_FEEDBACK
+$label is still live. To keep it going: kj drive $label --prompt <what next>"
+kj drive .senpai --if-idle

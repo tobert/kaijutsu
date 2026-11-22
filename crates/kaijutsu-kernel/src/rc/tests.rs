@@ -3553,6 +3553,24 @@ esac
                 assert!(r.is_ok(), "archive failed: {}", r.message());
                 ctx
             }
+            VERB_DONE => {
+                // An autonomous turn that cannot start (no reviewer) ends as
+                // failed, and its end fires `done`; only the run row is under test.
+                let ctx = crate::kj::test_helpers::register_context_with_model(&d, Some("wired-done"), None, principal, &["model"]);
+                perform_with_rc_dir(&d, ctx, "test");
+                d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+                d.block_store().insert_block_as(ctx, None, None, Role::User, BlockKind::Text, "go".to_string(),
+                    Status::Done, ContentType::Plain, Some(principal)).unwrap();
+                let caller = KjCaller { privileged: true, ..caller_with_context(ctx) };
+                let r = d.dispatch(&argv(&["drive"]), &caller).await;
+                assert!(r.is_ok(), "drive failed: {}", r.message());
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !run_rows_for_verb(&d, VERB_DONE).iter().any(|row| row.finished_at.is_some()) {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.expect("the failed turn runs the done verb");
+                ctx
+            }
             other => panic!(
                 "RC_VERBS gained '{other}': add its real caller here, or list it in \
                  SERVER_FIRED_VERBS and cover it in kaijutsu-server beat tests"
@@ -3629,6 +3647,165 @@ esac
         assert_eq!(vars["KJ_EDGE_SHOWN"], "");
         assert_eq!(vars["KJ_LOG_TAIL"], "");
         assert_eq!(vars["KJ_TURN_LIVE"], "false");
+    }
+
+    fn ended(reason: crate::flows::TurnStopReason, origin: crate::flows::TurnOrigin) -> crate::flows::TurnFlow {
+        crate::flows::TurnFlow::Completed {
+            turn_id: kaijutsu_types::TurnId::new(), context_id: ContextId::new(), principal_id: PrincipalId::new(),
+            output_block_id: None, reason, origin,
+        }
+    }
+
+    /// The `done` verb hears how an autonomous turn ended: the model's own
+    /// report when it called `done`, else the way the turn stopped.
+    #[test]
+    fn done_info_names_how_an_autonomous_turn_ended() {
+        use crate::flows::{TurnFlow, TurnOrigin::Autonomous, TurnStopReason};
+        let report = DoneReport { status: "blocked".into(), feedback: "needs the API key".into() };
+        let info = DoneInfo::from_ending(&ended(TurnStopReason::EndTurn, Autonomous), Autonomous, Some(report)).expect("fires");
+        let vars = info.vars();
+        assert_eq!(vars["KJ_DONE_STATUS"], "blocked");
+        assert_eq!(vars["KJ_DONE_FEEDBACK"], "needs the API key");
+        assert_eq!(vars["KJ_OUTPUT_BLOCK"], "", "empty, not absent, when the turn left no output");
+        assert_eq!(vars["KJ_TURN_ID"].len(), info.turn_id.to_string().len());
+
+        for (reason, status) in [(TurnStopReason::EndTurn, "ended"), (TurnStopReason::MaxTokens, "max_tokens"),
+            (TurnStopReason::MaxIterations, "max_iterations")] {
+            let info = DoneInfo::from_ending(&ended(reason, Autonomous), Autonomous, None).expect("fires");
+            assert_eq!(info.vars()["KJ_DONE_STATUS"], status);
+            assert_eq!(info.vars()["KJ_DONE_FEEDBACK"], "");
+        }
+
+        let failed = TurnFlow::Failed {
+            turn_id: kaijutsu_types::TurnId::new(), context_id: ContextId::new(), principal_id: PrincipalId::new(),
+            error: "provider returned 500".into(), origin: Autonomous,
+        };
+        let info = DoneInfo::from_ending(&failed, Autonomous, None).expect("a failure is reported");
+        assert_eq!(info.vars()["KJ_DONE_STATUS"], "failed");
+        assert_eq!(info.vars()["KJ_DONE_FEEDBACK"], "provider returned 500");
+    }
+
+    /// A cancelled turn, and a turn a person prompted, end quietly: whoever
+    /// cancelled or prompted already knows.
+    #[test]
+    fn done_info_is_silent_for_a_cancel_and_for_an_interactive_turn() {
+        use crate::flows::{TurnOrigin::{Autonomous, Interactive}, TurnStopReason};
+        for immediate in [true, false] {
+            assert!(DoneInfo::from_ending(&ended(TurnStopReason::Cancelled { immediate }, Autonomous), Autonomous, None).is_none());
+        }
+        assert!(DoneInfo::from_ending(&ended(TurnStopReason::EndTurn, Interactive), Interactive,
+            Some(DoneReport { status: "done".into(), feedback: "x".into() })).is_none());
+    }
+
+    /// A kohai under a senpai, created from the shipped rc, whose mock model
+    /// calls `done`. Returns the senpai and the kohai's label.
+    async fn kohai_that_calls_done(d: &std::sync::Arc<KjDispatcher>) -> (ContextId, &'static str) {
+        use crate::llm::{MockClient, Provider, StreamEvent};
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(d).await;
+        let console = console_caller(d);
+        let created = |label: &str, dir: &str| -> Vec<String> {
+            ["context", "create", rc_performer(d, dir).as_str(), "--name", label].map(String::from).to_vec()
+        };
+        let r = d.dispatch(&created("mid", "coder"), &console).await;
+        assert!(r.is_ok(), "create the senpai: {}", r.message());
+        let mid = lookup_context_id(d, "mid");
+        let kohai_character = rc_performer(d, "kohai");
+        let principal = d.kernel_db().lock().get_character_by_name(&kohai_character).unwrap().unwrap().principal_id;
+        d.kernel_db().lock().seed_test_slots(principal, "mock", "mock-model", &["model"]).unwrap();
+        let mut args = created("kh", "kohai");
+        args.extend(["--senpai".to_string(), "mid".to_string()]);
+        let r = d.dispatch(&args, &console).await;
+        assert!(r.is_ok(), "create the kohai: {}", r.message());
+        let stop = |reason: &str| StreamEvent::Done { stop_reason: Some(reason.into()), input_tokens: None, output_tokens: None, extra: None };
+        let mock = MockClient::new("").with_scripted_stream(vec![vec![
+            StreamEvent::ToolUse { id: "call_done".into(), name: "done".into(),
+                input: serde_json::json!({"status": "done", "feedback": "fixed the build"}), signature: None },
+            stop("tool_use"),
+        ]]);
+        d.kernel().llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        let _ = d.kernel().broker().register(std::sync::Arc::new(crate::mcp::servers::BuiltinTurnServer::new()),
+            crate::mcp::InstancePolicy::for_kernel(d.kernel())).await;
+        let kh = lookup_context_id(d, "kh");
+        let r = d.dispatch(&["drive".to_string(), "kh".to_string(), "--prompt".to_string(), "fix the build".to_string()], &console).await;
+        assert!(r.is_ok(), "drive the kohai: {}", r.message());
+        let _ = kh;
+        (mid, "kh")
+    }
+
+    async fn senpai_hears(d: &KjDispatcher, mid: ContextId) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let heard = d.block_store().block_snapshots(mid).unwrap().into_iter()
+                .find(|b| b.kind == kaijutsu_types::BlockKind::Drift && b.content.contains("finished: done"));
+            if let Some(block) = heard { return Some(block.content); }
+            if std::time::Instant::now() > deadline { return None; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A kohai that calls `done` tells its senpai what it reported and wakes
+    /// the senpai when the senpai is idle.
+    #[test]
+    fn a_kohai_that_calls_done_tells_an_idle_senpai_and_wakes_it() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            let mut requested = d.kernel().turn_flows().subscribe("turn.requested");
+            let (mid, label) = kohai_that_calls_done(&d).await;
+            let note = senpai_hears(&d, mid).await.expect("the senpai's log never heard the kohai finish");
+            assert!(note.contains("fixed the build") && note.contains(&format!("kj drive {label}")), "{note}");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let woken = loop {
+                let mut woken = false;
+                while let Some(event) = requested.try_recv() {
+                    woken |= matches!(event.payload, crate::flows::TurnFlow::Requested { context_id, .. } if context_id == mid);
+                }
+                if woken || std::time::Instant::now() > deadline { break woken; }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            assert!(woken, "an idle senpai is driven");
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+        });
+    }
+
+    /// A busy senpai still hears the kohai, in its log, and is not given a
+    /// second turn.
+    #[test]
+    fn a_kohai_that_calls_done_leaves_a_busy_senpai_its_turn() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            let mut requested = d.kernel().turn_flows().subscribe("turn.requested");
+            // The senpai is created inside the helper, so hold its turn open
+            // from the first event that names it.
+            let holder = {
+                let d = d.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Ok(Some(row)) = d.kernel_db().lock().find_context_by_label("mid") {
+                            return d.kernel().turns().begin(row.context_id);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+            };
+            let (mid, _) = kohai_that_calls_done(&d).await;
+            let running = holder.await.unwrap();
+            senpai_hears(&d, mid).await.expect("the senpai's log never heard the kohai finish");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            while let Some(event) = requested.try_recv() {
+                assert!(!matches!(event.payload, crate::flows::TurnFlow::Requested { context_id, .. } if context_id == mid),
+                    "a busy senpai was given a second turn");
+            }
+            assert_eq!(d.kernel().turns().active_count(mid), 1, "only the turn already running");
+            drop(running);
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn done_is_a_canonical_wired_verb() {
+        assert!(RC_VERBS.contains(&VERB_DONE));
+        assert!(verb_is_wired("done"));
     }
 
     #[test]

@@ -152,6 +152,13 @@ pub const VERB_SUBMIT: &str = "submit";
 /// is recorded and the archive still commits.
 pub const VERB_ARCHIVE: &str = "archive";
 
+/// The done verb: fired by the kernel after an autonomous turn ends, whether
+/// the model called `done` or the turn stopped another way. Scripts see how it
+/// ended as `KJ_DONE_*` variables ([`DoneInfo::vars`]) and typically tell the
+/// context's senpai. A turn a person prompted and a cancelled turn fire
+/// nothing. The context stays live, so the senpai may drive it again.
+pub const VERB_DONE: &str = "done";
+
 /// Canonical verbs shared by lifecycle dispatch and script path validation.
 pub const RC_VERBS: &[&str] = &[
     VERB_CREATE,
@@ -162,7 +169,71 @@ pub const RC_VERBS: &[&str] = &[
     VERB_ROTATE,
     VERB_SUBMIT,
     VERB_ARCHIVE,
+    VERB_DONE,
 ];
+
+/// What the model said when it called `done`: one of `done`, `blocked`,
+/// `gave_up`, `refused`, and its free-form feedback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoneReport {
+    pub status: String,
+    pub feedback: String,
+}
+
+/// How an autonomous turn ended, as the `done` verb's scripts see it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoneInfo {
+    pub turn_id: kaijutsu_types::TurnId,
+    /// The model's reported status, else `ended`, `max_tokens`,
+    /// `max_iterations`, or `failed`.
+    pub status: String,
+    /// The model's feedback, or the failure's message; empty otherwise.
+    pub feedback: String,
+    pub output_block: Option<BlockId>,
+}
+
+impl DoneInfo {
+    /// The facts for a turn's last event, or `None` when the verb should not
+    /// fire: a turn a person prompted, and a cancelled turn.
+    pub fn from_ending(
+        event: &crate::flows::TurnFlow,
+        origin: crate::flows::TurnOrigin,
+        report: Option<DoneReport>,
+    ) -> Option<Self> {
+        use crate::flows::{TurnFlow, TurnOrigin, TurnStopReason};
+        if origin != TurnOrigin::Autonomous {
+            return None;
+        }
+        match event {
+            TurnFlow::Completed { turn_id, output_block_id, reason, .. } => {
+                let (status, feedback) = match (report, reason) {
+                    (_, TurnStopReason::Cancelled { .. }) => return None,
+                    (Some(report), _) => (report.status, report.feedback),
+                    (None, TurnStopReason::EndTurn) => ("ended".to_string(), String::new()),
+                    (None, TurnStopReason::MaxTokens) => ("max_tokens".to_string(), String::new()),
+                    (None, TurnStopReason::MaxIterations) => ("max_iterations".to_string(), String::new()),
+                };
+                Some(Self { turn_id: *turn_id, status, feedback, output_block: *output_block_id })
+            }
+            TurnFlow::Failed { turn_id, error, .. } => Some(Self {
+                turn_id: *turn_id, status: "failed".to_string(), feedback: error.to_string(), output_block: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The script environment: KJ_DONE_STATUS, KJ_DONE_FEEDBACK, KJ_TURN_ID,
+    /// KJ_OUTPUT_BLOCK (a block key, "" when the turn left no output). Every
+    /// name is always set.
+    pub fn vars(&self) -> HashMap<String, String> {
+        HashMap::from([
+            ("KJ_DONE_STATUS".to_string(), self.status.clone()),
+            ("KJ_DONE_FEEDBACK".to_string(), self.feedback.clone()),
+            ("KJ_TURN_ID".to_string(), self.turn_id.to_string()),
+            ("KJ_OUTPUT_BLOCK".to_string(), self.output_block.map(|b| b.to_key()).unwrap_or_default()),
+        ])
+    }
+}
 
 fn verb_is_wired(verb: &str) -> bool {
     RC_VERBS.contains(&verb)

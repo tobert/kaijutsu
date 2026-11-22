@@ -78,6 +78,8 @@ pub struct TurnLease {
     delivery: Option<crate::hyoushigi::model::OutputDelivery>,
     blocks: std::cell::RefCell<Vec<kaijutsu_types::BlockId>>,
     interrupt: Arc<ContextInterruptState>,
+    /// What the model reported when its `done` call ended the turn.
+    done: parking_lot::Mutex<Option<crate::rc::DoneReport>>,
 }
 
 impl TurnLease {
@@ -106,6 +108,17 @@ impl TurnLease {
     }
     pub(crate) fn interrupt(&self) -> Arc<ContextInterruptState> { self.interrupt.clone() }
     pub(crate) fn context(&self) -> ContextId { self.context }
+    /// Keep the report of the `done` call that ended this turn, for the
+    /// `done` rc verb.
+    pub(super) fn record_done(&self, report: crate::rc::DoneReport) {
+        *self.done.lock() = Some(report);
+    }
+
+    /// The report [`Self::record_done`] kept, if the turn ended with `done`.
+    pub(super) fn take_done(&self) -> Option<crate::rc::DoneReport> {
+        self.done.lock().take()
+    }
+
     /// Record who asked for this turn, so [`TurnState::any_autonomous`] can
     /// answer for it while it is accepted.
     pub(crate) fn set_origin(&self, origin: crate::flows::TurnOrigin) {
@@ -174,7 +187,7 @@ impl TurnState {
         active.entry(context).or_default().insert(id, ActiveTurn {
             began: std::time::Instant::now(), interrupt: interrupt.clone(), origin: None,
         });
-        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt })
+        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt, done: Default::default() })
     }
 
     pub fn active_count(&self, context: ContextId) -> usize {

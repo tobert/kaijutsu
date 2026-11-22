@@ -2663,8 +2663,12 @@ async fn process_llm_stream(
                 record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event);
             }
             drop(idle);
+            let ending = crate::rc::DoneInfo::from_ending(&event, origin, turn_lease.take_done());
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
+            if let Some(ending) = ending {
+                super::rc_lifecycle::fire_done(&kernel, context_id, ending).await;
+            }
             if let Some(panic) = wake_undelivered_input(&kernel, &documents, context_id, undelivered).await {
                 cleanup_panic.get_or_insert(panic);
             }
@@ -3713,6 +3717,14 @@ async fn run_llm_stream(
             .filter(|pending| offers_done && pending.name == DONE_TOOL && pending.unparsed.is_none())
             .map(|pending| pending.id.clone())
             .collect();
+        // What each `done` call reported, read before the calls are consumed.
+        let done_reports: Vec<(String, crate::rc::DoneReport)> = tool_calls.iter()
+            .filter(|pending| done_calls.contains(&pending.id))
+            .filter_map(|pending| Some((pending.id.clone(), crate::rc::DoneReport {
+                status: pending.input.get("status")?.as_str()?.to_string(),
+                feedback: pending.input.get("feedback")?.as_str()?.trim().to_string(),
+            })))
+            .collect();
 
         // Calls that write the same file run in call order: each waits for the
         // one before it on that file. Run together, a second edit reads a file
@@ -3805,6 +3817,11 @@ async fn run_llm_stream(
             ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if done_calls.contains(tool_use_id)))
             && !tool_results.iter().any(|result| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
 
+        // The report of the `done` call that succeeded, for the `done` rc verb.
+        let done_report = done.then(|| done_reports.into_iter().find(|(id, _)| tool_results.iter().any(|result| matches!(result,
+            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == id)))
+            .map(|(_, report)| report)).flatten();
+
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
         // The model called `done`, it succeeded, and nothing beside it failed:
@@ -3812,6 +3829,9 @@ async fn run_llm_stream(
         // pending for the turn's end, like input after a final inference.
         if done {
             tracing::info!(%context_id, "The model called `done`; the turn ends");
+            if let Some(report) = done_report {
+                turn_lease.record_done(report);
+            }
             break;
         }
         // Input that arrived during this round joins here, after its
