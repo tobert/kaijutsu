@@ -219,6 +219,34 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
 - **Reading a background run's output is awkward.** Sol ran cargo with `run_in_background` and then grepped `kj wait --operation <id>` for `FAILED` and `test result:` lines; it took several asks to find which tests failed. A way to page or tail an operation's stdout would help.
 - **A reviewer's piped read asks too.** `kj character show sol | grep …` from the senpai console waited on Amy, while the same command without the pipe ran.
 
+## Senpai/kohai smoke test and archive work (2026-11-20)
+
+- **Make the shell choice obvious.** The earlier two-shell setup was confusing;
+  the current kohai binding exposes only `shell_write`. The archive worker
+  confirmed that routine `grep` and `ls` went through approval, and it fell
+  back to individual file reads after refusals. Try `shell_ro` and `shell_rw`
+  with contrasting descriptions. Lead with `shell_ro`: use freely for
+  inspection without approval (`find`, `grep`, `git status`, `kj` reads, and
+  read-only pipes). Refuse output redirects, writes, host programs, and
+  state-changing verbs before running anything, and say why. Use `shell_rw`
+  for changes and host commands such as `cargo test`; the gate may ask.
+  Use Kaibo's approval-free read path as the reference. Test that a fresh
+  kohai picks `shell_ro` on its own and can finish an inspection brief without
+  asks, while writes still go through the right gate.
+- **Make course corrections visible.** During the archive work, a drift
+  changed the brief while the kohai was waiting on tools. The senpai could not
+  tell whether the worker had adopted it and interrupted and drove it again.
+  The kohai found concrete pointers useful but had to infer whether the new
+  brief superseded the original read-only scope. Mark a replacement brief
+  explicitly and show when the worker acknowledges it. For small briefs,
+  state what evidence is enough to stop.
+- **Link approvals to command results.** `allowed` answers who approved, not
+  whether the command ran or finished. Link the ask, shell operation, and
+  exit result so `kj wait`, the ledger, and the TUI agree on waiting for
+  approval (and whose), running, and finished. The kohai repeatedly polled
+  for cargo results even though approval itself was quick. Check that a failed
+  background test updates the TUI without requiring a refresh.
+
 ## Council house rules, objects, and verbs (2026-11-08)
 
 - **Council house rules deadline.** An edited `AGENTS.md` reaches the council at the next decision, not at rotation.
