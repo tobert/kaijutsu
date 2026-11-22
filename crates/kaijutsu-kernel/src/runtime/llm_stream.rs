@@ -796,7 +796,7 @@ pub(super) async fn spawn_admitted_turn(
     }
 
     // A newer turn replaces the refusal an open ask was about.
-    if let Err(error) = kernel_db.lock().withdraw_refusal_asks(context_id) {
+    if let Err(error) = kernel_arc.withdraw_refusal_asks(context_id) {
         tracing::error!(%context_id, %error, "could not withdraw the refused context's ask");
     }
 
@@ -2656,13 +2656,23 @@ async fn process_llm_stream(
             }
             // Close the turn's record with how it ended. A write that fails
             // turns the ending into a failure that says so.
+            let mut record_failed = false;
             if records_turn && let Some(mut error) = finish_turn_record(&kernel_db, &event, refused) {
+                record_failed = true;
                 if let TurnFlow::Failed { error: original, .. } = &event {
                     error = format!("{original}; {error}");
                 }
                 tracing::error!(%context_id, %error);
                 event = TurnFlow::Failed { turn_id, context_id, principal_id: user_principal_id, error, origin };
                 needs_diagnostic = true;
+            }
+            // The ask opens once the turn's record says `refused`: an answer
+            // lifts the hold of that record, so it must exist first.
+            if refused && records_turn && !record_failed && matches!(event, TurnFlow::Failed { .. }) {
+                match kernel.open_refusal_ask(context_id, turn_id) {
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(%context_id, %error, "could not open the ask for a refused context"),
+                }
             }
             // Do not re-enter a document whose cleanup failed. Terminal
             // publication remains possible when its journal is unavailable.
@@ -3617,9 +3627,6 @@ async fn run_llm_stream(
                     if refusal {
                         if let Ok(error_block) = &error_block {
                             settle_refusal(&documents, &kernel_db, context_id, error_block);
-                            if let Err(error) = kernel.open_refusal_ask(context_id) {
-                                tracing::error!(%context_id, %error, "could not open the ask for a refused context");
-                            }
                         }
                         turn_lease.record_refusal();
                     }
@@ -9839,6 +9846,34 @@ mod lifetime_tests {
         submit_text(&kernel, context, call.principal_id, "next").await;
         tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
         assert!(pending().is_empty(), "a person's prompt withdraws the ask");
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// The ask opens only after the turn's record says `refused`: an answer
+    /// lifts the hold on that record, so one that landed first would lift
+    /// nothing and leave the context held with its answer spent.
+    #[tokio::test]
+    async fn the_refusal_ask_opens_after_the_turn_is_recorded_refused() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let refusal = StreamEvent::Error(crate::llm::StreamError::new(
+            crate::llm::StreamErrorKind::Unknown("cyber_policy".into()), "declined"));
+        let (mock, _sent) = MockClient::new("").with_scripted_stream(vec![vec![refusal]]).recording_sent_messages();
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let order = Arc::new(parking_lot::Mutex::new(Vec::<&'static str>::new()));
+        let seen = order.clone();
+        kernel.kernel_db().lock().conn_for_test_mut().authorizer(Some(move |ctx: AuthContext<'_>| {
+            match ctx.action {
+                AuthAction::Update { table_name: "turns", column_name: "stop_reason" } => seen.lock().push("turn_closed"),
+                AuthAction::Insert { table_name: "approvals" } => seen.lock().push("ask_opened"),
+                _ => {}
+            }
+            Authorization::Allow
+        })).unwrap();
+        let mut failed = kernel.turn_flows().subscribe("turn.failed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), failed.recv()).await.unwrap().unwrap();
+        kernel.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        assert_eq!(*order.lock(), ["turn_closed", "ask_opened"]);
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

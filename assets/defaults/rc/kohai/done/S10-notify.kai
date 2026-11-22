@@ -7,7 +7,7 @@
 # holds the model's feedback, or the failure's message.
 #
 # The drift push lands in the senpai's log: a senpai mid-turn reads it after
-# its next tool round, and it reads as a system message. The drive then
+# its next tool round, and it arrives as a user message in a `<drift>` element. The drive then
 # starts a turn only when the senpai has none running (`--if-idle`), so a
 # busy senpai is never given a second turn. This kohai stays live: the senpai
 # may drive it again when the work is going well.
@@ -28,7 +28,7 @@ if [[ "$KJ_DONE_STATUS" == "declined" ]]; then
   # The provider declined its request. Driving it again would be declined too,
   # so no invitation to repeat the work, and the kernel holds a drive anyway.
   kj drift push .senpai "=== kohai $label $said ===
-The request got no reply. $label stays paused until a person prompts it."
+The request got no reply. $label stays paused until its reviewer answers the refusal ask or a person prompts it."
 else
   kj drift push .senpai "=== kohai $label $said ===
 $KJ_DONE_FEEDBACK

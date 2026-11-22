@@ -103,7 +103,7 @@ pub use lineage::ContextEdgeRow;
 pub use llm_backends::{BackendRow, BackendModelRow, ModelTunablesRow, ModelAliasRow, EmbeddingConfigRow, embedding_refusal};
 pub use llm_characters::{CharacterRow, CharacterSlotRow, CharacterModelRow, REASONING_SUMMARIES, REPLAY_PHASES, VERBOSITIES};
 pub use approvals::ContinuationOrigin;
-pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};
+pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block, record_approval_refusal_turn};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};
 pub use contexts::ContextRow;
 pub use shadows::{IndexKey, Rendition, DESCRIBE as DESCRIBE_SHADOW, JUDGE as JUDGE_SHADOW};
