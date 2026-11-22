@@ -9,7 +9,7 @@ use kaijutsu_present::format::{BlockTone, block_tone};
 use kaijutsu_present::markdown::SpanTone;
 use kaijutsu_types::BlockSnapshot;
 
-/// ANSI 16-color palette for terminal/syntax rendering.
+/// ANSI 16-color palette for terminal output.
 ///
 /// Standard ANSI colors (0-7 normal, 8-15 bright):
 /// - 0/8: Black/Bright Black (gray)
@@ -114,25 +114,6 @@ impl AnsiColors {
     }
 }
 
-/// Syntax highlighting colors for kaish shell input.
-///
-/// Defaults are derived from the ANSI palette (Tokyo Night).
-#[derive(Clone, Debug, Reflect)]
-pub struct SyntaxColors {
-    pub keyword: Color,     // if, for, fn, while
-    pub string: Color,      // "hello", 'world'
-    pub number: Color,      // 42, 3.14
-    pub operator: Color,    // |, &&, ||, ;
-    pub variable: Color,    // $HOME, $foo
-    pub flag: Color,        // --verbose, -la
-    pub comment: Color,     // # comment
-    pub command: Color,     // echo, ls, git (the verb)
-    pub path: Color,        // /foo/bar
-    pub punctuation: Color, // { } ( )
-    pub error: Color,       // unrecognized tokens
-    pub prefix: Color,      // the : or ` shell prefix char
-}
-
 /// Application theme resource.
 ///
 /// Contains all colors used throughout the application, from base UI
@@ -176,8 +157,6 @@ pub struct Theme {
     pub block_error_severity: Color,
     /// Error block text color — fatal severity (dark red)
     pub block_error_fatal: Color,
-    /// Error block stub accent color (collapsed parent header strip)
-    pub block_error_accent: Color,
     /// Drift push block text color (cyan — conversational)
     pub block_drift_push: Color,
     /// Drift pull/distill block text color (blue — substantive)
@@ -224,14 +203,9 @@ pub struct Theme {
     pub cursor_replace: Vec4,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // ANSI palette (for terminal/syntax use)
+    // ANSI palette (for terminal output)
     // ═══════════════════════════════════════════════════════════════════════
     pub ansi: AnsiColors,
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Syntax highlighting (kaish shell input) — Phase 4: per-span styling via Parley
-    // ═══════════════════════════════════════════════════════════════════════
-    pub syntax: SyntaxColors,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Frame Configuration (9-slice system)
@@ -411,16 +385,6 @@ pub struct Theme {
     pub constellation_base_radius: f32,
     /// Spacing between concentric rings in radial tree (pixels, 2D fallback layout)
     pub constellation_ring_spacing: f32,
-    /// Card width in constellation view (pixels)
-    pub constellation_card_width: f32,
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Constellation 3D Configuration (hyperbolic layout)
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Base hemisphere radius for leaf nodes in the H3 layout
-    pub constellation_base_leaf_radius: f64,
-    /// Packing factor for hemisphere area sums (gap compensation)
-    pub constellation_packing_factor: f64,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Block Border Configuration (shader-rendered per-block borders)
@@ -576,7 +540,6 @@ impl Default for Theme {
             block_error_warning: Color::srgb(1.000, 0.706, 0.369), // #ffb45e amber
             block_error_severity: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a (same as block_tool_error)
             block_error_fatal: Color::srgb(0.769, 0.118, 0.227), // #c41e3a dark red
-            block_error_accent: Color::srgba(1.000, 0.361, 0.541, 0.5), // #ff5c8a, half alpha
             block_drift_push: Color::srgb(0.490, 0.878, 1.000), // #7de0ff cyan
             block_drift_pull: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
             block_drift_merge: Color::srgb(1.000, 0.478, 0.851), // #ff7ad9 magenta
@@ -628,22 +591,6 @@ impl Default for Theme {
                 bright_magenta: Color::srgb(1.000, 0.604, 0.894), // #ff9ae4
                 bright_cyan: Color::srgb(0.647, 0.925, 1.000),    // #a5ecff
                 bright_white: Color::srgb(0.925, 0.906, 0.980),   // #ece7fa
-            },
-
-            // Syntax highlighting — derived from ANSI palette
-            syntax: SyntaxColors {
-                keyword: Color::srgb(1.000, 0.478, 0.851),     // magenta
-                string: Color::srgb(0.298, 0.878, 0.702),      // green
-                number: Color::srgb(1.000, 0.812, 0.490),      // yellow
-                operator: Color::srgb(0.490, 0.878, 1.000),    // cyan
-                variable: Color::srgb(1.000, 0.878, 0.631),    // bright_yellow
-                flag: Color::srgb(0.741, 0.643, 1.000),        // bright_blue
-                comment: Color::srgb(0.271, 0.227, 0.400),     // bright_black
-                command: Color::srgb(0.643, 0.529, 1.000),     // blue
-                path: Color::srgb(0.490, 0.878, 1.000),        // cyan
-                punctuation: Color::srgb(0.847, 0.824, 0.933), // fg
-                error: Color::srgb(1.000, 0.361, 0.541),       // red
-                prefix: Color::srgb(0.271, 0.227, 0.400),      // bright_black
             },
 
             // Frame configuration
@@ -742,11 +689,6 @@ impl Default for Theme {
             // Constellation radial tree layout
             constellation_base_radius: 500.0,
             constellation_ring_spacing: 550.0,
-            constellation_card_width: 180.0,
-
-            // Constellation 2.5D layout
-            constellation_base_leaf_radius: 1.2, // Increased for better spread with many nodes
-            constellation_packing_factor: 1.8,   // More gap between nodes
 
             // Block borders
             block_border_tool_call: Color::srgba(0.910, 0.706, 0.369, 0.6), // #e8b45e gold
