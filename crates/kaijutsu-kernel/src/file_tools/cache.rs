@@ -402,17 +402,33 @@ impl FileDocumentCache {
             // getattr is lstat-like: the link generation says nothing about
             // target edits or deletion. Re-read clean symlink buffers; dirty
             // buffers above retain unsaved work under the normal file rules.
+            //
+            // A path with no attributes at all is gone — deleted, or renamed
+            // away. No clean entry that came *from* disk may keep serving text
+            // for a name that no longer exists (`docs/issues.md`, "2.2 File
+            // Caching"): the reload below re-reads the VFS and classifies, so a
+            // vanished file is a benign miss and any other VFS refusal stays a
+            // real failure. An entry with no `loaded_generation` never saw disk
+            // (a document created for a write that has not flushed yet), so a
+            // missing file is its normal state, not news.
+            let missing = loaded_generation.is_some() && disk_attr.is_none();
             let symlink = disk_attr.is_some_and(|attr| attr.kind.is_symlink());
-            if !stale && !symlink {
+            if !stale && !symlink && !missing {
                 return Ok((cid, bid));
             }
             match self.reload_block_from_disk(ctx_id, &bid, path).await {
                 Ok(()) => return Ok((cid, bid)),
                 Err(CacheReadError::NotCached) => {
                     // Benign: file was removed or became binary. Drop the
-                    // stale cache entry and surface NotCached so callers can
-                    // fall through to a raw VFS read.
-                    self.cache.write().remove(&ctx_id);
+                    // clean cache entry and surface NotCached so callers can
+                    // fall through to a raw VFS read. An entry an editor
+                    // session pins stays: the pin exists so a buffer is never
+                    // taken out from under an open session, and nothing serves
+                    // its text while the path is gone.
+                    let mut cache = self.cache.write();
+                    if cache.get(&ctx_id).is_some_and(|e| e.pinned_by.is_empty()) {
+                        cache.remove(&ctx_id);
+                    }
                     return Err(CacheReadError::NotCached);
                 }
                 Err(CacheReadError::Backend(msg)) => {
@@ -1718,6 +1734,131 @@ mod tests {
 
         // Local edits win — we must not clobber uncommitted work with disk state.
         assert_eq!(cache.try_read_content("/tmp/g.txt").await.unwrap(), "local-edit");
+    }
+
+    /// A clean entry must stop serving once its path is gone.
+    ///
+    /// These mutations go straight through the VFS, touching no cache call:
+    /// that is how a deleted path arrives from a writer the cache never sees
+    /// (`rm` in a subprocess, another process on the host, `kj rc rm`). The
+    /// cache's own recheck against disk has to catch it, or the shared
+    /// document keeps serving text for a name that no longer exists
+    /// (`docs/issues.md`, "2.2 File Caching").
+    #[tokio::test]
+    async fn a_deleted_path_stops_serving_its_cached_text() {
+        let (vfs, cache) = tmp_cache().await;
+        let path = "/tmp/gone.txt";
+        vfs.write_all(p(path), b"v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "v1");
+
+        vfs.unlink(p(path)).await.unwrap();
+
+        assert!(
+            matches!(cache.try_read_content(path).await, Err(CacheReadError::NotCached)),
+            "a deleted path must be a benign miss, never the text it used to hold"
+        );
+    }
+
+    /// The same for a rename: the old name serves nothing, and the new name
+    /// reads the moved content from disk.
+    #[tokio::test]
+    async fn a_renamed_away_path_stops_serving_its_cached_text() {
+        let (vfs, cache) = tmp_cache().await;
+        vfs.write_all(p("/tmp/before.txt"), b"v1").await.unwrap();
+        assert_eq!(cache.try_read_content("/tmp/before.txt").await.unwrap(), "v1");
+
+        vfs.rename(p("/tmp/before.txt"), p("/tmp/after.txt")).await.unwrap();
+
+        assert!(
+            matches!(
+                cache.try_read_content("/tmp/before.txt").await,
+                Err(CacheReadError::NotCached)
+            ),
+            "the old name must not serve the moved text"
+        );
+        assert_eq!(cache.try_read_content("/tmp/after.txt").await.unwrap(), "v1");
+    }
+
+    /// A deleted path under an open editor session: reads stop serving the
+    /// vanished file, and the pin survives. Dropping the entry would pull the
+    /// buffer out from under the session — the same reason
+    /// [`FileDocumentCache::invalidate`] refuses a pinned entry.
+    #[tokio::test]
+    async fn a_deleted_path_keeps_a_pinned_entries_pin_and_stops_serving_it() {
+        let (vfs, cache) = tmp_cache().await;
+        let path = "/tmp/pinned_gone.txt";
+        vfs.write_all(p(path), b"v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "v1");
+        cache.pin(path, 7).unwrap();
+
+        vfs.unlink(p(path)).await.unwrap();
+
+        assert!(
+            matches!(cache.try_read_content(path).await, Err(CacheReadError::NotCached)),
+            "a gone path must not serve text, pinned or not"
+        );
+        let refusal = cache.invalidate(path).expect_err("the session still holds the pin");
+        assert!(refusal.contains(path), "the refusal names the path: {refusal}");
+    }
+
+    /// The dirty overlay outranks a vanished backing file: unsaved text is
+    /// served as-is and never dropped for disk, matching
+    /// [`dirty_edits_survive_external_change`].
+    #[tokio::test]
+    async fn unsaved_edits_survive_their_path_being_deleted() {
+        let (vfs, cache) = tmp_cache().await;
+        let path = "/tmp/dirty_gone.txt";
+        vfs.write_all(p(path), b"disk-v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "disk-v1");
+        cache.create_or_replace(path, "local-edit", PrincipalId::system()).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+
+        vfs.unlink(p(path)).await.unwrap();
+
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "local-edit");
+    }
+
+    /// A missing path is benign, and outranks a broken document: with the file
+    /// gone there is nothing to serve, so the caller gets a miss (and falls
+    /// through to a raw read) rather than a store error about a document whose
+    /// file no longer exists.
+    #[tokio::test]
+    async fn a_missing_path_is_a_miss_even_when_its_document_is_broken() {
+        let (vfs, cache) = tmp_cache().await;
+        let path = "/tmp/gone_and_broken.txt";
+        vfs.write_all(p(path), b"v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "v1");
+
+        cache.block_store().delete_document(file_context_id(path)).unwrap();
+        vfs.unlink(p(path)).await.unwrap();
+
+        assert!(
+            matches!(cache.try_read_content(path).await, Err(CacheReadError::NotCached)),
+            "the file is gone: a benign miss, not the text it used to hold"
+        );
+    }
+
+    /// The other half of that classification: a path that still exists but
+    /// cannot be read as text is a real failure, and must not fall through to
+    /// `NotCached` — callers read that as "fall through to a raw read".
+    #[tokio::test]
+    async fn a_path_that_cannot_be_read_as_text_is_a_backend_failure() {
+        let (vfs, cache) = tmp_cache().await;
+        let path = "/tmp/link_to_dir";
+        let dir = "/tmp/real_dir";
+        vfs.mkdir(p(dir), 0o755).await.unwrap();
+        vfs.write_all(p(path), b"v1").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "v1");
+
+        // The name now holds a link to a directory: reading it refuses.
+        vfs.unlink(p(path)).await.unwrap();
+        vfs.symlink(p(path), p(dir)).await.unwrap();
+
+        let err = cache.try_read_content(path).await.expect_err("a link to a directory is not text");
+        assert!(
+            matches!(err, CacheReadError::Backend(_)),
+            "a real VFS failure must not look like a miss: {err:?}"
+        );
     }
 
     #[test]
