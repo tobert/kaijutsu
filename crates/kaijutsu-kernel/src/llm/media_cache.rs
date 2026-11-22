@@ -41,6 +41,11 @@ impl MediaBase64Cache {
         }
     }
 
+    /// Peek the cached MIME type without cloning `data_base64`.
+    pub fn peek_mime(&self, hash: &ContentHash) -> Option<String> {
+        self.entries.get(hash).map(|e| e.mime_type.clone())
+    }
+
     /// Read a cached entry. Returns a clone so callers can drop the dashmap
     /// guard before doing async work.
     pub fn get(&self, hash: &ContentHash) -> Option<ResolvedMedia> {

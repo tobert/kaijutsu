@@ -28,9 +28,11 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **A shadow keeps the `image` slot it was made with.** A character's later `kj character slot set <name> image ...` reaches a new shadow only after the old one is archived. The maker in the index is the shadow's own slot, so the key stays truthful. A rotation of the source does not yet carry its description shadow to the successor (`docs/contexts.md`).
 - **Simultaneous misses both call the model.** Two requests for one key that both miss the index each pay for a description. The second one is linked and not indexed, so its shadow holds a rendition the key does not name.
 - **A failed commit stops the shadow's document.** A rendition whose link or index row cannot be written fails the request and leaves no block, and the shadow's document refuses writes until the kernel restarts (the rule of `BlockStore::append_block_recorded`).
-- **A reused copy names no original.** The copy has its own link to its source block and no row that names the rendition it was copied from. The index keeps naming the original rendition after its shadow is archived; it still serves, since archive keeps blocks.
+- **A reused copy names no original.** The copy has its own link to its source block and no row that names the rendition it was copied from. The index keeps naming the original rendition after its shadow is archived; it still serves, since archive keeps blocks. If the indexed rendition block itself is deleted (`BlockStore::delete_block` / document deletion), `rendition_text` fails rather than recomputing because `shadow_renditions`/`rendition_index` are not pruned on block deletion.
+- **Shadows assume the store's default workspace.** `create_document` writes the store's `default_workspace_id` while `shadow_row` copies `seat.workspace_id`, so creating a shadow for a context moved to a non-default workspace triggers `DocumentDiverged` (`council/shadow.rs:547-557`).
+- **Static-allowed gate calls still prime the judge.** `council::shadow::record_call` spawns `spawn_prime` before `council::gate` consults the static rules, so calls allowed without judging still send a `POST /council/v2/contexts` prime.
 - **Presets and spans have no writer.** `preset` in `rendition_index` is empty, and `span_start` and `span_end` are NULL.
-- **`kj shadow describe` reads `image/*` only;** Claude and the OpenAI-compatible providers send images only (`video` and `audio` slot routing works on turns for Gemini and council backends).
+- **`kj shadow describe` reads `image/*` only;** Claude and the OpenAI-compatible providers send images only (`video` and `audio` slot routing works on turns for Gemini and council backends). Media-role slots also enforce `requires_slot_output_limit` when copying onto every newly created context (`context_characters.rs:472`), even text-only turns that never invoke `kj shadow describe`.
 - **The turn path guards one kind.** `chat_turn_refusal` refuses a description shadow's chat turn; a judge shadow still relies on its slot having no `max_tokens`.
 
 ## Control lists: what the first slice leaves open
@@ -182,7 +184,7 @@ Live, on Sol's third task (gpt-6-luna as guardian): it allowed a run of read-onl
 Second kaibo review (DeepSeek, of 1bdec2df) confirmed the first round's fixes and found:
 
 - **The pin is checked once per submission.** `verify_judged` runs before `kaish.execute`, so a submission can rewrite a judged file mid-run: through a program's own write (`python3 -c 'open("fix.py","w")…'; python3 fix.py`) or an existing symlink or hardlink, which `writes_of` does not resolve. Re-verify before the statement that runs each file.
-- **Local imports are not pinned.** `ShownProgram` now notes omitted local imports in the guardian prompt, while `-m` / local imports beside a judged file are still not hashed/pinned.
+- **Local imports and `python3 -m` modules are not pinned.** `ShownProgram` now notes omitted local imports in the guardian prompt, while `ProgramSource::Module` (`python3 -m pkg.mod`) skips `programs_in`'s written-before check and is silently dropped by `read_programs` when not yet written, and local imports beside a judged file are still not hashed/pinned.
 - **An ask's approved run is not pinned.** The approval worker runs without `judged`, so a program a judge read can change before a person approves it.
 
 A chat model (the guardian) or a Decisions API (the decisions judge) on a context's `gate` slot judges escalated shell submissions (`council/guardian.rs`, `council/decisions_judge.rs`; `docs/approval-identity.md`, "The guardian"). Not done:
@@ -271,7 +273,7 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
 - **Listening players: what is open.** `kj audio render` turns CAS notation or MIDI, or a track's last phrases, into a WAV in the CAS, and a musician with `KJ_LISTEN=<track>` gets that clip in its context before each turn (`rc/musician/tick/S10-drive.kai`). From the first live run and a kaibo review:
   - Prior listening blocks in the context are now excluded (`KJ_LISTEN_KEEP`), but older WAV blobs still accumulate in CAS with no blob pruning (~250 KB a phrase at 16 kHz).
   - A decision turn with clips in its context took 18 to 32 s on `lfm3-omni`, against 4 s without, and it grows as the kept history holds more clips. Each of the 16 decisions reads the audio again. The lead adapts and phrases commit, with repeats between them; one committed with no margin left.
-  - The render reads the whole score context and loads the soundfont file on every call, on the dispatch task; only synthesis runs on the blocking pool.
+  - The render reads the whole score context (`window_cells` scans all document blocks per cell) and loads the soundfont file on every call; mixing, `encode_wav`, and CAS store run on `spawn_blocking`.
   - Cells are placed with the track's current beat period, so a tempo change misplaces earlier phrases in a clip.
   - A rate under 16 kHz is made by averaging sample pairs with no filter.
   - The render uses its own soundfont (`~/.local/share/kaijutsu/models/soundfont/default.sf2`); the speakers use the audio node's synth. They can differ.
@@ -281,6 +283,7 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
   - Any 404 from a decision is read as a spec the server lost; a server with no decisions route gets a spec post per decision before the turn fails.
   - The turn refuses a served model without `reads`; the gate decides without that check. The contract should settle which is right.
   - A context past the server's decision limit (3,072 tokens on the nagaya) drops its oldest messages and the slot is sent again. The size that fit is not remembered, so each turn pays for the refused sends again: about 1 s of a 4 s turn on the live `omnijam` run, where the musician stance and ABC primer fill most of the limit. A decision player wants a shorter create rc, or a measured size before the first send.
+  - Multi-slot decision loops (`StepOutcome::Continue` in `llm/council/mod.rs:304`) complete all slots inside one `stream.next_event()` wait, so long programs risk hitting `llm_stream`'s `idle_timeout` without intermediate liveness events; concurrent orderings (`shuffle > 1`) also overwrite single-slot `SlotWaits` state (`llm/endpoint.rs`).
 
 ---
 

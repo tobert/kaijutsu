@@ -1625,10 +1625,10 @@ pub(crate) async fn resolve_turn_media(
             };
 
             // Identify real CAS MIME type first (from cache or CAS sidecar)
-            // without loading bytes if the slot will substitute text or a marker.
-            let mut cached_hit = cache.and_then(|c| c.get(&parsed));
-            if let Some(hit) = &cached_hit {
-                *media_type = hit.mime_type.clone();
+            // without loading or cloning payload bytes unless the slot sends
+            // bytes to the turn model.
+            if let Some(cached_mime) = cache.and_then(|c| c.peek_mime(&parsed)) {
+                *media_type = cached_mime;
             } else if !media_type_is_recorded(media_type) {
                 let cas_for_task = cas.clone();
                 let parsed_for_task = parsed.clone();
@@ -1641,69 +1641,75 @@ pub(crate) async fn resolve_turn_media(
                 }
             }
 
-            let (role, target) = slots.slot_for_mime(media_type);
-            let replacement = match target {
-                None => Some(format!(
-                    "[media {hash} ({media_type}) omitted: no `{role}` slot is configured on this character]"
-                )),
-                Some(slot) if slots.matches_turn_model(slot) => {
-                    if data_base64.is_none() {
-                        if let Some(hit) = cached_hit.take() {
-                            *media_type = hit.mime_type;
-                            *data_base64 = Some(hit.data_base64);
-                        } else {
-                            let cas_for_task = cas.clone();
-                            let parsed_for_task = parsed.clone();
-                            if let Ok((inspected, bytes)) = tokio::task::spawn_blocking(move || {
-                                let inspected = cas_for_task.inspect(&parsed_for_task).ok().flatten();
-                                let bytes = cas_for_task.retrieve(&parsed_for_task).ok().flatten();
-                                (inspected, bytes)
-                            })
-                            .await
-                            {
-                                if let Some(reference) = inspected {
-                                    *media_type = reference.mime_type;
-                                }
-                                if let Some(bytes) = bytes {
-                                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    if let Some(cache) = cache {
-                                        cache.insert(
-                                            parsed,
-                                            ResolvedMedia {
-                                                mime_type: media_type.clone(),
-                                                data_base64: encoded.clone(),
-                                            },
-                                        );
+            let replacement = if !media_type_is_recorded(media_type) {
+                Some(format!(
+                    "[media {hash} ({media_type}) omitted: media bytes or MIME type unavailable in CAS]"
+                ))
+            } else {
+                let (role, target) = slots.slot_for_mime(media_type);
+                match target {
+                    None => Some(format!(
+                        "[media {hash} ({media_type}) omitted: no `{role}` slot is bound on this context (set it on the character and `kj context rotate`)]"
+                    )),
+                    Some(slot) if slots.matches_turn_model(slot) => {
+                        if data_base64.is_none() {
+                            if let Some(hit) = cache.and_then(|c| c.get(&parsed)) {
+                                *media_type = hit.mime_type;
+                                *data_base64 = Some(hit.data_base64);
+                            } else {
+                                let cas_for_task = cas.clone();
+                                let parsed_for_task = parsed.clone();
+                                if let Ok((inspected, bytes)) = tokio::task::spawn_blocking(move || {
+                                    let inspected = cas_for_task.inspect(&parsed_for_task).ok().flatten();
+                                    let bytes = cas_for_task.retrieve(&parsed_for_task).ok().flatten();
+                                    (inspected, bytes)
+                                })
+                                .await
+                                {
+                                    if let Some(reference) = inspected {
+                                        *media_type = reference.mime_type;
                                     }
-                                    *data_base64 = Some(encoded);
+                                    if let Some(bytes) = bytes {
+                                        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                        if let Some(cache) = cache {
+                                            cache.insert(
+                                                parsed,
+                                                ResolvedMedia {
+                                                    mime_type: media_type.clone(),
+                                                    data_base64: encoded.clone(),
+                                                },
+                                            );
+                                        }
+                                        *data_base64 = Some(encoded);
+                                    }
                                 }
                             }
                         }
+                        None
                     }
-                    None
-                }
-                Some(slot) => {
-                    let maker = slot.maker();
-                    let key = crate::kernel_db::IndexKey::new(
-                        hash,
-                        crate::kernel_db::DESCRIBE_SHADOW,
-                        &maker,
-                    );
-                    let hit = db.lock().indexed_rendition(&key).ok().flatten();
-                    let description = hit.and_then(|block_id| {
-                        documents
-                            .non_draft_snapshots(block_id.context_id)
-                            .ok()?
-                            .into_iter()
-                            .find(|b| b.id == block_id)
-                            .map(|b| b.content)
-                    });
-                    Some(match description {
-                        Some(text) => format!("[media {hash} ({media_type}) description by {maker}:\n{text}]"),
-                        None => format!(
-                            "[media {hash} ({media_type}) omitted: routed to `{role}` slot {maker}, which has no cached description yet]"
-                        ),
-                    })
+                    Some(slot) => {
+                        let maker = slot.maker();
+                        let key = crate::kernel_db::IndexKey::new(
+                            hash,
+                            crate::kernel_db::DESCRIBE_SHADOW,
+                            &maker,
+                        );
+                        let hit = db.lock().indexed_rendition(&key).ok().flatten();
+                        let description = hit.and_then(|block_id| {
+                            documents
+                                .non_draft_snapshots(block_id.context_id)
+                                .ok()?
+                                .into_iter()
+                                .find(|b| b.id == block_id)
+                                .map(|b| b.content)
+                        });
+                        Some(match description {
+                            Some(text) => format!("[media {hash} ({media_type}) description by {maker}:\n{text}]"),
+                            None => format!(
+                                "[media {hash} ({media_type}) omitted: routed to `{role}` slot {maker}, which has no cached description yet]"
+                            ),
+                        })
+                    }
                 }
             };
             if let Some(text) = replacement {

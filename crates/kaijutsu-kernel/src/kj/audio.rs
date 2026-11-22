@@ -667,29 +667,30 @@ impl KjDispatcher {
             ));
         }
 
+        let cas = self.kernel().cas().clone();
         let (rate, tail_ms) = (req.rate, req.tail_ms);
         let joined = tokio::task::spawn_blocking(move || {
             let mut synth = loader(&font)?;
             let mut mix = render_mix(synth.as_mut(), &parts, rate, tail_ms)?;
             protect_clipping(&mut mix);
-            Ok::<_, String>(mix)
+            let seconds = mix.len() as f64 / rate as f64;
+            let wav = encode_wav(&mix, rate);
+            let bytes = wav.len();
+            let hash = cas
+                .store(&wav, WAV_MIME)
+                .map(|h| h.to_string())
+                .map_err(|e| format!("kj audio render: storing the clip: {e}"))?;
+            Ok::<_, String>((seconds, bytes, hash))
         })
         .await;
-        let mix = match joined {
-            Ok(Ok(mix)) => mix,
+        let (seconds, wav_bytes, hash) = match joined {
+            Ok(Ok(out)) => out,
             Ok(Err(e)) => return KjResult::Err(e),
             Err(e) => return KjResult::Err(format!("kj audio render: render task panicked: {e}")),
         };
 
-        let wav = encode_wav(&mix, rate);
-        let hash = match self.kernel().cas().store(&wav, WAV_MIME) {
-            Ok(h) => h.to_string(),
-            Err(e) => return KjResult::Err(format!("kj audio render: storing the clip: {e}")),
-        };
-        let seconds = mix.len() as f64 / rate as f64;
         let message = format!(
-            "{hash}\n{seconds:.2} s, {rate} Hz, {} bytes, {} source(s)",
-            wav.len(),
+            "{hash}\n{seconds:.2} s, {rate} Hz, {wav_bytes} bytes, {} source(s)",
             sources.len()
         );
         KjResult::ok_with_data(
@@ -698,7 +699,7 @@ impl KjDispatcher {
                 "hash": hash,
                 "seconds": seconds,
                 "rate": rate,
-                "bytes": wav.len(),
+                "bytes": wav_bytes,
                 "sources": sources,
             }),
         )

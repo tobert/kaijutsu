@@ -572,6 +572,7 @@ impl App {
     pub fn release(&mut self, id: ContextId) {
         self.views.remove(&id);
         self.submitted.remove(&id);
+        self.parked_screens.remove(&id);
         self.wrap.forget_context(id);
     }
 
@@ -1649,5 +1650,17 @@ mod tests {
         assert!(app.submitted.contains_key(&a));
         app.release(a);
         assert!(!app.submitted.contains_key(&a));
+    }
+
+    #[test]
+    fn releasing_a_context_prunes_its_parked_screen() {
+        let (mut app, a, b) = app_with_two();
+        app.switch_to(a);
+        let diff = crate::diff::DiffScreen::unparsed("t", "err", "body", &app.palette);
+        app.screen = crate::editor::ScreenMode::Diff(diff);
+        app.switch_to(b);
+        assert!(app.parked_screens.contains_key(&a));
+        app.release(a);
+        assert!(!app.parked_screens.contains_key(&a));
     }
 }

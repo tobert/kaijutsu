@@ -23,9 +23,9 @@ use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::view::scene_palette::{HeroicPalette, heroic_identity_color};
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 
-const LABEL_TEX_W: u32 = 240;
+const LABEL_TEX_W: u32 = 312;
 const LABEL_TEX_H: u32 = 88;
-const RIBBON_TEX_W: u32 = 360;
+const RIBBON_TEX_W: u32 = 371;
 const RIBBON_TEX_H: u32 = 88;
 const PAD: f32 = 8.0;
 const RIBBON_REFRESH_SECS: f64 = 0.25;

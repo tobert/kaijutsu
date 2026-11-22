@@ -38,7 +38,7 @@ case "$uncovered" in
     exit 1
     ;;
 esac
-if [[ "$KJ_OPEN_WORK" -gt 0 ]]; then
+if [[ "${KJ_OPEN_WORK:-0}" -gt 0 ]]; then
   echo "tick: $KJ_OPEN_WORK phrase(s) still open on $KJ_TRACK; no new turn"
   exit 0
 fi
@@ -70,6 +70,10 @@ if [[ -n "$KJ_LISTEN" ]]; then
       listen_failed="$heard"
       ;;
   esac
+fi
+if [[ "${KJ_PHRASE_BEATS:-0}" -le 0 ]]; then
+  echo "tick: KJ_PHRASE_BEATS is '${KJ_PHRASE_BEATS:-0}'; expected a positive phrase length"
+  exit 1
 fi
 bars=$(( KJ_PHRASE_BEATS / 4 ))
 phrases=$(( KJ_LEAD_BEATS / KJ_PHRASE_BEATS + 1 ))

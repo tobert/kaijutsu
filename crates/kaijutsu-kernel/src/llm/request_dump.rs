@@ -13,8 +13,7 @@
 //! envelope, pretty-printed, with image payloads replaced by markers. Files
 //! are written whole (temp file, then rename) with mode 0600; directories this
 //! module creates are mode 0700. Neither sensor can fail a request: a write
-//! error logs one warning per turn and the request proceeds. See
-//! `docs/telemetry.md`, "Provider request dump".
+//! error logs one warning per turn and the request proceeds.
 
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};

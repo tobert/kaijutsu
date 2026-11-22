@@ -735,7 +735,7 @@ impl Default for Theme {
             msdf_horz_scale: 1.1,
             msdf_vert_scale: 0.6,
             msdf_text_bias: 0.5,
-            msdf_gamma_correction: 0.85,
+            msdf_gamma_correction: 1.6,
             font_serif: "Noto Serif".into(),
             font_sans: "Noto Sans CJK JP".into(),
 
