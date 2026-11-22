@@ -40,6 +40,7 @@ fn wire_origin(origin: kaijutsu_types::AskOrigin) -> AskOrigin {
         O::ShellGate => AskOrigin::ShellGate,
         O::KjVerb => AskOrigin::KjVerb,
         O::Drift => AskOrigin::Drift,
+        O::Refusal => AskOrigin::Refusal,
     }
 }
 
@@ -51,6 +52,7 @@ fn origin(origin: AskOrigin) -> kaijutsu_types::AskOrigin {
         AskOrigin::ShellGate => O::ShellGate,
         AskOrigin::KjVerb => O::KjVerb,
         AskOrigin::Drift => O::Drift,
+        AskOrigin::Refusal => O::Refusal,
     }
 }
 

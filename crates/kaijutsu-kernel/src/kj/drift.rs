@@ -74,7 +74,7 @@ pub fn reconcile_root_held_drifts(kernel: &crate::Kernel) -> Result<usize, Strin
     for console in consoles {
         let live = {
             let db = kernel.kernel_db().lock();
-            approval_ledger::ask::list_unsettled_drift_asks(db.conn_for_ledger(), console.as_bytes())
+            approval_ledger::ask::list_unsettled_asks(db.conn_for_ledger(), console.as_bytes(), approval_ledger::types::Origin::Drift)
                 .map_err(|e| format!("could not read the console's drift asks: {e}"))?
         };
         let blocks = kernel.blocks();

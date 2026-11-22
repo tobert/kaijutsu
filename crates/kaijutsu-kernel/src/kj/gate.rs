@@ -263,6 +263,7 @@ pub(crate) fn statement_digest(origin: Origin, rendered: &str) -> String {
         Origin::Hook => format!("hook:v1:{rendered}"),
         Origin::HookResult => format!("hook-result:v1:{rendered}"),
         Origin::Drift => format!("drift:v1:{rendered}"),
+        Origin::Refusal => format!("refusal:v1:{rendered}"),
     }
 }
 

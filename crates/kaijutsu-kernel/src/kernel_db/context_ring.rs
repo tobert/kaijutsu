@@ -138,7 +138,7 @@ impl KernelDb {
     /// before they run anything; [`Self::archive_context_writes`] checks it
     /// again inside the write.
     pub(crate) fn held_drift_refusal(&self, id: ContextId) -> KernelDbResult<Option<String>> {
-        let held = approval_ledger::ask::list_unsettled_drift_asks(&self.conn, id.as_bytes())?;
+        let held = approval_ledger::ask::list_unsettled_asks(&self.conn, id.as_bytes(), approval_ledger::types::Origin::Drift)?;
         if held.is_empty() {
             return Ok(None);
         }

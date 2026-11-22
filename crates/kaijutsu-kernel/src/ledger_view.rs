@@ -170,6 +170,7 @@ pub(crate) fn ask_origin(origin: Origin) -> AskOrigin {
         Origin::ShellGate => AskOrigin::ShellGate,
         Origin::KjVerb => AskOrigin::KjVerb,
         Origin::Drift => AskOrigin::Drift,
+        Origin::Refusal => AskOrigin::Refusal,
     }
 }
 
@@ -180,6 +181,7 @@ pub(crate) fn ledger_origin(origin: AskOrigin) -> Origin {
         AskOrigin::ShellGate => Origin::ShellGate,
         AskOrigin::KjVerb => Origin::KjVerb,
         AskOrigin::Drift => Origin::Drift,
+        AskOrigin::Refusal => Origin::Refusal,
     }
 }
 
@@ -202,7 +204,7 @@ mod tests {
     /// so a swapped pair would typecheck. Comparing rendered names catches it.
     #[test]
     fn origin_and_status_maps_agree_with_the_ledger_names() {
-        for origin in [Origin::Hook, Origin::HookResult, Origin::ShellGate, Origin::KjVerb, Origin::Drift] {
+        for origin in [Origin::Hook, Origin::HookResult, Origin::ShellGate, Origin::KjVerb, Origin::Drift, Origin::Refusal] {
             assert_eq!(ask_origin(origin).as_str(), origin.as_str());
             assert_eq!(ledger_origin(ask_origin(origin)), origin);
         }

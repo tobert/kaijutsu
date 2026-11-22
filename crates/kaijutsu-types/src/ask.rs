@@ -26,6 +26,9 @@ pub enum AskOrigin {
     /// A drift into the console waits for its human. An allow lets the
     /// console's model read it; a deny keeps it out. It never runs source.
     Drift,
+    /// A refused context waits for its reviewer. An allow sends its work
+    /// again; a deny leaves it held. It never runs source.
+    Refusal,
 }
 
 impl AskOrigin {
@@ -36,6 +39,7 @@ impl AskOrigin {
             AskOrigin::ShellGate => "shell_gate",
             AskOrigin::KjVerb => "kj_verb",
             AskOrigin::Drift => "drift",
+            AskOrigin::Refusal => "refusal",
         }
     }
 }
@@ -97,10 +101,10 @@ impl AskSummary {
     }
 
     /// Whether `principal` may answer with a standing rule: it may answer,
-    /// and the ask is not a drift. A drift ask is answered one drift at a
-    /// time, and the kernel refuses a standing rule for one.
+    /// and the ask is not a drift or refusal. Those are answered one at a
+    /// time, and the kernel refuses a standing rule for them.
     pub fn can_remember(&self, principal: PrincipalId) -> bool {
-        self.answerable_by(principal) && self.origin != AskOrigin::Drift
+        self.answerable_by(principal) && !matches!(self.origin, AskOrigin::Drift | AskOrigin::Refusal)
     }
 
     /// Whether `principal` may answer with a standing rule for the

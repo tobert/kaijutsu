@@ -19,6 +19,7 @@ pub mod rc_lifecycle;
 pub mod prompt;
 pub mod turn_request;
 pub mod approval_resume;
+mod refusal_ask;
 pub mod held_asks;
 pub(crate) mod completion_notice;
 pub mod turn_state;

@@ -795,6 +795,11 @@ pub(super) async fn spawn_admitted_turn(
         return Err(format!("Could not write the turn record: {error}. The turn was not started."));
     }
 
+    // A newer turn replaces the refusal an open ask was about.
+    if let Err(error) = kernel_db.lock().withdraw_refusal_asks(context_id) {
+        tracing::error!(%context_id, %error, "could not withdraw the refused context's ask");
+    }
+
     // Queue admission and this function's return must stay in the same poll.
     // Startup owns refusal; the queued stream owns its terminal event.
     let record_db = kernel_db.clone();
@@ -3612,6 +3617,9 @@ async fn run_llm_stream(
                     if refusal {
                         if let Ok(error_block) = &error_block {
                             settle_refusal(&documents, &kernel_db, context_id, error_block);
+                            if let Err(error) = kernel.open_refusal_ask(context_id) {
+                                tracing::error!(%context_id, %error, "could not open the ask for a refused context");
+                            }
                         }
                         turn_lease.record_refusal();
                     }
@@ -9797,6 +9805,40 @@ mod lifetime_tests {
         submit_text(&kernel, context, call.principal_id, "next").await;
         tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
         assert!(!kernel.kernel_db().lock().last_turn_was_refused(context).unwrap(), "a person's prompt lifts the hold");
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A refused turn leaves one ask for the context's reviewer, with none of
+    /// the provider's words in it; a person's prompt, which lifts the hold on
+    /// its own, withdraws the ask.
+    #[tokio::test]
+    async fn a_refused_turn_asks_its_reviewer_and_a_prompt_withdraws_the_ask() {
+        let refusal = StreamEvent::Error(crate::llm::StreamError::new(
+            crate::llm::StreamErrorKind::Unknown("cyber_policy".into()), "flagged for possible risk"));
+        let (mock, _sent) = MockClient::new("").with_scripted_stream(vec![vec![refusal], text_reply("carrying on")])
+            .recording_sent_messages();
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut failed = kernel.turn_flows().subscribe("turn.failed");
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), failed.recv()).await.unwrap().unwrap();
+
+        let pending = || {
+            let db = kernel.kernel_db().lock();
+            let mut rows = approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap();
+            rows.retain(|row| row.origin == approval_ledger::types::Origin::Refusal);
+            rows
+        };
+        let asks = pending();
+        let [ask] = &asks[..] else { panic!("one refusal ask: {asks:?}") };
+        assert_eq!(ask.context_id, context.as_bytes().to_vec());
+        assert_eq!(ask.reviewer_id.as_deref(), Some(call.principal_id.as_bytes().as_slice()), "the senpai's performer reviews it");
+        assert!(ask.description.contains("declined"), "{}", ask.description);
+        assert!(!ask.description.contains("cyber_policy") && !ask.description.contains("flagged"), "{}", ask.description);
+
+        submit_text(&kernel, context, call.principal_id, "next").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(pending().is_empty(), "a person's prompt withdraws the ask");
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
