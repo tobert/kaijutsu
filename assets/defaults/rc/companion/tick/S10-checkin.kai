@@ -56,7 +56,7 @@ $report"
         ;;
       *)
         kj block create --role system --kind notification --content "=== Check-in $last left no QUIET: or FINDING: report ===
-It may have failed. Read it with: kj block list -c $last"
+It may have failed. Read it with: `kj block list -c '$last'`"
         ;;
     esac
     kj context unset --env LAST_CHECKIN

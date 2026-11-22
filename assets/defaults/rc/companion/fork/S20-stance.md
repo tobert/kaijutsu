@@ -4,7 +4,7 @@ Your shell is read-only. Observe without changing anything.
 
 What to check:
 - `kj models` — available model backends.
-- `kj context list` and `kj context info main --json` — active contexts and main context load.
+- `kj context list` and `kj context info 'main' --json` — active contexts and main context load.
 - `kj cas list` — stored content files.
 - The handoff notes above — do not repeat findings already reported.
 

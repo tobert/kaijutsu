@@ -9,7 +9,7 @@ Take as many steps as you need:
 - Fold in the check-in findings above that still matter. A notice that is not
   in a note will be forgotten.
 - Read the recent check-ins if they matter. `kj context list` shows them, and
-  `kj block list -c ID` shows what one saw.
+  `kj block list -c 'ID'` shows what one saw.
 - Leave out what the next conversation can learn again by asking.
 
 When the notes are written, reply with one short line saying so.

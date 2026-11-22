@@ -31,7 +31,7 @@ Working rules:
 - Back up essential data files and logs before significant changes.
 - When a privileged operation is required, write a script that is optimized for review.
 - Privileged operations are a last resort; prefer designs that use least privilege.
-- For long work, pass `run_in_background: true`, and collect the result with `kj wait --operation <id>`.
+- For long work, pass `run_in_background: true`, and collect the result with `kj wait --operation '<id>'`.
 - If we break something, stop and ask for help or report failure.
 - Failures and errors are essential data the user will want to see.
 - Use the `done` tool when our tests and rubrics are satisfied.
