@@ -330,73 +330,6 @@ pub(crate) fn hex32(bytes: [u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Format a single context's info for `kj context info`.
-///
-/// `trace_id` is the context's long-running OTel trace id (from the drift
-/// router handle); `None` when the context isn't registered in the router.
-pub fn format_context_info(
-    ctx: &ContextRow,
-    children_count: usize,
-    drift_edge_count: usize,
-    is_current: bool,
-    trace_id: Option<[u8; 16]>,
-) -> String {
-    let mut lines = Vec::new();
-
-    let label_display = ctx.label.as_deref().unwrap_or("(none)");
-    if is_current {
-        lines.push(format!("Context: {} *", label_display));
-    } else {
-        lines.push(format!("Context: {}", label_display));
-    }
-    lines.push(format!("ID:      {}", ctx.context_id.short()));
-    if let Some(tid) = trace_id {
-        lines.push(format!("Trace:   {}", hex32(tid)));
-    }
-
-    if let Some(forked_from) = ctx.forked_from {
-        let kind = ctx
-            .fork_kind
-            .as_ref()
-            .map(|k| format!("{k:?}"))
-            .unwrap_or_default();
-        lines.push(format!("Fork:    {} ({})", forked_from.short(), kind));
-    }
-
-    lines.push(format!("Created: {}", format_timestamp(ctx.created_at)));
-    lines.push(format!("By:      {}", ctx.created_by.short()));
-    // Advisory: the registering client's self-reported hostname, or "-" when
-    // unknown (old client, or a creation path with nothing to report — see
-    // `ContextRow::origin_host`'s doc comment). Always shown, unlike the
-    // conditionally-omitted fields below — "unknown" is itself the useful
-    // fleet-board answer, not noise to hide.
-    lines.push(format!(
-        "Host:    {}",
-        ctx.origin_host.as_deref().unwrap_or("-")
-    ));
-
-    // Time-well placement stamps — omitted entirely when unset, so the
-    // common (auto-placed, unpaused) context shows nothing extra.
-    if let Some(ts) = ctx.promoted_at {
-        lines.push(format!("Promoted: {}", format_timestamp(ts)));
-    }
-    if let Some(ts) = ctx.demoted_at {
-        lines.push(format!("Demoted: {}", format_timestamp(ts)));
-    }
-    if let Some(ts) = ctx.paused_at {
-        lines.push(format!("Paused:  {}", format_timestamp(ts)));
-    }
-
-    if children_count > 0 {
-        lines.push(format!("Children: {}", children_count));
-    }
-    if drift_edge_count > 0 {
-        lines.push(format!("Drifts:  {}", drift_edge_count));
-    }
-
-    lines.join("\n")
-}
-
 /// Format a Unix-millis timestamp for display.
 pub(crate) fn format_timestamp(millis: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
@@ -720,38 +653,6 @@ mod tests {
     }
 
     #[test]
-    fn info_shows_fields() {
-        let id = ContextId::new();
-        let row = make_row(Some("test-ctx"), id);
-        let output = format_context_info(&row, 2, 1, true, None);
-        assert!(output.contains("test-ctx *"));
-        assert!(output.contains("Children: 2"));
-        assert!(output.contains("Drifts:  1"));
-        // The type is not shown; `kj context info` names the performer.
-        assert!(!output.contains("Type:"), "{output}");
-        // No trace id passed -> no Trace line.
-        assert!(!output.contains("Trace:"));
-    }
-
-    #[test]
-    fn info_shows_placement_stamps_only_when_set() {
-        let id = ContextId::new();
-        let plain = make_row(Some("auto-placed"), id);
-        let output = format_context_info(&plain, 0, 0, false, None);
-        assert!(!output.contains("Promoted:"), "output: {output}");
-        assert!(!output.contains("Demoted:"), "output: {output}");
-        assert!(!output.contains("Paused:"), "output: {output}");
-
-        let mut seated = make_row(Some("seated"), ContextId::new());
-        seated.promoted_at = Some(kaijutsu_types::now_millis() as i64);
-        seated.paused_at = Some(kaijutsu_types::now_millis() as i64);
-        let output = format_context_info(&seated, 0, 0, false, None);
-        assert!(output.contains("Promoted: just now"), "output: {output}");
-        assert!(output.contains("Paused:  just now"), "output: {output}");
-        assert!(!output.contains("Demoted:"), "output: {output}");
-    }
-
-    #[test]
     fn table_tags_promoted_contexts() {
         let seated_id = ContextId::new();
         let mut seated = make_row(Some("seated"), seated_id);
@@ -762,38 +663,6 @@ mod tests {
         let lines: Vec<&str> = output.lines().collect();
         assert!(lines[0].contains("[ring0]"), "output: {output}");
         assert!(!lines[1].contains("[ring0]"), "output: {output}");
-    }
-
-    #[test]
-    fn info_shows_trace_id_when_present() {
-        let id = ContextId::new();
-        let row = make_row(Some("coder-ctx"), id);
-        let mut tid = [0u8; 16];
-        tid[15] = 0xab;
-        let output = format_context_info(&row, 0, 0, false, Some(tid));
-        // 32 lowercase hex chars, leading zeros preserved.
-        assert!(output.contains("Trace:   000000000000000000000000000000ab"));
-    }
-
-    /// `Host:` is UNCONDITIONAL — unlike Fork/Promoted/Demoted/Paused, which
-    /// are omitted entirely when unset, "unknown host" is itself the useful
-    /// fleet-board answer (not noise to hide), so it renders "-" rather than
-    /// disappearing. This is the display-layer half of "old rows without the
-    /// field still render" — `make_row` here has `origin_host: None`, same
-    /// as a genuinely pre-migration DB row.
-    #[test]
-    fn info_shows_host_as_dash_when_unknown() {
-        let row = make_row(Some("no-host-ctx"), ContextId::new());
-        let output = format_context_info(&row, 0, 0, false, None);
-        assert!(output.contains("Host:    -"), "output: {output}");
-    }
-
-    #[test]
-    fn info_shows_host_when_known() {
-        let mut row = make_row(Some("hosted-ctx"), ContextId::new());
-        row.origin_host = Some("zorak".to_string());
-        let output = format_context_info(&row, 0, 0, false, None);
-        assert!(output.contains("Host:    zorak"), "output: {output}");
     }
 
     /// `kj context list`'s table gets the same fact as an OPTIONAL

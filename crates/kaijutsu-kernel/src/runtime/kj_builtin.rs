@@ -1734,7 +1734,7 @@ mod tests {
             2,
             "expected 2 iterations: {stdout}"
         );
-        // `format_context_info` renders "ID: <short>"; both contexts'
+        // `kj context info` renders "ID: <short> (full <hex>)"; both contexts'
         // short ids should appear (independent of whether the handle
         // was the label or the full hex).
         assert!(

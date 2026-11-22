@@ -2055,6 +2055,26 @@ fn gate_judge(
     Ok(crate::kj::gate_policy::council_for_context(db, config, context, performer)?.map(GateJudge::Council))
 }
 
+/// Who judges `context`'s gate asks, in words, or `None` when nobody does
+/// ([`gate_judge`]).
+pub(crate) fn judge_summary(
+    db: &crate::kernel_db::KernelDb,
+    config: &crate::kj::gate_policy::GateConfig,
+    context: ContextId,
+    performer: Option<&crate::kj::gate_policy::GatePerformer>,
+) -> Result<Option<String>, String> {
+    Ok(gate_judge(db, config, context, performer)?.map(|judge| match judge {
+        GateJudge::Council(_) => "the council".to_string(),
+        GateJudge::Model(kind, _, bound) => {
+            let kind = match kind {
+                super::guardian::JudgeKind::Guardian => "guardian model",
+                super::guardian::JudgeKind::Decisions => "decisions model",
+            };
+            format!("the {kind} {}/{}", bound.backend, bound.slot.model)
+        }
+    }))
+}
+
 /// Whether the council or a model judge judges `context`'s gate asks
 /// ([`gate_judge`]). `Err` is a fault reading the context.
 pub(crate) fn judged(
