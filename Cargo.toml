@@ -52,7 +52,6 @@ kaijutsu-abc = { path = "crates/kaijutsu-abc" }
 kaijutsu-ansi = { path = "crates/kaijutsu-ansi" }
 kaijutsu-cas = { path = "crates/kaijutsu-cas" }
 kaijutsu-audio = { path = "crates/kaijutsu-audio" }
-kaijutsu-audio-runtime = { path = "crates/kaijutsu-audio-runtime" }
 kaijutsu-hyoushigi = { path = "crates/kaijutsu-hyoushigi" }
 kaijutsu-viz = { path = "crates/kaijutsu-viz" }
 kaijutsu-present = { path = "crates/kaijutsu-present" }

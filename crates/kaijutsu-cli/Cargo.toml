@@ -21,3 +21,6 @@ whoami.workspace = true
 [dev-dependencies]
 kaijutsu-server.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true
