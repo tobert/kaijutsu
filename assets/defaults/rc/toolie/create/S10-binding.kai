@@ -8,6 +8,3 @@
 # holds `facade:shell_write`, `exec`, or a write tool.
 set -e
 kj binding allow "facade:shell"
-kj binding allow "facade:edit_input"
-kj binding allow "facade:submit_input"
-kj binding allow "facade:commit_capture"

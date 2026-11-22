@@ -1,0 +1,6 @@
+# Person input facades shared by every rc directory a person talks to:
+# compose draft edits (`edit_input` covers `write_input`), submit, and capture.
+set -e
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"

@@ -11,10 +11,6 @@ kj binding allow "builtin.tasks"
 # `*` does not cover builtin.turn; this grant is the opt-in. See
 # docs/conversation-session.md, "Ending a task with done".
 kj binding allow "builtin.turn"
-# The person's input surfaces in this context: compose edits, submit, capture.
-kj binding allow "facade:edit_input"
-kj binding allow "facade:submit_input"
-kj binding allow "facade:commit_capture"
 # kj verb authorities a coder works with: fork a context, push and merge
 # drift, run host commands, and save through the editor.
 kj binding allow "fork"

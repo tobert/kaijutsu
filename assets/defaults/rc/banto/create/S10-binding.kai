@@ -56,11 +56,5 @@ kj binding allow "editor"
 # JUDGMENT CALL (Amy should confirm): granted here because banto performs the
 # operator's console and wants the safe tool available by default AND the hot
 # one on hand, not because coordination is inherently a write-shell role.
-# `edit_input` covers write_input too.
 kj binding allow "facade:shell"
 kj binding allow "facade:shell_write"
-kj binding allow "facade:edit_input"
-kj binding allow "facade:submit_input"
-# The app's MIDI ear commits capture batches against its context
-# (docs/midi.md M2); a banto context can host the ear. Musician/toolie stay capture-mute.
-kj binding allow "facade:commit_capture"

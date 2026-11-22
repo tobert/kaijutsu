@@ -6,10 +6,6 @@ set -e
 # and covers anything else this seat runs under `[rc.companion]`; a
 # statement no key covers asks the person.
 kj binding allow "facade:shell_write"
-# The person's input surfaces in this context: compose edits, submit, capture.
-kj binding allow "facade:edit_input"
-kj binding allow "facade:submit_input"
-kj binding allow "facade:commit_capture"
 kj binding allow "editor"
 # Deliberately NOT granted: fork, exec, transport, house, operator, system.
 # The check-in clock belongs to the person. This seat does not set its own
