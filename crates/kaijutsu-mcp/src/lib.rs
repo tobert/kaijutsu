@@ -20,6 +20,7 @@ pub mod hook_listener;
 pub mod hook_adapter;
 pub mod hook_types;
 mod models;
+pub mod subscriptions;
 mod tree;
 
 use regex::Regex;
@@ -49,6 +50,7 @@ use rmcp::{
         CompletionInfo,
         // Prompt types
         GetPromptResult,
+        ListResourceTemplatesResult,
         ListResourcesResult,
         PaginatedRequestParams,
         // Progress notifications (delegated-turn narration on `shell`)
@@ -60,6 +62,7 @@ use rmcp::{
         ReadResourceResult,
         Resource,
         ResourceContents,
+        ResourceTemplate,
         RequestMetaObject,
         Role,
         // Protocol negotiation
@@ -67,10 +70,11 @@ use rmcp::{
         // Server types
         ServerCapabilities,
         ServerConfig,
+        SubscriptionFilter,
     },
     prompt, prompt_handler, prompt_router,
     schemars::JsonSchema,
-    service::{NotificationContext, Peer, RequestContext},
+    service::{NotificationContext, Peer, RequestContext, SubscriptionContext, SubscriptionSendError},
     tool, tool_handler, tool_router,
 };
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kaijutsu still wants to
@@ -97,6 +101,7 @@ use tokio::sync::{broadcast, watch};
 // Re-export public types
 use helpers::*;
 pub use models::*;
+use subscriptions::{DriftRecord, SubscriptionHub, SubscriptionUri};
 use tree::format_dag_tree;
 
 /// This process's peer `instance` — minted once, stable for the process's
@@ -355,6 +360,8 @@ pub struct RemoteState {
     /// registration cannot both create and join a context. Label
     /// stabilization does not take it.
     pub registering: Arc<tokio::sync::Mutex<()>>,
+    /// Coalesced resource subscription hub fed by `spawn_pulse_task`.
+    pub subscriptions: SubscriptionHub,
 }
 
 /// State for a joined context — created by `register_session`.
@@ -425,30 +432,25 @@ pub(crate) struct JoinOutcome {
     pub previous_context: Option<serde_json::Value>,
 }
 
-/// Spawn the pulse task — the sole remaining consumer of the actor's event
-/// broadcast in this crate, and everything that replaced the old
-/// doc-task-plus-event-bridge pair.
-/// It applies nothing and holds no document: every `ServerEvent` just bumps
-/// `change`, waking `execute_and_poll_shell`'s completion poll early. A
-/// broadcast `Lagged` bumps too — a lag means events were dropped, so
-/// "something changed" is the only honest signal left, and that's all a
-/// bump ever claimed. `Closed` exits the loop rather than spin: once a
-/// broadcast sender is gone, `recv()` resolves `Closed` immediately on every
-/// subsequent poll.
+/// Spawn the pulse task consuming the actor's event broadcast.
 ///
-/// `actor.subscribe_events()` is already scoped to the single joined context
-/// (`scope_blocks_to_context = true`, set in `connect_with_config`), so every
-/// event received here is for our context — no `context_id` filtering
-/// needed.
+/// Each received `ServerEvent` is classified into `subscriptions` (for
+/// coalesced `subscriptions/listen` delivery and `/events`/`/turns` reads) and
+/// bumps `change` so `execute_and_poll_shell` wakes early. A broadcast `Lagged`
+/// bumps `change` too. `Closed` exits the loop.
 fn spawn_pulse_task(
     actor: ActorHandle,
     change: watch::Sender<u64>,
+    subscriptions: SubscriptionHub,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut event_rx = actor.subscribe_events();
         loop {
             match event_rx.recv().await {
-                Ok(_event) => change.send_modify(|g| *g = g.wrapping_add(1)),
+                Ok(event) => {
+                    subscriptions.record_server_event(&event);
+                    change.send_modify(|g| *g = g.wrapping_add(1));
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::debug!("pulse task: lagged by {n} events, bumping anyway");
                     change.send_modify(|g| *g = g.wrapping_add(1));
@@ -489,7 +491,11 @@ async fn finish_join(
     // 1. Spawn the pulse task — bumps `remote.change` on every server event
     // for this context, so the shell completion poll can wake early instead
     // of relying purely on its floor cadence. See `spawn_pulse_task`.
-    let pulse_join = spawn_pulse_task(remote.actor.clone(), remote.change.clone());
+    let pulse_join = spawn_pulse_task(
+        remote.actor.clone(),
+        remote.change.clone(),
+        remote.subscriptions.clone(),
+    );
     let pulse_abort = pulse_join.abort_handle();
 
     // Supervise: not fatal if it exits or panics (the shell poll just falls
@@ -854,6 +860,8 @@ pub struct KaijutsuMcp {
     character: Option<String>,
     /// Holds tool calls until startup registration settles.
     startup: StartupGate,
+    /// Coalesced resource subscription hub shared with pulse and listen tasks.
+    subscriptions: SubscriptionHub,
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -884,6 +892,7 @@ impl KaijutsuMcp {
             parent: None,
             character: None,
             startup: StartupGate::open(),
+            subscriptions: SubscriptionHub::new(),
         }
     }
 
@@ -958,6 +967,7 @@ impl KaijutsuMcp {
         tracing::info!(context_label = %context_name, "RPC actor spawned; it connects on first use");
 
         let shared_context_id = Arc::new(Mutex::new(None));
+        let subscriptions = SubscriptionHub::new();
 
         Self {
             backend: Backend::Remote(RemoteState {
@@ -969,6 +979,7 @@ impl KaijutsuMcp {
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
                 registering: Arc::new(tokio::sync::Mutex::new(())),
+                subscriptions: subscriptions.clone(),
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -982,7 +993,22 @@ impl KaijutsuMcp {
             parent: None,
             character: None,
             startup: StartupGate::open(),
+            subscriptions,
         }
+    }
+
+    /// Replace the subscription hub (e.g. with a shorter coalesce window in tests).
+    pub fn with_subscription_hub(mut self, hub: SubscriptionHub) -> Self {
+        if let Backend::Remote(ref mut remote) = self.backend {
+            remote.subscriptions = hub.clone();
+        }
+        self.subscriptions = hub;
+        self
+    }
+
+    /// Access the server's coalesced resource subscription hub.
+    pub fn subscriptions(&self) -> &SubscriptionHub {
+        &self.subscriptions
     }
 
     /// Hold tool calls on `gate` until the caller settles it.
@@ -2901,6 +2927,8 @@ impl ServerHandler for KaijutsuMcp {
                 .enable_prompts()
                 .enable_prompts_list_changed()
                 .enable_resources()
+                .enable_resources_subscribe()
+                .enable_resources_list_changed()
                 .enable_logging()
                 .enable_completions()
                 .build(),
@@ -2920,12 +2948,41 @@ impl ServerHandler for KaijutsuMcp {
     // Resources
     // ========================================================================
 
-    /// List available resources.
+    /// List parameterized resource templates.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let templates = vec![
+            ResourceTemplate::new("kaijutsu://docs/{id}", "document")
+                .with_title("Document Summary")
+                .with_description("Document metadata and block summary for context {id}")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("kaijutsu://blocks/{id}/{key}", "block")
+                .with_title("Block Content")
+                .with_description("Plain text content of block {key} in document {id}")
+                .with_mime_type("text/plain"),
+            ResourceTemplate::new("kaijutsu://contexts/{id}/drift", "context_drift")
+                .with_title("Context Drift Queue")
+                .with_description("Pending coalesced drifts targeting context {id}")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("kaijutsu://contexts/{id}/turns", "context_turns")
+                .with_title("Context Turn Lifecycle")
+                .with_description("Recent turn lifecycle events (started, completed, failed) for context {id}")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("kaijutsu://contexts/{id}/events", "context_events")
+                .with_title("Context Event Digest")
+                .with_description("Coalesced digest of recent block and turn events for context {id}")
+                .with_mime_type("application/json"),
+        ];
+        Ok(ListResourceTemplatesResult::with_all_items(templates))
+    }
+
+    /// List available concrete resources.
     ///
-    /// Resources exposed:
-    /// - `kaijutsu://docs` - List all documents
-    /// - `kaijutsu://docs/{doc_id}` - Document metadata and block list
-    /// - `kaijutsu://blocks/{doc_id}/{block_key}` - Block content
+    /// Individual blocks are addressed via the `kaijutsu://blocks/{id}/{key}`
+    /// template rather than enumerated here.
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -2933,7 +2990,6 @@ impl ServerHandler for KaijutsuMcp {
     ) -> Result<ListResourcesResult, McpError> {
         let mut resources = Vec::new();
 
-        // Add root docs resource
         resources.push(
             Resource::new("kaijutsu://docs", "documents")
                 .with_title("All Documents")
@@ -2941,48 +2997,47 @@ impl ServerHandler for KaijutsuMcp {
                 .with_mime_type("application/json"),
         );
 
-        // Add each document as a resource. Off the mirror on Remote — see
-        // `context_blocks`.
         for doc_id in self.context_ids().await {
-            let blocks = self
-                .context_blocks(doc_id)
-                .await
-                .map_err(|e| McpError::internal_error(e, None))?;
-            if let Some(blocks) = blocks {
-                let doc_hex = doc_id.to_hex();
-                resources.push(
-                    Resource::new(format!("kaijutsu://docs/{}", doc_hex), doc_hex.clone())
-                        .with_title(format!("Document: {}", doc_hex))
-                        .with_description(format!(
-                            "Conversation document with {} blocks",
-                            blocks.len()
-                        ))
-                        .with_mime_type("application/json"),
-                );
+            let doc_hex = doc_id.to_hex();
+            resources.push(
+                Resource::new(format!("kaijutsu://docs/{}", doc_hex), doc_hex.clone())
+                    .with_title(format!("Document: {}", doc_hex))
+                    .with_description("Conversation document metadata and block summary")
+                    .with_mime_type("application/json"),
+            );
+        }
 
-                // Add each block as a resource
-                for snapshot in blocks {
-                    let block_key = snapshot.id.to_key();
-                    resources.push(
-                        Resource::new(
-                            format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
-                            block_key.clone(),
-                        )
-                        .with_title(format!(
-                            "[{}/{}]",
-                            snapshot.role.as_str(),
-                            snapshot.kind.as_str()
-                        ))
-                        .with_description(format!(
-                            "{} block, {} bytes",
-                            snapshot.kind.as_str(),
-                            snapshot.content.len()
-                        ))
-                        .with_mime_type("text/plain")
-                        .with_size(snapshot.content.len() as u64),
-                    );
-                }
-            }
+        if let Some(remote) = self.remote()
+            && let Some(joined) = remote.joined.read().await.as_ref()
+        {
+            let ctx_hex = joined.context_id.to_hex();
+            resources.push(
+                Resource::new(
+                    format!("kaijutsu://contexts/{ctx_hex}/drift"),
+                    format!("{ctx_hex}/drift"),
+                )
+                .with_title(format!("Drift: {}", joined.context_id.short()))
+                .with_description("Pending coalesced drifts targeting the joined context")
+                .with_mime_type("application/json"),
+            );
+            resources.push(
+                Resource::new(
+                    format!("kaijutsu://contexts/{ctx_hex}/turns"),
+                    format!("{ctx_hex}/turns"),
+                )
+                .with_title(format!("Turns: {}", joined.context_id.short()))
+                .with_description("Recent turn lifecycle events for the joined context")
+                .with_mime_type("application/json"),
+            );
+            resources.push(
+                Resource::new(
+                    format!("kaijutsu://contexts/{ctx_hex}/events"),
+                    format!("{ctx_hex}/events"),
+                )
+                .with_title(format!("Events: {}", joined.context_id.short()))
+                .with_description("Coalesced digest of recent events for the joined context")
+                .with_mime_type("application/json"),
+            );
         }
 
         Ok(ListResourcesResult::with_all_items(resources))
@@ -2996,7 +3051,8 @@ impl ServerHandler for KaijutsuMcp {
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = &request.uri;
 
-        // Parse URI: kaijutsu://docs, kaijutsu://docs/{id}, kaijutsu://blocks/{id}/{key}
+        // Parse URI: kaijutsu://docs, kaijutsu://docs/{id}, kaijutsu://blocks/{id}/{key},
+        // kaijutsu://contexts/{id}/{drift|turns|events}
         if uri == "kaijutsu://docs" {
             // Return list of all documents. This wants only a per-context
             // count, but `context_blocks` transfers every block's full
@@ -3021,7 +3077,7 @@ impl ServerHandler for KaijutsuMcp {
             let content = serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".to_string());
 
             return Ok(
-                ReadResourceResult::new(vec![ResourceContents::text(content, uri.clone())]).into(),
+                ReadResourceResult::new(vec![json_resource_contents(content, uri.clone())]).into(),
             );
         }
 
@@ -3070,7 +3126,7 @@ impl ServerHandler for KaijutsuMcp {
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
             return Ok(
-                ReadResourceResult::new(vec![ResourceContents::text(content, uri.clone())]).into(),
+                ReadResourceResult::new(vec![json_resource_contents(content, uri.clone())]).into(),
             );
         }
 
@@ -3110,20 +3166,206 @@ impl ServerHandler for KaijutsuMcp {
             .into());
         }
 
+        if let Some(sub_uri) = SubscriptionUri::parse(uri) {
+            match sub_uri {
+                SubscriptionUri::Drift(ctx_id) => {
+                    let drifts: Vec<DriftRecord> = match self.remote() {
+                        Some(remote) => {
+                            let queue = remote.actor.drift_queue().await.map_err(|e| {
+                                McpError::internal_error(format!("Error reading drift queue: {e}"), None)
+                            })?;
+                            let targeted: Vec<_> = queue
+                                .into_iter()
+                                .filter(|d| d.target_ctx == ctx_id)
+                                .collect();
+                            for drift in &targeted {
+                                if let Err(e) = remote.actor.drift_cancel(drift.id).await {
+                                    tracing::warn!(
+                                        drift_id = drift.id,
+                                        "Failed to cancel consumed drift: {e}"
+                                    );
+                                }
+                            }
+                            targeted
+                                .into_iter()
+                                .map(|d| DriftRecord {
+                                    id: d.id,
+                                    source_ctx: d.source_ctx.to_hex(),
+                                    target_ctx: d.target_ctx.to_hex(),
+                                    content: d.content,
+                                    source_model: d.source_model,
+                                    drift_kind: drift_kind_wire(d.drift_kind).to_string(),
+                                    created_at: d.created_at,
+                                })
+                                .collect()
+                        }
+                        None => self.subscriptions.drain_local_drifts(ctx_id),
+                    };
+                    let payload = serde_json::json!({
+                        "context_id": ctx_id.to_hex(),
+                        "drifts": drifts,
+                    });
+                    let content = serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    return Ok(ReadResourceResult::new(vec![json_resource_contents(
+                        content,
+                        uri.clone(),
+                    )])
+                    .into());
+                }
+                SubscriptionUri::Turns(ctx_id) => {
+                    let events = self.subscriptions.recent_turns(ctx_id);
+                    let payload = serde_json::json!({
+                        "context_id": ctx_id.to_hex(),
+                        "events": events,
+                    });
+                    let content = serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    return Ok(ReadResourceResult::new(vec![json_resource_contents(
+                        content,
+                        uri.clone(),
+                    )])
+                    .into());
+                }
+                SubscriptionUri::Events(ctx_id) => {
+                    let events = self.subscriptions.recent_events(ctx_id);
+                    let payload = serde_json::json!({
+                        "context_id": ctx_id.to_hex(),
+                        "events": events,
+                    });
+                    let content = serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    return Ok(ReadResourceResult::new(vec![json_resource_contents(
+                        content,
+                        uri.clone(),
+                    )])
+                    .into());
+                }
+                SubscriptionUri::Doc(_) => {
+                    // Handled above by the `kaijutsu://docs/` branch.
+                }
+            }
+        }
+
         Err(McpError::invalid_params(
             format!("Unknown resource URI: {}", uri),
             None,
         ))
     }
 
-    // `subscribe`/`unsubscribe` are deliberately NOT implemented. We advertised
-    // `resources.subscribe` and accepted subscriptions into a HashSet that
-    // nothing ever read: no `resources/updated` notification is sent anywhere
-    // in this crate, so a subscriber waited forever for an event that could not
-    // arrive. Falling through to rmcp's default (`method_not_found`) fails loud
-    // instead. The 2026-07-28 replacement is `subscriptions/listen`
-    // (`accepted_subscription_filter` + `listen`); implement that if a real
-    // consumer appears.
+    /// Accept notification categories advertised by this server and valid
+    /// `kaijutsu://` resource subscription URIs.
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let mut builder = SubscriptionFilter::builder();
+        if requested.prompts_list_changed == Some(true) {
+            builder = builder.prompts_list_changed();
+        }
+        if requested.resources_list_changed == Some(true) {
+            builder = builder.resources_list_changed();
+        }
+        if let Some(ref uris) = requested.resource_subscriptions {
+            let valid: Vec<String> = uris
+                .iter()
+                .filter(|uri| SubscriptionUri::parse(uri).is_some())
+                .cloned()
+                .collect();
+            if !valid.is_empty() {
+                builder = builder.resource_subscriptions(valid);
+            }
+        }
+        Some(builder.build())
+    }
+
+    /// Stream coalesced `notifications/resources/updated` events for the
+    /// accepted resource URIs until the client cancels or the connection drops.
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
+        let accepted_uris: Vec<String> = context
+            .accepted()
+            .resource_subscriptions
+            .clone()
+            .unwrap_or_default();
+
+        // Map canonical parsed URI -> exact accepted string requested by client.
+        let mut accepted_map: std::collections::HashMap<SubscriptionUri, String> =
+            std::collections::HashMap::new();
+        let mut parsed_uris = Vec::new();
+        let mut drift_targets: HashSet<ContextId> = HashSet::new();
+
+        for raw_uri in accepted_uris {
+            if let Some(parsed) = SubscriptionUri::parse(&raw_uri) {
+                if let SubscriptionUri::Drift(ctx_id) = parsed {
+                    drift_targets.insert(ctx_id);
+                }
+                accepted_map.insert(parsed, raw_uri);
+                parsed_uris.push(parsed);
+            }
+        }
+
+        let _guard = self.subscriptions.register_subscriber(parsed_uris);
+        let mut rx = self.subscriptions.subscribe();
+
+        let remote_drift = self
+            .remote()
+            .filter(|_| !drift_targets.is_empty())
+            .cloned();
+
+        let mut change_rx = remote_drift.as_ref().map(|r| r.change.subscribe());
+        let mut drift_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        drift_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut seen_drift_ids: HashSet<u64> = HashSet::new();
+
+        loop {
+            tokio::select! {
+                _ = context.cancelled() => break,
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(uri) => {
+                            let target = SubscriptionUri::parse(&uri)
+                                .and_then(|parsed| accepted_map.get(&parsed));
+                            if let Some(accepted_uri) = target {
+                                match context.sink().notify_resource_updated(accepted_uri.clone()).await {
+                                    Ok(()) => {}
+                                    Err(SubscriptionSendError::SubscriptionClosed) => break,
+                                    Err(e) => {
+                                        tracing::debug!(uri = %accepted_uri, "subscription notify failed: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::debug!("subscription listener lagged by {n} notifications");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = drift_tick.tick(), if remote_drift.is_some() => {
+                    if let Some(ref remote) = remote_drift {
+                        poll_remote_drifts(remote, &drift_targets, &mut seen_drift_ids, &self.subscriptions).await;
+                    }
+                }
+                changed = async {
+                    match change_rx.as_mut() {
+                        Some(rx) => rx.changed().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                }, if change_rx.is_some() => {
+                    if !changed {
+                        change_rx = None;
+                        continue;
+                    }
+                    if let Some(ref remote) = remote_drift {
+                        poll_remote_drifts(remote, &drift_targets, &mut seen_drift_ids, &self.subscriptions).await;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 
     // ========================================================================
     // Completion
@@ -3254,6 +3496,53 @@ impl ServerHandler for KaijutsuMcp {
             "Request cancelled"
         );
         // Future: track in-flight operations and cancel them
+    }
+}
+
+/// Build a `ResourceContents::TextResourceContents` tagged as `application/json`.
+fn json_resource_contents(text: String, uri: String) -> ResourceContents {
+    ResourceContents::TextResourceContents {
+        uri,
+        mime_type: Some("application/json".to_string()),
+        text,
+        meta: None,
+    }
+}
+
+/// Wire string for a kernel [`kaijutsu_types::DriftKind`].
+fn drift_kind_wire(kind: kaijutsu_types::DriftKind) -> &'static str {
+    match kind {
+        kaijutsu_types::DriftKind::Push => "push",
+        kaijutsu_types::DriftKind::Pull => "pull",
+        kaijutsu_types::DriftKind::Merge => "merge",
+        kaijutsu_types::DriftKind::Distill => "distill",
+        kaijutsu_types::DriftKind::Notification => "notification",
+        kaijutsu_types::DriftKind::Fork => "fork",
+    }
+}
+
+/// Poll the remote kernel's drift queue for unseen drifts targeting any context
+/// in `targets`, notifying `subscriptions` once per drift ID.
+async fn poll_remote_drifts(
+    remote: &RemoteState,
+    targets: &HashSet<ContextId>,
+    seen_ids: &mut HashSet<u64>,
+    subscriptions: &SubscriptionHub,
+) {
+    let queue = match remote.actor.drift_queue().await {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::debug!("subscription drift poll failed: {e}");
+            return;
+        }
+    };
+    let live_ids: HashSet<u64> = queue.iter().map(|d| d.id).collect();
+    seen_ids.retain(|id| live_ids.contains(id));
+
+    for drift in queue {
+        if targets.contains(&drift.target_ctx) && seen_ids.insert(drift.id) {
+            subscriptions.notify_drift(drift.target_ctx);
+        }
     }
 }
 
