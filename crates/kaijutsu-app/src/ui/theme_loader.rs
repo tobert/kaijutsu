@@ -5,9 +5,9 @@
 //! The app has no disk-load path of its own — it reads the file the kernel
 //! reads, over the wire, never straight off the app's own host.
 //!
-//! One payload, two color lanes (docs/color.md): [`parse_theme_data`] yields
-//! the raw `ThemeData`, from which the caller derives both the UI `Theme`
-//! and the 3D `ScenePalette`.
+//! One payload, two color lanes: [`parse_theme_data`] yields the raw
+//! `ThemeData`, from which the caller derives both the UI `Theme` and the 3D
+//! `ScenePalette` / `HeroicPalette` (`docs/newui.md`, "Color").
 //!
 //! Theme values are plain hex strings and numbers — no computed colors.
 

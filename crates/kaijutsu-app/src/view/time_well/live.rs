@@ -4,16 +4,14 @@
 //!
 //! Both ingest the same kernel-wide `ServerEvent` stream the activity deck
 //! rides (see [`super::activity`]), but the ingest system runs **ungated**
-//! (every screen, like `metronome::ingest_beat_signals`) so the well opens
-//! warm: tails accumulate and phasors stay locked while you're in the
-//! conversation view.
+//! (every screen) so the well opens warm: tails accumulate and phasors stay
+//! locked while you're in the conversation view.
 //!
-//! Beat stance: *distribute tempo, not pulses* (`docs/midi.md`, applied to
-//! viz). The kernel ships low-rate [`ServerEvent::BeatSync`] references keyed
-//! by the track's **score context**; each becomes a local
-//! [`LocalBeat`] phasor here — the "later cut keys per track/score context"
-//! that `metronome.rs` anticipated. The pulse animation is derived locally
-//! from the phasor every frame; nothing streams per-beat over the wire.
+//! Beat stance: *distribute tempo, not pulses* (`docs/time.md`). The kernel
+//! ships low-rate [`ServerEvent::BeatSync`] references keyed by the track's
+//! **score context**; each becomes a local [`LocalBeat`] phasor here. The pulse
+//! animation is derived locally from the phasor every frame; nothing streams
+//! per-beat over the wire.
 //!
 //! Render targets (no card-texture rebuilds — see `WellCardMaterial`):
 //! - `dim.y` = **chatter**: the context's decaying event energy
@@ -279,13 +277,11 @@ pub struct WellBeatsRes(pub WellBeats);
 ///
 /// Each `BeatSync` is routed by its [`RefDisposition`]: `Fold` (age ≤
 /// `REF_FOLD_MAX`, or unstamped) folds at its own back-dated emission instant
-/// — not this frame's shared `now_inst` — the same flood-resistance fix as
-/// `metronome::ingest_beat_signals`. `Touch` and `Drop` (older than
+/// — not this frame's shared `now_inst` — keeping the phasor flood-resistant
+/// (`docs/time.md`, "The One Timebase"). `Touch` and `Drop` (older than
 /// `REF_FOLD_MAX`, whether or not past `REF_STALE_MAX`) both still prove the
 /// track alive: either bumps the phasor's liveness clock via
-/// [`WellBeats::touch`] without folding a beat position from the past — this
-/// is the one place `Touch` and `Drop` behave alike, because `WellBeats`
-/// (unlike the single-phasor metronome) HAS a liveness clock to bump.
+/// [`WellBeats::touch`] without folding a beat position from the past.
 pub fn ingest_live_events(
     mut events: MessageReader<ServerEventMessage>,
     mut tails: ResMut<ContextTails>,

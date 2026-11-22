@@ -37,9 +37,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         col = mix(sun_bot.rgb, sun_mid.rgb, h * 2.0);
     }
 
-    // Seven horizontal bands across the lower half (h < 0.52), thickening toward base.
-    if (h < 0.52) {
-        let lower_t = (0.52 - h) / 0.52; // 0 at mid, 1 at base
+    // Seven horizontal bands across the visible lower half (h in [0.46, 0.74]),
+    // thickening toward the horizon so the sky backdrop shows through.
+    if (h < 0.74 && h >= 0.46) {
+        let lower_t = (0.74 - h) / 0.28; // 0 at top of band, 1 at base
         let drift = select(fract(globals.time * 0.06), 0.0, params.z > 0.5);
         let band_pos = fract(lower_t * 7.0 - drift);
         let stripe_width = mix(0.10, 0.52, pow(lower_t, 1.25));

@@ -946,9 +946,9 @@ mod reconnect_config_refetch_tests {
 /// Apply a theme fetched over RPC. Slice 2: the app no longer reads a host
 /// `theme.toml` — the kernel is the sole owner, so theme arrives as a
 /// [`RpcResultMessage::ThemeReceived`] on connect and replaces BOTH color
-/// resources: `Theme` (the UI lane) and `ScenePalette` (the 3D scene lane's
-/// `[scene]` table — docs/color.md). Theme-reading systems pick the new values
-/// up next frame; `[scene.post]` hot-applies to the camera via
+/// resources: `Theme` (the UI lane) and `ScenePalette` / `HeroicPalette` (the
+/// 3D scene lane's `[scene]` and `[heroic]` tables — `docs/newui.md`, "Color").
+/// Theme-reading systems pick the new values up next frame; `[scene.post]` hot-applies to the camera via
 /// `apply_scene_post_on_change`. A parse failure is surfaced as a toast and
 /// leaves the current theme intact — never a silent revert to default.
 fn apply_theme_from_rpc(

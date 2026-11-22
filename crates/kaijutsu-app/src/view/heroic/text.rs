@@ -237,7 +237,22 @@ pub fn sync_heroic_text(
         }
     }
 
-    for (li, lane) in state.lanes.iter().enumerate() {
+    // Precompute non-overlapping world offsets for active streaming ribbons so
+    // performers clustered at similar Z/lanes separate vertically.
+    let active_ribbons: Vec<(ContextId, Vec3)> = state
+        .lanes
+        .iter()
+        .flat_map(|lane| lane.performers.iter())
+        .filter(|perf| perf.tail_lines.last().is_some_and(|s| !s.is_empty()))
+        .filter_map(|perf| {
+            pool.slots
+                .get(&perf.context_id)
+                .map(|slot| (perf.context_id, slot.world_pos))
+        })
+        .collect();
+    let ribbon_positions = layout_ribbon_positions(&active_ribbons);
+
+    for lane in &state.lanes {
         for perf in &lane.performers {
             let Some(perf_slot) = pool.slots.get(&perf.context_id) else {
                 continue;
@@ -292,8 +307,10 @@ pub fn sync_heroic_text(
                     *vis = Visibility::Hidden;
                 } else {
                     *vis = Visibility::Inherited;
-                    let stagger = (li % 2) as f32 * 0.28;
-                    tf.translation = perf_slot.world_pos + Vec3::new(0.0, 0.76 + stagger, 0.0);
+                    tf.translation = ribbon_positions
+                        .get(&perf.context_id)
+                        .copied()
+                        .unwrap_or(perf_slot.world_pos + Vec3::new(0.0, 0.76, 0.0));
                     tf.rotation = Quat::from_rotation_x(-0.14);
                     if snippet != rslot.last_text
                         && now - rslot.last_refresh >= RIBBON_REFRESH_SECS
@@ -407,5 +424,66 @@ pub fn sync_heroic_text(
                 }
             }
         }
+    }
+}
+
+/// Compute non-overlapping world translations for active streaming ribbons.
+///
+/// Ribbons start 0.76 units above each performer crystal and step upward when
+/// another visible ribbon sits within overlapping X/Y/Z bounds.
+fn layout_ribbon_positions(active: &[(ContextId, Vec3)]) -> HashMap<ContextId, Vec3> {
+    const BASE_Y: f32 = 0.76;
+    const STEP_Y: f32 = 0.34;
+    const MIN_DX: f32 = 1.35;
+    const MIN_DY: f32 = 0.30;
+    const MIN_DZ: f32 = 2.20;
+    const MAX_TIERS: usize = 5;
+
+    let mut ordered: Vec<(ContextId, Vec3)> = active.to_vec();
+    ordered.sort_by(|a, b| {
+        b.1.z
+            .total_cmp(&a.1.z)
+            .then_with(|| a.1.x.total_cmp(&b.1.x))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut placed: Vec<Vec3> = Vec::with_capacity(ordered.len());
+    let mut out = HashMap::with_capacity(ordered.len());
+    for (id, base_pos) in ordered {
+        let mut candidate = base_pos + Vec3::new(0.0, BASE_Y, 0.0);
+        for _ in 0..MAX_TIERS {
+            let collides = placed.iter().any(|p| {
+                (p.x - candidate.x).abs() < MIN_DX
+                    && (p.y - candidate.y).abs() < MIN_DY
+                    && (p.z - candidate.z).abs() < MIN_DZ
+            });
+            if !collides {
+                break;
+            }
+            candidate.y += STEP_Y;
+        }
+        placed.push(candidate);
+        out.insert(id, candidate);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearby_ribbons_separate_vertically() {
+        let a = ContextId::new();
+        let b = ContextId::new();
+        let c = ContextId::new();
+        let pos = layout_ribbon_positions(&[
+            (a, Vec3::new(0.0, 0.0, -5.0)),
+            (b, Vec3::new(0.8, 0.0, -5.2)),
+            (c, Vec3::new(-4.0, 0.0, -5.0)),
+        ]);
+        assert!((pos[&a].y - pos[&b].y).abs() >= 0.30);
+        assert!((pos[&a].y - 0.76).abs() < 1e-4);
+        assert!((pos[&c].y - 0.76).abs() < 1e-4);
     }
 }

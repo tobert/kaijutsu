@@ -50,6 +50,6 @@ Every producer implements the `Resolver` trait:
 Tracks serve as isolated clock domains and execution lanes within the kaijutsu engine.
 
 - **Tracks Table & Attachments**: The `tracks` table maps track identifiers to active performer contexts, tempo multipliers, and output routing attachments.
-- **Durable Score Contexts (`score-<track>`)**: Each track maintains an append-only, durable sequence of score cells representing past commitments and open future speculations.
+- **Durable Score Contexts (`score-<track>`)**: Each track maintains an append-only, durable sequence of committed score cells (one block per committed cell; pending and speculated work lives only in `Timeline.future` until committed).
 - **RenderCue Wire Contract**: Communication across the beat wire uses mime-keyed cues referencing Content Addressable Storage (CAS) hashes. **Raw media bytes never ride the beat wire.** CAS resolution happens out-of-band via content hash lookup.
 - **Transport Control**: `kj transport` and `kj play` manage global playhead states, transport synchronization, and track-level arming for playback and recording.

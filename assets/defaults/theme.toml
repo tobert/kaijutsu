@@ -1,9 +1,9 @@
 # Kaijutsu Default Theme — Synthwave
 #
-# The app-wide identity (docs/color.md): deep indigo-violet grounds, electric
-# violet + gold two-tone, neon accents. One identity, two lanes — these flat
-# keys + [ansi] are the sRGB UI lane; [scene.*] is the linear-HDR scene lane.
-# Colors are hex strings: "#rrggbb" or "#rrggbbaa" (with alpha).
+# The app-wide identity: deep indigo-violet grounds, electric violet + gold
+# two-tone, neon accents. One identity, two lanes — these flat keys + [ansi]
+# are the sRGB UI lane; [scene.*] and [heroic] are the linear-HDR scene lane
+# (docs/newui.md). Colors are hex strings: "#rrggbb" or "#rrggbbaa" (with alpha).
 
 # Base UI
 bg = "#131020"
@@ -174,7 +174,7 @@ bright_magenta = "#ff9ae4"
 bright_cyan = "#a5ecff"
 bright_white = "#ece7fa"
 
-# ─── The 3D scene lane (docs/color.md) ─────────────────────────────────────
+# ─── The 3D scene lane (docs/newui.md, "Color") ──────────────────────────────
 # Identity hues as sRGB hex — the app linearizes them for the HDR pipeline.
 # Brightness lives in [scene.tiers]; hues keep their brightest channel near
 # full. [scene.post] applies LIVE on theme change; hues/tiers apply at the
@@ -223,7 +223,7 @@ bloom_low_frequency_boost = 0.25
 tonemapper = "aces"
 
 [scene.lighting]
-# OPTIONAL hybrid lit-chamber spike (off = today's all-unlit room, docs/color.md)
+# OPTIONAL hybrid lit-chamber mode (off = today's all-unlit room)
 lit_chamber = false
 chamber_roughness = 0.5      # wet-asphalt sheen on the lit shell surfaces
 chamber_reflectance = 0.3    # a small specular kick

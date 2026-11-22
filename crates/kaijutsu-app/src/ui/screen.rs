@@ -31,7 +31,7 @@ pub enum Screen {
     /// by the `open_editor` peer signal (see `view::editor`).
     Editor,
     /// The room level above the well — the shell's station carousel
-    /// (`docs/scenes/shell.md`). Reached by Up-Up at the well's mouth ring;
+    /// (`view::room`). Reached by Up-Up at the well's mouth ring;
     /// Left/Right cycle stations, Enter/Down dives, Esc drops to Conversation.
     /// A bounded station is reached and left WITHOUT a further screen
     /// transition — "diving" into it is a camera pose plus a
@@ -39,10 +39,10 @@ pub enum Screen {
     /// ("diving IS fullscreening a panel").
     Room,
     /// The full diff viewer — an MSDF panel over a **frozen** `DiffCore`
-    /// (`docs/diff.md` slice 5, `view::diff_view`). Full-viewport, chrome
-    /// hidden, exactly like `Editor`; entered by `Action::OpenDiffViewer` on a
-    /// focused diff block in the conversation, left by `q`/`ZQ`/`:q` (never by
-    /// Esc — the vi surface owns Esc while it is live).
+    /// (`view::diff_view`). Full-viewport, chrome hidden, exactly like
+    /// `Editor`; entered by `Action::OpenDiffViewer` on a focused diff block
+    /// in the conversation, left by `q`/`ZQ`/`:q` (never by Esc — the vi
+    /// surface owns Esc while it is live).
     Diff,
     /// The heroic view — full-window 3D anticipation & commitment road
     /// (`docs/newui.md`, `view::heroic`). Reached by `Ctrl+A k`, left by `Esc`.
