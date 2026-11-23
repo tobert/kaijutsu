@@ -15,6 +15,10 @@
 //! leaves each held ask pending for the approval worker: an allow runs its
 //! stored command once and settles the call's result in place, as for an ask
 //! whose turn ended at the gate.
+//!
+//! A rotation signoff is neither: it grants the turn exactly one more
+//! inference with only `done` offered, and the turn ends after it
+//! (`ContextInterruptState::request_signoff`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +37,10 @@ pub struct ContextInterruptState {
     /// Set before `stop_waiting` fires by [`Self::soft_keeping_asks`]: a call
     /// that stops waiting leaves its ask pending instead of abandoning it.
     keep_held_asks: AtomicBool,
+    /// Rotation signoff: the turn takes exactly one more inference, offering
+    /// only `done`, and then ends. A rotation this context starts inside its
+    /// own turn asks for it, and the turn's end settles the rotation.
+    signoff: AtomicBool,
 }
 
 impl ContextInterruptState {
@@ -42,6 +50,7 @@ impl ContextInterruptState {
             cancel: CancellationToken::new(),
             stop_waiting: CancellationToken::new(),
             keep_held_asks: AtomicBool::new(false),
+            signoff: AtomicBool::new(false),
         })
     }
 
@@ -64,6 +73,19 @@ impl ContextInterruptState {
     /// worker instead of abandoning it.
     pub fn keeps_held_asks(&self) -> bool {
         self.keep_held_asks.load(Ordering::SeqCst)
+    }
+
+    /// Ask for one signoff inference: the turn offers only `done` for it,
+    /// says why, and ends after it. A rotation the context starts inside its
+    /// own turn asks for one, so the turn cannot spend a call on tools its
+    /// archived context will refuse.
+    pub(crate) fn request_signoff(&self) {
+        self.signoff.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a signoff was requested and not yet served.
+    pub(crate) fn signoff_requested(&self) -> bool {
+        self.signoff.load(Ordering::SeqCst)
     }
 
     /// Hard interrupt — abort the current LLM stream immediately.

@@ -3044,6 +3044,393 @@ esac
         d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
+    // ── rotation signoff ──────────────────────────────────────────────────
+
+    /// A context played by `rc-mcp` under a `mid` senpai: the `mcp` loadout
+    /// carries the writable shell and its gate allows an uncovered statement,
+    /// so a model tool call can run `kj context rotate`. The test installs an
+    /// `archive` lifecycle that leaves a marker and the shipped kohai `done` lifecycle,
+    /// which reports to the senpai. `grant_done` gives the seat its ordinary
+    /// `builtin.turn` grant; without it, only a rotation signoff may offer
+    /// `done`.
+    async fn rotate_fixture(grant_done: bool) -> (std::sync::Arc<KjDispatcher>, KjCaller, ContextId, ContextId) {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        d.kernel().broker().set_db(d.kernel_db().clone()).await;
+        // The test dispatcher leaves the broker empty; a model shell call and
+        // the signoff's `done` need the builtin servers production registers.
+        d.kernel()
+            .register_builtin_mcp_servers(d.block_store().clone(), d.kernel().file_cache().clone(), None, d.kernel_db().clone())
+            .await
+            .expect("register builtin mcp servers");
+        let console = console_caller(&d);
+
+        let r = d.dispatch(&argv(&["context", "create", rc_performer(&d, "coder").as_str(), "--name", "mid"]), &console).await;
+        assert!(r.is_ok(), "create the senpai: {}", r.message());
+        let mid = lookup_context_id(&d, "mid");
+
+        let performer = rc_performer(&d, "mcp");
+        let principal = d.kernel_db().lock().get_character_by_name(&performer).unwrap().unwrap().principal_id;
+        d.kernel_db().lock().seed_test_slots(principal, "mock", "mock-model", &["model"]).unwrap();
+        install_rc_script_file(
+            &d,
+            "/config/rc/mcp/archive/S00-mark.kai",
+            "kj block create --role system --kind text --content 'archive-hook-ran'",
+        ).await;
+        let done = crate::seed_scripts::seed_body("/config/rc/kohai/done/S10-notify.kai").expect("kohai done lifecycle");
+        install_rc_script_file(&d, "/config/rc/mcp/done/S10-notify.kai", done).await;
+
+        let r = d.dispatch(
+            &argv(&["context", "create", performer.as_str(), "--name", "rot", "--senpai", "mid"]),
+            &console,
+        ).await;
+        assert!(r.is_ok(), "create the rotating seat: {}", r.message());
+        let rot = lookup_context_id(&d, "rot");
+        if grant_done {
+            let r = d.dispatch(&argv(&["binding", "allow", "builtin.turn", "rot"]), &console).await;
+            assert!(r.is_ok(), "grant the seat its done tool: {}", r.message());
+        }
+        (d, console, mid, rot)
+    }
+
+    /// Register the fixture's mock backend and return the per-call tool
+    /// rosters, the per-call messages, and the handle that holds call
+    /// `hold_at` (or `usize::MAX` for none).
+    async fn install_rotate_mock(
+        d: &std::sync::Arc<KjDispatcher>,
+        script: Vec<Vec<crate::llm::StreamEvent>>,
+        hold_at: usize,
+    ) -> (
+        std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>>,
+        std::sync::Arc<parking_lot::Mutex<Vec<Vec<crate::llm::Message>>>>,
+        std::sync::Arc<crate::llm::CallHold>,
+    ) {
+        use crate::llm::{MockClient, Provider};
+        let (mock, sent) = MockClient::new("").with_scripted_stream(script).recording_sent_messages();
+        let (mock, tools) = mock.recording_tools();
+        let (mock, hold) = mock.holding_call(hold_at);
+        d.kernel().llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        (tools, sent, hold)
+    }
+
+    fn rotate_turn_stop(reason: &str) -> crate::llm::StreamEvent {
+        crate::llm::StreamEvent::Done {
+            stop_reason: Some(reason.into()), input_tokens: None, output_tokens: None, extra: None,
+        }
+    }
+
+    fn successor_of(d: &KjDispatcher, predecessor: ContextId) -> ContextId {
+        let db = d.kernel_db().lock();
+        db.list_all_contexts().unwrap().into_iter()
+            .find(|row| db.get_context_env(row.context_id).unwrap().iter()
+                .any(|env| env.key == "ROTATED_FROM" && env.value == predecessor.to_hex()))
+            .map(|row| row.context_id)
+            .unwrap_or_else(|| panic!("no successor of {}", predecessor.short()))
+    }
+
+    fn context_env(d: &KjDispatcher, ctx: ContextId) -> std::collections::HashMap<String, String> {
+        d.kernel_db().lock().get_context_env(ctx).unwrap().into_iter()
+            .map(|env| (env.key, env.value)).collect()
+    }
+
+    /// Poll a synchronous fact for up to 20 seconds. `kj drive` admits a turn
+    /// and returns, and the `done` and `archive` rc runs are queued out of
+    /// line, so their blocks and run rows trail the turn's own ending.
+    async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if ready() { return; }
+            if std::time::Instant::now() > deadline { panic!("timed out waiting for {what}"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A rotation the seat starts from its own running turn widens the turn by
+    /// exactly one inference, offering only `done`, and leaves the predecessor
+    /// live until that inference ends. The archive lifecycle runs after it,
+    /// the label and handoff move to the successor, and the ordinary `done`
+    /// lifecycle still reports to the senpai.
+    #[test]
+    fn rotate_signoff_defers_archive_and_offers_one_final_done_call() {
+        crate::on_rc_thread(rotate_signoff_defers_archive_and_offers_one_final_done_call_body);
+    }
+
+    async fn rotate_signoff_defers_archive_and_offers_one_final_done_call_body() {
+        use crate::llm::StreamEvent;
+        let (d, console, mid, rot) = rotate_fixture(true).await;
+        seat_on_track(&d, rot);
+        let script = vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "call_rotate".into(), name: "shell_write".into(),
+                    input: serde_json::json!({
+                        "command": "kj context rotate --handoff 'the next seat has the plan'"
+                    }),
+                    signature: None,
+                },
+                rotate_turn_stop("tool_use"),
+            ],
+            vec![
+                StreamEvent::TextStart,
+                StreamEvent::TextDelta("final signoff words".into()),
+                StreamEvent::TextEnd,
+                StreamEvent::ToolUse {
+                    id: "call_done".into(), name: "done".into(),
+                    input: serde_json::json!({"status": "done", "feedback": "handed off"}),
+                    signature: None,
+                },
+                rotate_turn_stop("tool_use"),
+            ],
+        ];
+        let (tools, sent, hold) = install_rotate_mock(&d, script, 1).await;
+
+        let admitted = d.dispatch(&argv(&["drive", "rot", "--prompt", "carry the work forward"]), &console).await;
+        assert!(admitted.is_ok(), "drive the rotating seat: {}", admitted.message());
+        tokio::time::timeout(std::time::Duration::from_secs(20), hold.entered.notified())
+            .await.expect("the signoff inference was entered");
+
+        {
+            let tools = tools.lock();
+            assert_eq!(tools.len(), 2, "one tool round and one signoff call: {tools:?}");
+            assert!(tools[0].iter().any(|tool| tool == "shell_write"), "the first call holds the writable shell: {:?}", tools[0]);
+            assert_eq!(tools[1], ["done"], "the signoff call offers only done: {:?}", tools[1]);
+        }
+        assert!(sent.lock().len() == 2, "the signoff call was sent");
+        let predecessor = d.kernel_db().lock().get_context(rot).unwrap().expect("predecessor row");
+        assert!(predecessor.archived_at.is_none(), "the predecessor stays live while the signoff inference runs");
+        assert!(run_rows_for_verb(&d, VERB_ARCHIVE).is_empty(), "the archive lifecycle waits for the signoff call to end");
+        assert!(!block_contents_in(&d, rot).iter().any(|content| content.contains("archive-hook-ran")),
+            "no archive marker before the signoff call ends");
+        let successor = successor_of(&d, rot);
+        assert_eq!(d.kernel_db().lock().get_context(successor).unwrap().unwrap().label, None,
+            "the successor takes no label until the signoff call ends");
+
+        hold.release.notify_one();
+        wait_for("the rotation to settle", || {
+            d.kernel_db().lock().get_context(rot).unwrap().unwrap().archived_at.is_some() || tools.lock().len() > 2
+        }).await;
+        {
+            let rosters = tools.lock();
+            assert_eq!(rosters.len(), 2, "no model call follows the signoff call: {rosters:?}");
+        }
+        assert_eq!(sent.lock().len(), 2, "no request follows the signoff request");
+        wait_for("the archive lifecycle to finish", || {
+            run_rows_for_verb(&d, VERB_ARCHIVE).iter()
+                .any(|run| run.context_id == rot.as_bytes() && run.finished_at.is_some())
+        }).await;
+        wait_for("the senpai to hear the done report", || {
+            d.block_store().block_snapshots(mid).unwrap().iter()
+                .any(|block| block.kind == BlockKind::Drift && block.content.contains("kohai rot finished"))
+        }).await;
+        wait_for("the done lifecycle to finish", || {
+            run_rows_for_verb(&d, VERB_DONE).iter()
+                .any(|run| run.context_id == rot.as_bytes() && run.finished_at.is_some())
+        }).await;
+        let predecessor = d.kernel_db().lock().get_context(rot).unwrap().unwrap();
+        assert!(predecessor.archived_at.is_some(), "the predecessor archived at the turn's end");
+        assert_eq!(lookup_context_id(&d, "rot"), successor, "the label moved to the successor");
+        let env = context_env(&d, successor);
+        assert_eq!(env.get("ROTATED_FROM"), Some(&rot.to_hex()), "the successor names its predecessor");
+        assert_eq!(env.get("ROTATED_HANDOFF"), Some(&"1".to_string()), "the handoff flag carried");
+        let attachments = d.kernel_db().lock().list_attachments_for_context(successor).unwrap();
+        assert!(attachments.iter().any(|attachment| attachment.track_id == "kaiten"),
+            "the successor keeps the predecessor's ring seat: {attachments:?}");
+
+        let contents = block_contents_in(&d, rot);
+        let marker = contents.iter().position(|content| content.contains("archive-hook-ran"))
+            .unwrap_or_else(|| panic!("the archive lifecycle left its marker: {contents:?}"));
+        let final_words = contents.iter().position(|content| content.contains("final signoff words"))
+            .unwrap_or_else(|| panic!("the final inference left its words: {contents:?}"));
+        assert!(marker > final_words, "the archive lifecycle runs after the final inference: {contents:?}");
+        let archive = run_rows_for_verb(&d, VERB_ARCHIVE);
+        assert_eq!(archive.len(), 1, "one archive lifecycle run: {archive:?}");
+        assert_eq!(archive[0].context_id, rot.as_bytes(), "the archive lifecycle ran on the predecessor");
+        assert!(archive[0].finished_at.is_some(), "the archive lifecycle finished: {:?}", archive[0]);
+        let done: Vec<_> = run_rows_for_verb(&d, VERB_DONE).into_iter()
+            .filter(|run| run.context_id == rot.as_bytes()).collect();
+        assert_eq!(done.len(), 1, "one done lifecycle run on the predecessor: {done:?}");
+        assert!(done[0].finished_at.is_some(), "the done lifecycle finished: {:?}", done[0]);
+        let drift = d.block_store().block_snapshots(mid).unwrap().into_iter()
+            .find(|block| block.kind == BlockKind::Drift && block.content.contains("kohai rot finished"))
+            .unwrap_or_else(|| panic!("the senpai heard how the turn ended: {:?}", block_contents_in(&d, mid)));
+        assert!(drift.content.contains("handed off"), "the done report carried the model's words: {}", drift.content);
+        assert!(block_contents_in(&d, successor).iter().any(|content| content.contains("the next seat has the plan")),
+            "the handoff brief reached the successor");
+        assert!(rc_errors(&d, rot).is_empty(), "{:?}", rc_errors(&d, rot));
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A signoff call that does not call `done` still ends the turn after that
+    /// one inference, and the predecessor still archives. The model gets no
+    /// done nudge for the final text.
+    #[test]
+    fn rotate_signoff_without_done_still_archives_and_makes_no_second_nudge() {
+        crate::on_rc_thread(rotate_signoff_without_done_still_archives_and_makes_no_second_nudge_body);
+    }
+
+    async fn rotate_signoff_without_done_still_archives_and_makes_no_second_nudge_body() {
+        use crate::llm::StreamEvent;
+        let (d, _console, mid, rot) = rotate_fixture(true).await;
+        let script = vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "call_rotate".into(), name: "shell_write".into(),
+                    input: serde_json::json!({"command": "kj context rotate"}),
+                    signature: None,
+                },
+                rotate_turn_stop("tool_use"),
+            ],
+            vec![
+                StreamEvent::TextStart,
+                StreamEvent::TextDelta("no done here".into()),
+                StreamEvent::TextEnd,
+                rotate_turn_stop("end_turn"),
+            ],
+        ];
+        let (tools, sent, _hold) = install_rotate_mock(&d, script, usize::MAX).await;
+
+        let r = d.dispatch(&argv(&["drive", "rot", "--prompt", "carry the work forward"]), &_console).await;
+        assert!(r.is_ok(), "drive the rotating seat: {}", r.message());
+        wait_for("the rotation to settle", || {
+            d.kernel_db().lock().get_context(rot).unwrap().unwrap().archived_at.is_some() || tools.lock().len() > 2
+        }).await;
+        {
+            let rosters = tools.lock();
+            assert_eq!(rosters.len(), 2, "the signoff call is the last model call: {rosters:?}");
+            assert_eq!(rosters[1], ["done"], "the signoff call offers only done: {:?}", rosters[1]);
+        }
+        assert_eq!(sent.lock().len(), 2, "the turn sends no request after the signoff call");
+        wait_for("the senpai to hear the text-only ending", || {
+            d.block_store().block_snapshots(mid).unwrap().iter()
+                .any(|block| block.kind == BlockKind::Drift && block.content.contains("ended its turn without calling done"))
+        }).await;
+
+        let predecessor = d.kernel_db().lock().get_context(rot).unwrap().unwrap();
+        assert!(predecessor.archived_at.is_some(), "the predecessor archived without a done call");
+        let successor = successor_of(&d, rot);
+        assert_eq!(lookup_context_id(&d, "rot"), successor, "the label moved to the successor");
+        let contents = block_contents_in(&d, rot);
+        let marker = contents.iter().position(|content| content.contains("archive-hook-ran"))
+            .unwrap_or_else(|| panic!("the archive lifecycle left its marker: {contents:?}"));
+        let final_text = contents.iter().position(|content| content.contains("no done here"))
+            .unwrap_or_else(|| panic!("the final inference left its text: {contents:?}"));
+        assert!(marker > final_text, "the archive lifecycle runs after the final inference: {contents:?}");
+        let drift = d.block_store().block_snapshots(mid).unwrap().into_iter()
+            .find(|block| block.kind == BlockKind::Drift && block.content.contains("kohai rot"))
+            .unwrap_or_else(|| panic!("the senpai heard how the turn ended: {:?}", block_contents_in(&d, mid)));
+        assert!(drift.content.contains("ended its turn without calling done"),
+            "the done lifecycle saw the text-only ending: {}", drift.content);
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A rotation with no turn running archives at once and neither asks the
+    /// model for a signoff nor runs the done lifecycle.
+    #[test]
+    fn rotate_idle_archives_immediately_without_a_model_call() {
+        crate::on_rc_thread(rotate_idle_archives_immediately_without_a_model_call_body);
+    }
+
+    async fn rotate_idle_archives_immediately_without_a_model_call_body() {
+        use crate::llm::StreamEvent;
+        let (d, console, mid, rot) = rotate_fixture(false).await;
+        let script = vec![vec![
+            StreamEvent::TextStart,
+            StreamEvent::TextDelta("the model must not run".into()),
+            StreamEvent::TextEnd,
+            rotate_turn_stop("end_turn"),
+        ]];
+        let (tools, sent, _hold) = install_rotate_mock(&d, script, usize::MAX).await;
+        let performer = d.kernel_db().lock().get_context(rot).unwrap().unwrap().performer.unwrap();
+        let mut caller = caller_with_context(rot);
+        caller.principal_id = console.principal_id;
+        caller.actor_id = performer;
+        caller.privileged = true;
+
+        let r = d.dispatch(&argv(&["context", "rotate", "--handoff", "idle handoff"]), &caller).await;
+        assert!(r.is_ok(), "rotate the idle seat: {}", r.message());
+        assert!(tools.lock().is_empty(), "idle rotation makes no model call");
+        assert!(sent.lock().is_empty(), "idle rotation sends no request");
+        let predecessor = d.kernel_db().lock().get_context(rot).unwrap().unwrap();
+        assert!(predecessor.archived_at.is_some(), "idle rotation archives at once");
+        let successor = successor_of(&d, rot);
+        assert_eq!(lookup_context_id(&d, "rot"), successor, "the label moved to the successor");
+        assert!(block_contents_in(&d, rot).iter().any(|content| content.contains("archive-hook-ran")),
+            "the archive lifecycle ran");
+        assert!(!block_contents_in(&d, rot).iter().any(|content| content.contains("the model must not run")),
+            "no model text reached the predecessor");
+        assert!(run_rows_for_verb(&d, VERB_DONE).is_empty(), "an idle rotation runs no done lifecycle");
+        assert!(!block_contents_in(&d, mid).iter().any(|content| content.contains("kohai rot")),
+            "the senpai hears nothing from a rotation with no turn");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A rotation signoff offers `done` even when the seat never held the
+    /// ordinary `builtin.turn` grant, so the final call can end the task.
+    #[test]
+    fn rotate_signoff_offers_done_without_the_turn_binding() {
+        crate::on_rc_thread(rotate_signoff_offers_done_without_the_turn_binding_body);
+    }
+
+    async fn rotate_signoff_offers_done_without_the_turn_binding_body() {
+        use crate::llm::StreamEvent;
+        let (d, console, mid, rot) = rotate_fixture(false).await;
+        let script = vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "call_rotate".into(), name: "shell_write".into(),
+                    input: serde_json::json!({"command": "kj context rotate"}),
+                    signature: None,
+                },
+                rotate_turn_stop("tool_use"),
+            ],
+            vec![
+                StreamEvent::ToolUse {
+                    id: "call_shell".into(), name: "shell_write".into(),
+                    input: serde_json::json!({
+                        "command": "kj block create --role model --kind text --content 'hallucinated shell ran'"
+                    }),
+                    signature: None,
+                },
+                StreamEvent::ToolUse {
+                    id: "call_done".into(), name: "done".into(),
+                    input: serde_json::json!({"status": "done", "feedback": "signoff only"}),
+                    signature: None,
+                },
+                rotate_turn_stop("tool_use"),
+            ],
+        ];
+        let (tools, _sent, _hold) = install_rotate_mock(&d, script, usize::MAX).await;
+
+        let r = d.dispatch(&argv(&["drive", "rot", "--prompt", "carry the work forward"]), &console).await;
+        assert!(r.is_ok(), "drive the rotating seat: {}", r.message());
+        wait_for("the rotation to settle", || {
+            d.kernel_db().lock().get_context(rot).unwrap().unwrap().archived_at.is_some() || tools.lock().len() > 2
+        }).await;
+        {
+            let rosters = tools.lock();
+            assert_eq!(rosters.len(), 2, "one tool round and one signoff call: {rosters:?}");
+            assert!(!rosters[0].iter().any(|tool| tool == "done"), "the ordinary call had no done tool: {:?}", rosters[0]);
+            assert_eq!(rosters[1], ["done"], "the signoff call offers done: {:?}", rosters[1]);
+        }
+        wait_for("the done call to report", || {
+            d.block_store().block_snapshots(mid).unwrap().iter()
+                .any(|block| block.kind == BlockKind::Drift && block.content.contains("kohai rot finished"))
+        }).await;
+        let predecessor = d.kernel_db().lock().get_context(rot).unwrap().unwrap();
+        assert!(predecessor.archived_at.is_some(), "the predecessor archived");
+        let drift = d.block_store().block_snapshots(mid).unwrap().into_iter()
+            .find(|block| block.kind == BlockKind::Drift && block.content.contains("kohai rot finished"))
+            .unwrap_or_else(|| panic!("the done call reached the shipped lifecycle: {:?}", block_contents_in(&d, mid)));
+        assert!(drift.content.contains("signoff only"), "the done report carried the model's words: {}", drift.content);
+        let contents = block_contents_in(&d, rot);
+        assert!(!contents.iter().any(|content| content.trim() == "hallucinated shell ran"),
+            "a tool the signoff did not offer did not run: {contents:?}");
+        assert!(contents.iter().any(|content| content.contains("not offered") && content.contains("only `done`")),
+            "the unoffered sibling was refused in place: {contents:?}");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
     /// When the person writes, the submit rc shows the seat the recent handoff
     /// notes as a notification that serves only that turn, and says nothing
     /// when the log is empty.

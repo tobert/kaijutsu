@@ -17,6 +17,71 @@ struct ActiveTurn {
 
 type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<TurnId, ActiveTurn>>;
 
+/// A rotation the running turn defers to the turn's end.
+///
+/// `kj context rotate` inside a context's own turn creates the successor and
+/// leaves the predecessor live: the turn gets one signoff inference, and its
+/// end runs the predecessor's `archive` lifecycle, archives it, and moves its
+/// label, ring seat, and handoff pointer to the successor
+/// (`docs/contexts.md`, "Rotation, handoffs, and archive"). The lease owns
+/// the record, so a turn that ends without settling one drops it and says so
+/// instead of refusing a later rotation.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingRotation {
+    pub predecessor: ContextId,
+    pub successor: ContextId,
+    /// The predecessor's label when the rotation began; the successor takes it.
+    pub label: Option<String>,
+    /// The predecessor's display name, for messages.
+    pub name: String,
+    /// A root console's successor has no senpai until the commit.
+    pub root_console: bool,
+    /// Who asked for the rotation; the archive lifecycle runs as this caller.
+    pub principal: PrincipalId,
+    pub actor: PrincipalId,
+    pub reviewer: Option<PrincipalId>,
+    pub session: SessionId,
+}
+
+type Rotations = HashMap<ContextId, (Option<TurnId>, RotationState)>;
+
+/// What the registry holds for a context with a rotation deferred to a turn's
+/// end. `Settling` keeps the entry while the turn's end archives, so a second
+/// rotation started in that window refuses instead of creating a successor
+/// nobody takes over from.
+enum RotationState {
+    Pending(PendingRotation),
+    Settling,
+}
+
+/// Keeps a settlement's slot in the registry until the settlement ends, so a
+/// second rotation refuses while the first archives and commits — including
+/// through a panic, which an unowned entry would otherwise leave behind
+/// forever.
+pub(crate) struct RotationSettlement {
+    rotations: Arc<parking_lot::Mutex<Rotations>>,
+    context: ContextId,
+}
+
+impl Drop for RotationSettlement {
+    fn drop(&mut self) {
+        self.rotations.lock().remove(&self.context);
+    }
+}
+
+/// How a running turn answered a rotation's request for a signoff call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignoffAsk {
+    /// The turn holding the context's conversation lock took the request: it
+    /// takes one more inference, offering only `done`, and its end settles
+    /// the rotation.
+    Taken,
+    /// No turn holds the lock, so the caller takes the immediate path.
+    Idle,
+    /// The context already has a rotation waiting on a turn's end.
+    AlreadyPending,
+}
+
 /// Input that arrived while a turn runs, which that turn has not yet
 /// delivered to its model. The block is already durable; `wake` says what
 /// the input asks of the turn.
@@ -82,6 +147,8 @@ pub struct TurnLease {
     done: parking_lot::Mutex<Option<crate::rc::DoneReport>>,
     /// Whether the provider refused this turn's request on policy grounds.
     refused: std::sync::atomic::AtomicBool,
+    /// The rotations this turn deferred to its end, shared with the state.
+    rotations: Arc<parking_lot::Mutex<Rotations>>,
 }
 
 impl TurnLease {
@@ -131,6 +198,37 @@ impl TurnLease {
         self.done.lock().take()
     }
 
+    /// The rotation this turn must settle at its end, if one is pending, and
+    /// the reservation that keeps a second rotation out until the settlement
+    /// ends. Taking it hands the slot to the returned guard, so the lease's own
+    /// drop no longer owns it.
+    pub(crate) fn take_rotation(&self) -> Option<(PendingRotation, RotationSettlement)> {
+        let mut rotations = self.rotations.lock();
+        let (owner, state) = rotations.get_mut(&self.context)?;
+        if *owner != Some(self.id) {
+            return None;
+        }
+        *owner = None;
+        match std::mem::replace(state, RotationState::Settling) {
+            RotationState::Pending(rotation) => Some((rotation, RotationSettlement {
+                rotations: self.rotations.clone(),
+                context: self.context,
+            })),
+            RotationState::Settling => None,
+        }
+    }
+
+    /// The rotation this turn will settle, for what the signoff call tells the
+    /// model. Reading it leaves it in place; only [`Self::take_rotation`]
+    /// takes it.
+    pub(crate) fn pending_rotation(&self) -> Option<PendingRotation> {
+        let rotations = self.rotations.lock();
+        match rotations.get(&self.context) {
+            Some((Some(turn), RotationState::Pending(rotation))) if *turn == self.id => Some(rotation.clone()),
+            _ => None,
+        }
+    }
+
     /// Record who asked for this turn, so [`TurnState::any_autonomous`] can
     /// answer for it while it is accepted.
     pub(crate) fn set_origin(&self, origin: crate::flows::TurnOrigin) {
@@ -142,10 +240,28 @@ impl TurnLease {
 
 impl Drop for TurnLease {
     fn drop(&mut self) {
-        let mut active = self.active.lock();
-        if let Some(turns) = active.get_mut(&self.context) {
-            turns.remove(&self.id);
-            if turns.is_empty() { active.remove(&self.context); }
+        {
+            let mut active = self.active.lock();
+            if let Some(turns) = active.get_mut(&self.context) {
+                turns.remove(&self.id);
+                if turns.is_empty() { active.remove(&self.context); }
+            }
+        }
+        // A deferred rotation is settled before its lease ends, and the
+        // settlement's guard clears its own slot. One still pending here died
+        // with the turn: say so, and let a later rotation start.
+        let mut rotations = self.rotations.lock();
+        if rotations.get(&self.context).is_some_and(|(owner, _)| *owner == Some(self.id))
+            && let Some((_, RotationState::Pending(rotation))) = rotations.remove(&self.context)
+        {
+            tracing::error!(
+                context = %self.context,
+                predecessor = %rotation.predecessor,
+                successor = %rotation.successor,
+                "a turn ended without settling its rotation; {} stays live and successor {} is unlabeled",
+                rotation.name,
+                rotation.successor.short(),
+            );
         }
     }
 }
@@ -155,6 +271,8 @@ pub struct TurnState {
     conversations: Arc<ConversationCache>,
     active: Arc<parking_lot::Mutex<ActiveTurns>>,
     ingress: parking_lot::Mutex<Ingresses>,
+    /// Rotations deferred to a turn's end, keyed by the predecessor.
+    rotations: Arc<parking_lot::Mutex<Rotations>>,
 }
 
 #[derive(Default)]
@@ -171,6 +289,7 @@ impl Default for TurnState {
             conversations: Arc::new(ConversationCache::new(64)),
             active: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             ingress: parking_lot::Mutex::new(Ingresses::default()),
+            rotations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -199,11 +318,46 @@ impl TurnState {
         active.entry(context).or_default().insert(id, ActiveTurn {
             began: std::time::Instant::now(), interrupt: interrupt.clone(), origin: None,
         });
-        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt, done: Default::default(), refused: Default::default() })
+        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt, done: Default::default(), refused: Default::default(), rotations: self.rotations.clone() })
     }
 
     pub fn active_count(&self, context: ContextId) -> usize {
         self.active.lock().get(&context).map_or(0, |turns| turns.len())
+    }
+
+    /// Whether a rotation is already waiting on this context's turn end,
+    /// either pending or settling. `kj context rotate` checks it before it
+    /// creates a successor nobody would take over from.
+    pub(crate) fn rotation_pending(&self, context: ContextId) -> bool {
+        self.rotations.lock().contains_key(&context)
+    }
+
+    /// Ask the turn that holds `context`'s conversation lock for one signoff
+    /// inference and record the rotation its end settles.
+    ///
+    /// `kj context rotate` asks this when it runs in a context's own shell
+    /// while a turn holds that context's lock; the turn then offers only
+    /// `done` for one more inference and ends, and its end archives the
+    /// predecessor. Idle, a rotation takes the immediate path, so this
+    /// matters only while a turn is running. A shell in the context that is
+    /// not the turn's own tool call asks the same way: the alternative is
+    /// archiving under the running turn, which the turn cannot see.
+    pub(crate) fn begin_rotation_signoff(
+        &self,
+        context: ContextId,
+        rotation: PendingRotation,
+    ) -> SignoffAsk {
+        let mut rotations = self.rotations.lock();
+        if rotations.contains_key(&context) {
+            return SignoffAsk::AlreadyPending;
+        }
+        let ingress = self.ingress.lock();
+        let Some(open) = ingress.open.get(&context) else {
+            return SignoffAsk::Idle;
+        };
+        open.interrupt.request_signoff();
+        rotations.insert(context, (Some(open.turn), RotationState::Pending(rotation)));
+        SignoffAsk::Taken
     }
 
     /// Whether any accepted turn in `context` was driven by the kernel
