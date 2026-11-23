@@ -456,6 +456,8 @@ pub fn spawn_docks(
     // material's pipeline declares that blend state. The ImageNode stays as
     // the handle slot resize_rtt_texture repoints, tinted fully transparent
     // so the UI image pipeline (straight-alpha) never draws it.
+    // Stretch keeps the RTT's previous dimensions out of intrinsic layout
+    // measurement when the window shrinks.
 
     // North dock — inserted at index 0 (before ContentArea). Carries
     // `MsdfBlockGeometry` for its two sparklines (flat triangles in the same
@@ -469,7 +471,7 @@ pub fn spawn_docks(
                 ..default()
             },
             BorderColor::all(theme.border),
-            ImageNode::default().with_color(Color::NONE),
+            ImageNode::default().with_color(Color::NONE).with_mode(NodeImageMode::Stretch),
             MaterialNode(fx_materials.add(BlockFxMaterial::default())),
             MsdfBlockGlyphs::default(),
             MsdfBlockGeometry::default(),
@@ -490,7 +492,7 @@ pub fn spawn_docks(
                 ..default()
             },
             BorderColor::all(theme.border),
-            ImageNode::default().with_color(Color::NONE),
+            ImageNode::default().with_color(Color::NONE).with_mode(NodeImageMode::Stretch),
             MaterialNode(fx_materials.add(BlockFxMaterial::default())),
             MsdfBlockGlyphs::default(),
             UiRttTexture::default(),

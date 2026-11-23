@@ -568,6 +568,97 @@ fn setup_ui(mut commands: Commands) {
 }
 
 #[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use bevy::app::{HierarchyPropagatePlugin, PropagateSet, TaskPoolPlugin};
+    use bevy::camera::{ComputedCameraValues, RenderTargetInfo, Viewport};
+    use bevy::text::{FontCx, RemSize, ScaleCx, TextPipeline};
+    use bevy::ui::{
+        ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiScale,
+        sync_font_size_to_em_size, ui_layout_system, ui_surface::UiSurface,
+        update::propagate_ui_target_cameras, widget::update_image_content_size_system,
+    };
+
+    #[test]
+    fn stale_dock_images_do_not_expand_the_conversation_after_resize() {
+        for scale in [1.0_f32, 2.0] {
+            let mut app = App::new();
+            app.add_plugins(TaskPoolPlugin::default());
+            app.add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate));
+            app.add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate));
+            app.init_resource::<UiScale>();
+            app.init_resource::<UiSurface>();
+            app.init_resource::<TextPipeline>();
+            app.init_resource::<FontCx>();
+            app.init_resource::<ScaleCx>();
+            app.init_resource::<RemSize>();
+            app.init_resource::<ui::theme::Theme>();
+            app.init_resource::<Assets<Image>>();
+            app.init_resource::<Assets<TextureAtlasLayout>>();
+            app.init_resource::<Assets<shaders::BlockFxMaterial>>();
+            app.add_systems(Startup, setup_ui);
+            app.add_systems(PostStartup, ui::dock::spawn_docks);
+            app.add_systems(PostUpdate, (
+                ApplyDeferred,
+                propagate_ui_target_cameras,
+                sync_font_size_to_em_size,
+                update_image_content_size_system,
+                ui_layout_system,
+            ).chain());
+            app.configure_sets(PostUpdate,
+                PropagateSet::<ComputedUiTargetCamera>::default()
+                    .after(propagate_ui_target_cameras)
+                    .before(update_image_content_size_system));
+            app.configure_sets(PostUpdate,
+                PropagateSet::<ComputedUiRenderTargetInfo>::default()
+                    .after(propagate_ui_target_cameras)
+                    .before(update_image_content_size_system));
+
+            let size = UVec2::new((2347.0 * scale) as u32, (1091.0 * scale) as u32);
+            let camera = app.world_mut().spawn((Camera2d, Camera {
+                computed: ComputedCameraValues {
+                    target_info: Some(RenderTargetInfo { physical_size: size, scale_factor: scale }),
+                    ..default()
+                },
+                viewport: Some(Viewport { physical_size: size, ..default() }),
+                ..default()
+            })).id();
+            app.update();
+
+            let images = {
+                let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+                [40, 31].map(|height| view::ui_rtt::create_ui_rtt_texture(
+                    &mut images, (2347.0 * scale) as u32, (height as f32 * scale) as u32,
+                ))
+            };
+            let world = app.world_mut();
+            let north = world.query_filtered::<Entity, With<ui::dock::NorthDock>>().single(world).unwrap();
+            let south = world.query_filtered::<Entity, With<ui::dock::SouthDock>>().single(world).unwrap();
+            world.get_mut::<ImageNode>(north).unwrap().image = images[0].clone();
+            world.get_mut::<ImageNode>(south).unwrap().image = images[1].clone();
+            app.update();
+
+            for width in [1895_u32, 800] {
+                let size = UVec2::new((width as f32 * scale) as u32, (1091.0 * scale) as u32);
+                let mut camera = app.world_mut().get_mut::<Camera>(camera).unwrap();
+                camera.computed.target_info.as_mut().unwrap().physical_size = size;
+                camera.viewport.as_mut().unwrap().physical_size = size;
+                app.update();
+                let world = app.world_mut();
+                let root = world.query_filtered::<Entity, With<ui::tiling_reconciler::TilingRoot>>().single(world).unwrap();
+                let content = world.query_filtered::<Entity, With<ui::state::ContentArea>>().single(world).unwrap();
+                let conversation = world.query_filtered::<Entity, With<ui::state::ConversationRoot>>().single(world).unwrap();
+                for entity in [root, north, south, content, conversation] {
+                    let actual = world.get::<ComputedNode>(entity).unwrap().size().x;
+                    assert!((actual - size.x as f32).abs() <= 1.0,
+                        "entity {entity:?} is {actual}px wide in a {}px viewport at scale {scale}", size.x);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod cli_tests {
     use super::*;
 

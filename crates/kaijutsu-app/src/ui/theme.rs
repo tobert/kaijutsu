@@ -515,17 +515,17 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Base UI — Synthwave palette (docs/color.md; the compiled
+            // Base UI — Synthwave palette (docs/newui.md; the compiled
             // fallback mirrors the shipped theme.toml so there's no skin
             // flash between boot and the theme RPC)
-            bg: Color::srgb(0.075, 0.063, 0.125), // #131020
-            panel_bg: Color::srgba(0.075, 0.063, 0.125, 0.95), // #131020 semi-transparent
+            bg: hex_to_color("#0d0221"),
+            panel_bg: hex_to_color("#12041ff2"),
             fg: Color::srgb(0.925, 0.910, 0.968), // #ece8f7 — lifted for text contrast (2026-09-12)
             fg_dim: Color::srgb(0.604, 0.565, 0.741), // #9a90bd — legible secondary text (2026-09-12)
-            accent: Color::srgb(0.643, 0.529, 1.000), // #a487ff
-            accent2: Color::srgb(1.000, 0.812, 0.490), // #ffcf7d
-            border: Color::srgb(0.239, 0.196, 0.376), // #3d3260
-            selection_bg: Color::srgba(0.643, 0.529, 1.000, 0.30), // #a487ff selection
+            accent: hex_to_color("#ff2e88"),
+            accent2: hex_to_color("#00f0ff"),
+            border: hex_to_color("#44245e"),
+            selection_bg: hex_to_color("#ff2e8833"),
 
             // Row type colors
             row_tool: Color::srgb(0.820, 0.545, 1.000), // #d18bff violet
@@ -547,7 +547,7 @@ impl Default for Theme {
             block_resource: Color::srgb(0.447, 0.757, 0.667), // #72c1aa muted teal
 
             // Semantic
-            error: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a
+            error: hex_to_color("#ff2020"),
             warning: Color::srgb(1.000, 0.706, 0.369), // #ffb45e
             success: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3
 
@@ -599,12 +599,12 @@ impl Default for Theme {
             frame_content_padding: 12.0,
 
             // Frame colors
-            frame_base: Color::srgba(0.075, 0.063, 0.125, 0.95), // #131020
-            frame_focused: Color::srgba(0.643, 0.529, 1.000, 0.15), // #a487ff
+            frame_base: hex_to_color("#12041ff2"),
+            frame_focused: hex_to_color("#ff2e8826"),
             frame_insert: Color::srgba(0.298, 0.878, 0.702, 0.12), // #4ce0b3
             frame_visual: Color::srgba(1.000, 0.478, 0.851, 0.12), // #ff7ad9
-            frame_unfocused: Color::srgba(0.075, 0.063, 0.125, 0.80), // #131020
-            frame_edge: Color::srgba(0.239, 0.196, 0.376, 0.6),  // #3d3260
+            frame_unfocused: hex_to_color("#0d0221cc"),
+            frame_edge: hex_to_color("#44245e99"),
 
             // Frame shader params
             frame_params_base: Vec4::new(0.0, 0.0, 0.0, 0.0),
@@ -635,7 +635,7 @@ impl Default for Theme {
             input_minimized_height: 48.0,
             input_docked_height: 200.0,
             input_overlay_width_pct: 0.6,
-            input_backdrop_color: Color::srgba(0.075, 0.063, 0.125, 0.85),
+            input_backdrop_color: hex_to_color("#0d0221d9"),
 
             // OutputData rendering (structured tool results)
             output_directory: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
@@ -691,26 +691,26 @@ impl Default for Theme {
             constellation_ring_spacing: 550.0,
 
             // Block borders
-            block_border_tool_call: Color::srgba(0.910, 0.706, 0.369, 0.6), // #e8b45e gold
-            block_border_tool_result: Color::srgba(0.298, 0.878, 0.702, 0.4), // #4ce0b3 teal
-            block_border_error: Color::srgba(1.000, 0.176, 0.431, 0.8),  // #ff2d6e hot red
+            block_border_tool_call: hex_to_color("#ff2e8899"),
+            block_border_tool_result: hex_to_color("#a487ff66"),
+            block_border_error: hex_to_color("#ff2020cc"),
             block_border_error_warning: Color::srgba(1.000, 0.706, 0.369, 0.7), // #ffb45e amber
             block_border_error_fatal: Color::srgba(0.769, 0.118, 0.227, 0.9),   // #c41e3a dark red
             block_border_thinking: Color::srgba(0.478, 0.416, 0.627, 0.3), // #7a6aa0 muted violet
             block_border_drift: Color::srgba(0.769, 0.463, 0.882, 0.5),  // #c476e1 violet-thread
-            block_border_thickness: 1.5,
-            block_border_corner_radius: 4.0,
-            block_border_glow_radius: 6.0,
-            block_border_glow_intensity: 0.12,
+            block_border_thickness: 1.0,
+            block_border_corner_radius: 2.0,
+            block_border_glow_radius: 4.0,
+            block_border_glow_intensity: 0.10,
             text_glow_radius: 2.5,
             text_glow_color: Color::srgba(0.796, 0.722, 1.000, 0.18), // #cbb8ff violet-white, thinned halo (2026-09-12)
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose block
-            compose_border: Color::srgb(0.239, 0.196, 0.376), // #3d3260 matches border
-            compose_bg: Color::srgb(0.075, 0.063, 0.125),     // #131020 matches bg
-            compose_palette_border: Color::srgb(0.643, 0.529, 1.000), // #a487ff accent violet
+            compose_border: hex_to_color("#44245e"),
+            compose_bg: hex_to_color("#0d0221"),
+            compose_palette_border: hex_to_color("#ff2e88"),
             compose_palette_glow_radius: 10.0,
             compose_palette_glow_intensity: 0.6,
 
@@ -720,9 +720,9 @@ impl Default for Theme {
             // User/assistant text borders — transparent (opt-in)
             block_border_user: Color::srgba(0.0, 0.0, 0.0, 0.0),
             block_border_assistant: Color::srgba(0.0, 0.0, 0.0, 0.0),
-            // Focus ring — cyan #8be9fdcc, distinct from every block-kind
+            // Focus ring — cyan #00f0ffcc, distinct from every block-kind
             // border color
-            block_border_focus: Color::srgba(0.545, 0.914, 0.992, 0.8),
+            block_border_focus: hex_to_color("#00f0ffcc"),
 
             // Layout spacing
             indent_width: 24.0,

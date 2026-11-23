@@ -1,26 +1,26 @@
 # Kaijutsu Default Theme — Synthwave
 #
-# The app-wide identity: deep indigo-violet grounds, electric violet + gold
-# two-tone, neon accents. One identity, two lanes — these flat keys + [ansi]
+# The app-wide identity: deep violet grounds, magenta and cyan accents.
+# One identity, two lanes — these flat keys + [ansi]
 # are the sRGB UI lane; [scene.*] and [heroic] are the linear-HDR scene lane
 # (docs/newui.md). Colors are hex strings: "#rrggbb" or "#rrggbbaa" (with alpha).
 
 # Base UI
-bg = "#131020"
-panel_bg = "#131020f2"
+bg = "#0d0221"
+panel_bg = "#12041ff2"
 fg = "#ece8f7"
 fg_dim = "#9a90bd"
-accent = "#a487ff"
-accent2 = "#ffcf7d"
-border = "#3d3260"
-selection_bg = "#a487ff4d"
+accent = "#ff2e88"
+accent2 = "#00f0ff"
+border = "#44245e"
+selection_bg = "#ff2e8833"
 
 # Row type colors (conversation left borders)
 row_tool = "#d18bff"
 row_result = "#e8b45e"
 
 # Semantic colors
-error = "#ff5c8a"
+error = "#ff2020"
 warning = "#ffb45e"
 success = "#4ce0b3"
 
@@ -52,12 +52,12 @@ frame_edge_thickness = 2.0
 frame_content_padding = 12.0
 
 # Frame colors
-frame_base = "#131020f2"
-frame_focused = "#a487ff26"
+frame_base = "#12041ff2"
+frame_focused = "#ff2e8826"
 frame_insert = "#4ce0b31f"
 frame_visual = "#ff7ad91f"
-frame_unfocused = "#131020cc"
-frame_edge = "#3d326099"
+frame_unfocused = "#0d0221cc"
+frame_edge = "#44245e99"
 
 # Frame shader params [intensity, _, _, _]
 frame_params_base = [0.0, 0.0, 0.0, 0.0]
@@ -92,7 +92,7 @@ effect_chase_color_cycle = 0.0
 input_minimized_height = 48.0
 input_docked_height = 200.0
 input_overlay_width_pct = 0.6
-input_backdrop_color = "#131020d9"
+input_backdrop_color = "#0d0221d9"
 
 # Font configuration
 font_rainbow = true
@@ -116,23 +116,23 @@ constellation_base_radius = 500.0
 constellation_ring_spacing = 550.0
 
 # Block borders
-block_border_tool_call = "#e8b45e99"
-block_border_tool_result = "#4ce0b366"
-block_border_error = "#ff2d6ecc"
+block_border_tool_call = "#ff2e8899"
+block_border_tool_result = "#a487ff66"
+block_border_error = "#ff2020cc"
 block_border_thinking = "#7a6aa04d"
 block_border_drift = "#c476e180"
-block_border_thickness = 1.5
-block_border_corner_radius = 4.0
-block_border_glow_radius = 6.0
-block_border_glow_intensity = 0.12
+block_border_thickness = 1.0
+block_border_corner_radius = 2.0
+block_border_glow_radius = 4.0
+block_border_glow_intensity = 0.10
 text_glow_radius = 2.5
 text_glow_color = "#cbb8ff2e"
 block_border_padding = 0.6
 block_spacing = 12.0
 
 # Compose block (input area)
-compose_border = "#3d3260"
-compose_bg = "#131020"
+compose_border = "#44245e"
+compose_bg = "#0d0221"
 
 # Modal overlays
 modal_backdrop = "#00000099"
@@ -143,7 +143,7 @@ block_border_assistant = "#00000000"
 
 # Focus ring for the keyboard-focused conversation block (j/k) — cyan on
 # purpose, absent from the block-kind border palette above
-block_border_focus = "#8be9fdcc"
+block_border_focus = "#00f0ffcc"
 
 # Layout spacing
 indent_width = 24.0

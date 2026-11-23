@@ -184,6 +184,15 @@ distinguish refusals from absent controls.
 Conversations moved from Bevy UI flex columns to cached shaped glyph runs
 drawn in a ±1-screen window with scroll as a uniform.
 
+The November app pass found that dock images still contributed their previous
+render-target width to intrinsic layout. After a resize, a 1895px window
+kept a 2347px UI root, so conversation text wrapped offscreen. Stretch image
+sizing removes that feedback. A regression drives the real root and docks
+through shrinking viewports at 1× and 2× scale. Conversation chrome now uses
+heroic's violet ground, magenta accents, and cyan focus with thinner borders.
+An isolated app confirmed widths 2347 → 1895 → 1280 → 800 over BRP;
+screenshots showed prose reflow and both border edges inside the pane.
+
 ## The file cache learns what vim already knew (August 18–20)
 
 Disk is the source of truth; file buffers operate like vim swaps. Dirty buffers

@@ -270,8 +270,9 @@ trouble = "#ff2020"
 now = "#ffffff"
 ```
 
-The UI lane's `error` (`#ff5c8a`) sits close to the horizon magenta. In the
-scene, trouble uses `trouble`, which is clear of both.
+The UI lane's `error` and the scene's `trouble` share `#ff2020`, distinct
+from horizon magenta. Conversation chrome uses the same deep violet ground,
+magenta accents, and cyan focus, with thin borders and restrained glow.
 
 ### Identity hues: one rule, separate keys
 

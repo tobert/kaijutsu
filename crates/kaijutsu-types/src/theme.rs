@@ -29,7 +29,7 @@ pub struct AnsiColorsData {
 
 impl Default for AnsiColorsData {
     fn default() -> Self {
-        // Synthwave terminal palette (docs/color.md).
+        // Synthwave terminal palette (docs/newui.md).
         Self {
             black: "#16121f".into(),
             red: "#ff5c8a".into(),
@@ -51,11 +51,11 @@ impl Default for AnsiColorsData {
     }
 }
 
-/// Cyan, deliberately absent from the rest of the border palette (gold
-/// tool calls, teal results, red errors, lavender thinking, purple drift)
+/// Cyan, deliberately absent from the rest of the border palette (magenta
+/// tool calls, violet results, red errors, lavender thinking, purple drift)
 /// so the focus ring can't be mistaken for block-kind styling.
 fn default_block_border_focus() -> String {
-    "#8be9fdcc".into()
+    "#00f0ffcc".into()
 }
 
 /// Framework-agnostic theme data.
@@ -225,7 +225,7 @@ pub struct ThemeData {
     /// The 3D scene lane (`[scene]` table): identity hues, the brightness tier
     /// ladder, live-signal gains, and the camera post chain. `serde(default)`
     /// on purpose — themes written before this section existed must keep
-    /// parsing (the live kernel theme.toml predates it). See `docs/color.md`.
+    /// parsing (the live kernel theme.toml predates it). See `docs/newui.md`.
     #[serde(default)]
     pub scene: SceneData,
 
@@ -239,23 +239,23 @@ pub struct ThemeData {
 impl Default for ThemeData {
     fn default() -> Self {
         Self {
-            // Base UI — Synthwave (docs/color.md; Tokyo Night lives on in
+            // Base UI — Synthwave (docs/newui.md; Tokyo Night lives on in
             // contrib/themes/tokyo-night.toml)
-            bg: "#131020".into(),
-            panel_bg: "#131020f2".into(),
+            bg: "#0d0221".into(),
+            panel_bg: "#12041ff2".into(),
             fg: "#ece8f7".into(),
             fg_dim: "#6f6592".into(),
-            accent: "#a487ff".into(),
-            accent2: "#ffcf7d".into(),
-            border: "#3d3260".into(),
-            selection_bg: "#a487ff4d".into(),
+            accent: "#ff2e88".into(),
+            accent2: "#00f0ff".into(),
+            border: "#44245e".into(),
+            selection_bg: "#ff2e8833".into(),
 
             // Row type colors
             row_tool: "#d18bff".into(),
             row_result: "#e8b45e".into(),
 
             // Semantic
-            error: "#ff5c8a".into(),
+            error: "#ff2020".into(),
             warning: "#ffb45e".into(),
             success: "#4ce0b3".into(),
 
@@ -290,12 +290,12 @@ impl Default for ThemeData {
             frame_content_padding: 12.0,
 
             // Frame colors
-            frame_base: "#131020f2".into(),
-            frame_focused: "#a487ff26".into(),
+            frame_base: "#12041ff2".into(),
+            frame_focused: "#ff2e8826".into(),
             frame_insert: "#4ce0b31f".into(),
             frame_visual: "#ff7ad91f".into(),
-            frame_unfocused: "#131020cc".into(),
-            frame_edge: "#3d326099".into(),
+            frame_unfocused: "#0d0221cc".into(),
+            frame_edge: "#44245e99".into(),
 
             // Frame shader params
             frame_params_base: [0.0, 0.0, 0.0, 0.0],
@@ -326,7 +326,7 @@ impl Default for ThemeData {
             input_minimized_height: 48.0,
             input_docked_height: 200.0,
             input_overlay_width_pct: 0.6,
-            input_backdrop_color: "#131020d9".into(),
+            input_backdrop_color: "#0d0221d9".into(),
 
             // Font configuration
             font_rainbow: true,
@@ -347,23 +347,23 @@ impl Default for ThemeData {
             constellation_ring_spacing: 550.0,
 
             // Block borders
-            block_border_tool_call: "#e8b45e99".into(),
-            block_border_tool_result: "#4ce0b366".into(),
-            block_border_error: "#ff2d6ecc".into(),
+            block_border_tool_call: "#ff2e8899".into(),
+            block_border_tool_result: "#a487ff66".into(),
+            block_border_error: "#ff2020cc".into(),
             block_border_thinking: "#7a6aa04d".into(),
             block_border_drift: "#c476e180".into(),
-            block_border_thickness: 1.5,
-            block_border_corner_radius: 4.0,
-            block_border_glow_radius: 6.0,
-            block_border_glow_intensity: 0.25,
+            block_border_thickness: 1.0,
+            block_border_corner_radius: 2.0,
+            block_border_glow_radius: 4.0,
+            block_border_glow_intensity: 0.10,
             text_glow_radius: 2.5,
             text_glow_color: "#cbb8ff59".into(), // soft violet-white, 35% alpha
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose
-            compose_border: "#3d3260".into(),
-            compose_bg: "#131020".into(),
+            compose_border: "#44245e".into(),
+            compose_bg: "#0d0221".into(),
 
             // Modal
             modal_backdrop: "#00000099".into(),
@@ -389,7 +389,7 @@ impl Default for ThemeData {
 
 // ─── Scene lane (`[scene]`) ─────────────────────────────────────────────────
 //
-// The 3D scenes' color contract (docs/color.md): identity hues as sRGB hex
+// The 3D scenes' color contract (docs/newui.md): identity hues as sRGB hex
 // (the app linearizes them for HDR materials), the brightness tier ladder,
 // live-signal gains, and the camera post chain. Defaults mirror the values
 // the scene modules shipped with, so a theme without `[scene]` renders
@@ -505,7 +505,7 @@ impl Default for SceneTiersData {
 }
 
 /// `[scene.gains]` — live-signal HDR gains. These are allowed to sustain
-/// >1.0 because they ARE the live-activity tell (docs/color.md).
+/// >1.0 because they ARE the live-activity tell (docs/newui.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SceneGainsData {
@@ -562,7 +562,7 @@ impl Default for ScenePostData {
     }
 }
 
-/// `[scene.lighting]` — the OPTIONAL hybrid lit-chamber mode (`docs/color.md`,
+/// `[scene.lighting]` — the OPTIONAL hybrid lit-chamber mode (`docs/newui.md`,
 /// the two-lane contract; `docs/scenes/shell.md`, "all-unlit discipline").
 /// Off by default: the room renders exactly as the all-unlit shell. On, only
 /// the chamber SHELL (floor disc, wall panel bases, vault dome, console table)

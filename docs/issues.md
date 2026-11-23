@@ -16,6 +16,18 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 - **`kj board read --include-hidden` and `kj ledger list` previews** show pending held posts to non-moderators (`kj/board.rs`); gate `--include-hidden` or split `--include-held` for moderators/authors if stricter visibility is wanted.
 - **TUI / App board picker** (Phase 2 of `docs/board.md`, "Human perusal and future clients"): topics are `BlockStore` documents, so adding a picker entry unlocks existing rendering, folds, and copy mode.
 
+## App conversation follow-ups (2026-11-23)
+
+- **Long unbroken tokens can run past the text column.** `block_text_style`
+  in `view/surface/shape_cache.rs` inherits Parley's `OverflowWrap::Normal`.
+  URLs and code without break opportunities need a separate wrapping
+  regression and an explicit policy. The window-resize overflow was caused
+  by dock image measurement, independently of this text policy.
+- **Theme fallbacks differ from the shipped file.** Untouched values in
+  `ThemeData::default()` include dim text, text halo, and MSDF gamma values
+  that differ from `assets/defaults/theme.toml`. Existing default tests only
+  spot-check equality.
+
 ## Heroic view follow-ups (2026-11-21)
 
 - Live kernel work updates still poll `kj transport work --track <id>` at 1 Hz via `execute_kj_quiet` (`view/heroic/live.rs`); a dedicated work-status wire event + measured performer lead field remains future work (`docs/newui.md`, "The live driver").
