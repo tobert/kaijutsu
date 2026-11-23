@@ -6,6 +6,16 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Boards: what Slices 1–3 leave open (2026-11-22)
+
+From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
+
+- **Slice 4 (`kj handoff` migration).** Intentionally deferred until `kj board` has live mileage: route `<char>/handoff` through boards, update `S16-handoff.kai`, move continuation close to `kj context signoff`, migrate `handoff_ctx` rows, and delete `kj/handoff.rs`.
+- **Two-step topic creation can leave an orphan `DocKind::Topic` document** if concurrent posts collide on `idx_board_topics_slug` or if `open_board_post_ask` fails after `create_document_with_held_block` (`kj/board.rs`). Fix: wrap document + topic insert or delete the document on error.
+- **Plain `kj context archive <senpai>` archives the context board** when no other live context holds `board_id`, even if live kohai still address it via `.senpai` (rotation is safe because the successor receives `board_id` first).
+- **`kj board read --include-hidden` and `kj ledger list` previews** show pending held posts to non-moderators (`kj/board.rs`); gate `--include-hidden` or split `--include-held` for moderators/authors if stricter visibility is wanted.
+- **TUI / App board picker** (Phase 2 of `docs/board.md`, "Human perusal and future clients"): topics are `BlockStore` documents, so adding a picker entry unlocks existing rendering, folds, and copy mode.
+
 ## Heroic view follow-ups (2026-11-21)
 
 - Live kernel work updates still poll `kj transport work --track <id>` at 1 Hz via `execute_kj_quiet` (`view/heroic/live.rs`); a dedicated work-status wire event + measured performer lead field remains future work (`docs/newui.md`, "The live driver").

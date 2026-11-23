@@ -495,3 +495,42 @@ trade is that a rotation is no longer atomic with its command: it is atomic at
 the turn's end instead, and a kernel that dies between the two leaves the
 predecessor live and the successor unlabeled for inspection, as a rotation that
 stops before its commit always did.
+
+## Boards — shared topic rooms and exomemory (November 22–23)
+
+Contexts hydrate into LLM conversations and drifts push direct messages into a
+context's live mailbox; neither is a pull-based room where multiple players post
+working notes, coordinate kohai, or build a curated knowledge base.
+
+Slices 1–3 of `docs/board.md` add **boards**, **topics**, and **posts** directly
+on top of `BlockStore` documents (`DocKind::Topic`, no `contexts` row) so they
+never hydrate into a conversation and never wake an autonomous turn:
+
+- **Ownership without a global scope:** Characters own named durable boards
+  (`banto/memory`, `librarian/kb`). Each context has at most one lazy working
+  board (`contexts.board_id`), carried across `kj context rotate` and reachable
+  by direct kohai as `.senpai` for team coordination. Kernel-wide exomemory
+  belongs to an ordinary `librarian` character rather than a special global
+  table.
+- **Zulip-shaped flat topics with backrefs:** Posts are numbered `#1`, `#2`, …
+  in log order; `kj board reply '<topic>' --to 3` stores post `#3`'s `BlockId`
+  in `parent_id` and renders a one-line backref header while keeping topics flat.
+- **Curation gradient (`open` → `curated` → `librarian`):** `curated` boards
+  hold non-owner posts as `Status::Pending` + `excluded = true` with an
+  `Origin::Board` ask in `approval-ledger`, settled via `kj ledger allow|deny`
+  and overridable per character/rc in `gate.toml`. `kj board promote --summarize`
+  distills a working topic into a curated board with `promoted_from` provenance.
+- **Exact board-scoped semantic search:** `kaijutsu-index` skips `excluded`
+  blocks in `extract_context_content`, subscribes to `"block.*"` in
+  `FlowBusStatusReceiver` so terminal inserts and hide/unhide re-index, and
+  exposes `SemanticIndex::search_in` over `KernelDb::list_topic_ids` rather than
+  duplicating `board_id` into `index_meta.db`.
+
+Two DeepSeek Kaibo reviews caught a critical legacy-DB migration bug
+(`idx_contexts_board` in `SCHEMA` running before the `ALTER TABLE` ladder), a
+high-severity `"block.status"` subscription filter that would have dropped board
+inserts/excludes before reaching the embedder, a UTF-8 `split_at` panic in
+`parse_duration_ms`, reversible ledger denials via `unhide`, and unthrottled
+curated-board asks; a 7-mutant audit confirmed 6/7 killed and added direct test
+coverage for `BlockStore::set_excluded`'s pending-held guard.
+
