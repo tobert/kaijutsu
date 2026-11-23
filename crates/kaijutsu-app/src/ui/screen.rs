@@ -1,9 +1,7 @@
 //! Screen state machine — the single authority for which full-viewport view is active.
 //!
-//! After the app reset there is a single screen, `Conversation`. The state
-//! machine is retained (rather than removed) so that `OnEnter(Screen::Conversation)`
-//! still drives the initial visibility + focus setup, and so future screens can
-//! be reintroduced without rewiring `run_if(in_state(...))` call sites.
+//! Screen transitions control conversation visibility and focus. UI screens
+//! use the theme background; Room and Heroic own their scene backgrounds.
 //!
 //! ## Design
 //!
@@ -61,7 +59,8 @@ impl Plugin for ScreenPlugin {
         app.init_state::<Screen>()
             .register_type::<Screen>()
             .register_type::<State<Screen>>()
-            .register_type::<NextState<Screen>>();
+            .register_type::<NextState<Screen>>()
+            .add_systems(PostUpdate, sync_ui_camera_background);
 
         // ── Conversation ──
         app.add_systems(
@@ -116,6 +115,21 @@ impl Plugin for ScreenPlugin {
     }
 }
 
+fn sync_ui_camera_background(
+    theme: Res<super::theme::Theme>,
+    screen: Res<State<Screen>>,
+    mut cameras: Query<&mut Camera, With<IsDefaultUiCamera>>,
+) {
+    if !matches!(screen.get(), Screen::Conversation | Screen::Editor | Screen::Diff)
+        || (!theme.is_changed() && !screen.is_changed())
+    {
+        return;
+    }
+    for mut camera in &mut cameras {
+        camera.clear_color = ClearColorConfig::Custom(theme.bg);
+    }
+}
+
 // ============================================================================
 // OnEnter/OnExit SYSTEMS
 // ============================================================================
@@ -140,4 +154,57 @@ fn hide_conversation_root(mut roots: Query<&mut Visibility, With<ConversationRoo
 /// Entering conversation view = navigation mode by default.
 fn set_focus_conversation(mut focus: ResMut<crate::input::focus::FocusArea>) {
     *focus = crate::input::focus::FocusArea::Conversation;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::theme::Theme;
+
+    fn app(screen: Screen) -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(bevy::state::app::StatesPlugin);
+        app.init_resource::<Theme>();
+        app.init_resource::<crate::input::focus::FocusArea>();
+        app.add_plugins(ScreenPlugin);
+        app.insert_state(screen);
+        let camera = app.world_mut().spawn((Camera3d::default(), IsDefaultUiCamera, Camera {
+            clear_color: ClearColorConfig::Custom(Color::BLACK),
+            ..default()
+        })).id();
+        app.update();
+        (app, camera)
+    }
+
+    fn background(app: &App, camera: Entity) -> Color {
+        match app.world().get::<Camera>(camera).unwrap().clear_color {
+            ClearColorConfig::Custom(color) => color,
+            other => panic!("expected a custom background, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ui_camera_background_follows_theme_reload() {
+        for screen in [Screen::Conversation, Screen::Editor, Screen::Diff] {
+            let (mut app, camera) = app(screen);
+            let color = Color::srgb(0.1, 0.2, 0.3);
+            app.world_mut().resource_mut::<Theme>().bg = color;
+            app.update();
+            assert_eq!(background(&app, camera), color);
+        }
+    }
+
+    #[test]
+    fn scene_background_is_preserved_until_returning_to_ui() {
+        for screen in [Screen::Room, Screen::Heroic] {
+            let (mut app, camera) = app(screen);
+            let color = Color::srgb(0.1, 0.2, 0.3);
+            app.world_mut().resource_mut::<Theme>().bg = color;
+            app.update();
+            assert_eq!(background(&app, camera), Color::BLACK);
+            app.world_mut().resource_mut::<NextState<Screen>>().set(Screen::Conversation);
+            app.update();
+            assert_eq!(background(&app, camera), color);
+        }
+    }
 }

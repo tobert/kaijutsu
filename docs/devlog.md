@@ -202,6 +202,8 @@ change. Compose borders follow the loaded accent instead of a fixed color.
 The outermost tiling split now uses the same subtree renderer as nested
 splits. Dropping that node had discarded its direction and stacked row
 splits vertically. Layout tests cover both directions and nested rebuilds.
+UI camera backgrounds follow theme reloads and screen returns; scene
+backgrounds stay owned by Room and Heroic while those screens are active.
 
 ## The file cache learns what vim already knew (August 18–20)
 
