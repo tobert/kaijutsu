@@ -610,6 +610,75 @@ impl KernelDb {
         }
         Ok(())
     }
+
+    /// Return all contexts pointing to `board_id`, live contexts first.
+    pub fn contexts_for_board(&self, board_id: BoardId) -> KernelDbResult<Vec<ContextRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, label,
+                    system_prompt, context_state,
+                    created_at, created_by, forked_from, fork_kind,
+                    archived_at, workspace_id, preset_id, concluded_at,
+                    last_activity_at, promoted_at, demoted_at, paused_at,
+                    origin_host, performer, senpai_ctx, persona, board_id
+             FROM contexts
+             WHERE board_id = ?1
+             ORDER BY CASE WHEN archived_at IS NULL THEN 0 ELSE 1 END, created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![blob_param(board_id.as_bytes())], row_to_context_row)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// True if `candidate_principal` or `candidate_ctx` appears strictly above
+    /// `target_context` on its `senpai_ctx` chain.
+    pub fn is_on_senpai_chain_of_context(
+        &self,
+        candidate_principal: PrincipalId,
+        candidate_ctx: Option<ContextId>,
+        target_context: ContextId,
+    ) -> KernelDbResult<bool> {
+        let mut visited = HashSet::from([target_context]);
+        let mut at = self.senpai_of(target_context)?;
+        while let Some(senpai_id) = at {
+            if !visited.insert(senpai_id) {
+                break;
+            }
+            if candidate_ctx == Some(senpai_id) {
+                return Ok(true);
+            }
+            let Some(row) = self.get_context(senpai_id)? else {
+                break;
+            };
+            if row.performer == Some(candidate_principal) {
+                return Ok(true);
+            }
+            at = row.senpai_ctx;
+        }
+        Ok(false)
+    }
+
+    /// True if `candidate_principal` or `candidate_ctx` appears on the
+    /// `senpai_ctx` chain above any live context performed by `target_character`.
+    pub fn is_on_senpai_chain_of_character(
+        &self,
+        candidate_principal: PrincipalId,
+        candidate_ctx: Option<ContextId>,
+        target_character: PrincipalId,
+    ) -> KernelDbResult<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id FROM contexts WHERE performer = ?1 AND archived_at IS NULL",
+        )?;
+        let ctx_ids: Vec<ContextId> = stmt
+            .query_map(params![blob_param(target_character.as_bytes())], |row| {
+                read_context_id(row, 0)
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        for ctx_id in ctx_ids {
+            if self.is_on_senpai_chain_of_context(candidate_principal, candidate_ctx, ctx_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]

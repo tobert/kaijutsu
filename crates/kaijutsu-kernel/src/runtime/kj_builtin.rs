@@ -483,11 +483,16 @@ impl Tool for KjBuiltin {
         // Preserve stdin exactly when the command accepts content and no
         // explicit --content was supplied. File redirection avoids command
         // substitution's trailing-newline removal and stdout preview limits.
-        if wants_stdin_content(&argv) && !crate::kj::parse::has_flag(&argv, &["--content"]) {
+        if wants_stdin_content(&argv)
+            && !crate::kj::parse::has_flag(&argv, &["--content", "--help", "-h"])
+        {
             match ctx.read_stdin_to_text().await {
                 Ok(Some(body)) if !body.is_empty() => {
-                    argv.push("--content".into());
-                    argv.push(body);
+                    // Insert right after the `<cmd> <subcmd>` prefix so a
+                    // trailing variadic body arg (`kj board post`/`reply`)
+                    // never swallows `--content`.
+                    let insert_at = argv.len().min(2);
+                    argv.splice(insert_at..insert_at, ["--content".into(), body]);
                 }
                 Ok(_) => {} // no stdin (or empty) — nothing to inject
                 Err(e) => return ExecResult::failure(1, format!("kj: reading stdin: {e}")),
@@ -690,7 +695,10 @@ fn wants_stdin_content(argv: &[String]) -> bool {
             argv.first().map(String::as_str),
             argv.get(1).map(String::as_str)
         ),
-        (Some("rc"), Some("add")) | (Some("block"), Some("create"))
+        (Some("rc"), Some("add"))
+            | (Some("block"), Some("create"))
+            | (Some("board"), Some("post"))
+            | (Some("board"), Some("reply"))
     )
 }
 

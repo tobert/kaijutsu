@@ -28,7 +28,7 @@ pub(crate) const SENPAI_VERBS: &[&str] = &[
 /// which is what makes a new verb choose a table.
 #[cfg(test)]
 pub(crate) const WORKER_VERBS: &[&str] = &[
-    "block", "cache", "cas", "context", "diff", "drift", "fork", "stage", "handoff",
+    "block", "board", "cache", "cas", "context", "diff", "drift", "fork", "stage", "handoff",
     "kaish", "models", "search", "shadow", "synth", "vfs", "vi", "wait", "watch", "workspace",
 ];
 

@@ -20,7 +20,7 @@ senpai.
 ### Contexts
 
 ```
-context (ctx)   make, list, inspect, switch, rotate, and archive contexts; set a context's senpai
+context (ctx)   make, list, inspect, switch, rotate, archive contexts; set senpai
 fork            fork this context into a child; we stay on the parent
 stage           leave blocks out of what models read; commit a staged fork
 attach          attach to a context and run its rc attach lifecycle
@@ -31,12 +31,13 @@ preset          fork presets: what a child copies from its parent
 ### Work across contexts
 
 ```
-drift           send text to another context (`kj drift push .senpai` reaches our senpai), or distill one context into another
+drift           send text to another context, or distill one into another
 wait            wait for a turn, a shell operation, an ask, or a kaish job
 watch           watch files; changes go with the next prompt as a notice
 drive           start one autonomous turn on a context
 interrupt       stop a turn; the context does not resume on its own after it
 handoff         a character's handoff log: leave notes and read them
+board           shared topic boards: list, read, post, reply, search
 roster          post your status; list who is around
 cc              list live Claude Code sessions; send one a message
 ```
@@ -47,14 +48,14 @@ cc              list live Claude Code sessions; send one a message
 block           read, append to, and edit the blocks of a context
 shadow          describe an image block; list shadows
 search          regex search across blocks
-diff            unified diff of a kernel-held file against disk, another file, or its history
+diff            unified diff of a kernel file against disk, another file, or history
 vi              kernel-owned vi editor sessions for agents and scripts
 vfs             VFS snapshot listings and per-directory activity totals
 cas             content-addressed storage: put, get, list, remove
 cache           Claude prompt-cache breakpoints on the current context
 cp              copy a file between VFS paths
 doc             kernel documents of every kind (the storage layer)
-swap            keep or discard a file buffer recovered after a kernel restart
+swap            keep or discard a recovered file buffer
 ```
 
 ### Models and characters

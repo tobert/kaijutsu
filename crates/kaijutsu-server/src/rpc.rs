@@ -1161,12 +1161,27 @@ impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
         Box::pin(async {
             loop {
                 let msg = self.sub.recv().await?;
-                if let BlockFlow::StatusChanged {
-                    context_id, status, ..
-                } = msg.payload
-                    && status.is_terminal()
-                {
-                    return Some(kaijutsu_index::StatusEvent { context_id, status });
+                match msg.payload {
+                    BlockFlow::StatusChanged {
+                        context_id, status, ..
+                    } if status.is_terminal() => {
+                        return Some(kaijutsu_index::StatusEvent { context_id, status });
+                    }
+                    BlockFlow::Inserted {
+                        context_id, block, ..
+                    } if block.status.is_terminal() => {
+                        return Some(kaijutsu_index::StatusEvent {
+                            context_id,
+                            status: block.status,
+                        });
+                    }
+                    BlockFlow::ExcludedChanged { context_id, .. } => {
+                        return Some(kaijutsu_index::StatusEvent {
+                            context_id,
+                            status: kaijutsu_types::Status::Done,
+                        });
+                    }
+                    _ => {}
                 }
             }
         })

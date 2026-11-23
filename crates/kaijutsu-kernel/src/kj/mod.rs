@@ -18,6 +18,7 @@ pub mod backend;
 pub mod binding;
 pub mod ledger;
 pub mod block;
+pub mod board;
 pub mod cache;
 pub mod cas;
 pub mod cc;
@@ -608,6 +609,11 @@ impl KjDispatcher {
         // context — same exemption rationale as `kj character`.
         if cmd == "handoff" {
             return self.dispatch_handoff(&argv[1..], caller).await;
+        }
+        // `kj board` addresses character boards and topics without requiring
+        // an active context; `.` and `.senpai` check `caller.context_id`.
+        if cmd == "board" {
+            return Box::pin(async { self.dispatch_board(&argv[1..], caller).await }).await;
         }
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
