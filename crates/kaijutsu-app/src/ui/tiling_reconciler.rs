@@ -274,20 +274,22 @@ pub fn update_pane_focus(
     focused_panes: Query<Entity, With<PaneFocus>>,
     mut conv_borders: Query<(&PaneMarker, &mut BorderColor), With<ConversationContainer>>,
 ) {
-    if !tree.is_changed() {
+    if !tree.is_changed() && !theme.is_changed() {
         return;
     }
 
-    // Remove stale focus markers
-    for entity in focused_panes.iter() {
-        commands.entity(entity).remove::<PaneFocus>();
-    }
+    if tree.is_changed() {
+        // Remove stale focus markers
+        for entity in focused_panes.iter() {
+            commands.entity(entity).remove::<PaneFocus>();
+        }
 
-    // Add focus to the focused conversation pane
-    for (entity, marker) in pane_markers.iter() {
-        if marker.pane_id == tree.focused {
-            commands.entity(entity).insert(PaneFocus);
-            break;
+        // Add focus to the focused conversation pane
+        for (entity, marker) in pane_markers.iter() {
+            if marker.pane_id == tree.focused {
+                commands.entity(entity).insert(PaneFocus);
+                break;
+            }
         }
     }
 
@@ -681,5 +683,41 @@ mod short_id_tests {
         // '—' spans bytes 11..14, across the 12-byte cut.
         let id = format!("{}—tail", "x".repeat(11));
         assert_eq!(short_id(&id), format!("{}…", "x".repeat(11)));
+    }
+}
+
+#[cfg(test)]
+mod border_theme_tests {
+    use super::*;
+
+    #[test]
+    fn pane_borders_follow_theme_without_tree_changes() {
+        for multiple in [false, true] {
+            let mut app = App::new();
+            let mut tree = TilingTree::default_layout();
+            let focused = tree.focused;
+            let other = multiple.then(|| tree.split(focused, SplitDirection::Row).unwrap());
+            app.insert_resource(tree).init_resource::<Theme>();
+            app.add_systems(Update, update_pane_focus);
+            let spawn = |world: &mut World, pane_id| world.spawn((
+                PaneMarker { pane_id, content: PaneContent::Conversation { document_id: String::new() } },
+                ConversationContainer,
+                BorderColor::all(Color::NONE),
+            )).id();
+            let first = spawn(app.world_mut(), focused);
+            let second = other.map(|id| spawn(app.world_mut(), id));
+            app.update();
+            let (accent, border) = (Color::srgb(0.2, 0.8, 0.3), Color::srgb(0.7, 0.3, 0.1));
+            let mut theme = app.world_mut().resource_mut::<Theme>();
+            theme.accent = accent;
+            theme.border = border;
+            app.update();
+            assert_eq!(*app.world().get::<BorderColor>(first).unwrap(), BorderColor::all(if multiple { accent } else { border }));
+            assert!(app.world().get::<PaneFocus>(first).is_some());
+            if let Some(second) = second {
+                assert_eq!(*app.world().get::<BorderColor>(second).unwrap(), BorderColor::all(border));
+                assert!(app.world().get::<PaneFocus>(second).is_none());
+            }
+        }
     }
 }

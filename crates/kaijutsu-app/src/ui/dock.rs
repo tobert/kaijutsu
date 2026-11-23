@@ -502,6 +502,17 @@ pub fn spawn_docks(
     commands.entity(root).add_child(south);
 }
 
+fn sync_dock_borders(
+    theme: Res<Theme>,
+    mut borders: Query<&mut BorderColor, Or<(With<NorthDock>, With<SouthDock>)>>,
+) {
+    if theme.is_changed() {
+        for mut border in &mut borders {
+            *border = BorderColor::all(theme.border);
+        }
+    }
+}
+
 // ============================================================================
 // RENDER SYSTEMS (PostUpdate, after Layout)
 // ============================================================================
@@ -1312,6 +1323,30 @@ mod tests {
         BackgroundActivityLevel, PRESENCE_MAX_AGE,
     };
     use crate::ui::theme::Theme;
+
+    #[test]
+    fn dock_borders_follow_theme_after_spawn() {
+        use bevy::prelude::*;
+        use super::{NorthDock, SouthDock, spawn_docks, sync_dock_borders};
+        use crate::shaders::BlockFxMaterial;
+        use crate::ui::tiling_reconciler::TilingRoot;
+
+        let mut app = App::new();
+        app.init_resource::<Theme>();
+        app.init_resource::<Assets<BlockFxMaterial>>();
+        app.world_mut().spawn((TilingRoot, Node::default()));
+        app.add_systems(Startup, spawn_docks);
+        app.add_systems(Update, sync_dock_borders);
+        app.update();
+        let color = Color::srgb(0.2, 0.8, 0.3);
+        app.world_mut().resource_mut::<Theme>().border = color;
+        app.update();
+        let world = app.world_mut();
+        let north = world.query_filtered::<&BorderColor, With<NorthDock>>().single(world).unwrap();
+        assert_eq!(*north, BorderColor::all(color));
+        let south = world.query_filtered::<&BorderColor, With<SouthDock>>().single(world).unwrap();
+        assert_eq!(*south, BorderColor::all(color));
+    }
 
     /// The mark's color is a pure function of the performer's name: one
     /// performer keeps one color, and different performers do not share one.
@@ -3015,6 +3050,7 @@ impl Plugin for DockPlugin {
             .add_systems(
                 Update,
                 (
+                    sync_dock_borders,
                     sync_hud_detach,
                     update_mode,
                     update_connection,

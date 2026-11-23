@@ -790,6 +790,7 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
         theme.fg = hex_to_color(&td.fg);
         theme.fg_dim = hex_to_color(&td.fg_dim);
         theme.accent = hex_to_color(&td.accent);
+        theme.compose_palette_border = theme.accent;
         theme.accent2 = hex_to_color(&td.accent2);
         theme.border = hex_to_color(&td.border);
         theme.selection_bg = hex_to_color(&td.selection_bg);
@@ -947,6 +948,15 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_border_follows_the_loaded_accent() {
+        let theme = Theme::from(kaijutsu_types::theme::ThemeData {
+            accent: "#00ff80".into(),
+            ..default()
+        });
+        assert_eq!(theme.compose_palette_border, theme.accent);
+    }
 
     /// Every `BlockTone` resolves to the theme field it is named for. The
     /// match in `color_for` is exhaustive, so a new tone fails to compile;
