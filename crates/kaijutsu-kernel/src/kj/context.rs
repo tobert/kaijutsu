@@ -2398,13 +2398,6 @@ impl KjDispatcher {
             Ok(Some(why)) => return KjResult::Err(format!("kj context rotate: {why}")),
             Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
         }
-        // A rotation already waiting on this context's turn end owns the
-        // successor it made; a second would archive the predecessor under it.
-        if self.kernel().turns().rotation_pending(predecessor.context_id) {
-            return KjResult::Err(format!(
-                "kj context rotate: {name} already has a rotation waiting on its turn's end; it settles when that turn ends"
-            ));
-        }
         let placement = match (&character, &handoff_owner) {
             (Some(character), _) => {
                 // The one authority rule, and the context's own character
@@ -2456,14 +2449,27 @@ impl KjDispatcher {
             Ok(root) => root,
             Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
         };
-        // A rotation already waiting on this context's turn end owns the
-        // successor it made; a second would archive the predecessor under it.
-        // Checked after the authority above, so only a caller who may rotate
-        // learns that one is pending.
-        if self.kernel().turns().rotation_pending(predecessor.context_id) {
+        // Claim the context after the authority above and before anything
+        // moves. The check and the claim are one atomic act, so a second
+        // rotation is refused with no successor created and nothing detached,
+        // and only a caller who may rotate learns that one is under way.
+        let Some(reservation) = self.kernel().turns().try_reserve_rotation(predecessor.context_id) else {
             return KjResult::Err(format!(
-                "kj context rotate: {name} already has a rotation waiting on its turn's end; it settles when that turn ends"
+                "kj context rotate: {name} already has a rotation in progress; it must finish first"
             ));
+        };
+        // The row read above may be stale: an archive can land between it and
+        // this claim. Refuse before any side effect when the predecessor is no
+        // longer live, whatever archived it.
+        match self.kernel_db().lock().get_context(predecessor.context_id) {
+            Ok(Some(row)) if !row.is_archived() => {}
+            Ok(Some(_)) => return KjResult::Err(format!(
+                "kj context rotate: {name} was archived before this rotation could start; nothing changed"
+            )),
+            Ok(None) => return KjResult::Err(format!(
+                "kj context rotate: {name} has no row any more; nothing changed"
+            )),
+            Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
         }
 
         // Resolve the drop before anything is created, so a bad entry
@@ -2639,7 +2645,7 @@ impl KjDispatcher {
         // them inline otherwise — the same reason `run_archive_lifecycle` boxes
         // its lifecycle. A test thread's stack is small.
         Box::pin(self.rotate_after_successor(
-            &predecessor, successor_id, &name, root_console, is_handoff_log, caller,
+            &predecessor, successor_id, &name, root_console, is_handoff_log, caller, reservation,
         ))
         .await
     }
@@ -2655,6 +2661,10 @@ impl KjDispatcher {
     /// name a successor that does not answer yet. Otherwise the archive
     /// lifecycle runs while the predecessor is live and the rotation commits
     /// after it, as `kj context archive` would.
+    ///
+    /// The reservation claims the predecessor for this rotation. A turn that
+    /// takes the signoff owns it until its end; the immediate path keeps it
+    /// through the commit and releases it when this returns.
     #[allow(clippy::too_many_arguments)]
     async fn rotate_after_successor(
         &self,
@@ -2664,23 +2674,17 @@ impl KjDispatcher {
         root_console: bool,
         is_handoff_log: bool,
         caller: &KjCaller,
+        reservation: crate::runtime::turn_state::RotationReservation,
     ) -> KjResult {
         use crate::runtime::turn_state::SignoffAsk;
-        match self.ask_running_turn_to_sign_off(predecessor, successor_id, name, root_console, caller) {
+        let _reservation = match self.ask_running_turn_to_sign_off(
+            predecessor, successor_id, name, root_console, caller, reservation,
+        ) {
             SignoffAsk::Taken => {
                 return self.rotation_under_way_result(predecessor, successor_id, name, is_handoff_log);
             }
-            // A turn took the request in a race the caller's check missed: the
-            // rotation that turn holds owns the context, so this one stops.
-            SignoffAsk::AlreadyPending => {
-                let fate = self.successor_fate(root_console, successor_id);
-                return KjResult::Err(format!(
-                    "kj context rotate: {fate}{name} already has a rotation waiting on its turn's end, \
-                     so the successor {successor_id} takes over nothing; its create lifecycle ran"
-                ));
-            }
-            SignoffAsk::Idle => {}
-        }
+            SignoffAsk::Idle(reservation) => reservation,
+        };
 
         // The predecessor's archive lifecycle runs while it is still live,
         // as `kj context archive` runs it; the rotation commits after it.
@@ -2772,10 +2776,10 @@ impl KjDispatcher {
     /// Only a rotation asked from the predecessor's own context defers: the
     /// signoff call belongs to the turn running there. A rotation asked from
     /// anywhere else, or with no turn holding that context's conversation
-    /// lock, takes the immediate path. A shell in the context that is not the
-    /// turn's own tool call asks the same way — a rotation under a running
-    /// turn is what the turn cannot see — so the deferral follows the lock,
-    /// not the caller's identity.
+    /// lock, takes the immediate path under the reservation it passes in. A
+    /// shell in the context that is not the turn's own tool call asks the same
+    /// way — a rotation under a running turn is what the turn cannot see — so
+    /// the deferral follows the lock, not the caller's identity.
     fn ask_running_turn_to_sign_off(
         &self,
         predecessor: &crate::ContextRow,
@@ -2783,12 +2787,14 @@ impl KjDispatcher {
         name: &str,
         root_console: bool,
         caller: &KjCaller,
+        reservation: crate::runtime::turn_state::RotationReservation,
     ) -> crate::runtime::turn_state::SignoffAsk {
         if caller.context_id != Some(predecessor.context_id) {
-            return crate::runtime::turn_state::SignoffAsk::Idle;
+            return crate::runtime::turn_state::SignoffAsk::Idle(reservation);
         }
         self.kernel().turns().begin_rotation_signoff(
             predecessor.context_id,
+            reservation,
             crate::runtime::turn_state::PendingRotation {
                 predecessor: predecessor.context_id,
                 successor,
@@ -2945,6 +2951,13 @@ impl KjDispatcher {
             Ok(Some(_)) => {}
             Ok(None) => return Err(format!("{name} has no row any more, so the successor {successor} takes over nothing")),
             Err(e) => return Err(format!("could not read {name}: {e}")),
+        }
+        // Skip the predecessor's archive scripts if the successor is already
+        // gone. The commit repeats this check inside the transaction in case
+        // another writer archives the successor while the scripts run.
+        let successor_check = self.kernel_db().lock().require_live_rotation_successor(predecessor, successor);
+        if let Err(e) = successor_check {
+            return Err(format!("{e}; {name} stays live and its archive lifecycle did not run"));
         }
         if let Err(e) = self.run_archive_lifecycle(predecessor, caller).await {
             let successor_fate = self.successor_fate(root_console, successor);

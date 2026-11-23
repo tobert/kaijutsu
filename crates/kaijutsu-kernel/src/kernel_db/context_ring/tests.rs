@@ -647,3 +647,42 @@ fn a_demote_that_archives_a_console_checks_its_person_inside_the_write() {
     let (outcome, _) = db.demote_context_with_shadows(con, true, Some(amy)).unwrap();
     assert_eq!(outcome, DemoteOutcome::Archived);
 }
+
+/// A rotation whose successor was archived after it was created refuses
+/// inside the write, before any pointer moves: the predecessor keeps its
+/// label, ring seat, and handoff pointer, and stays live for another
+/// rotation. Falsified by committing without reading the successor.
+#[test]
+fn a_rotate_to_an_archived_successor_leaves_the_predecessor_live() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let (amy, _console) = db.seed_test_root_console().unwrap();
+    let old = make_context_row(Some("rot-old"));
+    insert_kohai_with_doc(&db, &old, ws_id);
+    db.set_character_handoff_ctx(amy, Some(old.context_id)).unwrap();
+    assert_eq!(db.promote_context(old.context_id).unwrap(), PromoteOutcome::Promoted);
+    let successor = make_context_row(Some("rot-next"));
+    insert_kohai_with_doc(&db, &successor, ws_id);
+    assert!(db.archive_context(successor.context_id).unwrap());
+
+    let error = db.commit_rotation(old.context_id, successor.context_id).unwrap_err();
+    assert!(matches!(&error, KernelDbError::Validation(_)), "{error}");
+    let error = error.to_string();
+    assert!(error.contains("rot-next") && error.contains("archived"), "{error}");
+    assert!(error.contains("cannot take the place of rot-old"), "{error}");
+
+    let loaded = db.get_context(old.context_id).unwrap().unwrap();
+    assert!(!loaded.is_archived(), "the predecessor stays live");
+    assert_eq!(loaded.label.as_deref(), Some("rot-old"), "its label does not move");
+    assert!(loaded.promoted_at.is_some(), "its ring seat does not move");
+    assert_eq!(
+        db.get_character(amy).unwrap().unwrap().handoff_ctx,
+        Some(old.context_id),
+        "its handoff pointer does not move"
+    );
+    assert_eq!(
+        db.get_context(successor.context_id).unwrap().unwrap().label.as_deref(),
+        Some("rot-next"),
+        "the archived successor takes nothing"
+    );
+}

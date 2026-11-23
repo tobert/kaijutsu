@@ -263,11 +263,38 @@ impl KernelDb {
         Ok(updated > 0)
     }
 
+    /// Refuse a rotation whose successor cannot take the predecessor's
+    /// place: it has no row any more, or it is archived. A rotation creates
+    /// its successor long before it commits, and a turn's end can be far
+    /// away, so another writer can archive the successor in between.
+    /// [`Self::commit_rotation`] runs this inside its transaction, before
+    /// the pointer and archive writes; a caller that defers a rotation runs
+    /// it before the archive lifecycle, so a lost successor refuses without
+    /// running scripts.
+    pub(crate) fn require_live_rotation_successor(
+        &self,
+        predecessor: ContextId,
+        successor: ContextId,
+    ) -> KernelDbResult<()> {
+        let successor_name = match self.get_context(successor)? {
+            Some(row) if row.is_archived() => format!("{} was archived", Self::context_display(&row)),
+            Some(_) => return Ok(()),
+            None => format!("{} has no row any more", successor.short()),
+        };
+        Err(KernelDbError::Validation(format!(
+            "the successor {successor_name}, so it cannot take the place of {}",
+            self.context_name(predecessor)
+        )))
+    }
+
     /// Finish a rotation in one transaction: archive `predecessor` and its
     /// shadows ([`Self::archive_with_shadows`], give
     /// `successor` its label and ring placement, and point a character's
     /// `handoff_ctx` at the successor when it named the predecessor. A
-    /// predecessor that is missing or already archived refuses. Moves a
+    /// predecessor that is missing or already archived refuses. A successor
+    /// that is missing or archived refuses too, before the pointers move
+    /// ([`Self::require_live_rotation_successor`]); a refused rotation rolls
+    /// back, so the predecessor stays live. Moves a
     /// character's `root_ctx` and `console_ctx` the same way; the archived
     /// root console then takes the successor as its senpai. Both pointers
     /// move before the archive, which would otherwise refuse a root console
@@ -282,6 +309,9 @@ impl KernelDb {
             let row = db.get_context(predecessor)?.ok_or_else(|| {
                 KernelDbError::NotFound(format!("context {}", predecessor.short()))
             })?;
+            // Refuse a successor that is gone before any pointer moves: it
+            // has no live place to take, and the predecessor keeps its own.
+            db.require_live_rotation_successor(predecessor, successor)?;
             // A console pointer moving does not touch the predecessor's senpai.
             db.conn.execute(
                 "UPDATE characters SET console_ctx = ?1 WHERE console_ctx = ?2",

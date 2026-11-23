@@ -43,13 +43,52 @@ pub(crate) struct PendingRotation {
     pub session: SessionId,
 }
 
+/// A rotation's claim on its predecessor before anything is created or
+/// detached.
+///
+/// `kj context rotate` takes it after authority and before its first side
+/// effect, so a second rotation is refused while the first still prepares and
+/// every early return releases the slot. The immediate path holds it through
+/// the commit; a deferred rotation hands it to the turn whose end settles it
+/// ([`Self::defer_to`]).
+#[must_use = "a rotation reservation releases its slot when dropped"]
+pub(crate) struct RotationReservation {
+    rotations: Arc<parking_lot::Mutex<Rotations>>,
+    context: ContextId,
+    held: bool,
+}
+
+impl RotationReservation {
+    /// Record the rotation the turn at the context's conversation lock will
+    /// settle, handing the slot to that turn.
+    ///
+    /// The reservation is the only holder of the context's slot, so replacing
+    /// it is atomic under the registry lock.
+    pub(crate) fn defer_to(mut self, turn: TurnId, rotation: PendingRotation) {
+        let mut rotations = self.rotations.lock();
+        rotations.insert(self.context, (Some(turn), RotationState::Pending(rotation)));
+        self.held = false;
+    }
+}
+
+impl Drop for RotationReservation {
+    fn drop(&mut self) {
+        if self.held {
+            self.rotations.lock().remove(&self.context);
+        }
+    }
+}
+
 type Rotations = HashMap<ContextId, (Option<TurnId>, RotationState)>;
 
-/// What the registry holds for a context with a rotation deferred to a turn's
-/// end. `Settling` keeps the entry while the turn's end archives, so a second
-/// rotation started in that window refuses instead of creating a successor
-/// nobody takes over from.
+/// What the registry holds for a context with a rotation under way.
+///
+/// `Reserved` is a rotation that has not yet created its successor; `Pending`
+/// is one a turn's end settles; `Settling` keeps the entry while that end
+/// archives, so a second rotation started in any window refuses instead of
+/// creating a successor nobody takes over from.
 enum RotationState {
+    Reserved,
     Pending(PendingRotation),
     Settling,
 }
@@ -70,16 +109,14 @@ impl Drop for RotationSettlement {
 }
 
 /// How a running turn answered a rotation's request for a signoff call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignoffAsk {
     /// The turn holding the context's conversation lock took the request: it
     /// takes one more inference, offering only `done`, and its end settles
     /// the rotation.
     Taken,
-    /// No turn holds the lock, so the caller takes the immediate path.
-    Idle,
-    /// The context already has a rotation waiting on a turn's end.
-    AlreadyPending,
+    /// No turn holds the lock, so the caller takes the immediate path under
+    /// the reservation it still holds.
+    Idle(RotationReservation),
 }
 
 /// Input that arrived while a turn runs, which that turn has not yet
@@ -214,7 +251,9 @@ impl TurnLease {
                 rotations: self.rotations.clone(),
                 context: self.context,
             })),
-            RotationState::Settling => None,
+            // A reservation has no turn yet and a settlement belongs to a
+            // previous turn, so neither is this lease's to take.
+            RotationState::Reserved | RotationState::Settling => None,
         }
     }
 
@@ -325,38 +364,44 @@ impl TurnState {
         self.active.lock().get(&context).map_or(0, |turns| turns.len())
     }
 
-    /// Whether a rotation is already waiting on this context's turn end,
-    /// either pending or settling. `kj context rotate` checks it before it
-    /// creates a successor nobody would take over from.
-    pub(crate) fn rotation_pending(&self, context: ContextId) -> bool {
-        self.rotations.lock().contains_key(&context)
+    /// Claim `context` for a rotation that is about to create its successor.
+    ///
+    /// The check and the claim are one act: a context already reserved,
+    /// pending, or settling has no free slot, so a second rotation is refused
+    /// before it changes anything. The reservation releases the slot on every
+    /// exit.
+    pub(crate) fn try_reserve_rotation(&self, context: ContextId) -> Option<RotationReservation> {
+        let mut rotations = self.rotations.lock();
+        if rotations.contains_key(&context) { return None; }
+        rotations.insert(context, (None, RotationState::Reserved));
+        Some(RotationReservation { rotations: self.rotations.clone(), context, held: true })
     }
 
     /// Ask the turn that holds `context`'s conversation lock for one signoff
-    /// inference and record the rotation its end settles.
+    /// inference and hand it the rotation its end settles.
     ///
     /// `kj context rotate` asks this when it runs in a context's own shell
     /// while a turn holds that context's lock; the turn then offers only
     /// `done` for one more inference and ends, and its end archives the
-    /// predecessor. Idle, a rotation takes the immediate path, so this
-    /// matters only while a turn is running. A shell in the context that is
-    /// not the turn's own tool call asks the same way: the alternative is
-    /// archiving under the running turn, which the turn cannot see.
+    /// predecessor. Idle, the reservation comes back and the caller takes the
+    /// immediate path, so this matters only while a turn is running. A shell
+    /// in the context that is not the turn's own tool call asks the same way:
+    /// the alternative is archiving under the running turn, which the turn
+    /// cannot see.
     pub(crate) fn begin_rotation_signoff(
         &self,
         context: ContextId,
+        reservation: RotationReservation,
         rotation: PendingRotation,
     ) -> SignoffAsk {
-        let mut rotations = self.rotations.lock();
-        if rotations.contains_key(&context) {
-            return SignoffAsk::AlreadyPending;
-        }
+        // The ingress lock keeps the turn that owns it from closing between
+        // the check and the handoff.
         let ingress = self.ingress.lock();
         let Some(open) = ingress.open.get(&context) else {
-            return SignoffAsk::Idle;
+            return SignoffAsk::Idle(reservation);
         };
+        reservation.defer_to(open.turn, rotation);
         open.interrupt.request_signoff();
-        rotations.insert(context, (Some(open.turn), RotationState::Pending(rotation)));
         SignoffAsk::Taken
     }
 
@@ -787,4 +832,67 @@ mod conversation_cache_tests {
         drop(third);
     }
 
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    fn pending(context: ContextId) -> PendingRotation {
+        PendingRotation {
+            predecessor: context,
+            successor: ContextId::new(),
+            label: Some("seat".into()),
+            name: "seat".into(),
+            root_console: false,
+            principal: PrincipalId::new(),
+            actor: PrincipalId::new(),
+            reviewer: None,
+            session: SessionId::new(),
+        }
+    }
+
+    /// A turn that takes the signoff owns the slot until its end; taking the
+    /// rotation hands it to the settlement, which returns it.
+    #[test]
+    fn a_turn_takes_the_reservation_and_its_settlement_returns_the_slot() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let reservation = state.try_reserve_rotation(context).expect("reserve");
+        assert!(state.try_reserve_rotation(context).is_none(), "the reservation is the check");
+        let lease = state.begin(context);
+        state.open_ingress(context, lease.id(), lease.interrupt());
+        let rotation = pending(context);
+        assert!(matches!(
+            state.begin_rotation_signoff(context, reservation, rotation.clone()),
+            SignoffAsk::Taken
+        ));
+        assert_eq!(lease.pending_rotation().map(|r| r.successor), Some(rotation.successor));
+        assert!(state.try_reserve_rotation(context).is_none(), "the deferred rotation holds the slot");
+
+        let (taken, settlement) = lease.take_rotation().expect("the turn takes its rotation");
+        assert_eq!(taken.successor, rotation.successor);
+        assert!(state.try_reserve_rotation(context).is_none(), "settling holds the slot");
+        drop(settlement);
+        assert!(state.try_reserve_rotation(context).is_some(), "the settlement returns the slot");
+        drop(lease);
+    }
+
+    /// A lease that ends without settling the rotation it owns releases the
+    /// slot, so a later rotation may start.
+    #[test]
+    fn a_lease_that_ends_without_settling_returns_its_slot() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let reservation = state.try_reserve_rotation(context).expect("reserve");
+        let lease = state.begin(context);
+        state.open_ingress(context, lease.id(), lease.interrupt());
+        assert!(matches!(
+            state.begin_rotation_signoff(context, reservation, pending(context)),
+            SignoffAsk::Taken
+        ));
+        assert!(state.close_ingress(context, lease.id()).is_empty());
+        drop(lease);
+        assert!(state.try_reserve_rotation(context).is_some(), "a dropped lease returns its slot");
+    }
 }
