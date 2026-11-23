@@ -579,6 +579,7 @@ pub fn block_text_style(text_metrics: &TextMetrics, brush: Brush) -> VelloTextSt
     VelloTextStyle {
         brush,
         font_size: text_metrics.cell_font_size,
+        overflow_wrap: crate::text::shaping::OverflowWrap::BreakWord,
         font_axes: VelloFontAxes {
             weight: Some(200.0),
             ..default()
@@ -2002,6 +2003,39 @@ mod tests {
 
     fn style() -> VelloTextStyle {
         block_text_style(&TextMetrics::default(), bevy_color_to_brush(Color::WHITE))
+    }
+
+    #[test]
+    fn long_tokens_wrap_inside_the_conversation_column() {
+        let font = mono();
+        let text = "abcdefgh0123456789".repeat(12);
+        let wrap = 180.0;
+        let style = style();
+        let spans = [SpanBrush {
+            start: 0,
+            end: text.len(),
+            brush: bevy_color_to_brush(Color::WHITE),
+        }];
+        let styled = [StyledSpan {
+            start: 0,
+            end: text.len(),
+            brush: StyledBrush {
+                color: [255, 255, 255, 255],
+                ..default()
+            },
+            bg: None,
+            ink: [255, 255, 255, 255],
+            underline: false,
+            strikethrough: false,
+        }];
+        for (spans, styled) in [(&[][..], &[][..]), (&spans[..], &[][..]), (&[][..], &styled[..])] {
+            let output = shape_block(&font, &text, spans, styled, &style, wrap, CHUNK_LINES);
+            let glyphs = &output.chunks[0].glyphs;
+            assert_eq!(glyphs.len(), text.len(), "wrapping must preserve every glyph");
+            assert!(output.text_height > style.font_size * 2.0, "long tokens must occupy several lines");
+            assert!(glyphs.iter().all(|glyph| glyph.x >= 0.0 && glyph.x < wrap),
+                "glyph origins must remain inside the wrap width");
+        }
     }
 
     /// A styled span that covers only the newline closing a chunk must not

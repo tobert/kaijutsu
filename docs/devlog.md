@@ -195,6 +195,8 @@ screenshots showed prose reflow and both border edges inside the pane.
 Comparing the whole serialized theme exposed stale fallback values for dim
 text, glow, and MSDF gamma. Defaults now agree with the shipped theme, and
 the complete comparison replaces the old spot checks.
+Long unbroken tokens now use emergency word wrapping in all three text
+shaping paths, preserving glyphs within the conversation column.
 
 ## The file cache learns what vim already knew (August 18–20)
 

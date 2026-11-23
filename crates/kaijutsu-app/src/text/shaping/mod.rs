@@ -23,7 +23,7 @@ mod types;
 
 pub use font::VelloFont;
 pub use loader::VelloFontLoader;
-pub use types::{VelloFontAxes, VelloTextAlign, VelloTextStyle};
+pub use types::{OverflowWrap, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 
 /// The loader's registration half, without Bevy's asset machinery — a test
 /// that needs to shape real text registers a shipped `.ttf` through this and
