@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 /// Extract indexable text from a context's blocks and compute a content hash.
 ///
-/// Filters to terminal-status, text/thinking blocks.
+/// Filters to non-excluded, terminal-status, text/thinking blocks.
 /// Concatenates with role prefixes. Truncates to `max_chars`.
 ///
 /// Returns `(text, sha256_hex)`.
@@ -13,8 +13,8 @@ pub fn extract_context_content(blocks: &[BlockSnapshot], max_chars: usize) -> (S
     let mut buf = String::new();
 
     for block in blocks {
-        // Skip non-terminal or irrelevant blocks
-        if !block.status.is_terminal() {
+        // Skip excluded, non-terminal, or irrelevant blocks
+        if block.excluded || !block.status.is_terminal() {
             continue;
         }
         match block.kind {
@@ -170,5 +170,24 @@ mod tests {
         let (_, hash1) = extract_context_content(&blocks, 10000);
         let (_, hash2) = extract_context_content(&blocks, 10000);
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_skips_excluded() {
+        let visible = test_block(Role::User, BlockKind::Text, "visible post");
+        let mut hidden = test_block(Role::User, BlockKind::Text, "held or hidden post");
+        hidden.excluded = true;
+
+        let (text_only_visible, hash_only_visible) =
+            extract_context_content(&[visible.clone()], 10000);
+        let (text_with_hidden, hash_with_hidden) =
+            extract_context_content(&[visible, hidden.clone()], 10000);
+
+        assert_eq!(text_with_hidden, text_only_visible);
+        assert_eq!(hash_with_hidden, hash_only_visible);
+        assert!(!text_with_hidden.contains("held or hidden post"));
+
+        let (text_only_hidden, _) = extract_context_content(&[hidden], 10000);
+        assert!(text_only_hidden.is_empty());
     }
 }

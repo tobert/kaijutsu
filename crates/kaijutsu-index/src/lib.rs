@@ -128,6 +128,28 @@ pub struct ClusterInfo {
     pub label: Option<String>,
 }
 
+/// Cosine similarity clamped to `[0.0, 1.0]`, returning `0.0` for zero-norm or
+/// mismatched-length vectors.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 || !denom.is_finite() {
+        0.0
+    } else {
+        (dot / denom).clamp(0.0, 1.0)
+    }
+}
+
 /// Pick a cluster label from its members' synthesis keywords.
 ///
 /// Tallies each keyword's summed score across all members and returns the
@@ -485,6 +507,72 @@ impl SemanticIndex {
 
             Ok(results)
         }).await.map_err(|e| IndexError::Index(format!("search index: {e}")))?
+    }
+
+    /// Search for contexts similar to a text query, restricted to `allowed` IDs.
+    ///
+    /// Returns immediately without calling the embedder when `allowed` is empty
+    /// or `k == 0`. Unindexed IDs and slots without stored embeddings are skipped.
+    pub async fn search_in(
+        &self,
+        query: &str,
+        allowed: &std::collections::HashSet<ContextId>,
+        k: usize,
+    ) -> Result<Vec<SearchResult>, IndexError> {
+        if allowed.is_empty() || k == 0 {
+            return Ok(vec![]);
+        }
+
+        let query_embedding = self.embedder.embed(query, EmbeddingPurpose::Query).await?;
+        let candidates: Vec<ContextId> = allowed.iter().copied().collect();
+        let metadata = self.metadata.clone();
+        let hnsw_store = self.hnsw.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // Lock order: resolve slots under metadata and drop the guard before
+            // taking hnsw so we never hold both locks across readers/writers.
+            let slotted = {
+                let meta = metadata.lock().unwrap();
+                let mut pairs = Vec::with_capacity(candidates.len());
+                for ctx_id in candidates {
+                    if let Some(slot) = meta.get_slot(ctx_id)? {
+                        pairs.push((ctx_id, slot));
+                    }
+                }
+                pairs
+            };
+
+            if slotted.is_empty() {
+                return Ok(vec![]);
+            }
+
+            let mut results = {
+                let hnsw = hnsw_store.read().unwrap();
+                let mut scored = Vec::with_capacity(slotted.len());
+                for (ctx_id, slot) in slotted {
+                    let Ok(stored) = hnsw.get_embedding(slot) else {
+                        continue;
+                    };
+                    let score = cosine_similarity(&query_embedding, &stored);
+                    scored.push(SearchResult {
+                        context_id: ctx_id,
+                        score,
+                        label: None,
+                    });
+                }
+                scored
+            };
+
+            results.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.context_id.cmp(&b.context_id))
+            });
+            results.truncate(k);
+            Ok(results)
+        })
+        .await
+        .map_err(|e| IndexError::Index(format!("search_in index: {e}")))?
     }
 
     /// Find contexts similar to a given context.
@@ -1644,5 +1732,175 @@ mod tests {
         );
         assert!(idx.synthesis_cache().get_any(ctx2).is_some());
         assert!(idx.synthesis_cache().get_any(ctx3).is_some());
+    }
+
+    /// Embedder that maps tagged texts to explicit unit vectors on axes 0..2
+    /// and counts every embed invocation.
+    struct AngleEmbedder {
+        dims: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for AngleEmbedder {
+        fn model_name(&self) -> &str { "angle" }
+        fn revision(&self) -> &str { "angle-v1" }
+        fn dimensions(&self) -> usize { self.dims }
+
+        async fn embed_batch(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(self.embed(text, purpose).await?);
+            }
+            Ok(out)
+        }
+
+        async fn embed(&self, text: &str, _purpose: EmbeddingPurpose) -> Result<Vec<f32>, IndexError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut v = vec![0.0f32; self.dims];
+            let (a, b) = if text.contains("EXACT") {
+                (1.0, 0.0)
+            } else if text.contains("CLOSE") {
+                (0.8, 0.6)
+            } else if text.contains("FAR") {
+                (0.2, 0.979_795_9)
+            } else {
+                (0.0, 1.0)
+            };
+            v[0] = a;
+            v[1] = b;
+            Ok(v)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_in_filters_to_allowed_even_when_others_score_higher() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let idx = SemanticIndex::new(
+            test_config(dir.path()),
+            Box::new(AngleEmbedder { dims: 32, calls }),
+        ).unwrap();
+
+        let ctx_best = ContextId::new();
+        let ctx_mid = ContextId::new();
+        let ctx_low = ContextId::new();
+
+        idx.index_context(ctx_best, &make_blocks(ctx_best, "EXACT match outside allowed")).await.unwrap();
+        idx.index_context(ctx_mid, &make_blocks(ctx_mid, "CLOSE match inside allowed")).await.unwrap();
+        idx.index_context(ctx_low, &make_blocks(ctx_low, "FAR match inside allowed")).await.unwrap();
+
+        let allowed = std::collections::HashSet::from([ctx_mid, ctx_low]);
+        let results = idx.search_in("EXACT query", &allowed, 5).await.unwrap();
+
+        let ids: Vec<ContextId> = results.iter().map(|r| r.context_id).collect();
+        assert_eq!(ids, vec![ctx_mid, ctx_low]);
+        assert!(results[0].score > results[1].score);
+        assert!(results.iter().all(|r| r.score >= 0.0 && r.score <= 1.0));
+    }
+
+    #[tokio::test]
+    async fn test_search_in_empty_allowed_or_zero_k_skips_embedder() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let idx = SemanticIndex::new(
+            test_config(dir.path()),
+            Box::new(AngleEmbedder { dims: 32, calls: calls.clone() }),
+        ).unwrap();
+
+        let ctx = ContextId::new();
+        idx.index_context(ctx, &make_blocks(ctx, "EXACT doc")).await.unwrap();
+        let calls_after_index = calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        let empty_allowed = std::collections::HashSet::new();
+        assert!(idx.search_in("EXACT query", &empty_allowed, 5).await.unwrap().is_empty());
+
+        let allowed = std::collections::HashSet::from([ctx]);
+        assert!(idx.search_in("EXACT query", &allowed, 0).await.unwrap().is_empty());
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_index,
+            "search_in must not invoke embedder when allowed is empty or k == 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_in_ignores_unindexed_allowed_ids() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let idx = SemanticIndex::new(
+            test_config(dir.path()),
+            Box::new(AngleEmbedder { dims: 32, calls }),
+        ).unwrap();
+
+        let ctx_indexed = ContextId::new();
+        let ctx_unindexed = ContextId::new();
+        idx.index_context(ctx_indexed, &make_blocks(ctx_indexed, "CLOSE doc")).await.unwrap();
+
+        let allowed = std::collections::HashSet::from([ctx_indexed, ctx_unindexed]);
+        let results = idx.search_in("EXACT query", &allowed, 5).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].context_id, ctx_indexed);
+
+        let only_unindexed = std::collections::HashSet::from([ctx_unindexed]);
+        let results = idx.search_in("EXACT query", &only_unindexed, 5).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_in_ranks_descending_and_respects_k() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let idx = SemanticIndex::new(
+            test_config(dir.path()),
+            Box::new(AngleEmbedder { dims: 32, calls }),
+        ).unwrap();
+
+        let ctx_exact = ContextId::new();
+        let ctx_close = ContextId::new();
+        let ctx_far = ContextId::new();
+
+        idx.index_context(ctx_far, &make_blocks(ctx_far, "FAR doc")).await.unwrap();
+        idx.index_context(ctx_exact, &make_blocks(ctx_exact, "EXACT doc")).await.unwrap();
+        idx.index_context(ctx_close, &make_blocks(ctx_close, "CLOSE doc")).await.unwrap();
+
+        let allowed = std::collections::HashSet::from([ctx_exact, ctx_close, ctx_far]);
+        let results = idx.search_in("EXACT query", &allowed, 2).await.unwrap();
+
+        let ids: Vec<ContextId> = results.iter().map(|r| r.context_id).collect();
+        assert_eq!(ids, vec![ctx_exact, ctx_close]);
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[tokio::test]
+    async fn test_search_in_deterministic_tie_breaker_by_context_id() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let idx = SemanticIndex::new(
+            test_config(dir.path()),
+            Box::new(AngleEmbedder { dims: 32, calls }),
+        ).unwrap();
+
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+        let (smaller, larger) = if ctx_a < ctx_b { (ctx_a, ctx_b) } else { (ctx_b, ctx_a) };
+
+        idx.index_context(larger, &make_blocks(larger, "CLOSE doc one")).await.unwrap();
+        idx.index_context(smaller, &make_blocks(smaller, "CLOSE doc two")).await.unwrap();
+
+        let allowed = std::collections::HashSet::from([smaller, larger]);
+        let results = idx.search_in("EXACT query", &allowed, 5).await.unwrap();
+
+        let ids: Vec<ContextId> = results.iter().map(|r| r.context_id).collect();
+        assert_eq!(ids, vec![smaller, larger]);
+    }
+
+    #[test]
+    fn test_cosine_similarity_zero_norm_safe() {
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[0.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]), 0.0);
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
     }
 }
