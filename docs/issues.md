@@ -23,10 +23,6 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
   URLs and code without break opportunities need a separate wrapping
   regression and an explicit policy. The window-resize overflow was caused
   by dock image measurement, independently of this text policy.
-- **Theme fallbacks differ from the shipped file.** Untouched values in
-  `ThemeData::default()` include dim text, text halo, and MSDF gamma values
-  that differ from `assets/defaults/theme.toml`. Existing default tests only
-  spot-check equality.
 
 ## Heroic view follow-ups (2026-11-21)
 

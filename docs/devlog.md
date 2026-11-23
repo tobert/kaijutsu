@@ -192,6 +192,9 @@ through shrinking viewports at 1× and 2× scale. Conversation chrome now uses
 heroic's violet ground, magenta accents, and cyan focus with thinner borders.
 An isolated app confirmed widths 2347 → 1895 → 1280 → 800 over BRP;
 screenshots showed prose reflow and both border edges inside the pane.
+Comparing the whole serialized theme exposed stale fallback values for dim
+text, glow, and MSDF gamma. Defaults now agree with the shipped theme, and
+the complete comparison replaces the old spot checks.
 
 ## The file cache learns what vim already knew (August 18–20)
 

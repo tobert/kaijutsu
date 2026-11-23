@@ -244,7 +244,7 @@ impl Default for ThemeData {
             bg: "#0d0221".into(),
             panel_bg: "#12041ff2".into(),
             fg: "#ece8f7".into(),
-            fg_dim: "#6f6592".into(),
+            fg_dim: "#9a90bd".into(),
             accent: "#ff2e88".into(),
             accent2: "#00f0ff".into(),
             border: "#44245e".into(),
@@ -308,7 +308,7 @@ impl Default for ThemeData {
 
             // Shader effects
             effect_glow_radius: 4.0,
-            effect_glow_intensity: 0.3,
+            effect_glow_intensity: 0.15,
             effect_glow_falloff: 2.0,
             effect_sheen_speed: 0.5,
             effect_sheen_sparkle_threshold: 0.95,
@@ -340,7 +340,7 @@ impl Default for ThemeData {
             msdf_horz_scale: 1.1,
             msdf_vert_scale: 0.6,
             msdf_text_bias: 0.5,
-            msdf_gamma_correction: 0.85,
+            msdf_gamma_correction: 1.6,
 
             // Constellation
             constellation_base_radius: 500.0,
@@ -357,7 +357,7 @@ impl Default for ThemeData {
             block_border_glow_radius: 4.0,
             block_border_glow_intensity: 0.10,
             text_glow_radius: 2.5,
-            text_glow_color: "#cbb8ff59".into(), // soft violet-white, 35% alpha
+            text_glow_color: "#cbb8ff2e".into(),
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
@@ -830,22 +830,10 @@ mod tests {
         let td: ThemeData = toml::from_str(DEFAULT_THEME_TOML)
             .expect("theme.toml should deserialize into ThemeData");
 
-        // Spot-check against Default impl
-        let defaults = ThemeData::default();
-        assert_eq!(td.bg, defaults.bg);
-        assert_eq!(td.fg, defaults.fg);
-        assert_eq!(td.accent, defaults.accent);
-        assert_eq!(td.panel_bg, defaults.panel_bg);
-        assert_eq!(td.cursor_normal, defaults.cursor_normal);
-        assert_eq!(td.ansi.red, defaults.ansi.red);
-        assert_eq!(td.ansi.bright_cyan, defaults.ansi.bright_cyan);
-        assert_eq!(td.frame_corner_size, defaults.frame_corner_size);
-        assert_eq!(td.effect_glow_radius, defaults.effect_glow_radius);
-        assert_eq!(td.font_rainbow, defaults.font_rainbow);
-        assert_eq!(td.font_mono, defaults.font_mono);
-        assert_eq!(td.modal_backdrop, defaults.modal_backdrop);
-        assert_eq!(td.block_spacing, defaults.block_spacing);
-        assert_eq!(td.scene.hues.ask, defaults.scene.hues.ask);
+        assert_eq!(
+            toml::Value::try_from(td).unwrap(),
+            toml::Value::try_from(ThemeData::default()).unwrap(),
+        );
     }
 
     #[test]
