@@ -85,7 +85,7 @@ impl BoardRateLimiter {
         if entries.len() >= limit {
             let secs = (window_ms / 1000).max(1);
             return Err(format!(
-                "rate limit exceeded: at most {limit} posts per {secs}s per character on an open board"
+                "rate limit exceeded: at most {limit} posts per {secs}s per character per board"
             ));
         }
         entries.push_back(now_ms);
@@ -123,21 +123,21 @@ pub(crate) fn settle_board_post_answer(
         blocks
             .settle_held_board_post(post.document_id, &post.block_id, allowed)
             .map_err(|e| format!("could not settle the held board post: {e}"))?;
-        if allowed {
-            let visible_count = blocks
-                .non_draft_snapshots(post.document_id)
-                .map(|snaps| snaps.iter().filter(|b| !b.excluded).count() as i64)
-                .unwrap_or(1);
-            kernel
-                .kernel_db()
-                .lock()
-                .update_topic_on_post_release(
-                    post.document_id,
-                    visible_count,
-                    now_millis() as i64,
-                )
-                .map_err(|e| format!("could not update topic stats on release: {e}"))?;
-        }
+    }
+    if allowed {
+        let visible_count = blocks
+            .non_draft_snapshots(post.document_id)
+            .map(|snaps| snaps.iter().filter(|b| !b.excluded).count() as i64)
+            .unwrap_or(1);
+        kernel
+            .kernel_db()
+            .lock()
+            .update_topic_on_post_release(
+                post.document_id,
+                visible_count,
+                now_millis() as i64,
+            )
+            .map_err(|e| format!("could not update topic stats on release: {e}"))?;
     }
     kernel
         .kernel_db()
@@ -599,7 +599,7 @@ impl KjDispatcher {
     ) -> KjResult {
         let topic = {
             let db = self.kernel_db().lock();
-            match self.resolve_topic(topic_ref, caller, &db) {
+            match self.resolve_topic_with_archived(topic_ref, true, caller, &db) {
                 Ok(t) => t,
                 Err(e) => return KjResult::Err(format!("kj board read: {e}")),
             }
@@ -872,26 +872,44 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj board search: invalid regex: {e}")),
         };
 
-        let topic_ids = {
+        // Snapshot topic metadata and board labels under a short DB lock so we
+        // never hold the KernelDb mutex across the full-corpus block scan.
+        let candidates: Vec<(BoardTopicRow, String)> = {
             let db = self.kernel_db().lock();
-            match db.list_topic_ids(board_filter) {
+            let topic_ids = match db.list_topic_ids(board_filter) {
                 Ok(ids) => ids,
                 Err(e) => return KjResult::Err(format!("kj board search: {e}")),
+            };
+            let mut board_labels: HashMap<BoardId, String> = HashMap::new();
+            let mut out = Vec::with_capacity(topic_ids.len());
+            for doc_id in topic_ids {
+                let Some(topic) = db.get_topic(doc_id).ok().flatten() else {
+                    continue;
+                };
+                let label = board_labels
+                    .entry(topic.board_id)
+                    .or_insert_with(|| format_board_label(&db, topic.board_id))
+                    .clone();
+                out.push((topic, label));
             }
+            out
         };
 
-        let db = self.kernel_db().lock();
-        let mut lines = Vec::new();
-        let mut data = Vec::new();
+        struct RegexHit {
+            short_id: String,
+            board_label: String,
+            slug: String,
+            post_num: usize,
+            author_id: PrincipalId,
+            line: String,
+        }
+        let mut hits: Vec<RegexHit> = Vec::new();
 
-        'outer: for doc_id in topic_ids {
-            let Ok(snaps) = self.block_store().non_draft_snapshots(doc_id) else {
+        'outer: for (topic, board_label) in candidates {
+            let Ok(snaps) = self.block_store().non_draft_snapshots(topic.document_id) else {
                 continue;
             };
-            let Some(topic) = db.get_topic(doc_id).ok().flatten() else {
-                continue;
-            };
-            let board_label = format_board_label(&db, topic.board_id);
+            let short_id = topic.document_id.short();
 
             for (idx, snap) in snaps.iter().enumerate() {
                 if snap.excluded {
@@ -900,22 +918,15 @@ impl KjDispatcher {
                 let post_num = idx + 1;
                 for line in snap.content.lines() {
                     if regex.is_match(line) {
-                        let author = db.name_for(snap.author());
-                        lines.push(format!(
-                            "{}  {}/{}#{}  @{}: {}",
-                            topic.document_id.short(),
-                            board_label,
-                            topic.slug,
+                        hits.push(RegexHit {
+                            short_id: short_id.clone(),
+                            board_label: board_label.clone(),
+                            slug: topic.slug.clone(),
                             post_num,
-                            author,
-                            line.trim(),
-                        ));
-                        data.push(serde_json::Value::String(format!(
-                            "{}#{}",
-                            topic.document_id.short(),
-                            post_num
-                        )));
-                        if lines.len() >= limit {
+                            author_id: snap.author(),
+                            line: line.trim().to_string(),
+                        });
+                        if hits.len() >= limit {
                             break 'outer;
                         }
                     }
@@ -923,8 +934,36 @@ impl KjDispatcher {
             }
         }
 
-        if lines.is_empty() {
+        if hits.is_empty() {
             return KjResult::ok_with_data("(no matches)", serde_json::Value::Array(Vec::new()));
+        }
+
+        let author_names: HashMap<PrincipalId, String> = {
+            let db = self.kernel_db().lock();
+            let mut names = HashMap::new();
+            for hit in &hits {
+                names
+                    .entry(hit.author_id)
+                    .or_insert_with(|| db.name_for(hit.author_id));
+            }
+            names
+        };
+
+        let mut lines = Vec::with_capacity(hits.len());
+        let mut data = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let author = author_names
+                .get(&hit.author_id)
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            lines.push(format!(
+                "{}  {}/{}#{}  @{}: {}",
+                hit.short_id, hit.board_label, hit.slug, hit.post_num, author, hit.line,
+            ));
+            data.push(serde_json::Value::String(format!(
+                "{}#{}",
+                hit.short_id, hit.post_num
+            )));
         }
         KjResult::ok_with_data(lines.join("\n"), serde_json::Value::Array(data))
     }
@@ -1228,7 +1267,7 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
         };
 
-        let (board, slug, board_label, decision) = {
+        let (board, slug, board_label, decision, is_privileged_or_root) = {
             let db = self.kernel_db().lock();
             let board = match self.resolve_board_write(board_ref, caller, &db) {
                 Ok(b) => b,
@@ -1249,12 +1288,21 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
             };
             let label = format_board_label(&db, board.board_id);
-            (board, slug, label, decision)
+            let is_priv_or_root = caller.privileged
+                || db
+                    .get_character(caller.actor_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|c| c.is_live_root());
+            (board, slug, label, decision, is_priv_or_root)
         };
 
         let now = now_millis() as i64;
-        if board.write_policy == BoardWritePolicy::Open
-            && matches!(decision, WriteDecision::PublishDirect)
+        let should_rate_limit = match decision {
+            WriteDecision::PublishDirect => board.write_policy == BoardWritePolicy::Open,
+            WriteDecision::HoldForReview { .. } => !is_privileged_or_root,
+        };
+        if should_rate_limit
             && let Err(e) = self
                 .board_rate_limiter()
                 .check_and_record(board.board_id, caller.actor_id, now)
@@ -1411,7 +1459,7 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj board reply: {e}")),
         };
 
-        let (board, topic, board_label, decision) = {
+        let (board, topic, board_label, decision, is_privileged_or_root) = {
             let db = self.kernel_db().lock();
             let topic = match self.resolve_topic(topic_ref, caller, &db) {
                 Ok(t) => t,
@@ -1452,7 +1500,13 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(e),
             };
             let label = format_board_label(&db, board.board_id);
-            (board, topic, label, decision)
+            let is_priv_or_root = caller.privileged
+                || db
+                    .get_character(caller.actor_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|c| c.is_live_root());
+            (board, topic, label, decision, is_priv_or_root)
         };
 
         let existing = match self.block_store().non_draft_snapshots(topic.document_id) {
@@ -1479,8 +1533,11 @@ impl KjDispatcher {
         };
 
         let now = now_millis() as i64;
-        if board.write_policy == BoardWritePolicy::Open
-            && matches!(decision, WriteDecision::PublishDirect)
+        let should_rate_limit = match decision {
+            WriteDecision::PublishDirect => board.write_policy == BoardWritePolicy::Open,
+            WriteDecision::HoldForReview { .. } => !is_privileged_or_root,
+        };
+        if should_rate_limit
             && let Err(e) = self
                 .board_rate_limiter()
                 .check_and_record(board.board_id, caller.actor_id, now)
@@ -1596,7 +1653,8 @@ impl KjDispatcher {
         caller: &KjCaller,
     ) -> KjResult {
         let db = self.kernel_db().lock();
-        let topic = match self.resolve_topic(topic_ref, caller, &db) {
+        let include_archived = new_status == TopicStatus::Open;
+        let topic = match self.resolve_topic_with_archived(topic_ref, include_archived, caller, &db) {
             Ok(t) => t,
             Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
         };
@@ -1764,19 +1822,45 @@ impl KjDispatcher {
             ));
         };
 
-        if !hidden && target.status == Status::Pending && target.excluded {
-            let ask_hint = self
-                .kernel_db()
-                .lock()
-                .approval_for_board_post(&target.id)
-                .ok()
-                .flatten()
-                .map(|ask_id| format!(" (ask '{ask_id}'); release it with `kj ledger allow '{ask_id}'`"))
-                .unwrap_or_else(|| "; release it through `kj ledger allow`".to_string());
-            return KjResult::Err(format!(
-                "kj board unhide: post #{post_num} in topic '{}' is held pending review{ask_hint}",
-                topic.slug
-            ));
+        if !hidden {
+            let ask_state = {
+                let db = self.kernel_db().lock();
+                db.approval_for_board_post(&target.id)
+                    .ok()
+                    .flatten()
+                    .map(|ask_id| {
+                        let status = db.get_approval(&ask_id).ok().flatten().map(|r| r.status);
+                        (ask_id, status)
+                    })
+            };
+            if let Some((ask_id, status)) = ask_state {
+                match status {
+                    Some(s) if s.is_allowed() => {}
+                    Some(s @ (crate::ApprovalStatus::Pending | crate::ApprovalStatus::Claimed)) => {
+                        return KjResult::Err(format!(
+                            "kj board unhide: post #{post_num} in topic '{}' is held pending review (ask '{ask_id}', status {s}); release it with `kj ledger allow '{ask_id}'`",
+                            topic.slug
+                        ));
+                    }
+                    Some(s) => {
+                        return KjResult::Err(format!(
+                            "kj board unhide: post #{post_num} in topic '{}' cannot be unhidden because review ask '{ask_id}' is {s}",
+                            topic.slug
+                        ));
+                    }
+                    None => {
+                        return KjResult::Err(format!(
+                            "kj board unhide: post #{post_num} in topic '{}' is bound to review ask '{ask_id}' whose approval record is missing",
+                            topic.slug
+                        ));
+                    }
+                }
+            } else if target.status == Status::Pending && target.excluded {
+                return KjResult::Err(format!(
+                    "kj board unhide: post #{post_num} in topic '{}' is held pending review; release it through `kj ledger allow`",
+                    topic.slug
+                ));
+            }
         }
 
         if let Err(e) = self.block_store().set_excluded(topic.document_id, &target.id, hidden) {
@@ -1974,6 +2058,25 @@ impl KjDispatcher {
         caller: &KjCaller,
         db: &KernelDb,
     ) -> Result<BoardTopicRow, String> {
+        self.resolve_topic_with_archived(topic_ref, false, caller, db)
+    }
+
+    fn resolve_topic_with_archived(
+        &self,
+        topic_ref: &str,
+        include_archived: bool,
+        caller: &KjCaller,
+        db: &KernelDb,
+    ) -> Result<BoardTopicRow, String> {
+        let lookup_slug = |board_id: BoardId, topic_slug: &str| {
+            if include_archived {
+                db.get_topic_by_slug_including_archived(board_id, topic_slug)
+            } else {
+                db.get_topic_by_slug(board_id, topic_slug)
+            }
+            .map_err(|e| e.to_string())
+        };
+
         if let Some(topic_slug) = topic_ref.strip_prefix("./") {
             let board = match self.resolve_board_read(".", caller, db)? {
                 ReadBoard::Found(b) => b,
@@ -1981,9 +2084,7 @@ impl KjDispatcher {
                     return Err(format!("no topic '{topic_ref}': current context has no board yet"));
                 }
             };
-            return db
-                .get_topic_by_slug(board.board_id, topic_slug)
-                .map_err(|e| e.to_string())?
+            return lookup_slug(board.board_id, topic_slug)?
                 .ok_or_else(|| format!("no topic '{topic_slug}' on current context board"));
         }
 
@@ -1994,9 +2095,7 @@ impl KjDispatcher {
                     return Err(format!("no topic '{topic_ref}': senpai context has no board yet"));
                 }
             };
-            return db
-                .get_topic_by_slug(board.board_id, topic_slug)
-                .map_err(|e| e.to_string())?
+            return lookup_slug(board.board_id, topic_slug)?
                 .ok_or_else(|| format!("no topic '{topic_slug}' on senpai context board"));
         }
 
@@ -2007,15 +2106,13 @@ impl KjDispatcher {
                 .map_err(|e| e.to_string()),
             [board_slug, topic_slug] => {
                 let board = self.resolve_named_board(board_slug, caller, db)?;
-                db.get_topic_by_slug(board.board_id, topic_slug)
-                    .map_err(|e| e.to_string())?
+                lookup_slug(board.board_id, topic_slug)?
                     .ok_or_else(|| format!("no topic '{topic_slug}' on board '{board_slug}'"))
             }
             [char_or_self, board_slug, topic_slug] => {
                 let board_ref = format!("{char_or_self}/{board_slug}");
                 let board = self.resolve_named_board(&board_ref, caller, db)?;
-                db.get_topic_by_slug(board.board_id, topic_slug)
-                    .map_err(|e| e.to_string())?
+                lookup_slug(board.board_id, topic_slug)?
                     .ok_or_else(|| format!("no topic '{topic_slug}' on board '{board_ref}'"))
             }
             _ => Err(format!(
@@ -2028,10 +2125,10 @@ impl KjDispatcher {
     // Authority & write-policy seam
     // ========================================================================
 
-    /// True if caller is privileged, bare-shell (no context), a live root
-    /// character, or holds the `house` capability.
+    /// True if caller is privileged, a live root character, or holds the
+    /// `house` capability.
     fn caller_is_root_or_house(&self, caller: &KjCaller, db: &KernelDb) -> Result<bool, String> {
-        if caller.privileged || caller.context_id.is_none() {
+        if caller.privileged {
             return Ok(true);
         }
         if db
@@ -2041,7 +2138,9 @@ impl KjDispatcher {
         {
             return Ok(true);
         }
-        let ctx = caller.context_id.expect("checked Some above");
+        let Some(ctx) = caller.context_id else {
+            return Ok(false);
+        };
         db.get_context_binding(ctx)
             .map(|b| b.is_some_and(|b| b.allows(&crate::mcp::Capability::House)))
             .map_err(|e| e.to_string())
@@ -2057,7 +2156,7 @@ impl KjDispatcher {
             return Ok(true);
         }
         let Some(ctx) = caller.context_id else {
-            return Ok(true);
+            return Ok(false);
         };
         db.get_context_binding(ctx)
             .map(|b| b.is_some_and(|b| b.allows(&crate::mcp::Capability::Operator)))
@@ -2448,12 +2547,12 @@ fn parse_post_ref(post_ref: &str) -> Result<(&str, usize), String> {
 
 fn parse_duration_ms(raw: &str) -> Result<i64, String> {
     let s = raw.trim();
-    if s.len() < 2 {
+    let Some(unit) = s.chars().next_back() else {
         return Err(format!(
             "invalid duration '{raw}': use a number followed by s, m, h, d, or w (for example '24h')"
         ));
-    }
-    let (digits, unit) = s.split_at(s.len() - 1);
+    };
+    let digits = &s[..s.len() - unit.len_utf8()];
     let value: i64 = digits.parse().map_err(|_| {
         format!(
             "invalid duration '{raw}': use a number followed by s, m, h, d, or w (for example '24h')"
@@ -2463,11 +2562,11 @@ fn parse_duration_ms(raw: &str) -> Result<i64, String> {
         return Err(format!("invalid duration '{raw}': value must be positive"));
     }
     let unit_ms: i64 = match unit {
-        "s" => 1_000,
-        "m" => 60 * 1_000,
-        "h" => 3_600 * 1_000,
-        "d" => 86_400 * 1_000,
-        "w" => 7 * 86_400 * 1_000,
+        's' => 1_000,
+        'm' => 60 * 1_000,
+        'h' => 3_600 * 1_000,
+        'd' => 86_400 * 1_000,
+        'w' => 7 * 86_400 * 1_000,
         _ => {
             return Err(format!(
                 "invalid duration unit '{unit}' in '{raw}': expected s, m, h, d, or w"

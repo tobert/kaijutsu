@@ -394,6 +394,31 @@ impl KernelDb {
             .map_err(KernelDbError::from)
     }
 
+    /// Fetch a topic by board and slug, preferring a non-archived topic and
+    /// falling back to the most recently active archived topic with that slug.
+    pub fn get_topic_by_slug_including_archived(
+        &self,
+        board_id: BoardId,
+        slug: &str,
+    ) -> KernelDbResult<Option<BoardTopicRow>> {
+        let sql = format!(
+            "{TOPIC_SELECT}
+             WHERE board_id = ?1 AND slug = ?2
+             ORDER BY CASE WHEN status != 'archived' THEN 0 ELSE 1 END,
+                      last_post_at DESC,
+                      document_id DESC
+             LIMIT 1"
+        );
+        self.conn
+            .query_row(
+                &sql,
+                params![blob_param(board_id.as_bytes()), slug],
+                row_to_topic_row,
+            )
+            .optional()
+            .map_err(KernelDbError::from)
+    }
+
     /// Resolve a topic by full `document_id` (32-char hex or hyphenated UUID)
     /// or a prefix of its entropy-tail `short()` form. Non-archived topics are
     /// searched first; if none match, archived topics are checked.
@@ -484,25 +509,44 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// List recent non-archived topics across all boards or one board.
+    /// List recent non-archived topics across all live boards or one board.
     pub fn list_recent_topics(
         &self,
         board_filter: Option<BoardId>,
         since_ms: Option<i64>,
         limit: Option<usize>,
     ) -> KernelDbResult<Vec<BoardTopicRow>> {
-        let mut sql = format!("{TOPIC_SELECT} WHERE status != 'archived'");
         let mut bound: Vec<SqlValue> = Vec::new();
-
-        if let Some(board_id) = board_filter {
+        let mut sql = if let Some(board_id) = board_filter {
             bound.push(SqlValue::Blob(board_id.as_bytes().to_vec()));
-            sql.push_str(&format!(" AND board_id = ?{}", bound.len()));
-        }
+            format!(
+                "{TOPIC_SELECT} WHERE status != 'archived' AND board_id = ?{}",
+                bound.len()
+            )
+        } else {
+            "SELECT t.document_id, t.board_id, t.slug, t.title, t.status, t.locked, t.tags,
+                    t.promoted_from, t.created_by, t.created_at, t.last_post_at, t.post_count
+             FROM board_topics t
+             JOIN boards b ON b.board_id = t.board_id
+             WHERE t.status != 'archived' AND b.archived_at IS NULL"
+                .to_string()
+        };
+
+        let ts_col = if board_filter.is_some() {
+            "last_post_at"
+        } else {
+            "t.last_post_at"
+        };
+        let doc_col = if board_filter.is_some() {
+            "document_id"
+        } else {
+            "t.document_id"
+        };
         if let Some(since) = since_ms {
             bound.push(SqlValue::Integer(since));
-            sql.push_str(&format!(" AND last_post_at >= ?{}", bound.len()));
+            sql.push_str(&format!(" AND {ts_col} >= ?{}", bound.len()));
         }
-        sql.push_str(" ORDER BY last_post_at DESC, document_id DESC");
+        sql.push_str(&format!(" ORDER BY {ts_col} DESC, {doc_col} DESC"));
         if let Some(lim) = limit {
             bound.push(SqlValue::Integer(lim as i64));
             sql.push_str(&format!(" LIMIT ?{}", bound.len()));
@@ -514,7 +558,7 @@ impl KernelDb {
     }
 
     /// List `document_id`s of non-archived topics (for semantic search filtering),
-    /// optionally scoped to a single board.
+    /// optionally scoped to a single board. When unscoped, archived boards are excluded.
     pub fn list_topic_ids(&self, board_filter: Option<BoardId>) -> KernelDbResult<Vec<ContextId>> {
         match board_filter {
             Some(board_id) => {
@@ -530,9 +574,10 @@ impl KernelDb {
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT document_id FROM board_topics
-                     WHERE status != 'archived'
-                     ORDER BY last_post_at DESC, document_id DESC",
+                    "SELECT t.document_id FROM board_topics t
+                     JOIN boards b ON b.board_id = t.board_id
+                     WHERE t.status != 'archived' AND b.archived_at IS NULL
+                     ORDER BY t.last_post_at DESC, t.document_id DESC",
                 )?;
                 let rows = stmt.query_map([], |row| read_context_id(row, 0))?;
                 Ok(rows.collect::<SqliteResult<Vec<_>>>()?)

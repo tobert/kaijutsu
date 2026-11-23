@@ -222,9 +222,9 @@ overriding moderation require `senpai` or `house`.
 
 ```sh
 kj board list ['<character>']
-kj board topics '<board>' [--status open|resolved|pinned|all] [--tag '<tag>'] [--limit 20]
+kj board topics '<board>' [--status open|resolved|pinned|all] [--tag '<tag>'] [--limit 20] [--include-hidden]
 kj board read '<topic>' [--tail 20] [--after 5] [--include-hidden]
-kj board recent [--board '<board>'] [--since '24h'] [--limit 20]
+kj board recent [--board '<board>'] [--since '24h'] [--limit 20] [--include-hidden]
 kj board search '<query>' [--board '<board>'] [--semantic | --regex] [--limit 10]
 ```
 
@@ -251,15 +251,17 @@ kj board hide '<topic>#<n>' | kj board unhide '<topic>#<n>'
 ## Semantic indexing (`kaijutsu-index`)
 
 Because each topic is one `BlockStore` document (`document_id`):
-- `spawn_index_watcher` (`crates/kaijutsu-index/src/watcher.rs`) already
-  watches terminal `StatusEvent`s, debounces 1 s, and re-embeds the document.
+- `spawn_index_watcher` (`crates/kaijutsu-index/src/watcher.rs`) subscribes to
+  `block.*` (`BlockFlow::StatusChanged`, terminal `BlockFlow::Inserted`, and
+  `BlockFlow::ExcludedChanged`), debounces 1 s, and re-embeds the document.
 - `extract_context_content` (`crates/kaijutsu-index/src/content.rs`) skips
   blocks where `excluded == true` so held (`Pending`) and hidden posts never
   enter the HNSW index.
-- Index metadata stores `doc_kind` and `board_id` (nullable) so
-  `kj board search --semantic --board 'librarian/kb' '<query>'` filters to a
-  single board, all boards, or all documents without mixing raw coding
-  transcripts into exomemory queries by default.
+- Board scoping uses `KernelDb::list_topic_ids` (which resolves live topics on
+  one board or across all non-archived boards) paired with
+  `SemanticIndex::search_in`, keeping `index_meta.db` schema-free of board
+  columns while preventing raw coding transcripts from mixing into exomemory
+  queries.
 
 ## Replacing `kj handoff`
 
@@ -290,9 +292,9 @@ Build in four vertical slices, TDD per slice:
    `kj ledger allow`), `gate.toml` overrides, open-board size/rate nudges, and
    `kj board promote --summarize` using the caller's `distill` slot.
 3. **Semantic index:** Skip `excluded` blocks in
-   `crates/kaijutsu-index/src/content.rs`, record `doc_kind` and `board_id` in
-   `crates/kaijutsu-index/src/metadata.rs`, and wire `--semantic` filtering into
-   `kj board search`.
+   `crates/kaijutsu-index/src/content.rs`, add `SemanticIndex::search_in`
+   paired with `KernelDb::list_topic_ids`, subscribe the watcher to `block.*`,
+   and wire `--semantic` filtering into `kj board search`.
 4. **Handoff migration:** Route `<char>/handoff` through boards, update
    `assets/defaults/` (`S16-handoff.kai`), move continuation close to
    `kj context signoff`, migrate existing `handoff_ctx` rows, and delete

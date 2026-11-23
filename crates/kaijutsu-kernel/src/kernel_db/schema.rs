@@ -184,8 +184,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL AND archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_contexts_board
-    ON contexts(board_id) WHERE board_id IS NOT NULL;
 
 -- Contexts whose senpai the migration did not take from the nearest ancestor
 -- (`docs/senpai-kohai.md`, "Migration"). `kj context info` prints the note until

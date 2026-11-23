@@ -1390,6 +1390,13 @@ impl BlockStore {
         release: bool,
     ) -> BlockStoreResult<()> {
         self.accept(document_id, |entry| {
+            if entry.kind != DocKind::Topic {
+                return Err(BlockStoreError::Validation(format!(
+                    "document {} is {:?}, not a board topic",
+                    document_id.short(),
+                    entry.kind
+                )));
+            }
             let held = entry
                 .doc
                 .get_block_snapshot(block_id)

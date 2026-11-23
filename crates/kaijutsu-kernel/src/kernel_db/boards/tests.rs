@@ -391,3 +391,95 @@ fn list_topics_recent_and_topic_ids_filtering() {
     );
     assert_eq!(db.list_topic_ids(Some(b2)).unwrap(), vec![d_other]);
 }
+
+#[test]
+fn legacy_db_without_contexts_board_id_migrates_cleanly_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kernel.db");
+    let ctx_id = {
+        let db = KernelDb::open(&path).unwrap();
+        let ws = setup_test_db(&db);
+        let row = make_context_row(Some("legacy-ctx"));
+        let id = row.context_id;
+        db.insert_context_with_document(&row, ws).unwrap();
+        // Simulate a pre-boards kernel.db: no idx_contexts_board and no contexts.board_id column.
+        db.conn
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_contexts_board;
+                 ALTER TABLE contexts DROP COLUMN board_id;",
+            )
+            .unwrap();
+        id
+    };
+
+    // Reopening must run SCHEMA + apply_additive_migrations cleanly without failing on missing board_id.
+    let db = KernelDb::open(&path).expect("pre-boards kernel.db must migrate cleanly on open");
+    let has_idx: bool = db
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_contexts_board')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_idx, "idx_contexts_board must be created after additive migration");
+    let loaded = db.get_context(ctx_id).unwrap().expect("legacy context row must survive");
+    assert_eq!(loaded.board_id, None);
+}
+
+#[test]
+fn archived_boards_excluded_from_recent_and_unfiltered_topic_ids() {
+    let (db, ws, char_id) = setup_db_with_character("librarian");
+    let live_board = BoardId::new();
+    let archived_board = BoardId::new();
+    for (bid, slug) in [(live_board, "live"), (archived_board, "retired")] {
+        db.insert_board(&BoardRow {
+            board_id: bid,
+            owner_character: Some(char_id),
+            slug: Some(slug.to_string()),
+            description: String::new(),
+            write_policy: BoardWritePolicy::Open,
+            created_by: char_id,
+            created_at: 1000,
+            archived_at: None,
+        })
+        .unwrap();
+    }
+
+    let d_live = make_topic_doc(&db, ws, char_id);
+    let d_retired = make_topic_doc(&db, ws, char_id);
+    for (doc_id, board_id, slug, ts) in [
+        (d_live, live_board, "live-topic", 2000),
+        (d_retired, archived_board, "retired-topic", 3000),
+    ] {
+        db.insert_topic(&BoardTopicRow {
+            document_id: doc_id,
+            board_id,
+            slug: slug.to_string(),
+            title: slug.to_string(),
+            status: TopicStatus::Open,
+            locked: false,
+            tags: vec![],
+            promoted_from: None,
+            created_by: char_id,
+            created_at: ts,
+            last_post_at: ts,
+            post_count: 1,
+        })
+        .unwrap();
+    }
+
+    db.archive_board(archived_board).unwrap();
+
+    let recent_all = db.list_recent_topics(None, None, None).unwrap();
+    assert_eq!(
+        recent_all.iter().map(|t| t.document_id).collect::<Vec<_>>(),
+        vec![d_live],
+        "archived board's topics must not appear in unfiltered list_recent_topics"
+    );
+    assert_eq!(
+        db.list_topic_ids(None).unwrap(),
+        vec![d_live],
+        "archived board's topics must not appear in unfiltered list_topic_ids"
+    );
+}

@@ -561,6 +561,12 @@ async fn moderation_hide_lock_resolve_reopen_pin_archive_and_authority() {
     assert!(d.dispatch(&[s("board"), s("reopen"), s("librarian/notes/topic-one")], &outsider).await.is_ok());
     assert!(!d.dispatch(&[s("board"), s("archive"), s("librarian/notes/topic-one")], &outsider).await.is_ok());
     assert!(d.dispatch(&[s("board"), s("archive"), s("librarian/notes/topic-one")], &owner).await.is_ok());
+    // Reopen archived topic by slug (not only hex ID), then archive again for the rest of the test.
+    let reopen_by_slug = d
+        .dispatch(&[s("board"), s("reopen"), s("librarian/notes/topic-one")], &owner)
+        .await;
+    assert!(reopen_by_slug.is_ok(), "reopen archived topic by slug failed: {}", reopen_by_slug.message());
+    assert!(d.dispatch(&[s("board"), s("archive"), s("librarian/notes/topic-one")], &owner).await.is_ok());
 
     // Curated board: owner & senpai publish directly, outsider is held with an ask.
     assert!(
@@ -743,6 +749,8 @@ fn duration_and_post_ref_parsers_validate_inputs() {
     assert!(parse_duration_ms("0h").is_err());
     assert!(parse_duration_ms("24x").is_err());
     assert!(parse_duration_ms("abc").is_err());
+    assert!(parse_duration_ms("24é").is_err());
+    assert!(parse_duration_ms("é").is_err());
 
     assert_eq!(parse_post_ref("a1b2c3d4#3").unwrap(), ("a1b2c3d4", 3));
     assert_eq!(parse_post_ref("librarian/kb/topic#1").unwrap(), ("librarian/kb/topic", 1));
@@ -879,6 +887,14 @@ async fn curated_board_held_post_ledger_allow_and_deny_lifecycle() {
         "unhide refusal should point to kj ledger allow: {}",
         unhide_err.message()
     );
+    // BlockStore's defense-in-depth guard also refuses direct un-exclusion while pending.
+    let direct_unexclude = d.block_store().set_excluded(doc_id, &snaps[0].id, false);
+    assert!(
+        direct_unexclude
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("held pending review")),
+        "direct set_excluded(false) on pending board post must fail: {direct_unexclude:?}"
+    );
 
     // `--remember` is refused on a board ask, leaving it open.
     let remember_err = d
@@ -945,9 +961,26 @@ async fn curated_board_held_post_ledger_allow_and_deny_lifecycle() {
         .await;
     assert!(!read_denied.message().contains("dismissed_reply_token"), "{}", read_denied.message());
 
-    let show_dismissed = d.dispatch(&[s("ledger"), s("show"), reply_ask], &lib).await;
+    let show_dismissed = d.dispatch(&[s("ledger"), s("show"), reply_ask.clone()], &lib).await;
     assert!(show_dismissed.message().contains("board:      dismissed"), "{}", show_dismissed.message());
     assert!(show_dismissed.message().contains("off topic"), "{}", show_dismissed.message());
+
+    // `kj board unhide` must refuse to republish a denied post.
+    let unhide_denied = d
+        .dispatch(&[s("board"), s("unhide"), s("librarian/kb/proposed-entry#2")], &lib)
+        .await;
+    assert!(
+        !unhide_denied.is_ok(),
+        "unhide must refuse to reverse a denied board post"
+    );
+    assert!(
+        unhide_denied.message().contains(&reply_ask)
+            && unhide_denied.message().contains("denied"),
+        "unhide refusal must name the ask id and status: {}",
+        unhide_denied.message()
+    );
+    let snaps_still_denied = d.block_store().non_draft_snapshots(doc_id).unwrap();
+    assert!(snaps_still_denied[1].excluded, "denied post must remain excluded");
 }
 
 #[tokio::test]
@@ -1298,4 +1331,84 @@ deny = ["kj board post"]
         .dispatch(&[s("board"), s("read"), s("librarian/open-room/noisy-post")], &lib)
         .await;
     assert!(read.message().contains("held on open"), "{}", read.message());
+}
+
+#[tokio::test]
+async fn curated_board_held_posts_are_rate_limited() {
+    let d = test_dispatcher().await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let lib_id = create_character(&d, "librarian", false).await;
+    let writer_id = create_character(&d, "writer", false).await;
+    let lib_ctx = register_bound_context(&d, "lib-ctx", lib_id, Some(root_ctx), &senpai_binding());
+    let writer_ctx = register_bound_context(&d, "writer-ctx", writer_id, Some(root_ctx), &worker_binding());
+    let lib = caller_as(lib_id, Some(lib_ctx));
+    let writer = caller_as(writer_id, Some(writer_ctx));
+
+    d.board_rate_limiter().configure(2, 60_000);
+    assert!(
+        d.dispatch(&[s("board"), s("create"), s("kb"), s("--policy"), s("curated")], &lib)
+            .await
+            .is_ok()
+    );
+
+    for i in 1..=2 {
+        let res = d
+            .dispatch(
+                &[s("board"), s("post"), s("librarian/kb"), s("--title"), format!("Proposal {i}"), s("body")],
+                &writer,
+            )
+            .await;
+        assert!(res.is_ok(), "proposal {i} should be held: {}", res.message());
+    }
+    assert_eq!(d.kernel_db().lock().list_pending_asks().unwrap().len(), 2);
+
+    // 3rd held post hits rate limit and opens no 3rd ask.
+    let flood = d
+        .dispatch(
+            &[s("board"), s("post"), s("librarian/kb"), s("--title"), s("Proposal 3"), s("flood")],
+            &writer,
+        )
+        .await;
+    assert!(!flood.is_ok(), "curated board flood must be throttled by rate limiter");
+    assert!(flood.message().contains("rate limit"), "{}", flood.message());
+    assert_eq!(d.kernel_db().lock().list_pending_asks().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn unprivileged_no_context_caller_is_not_treated_as_root() {
+    let d = test_dispatcher().await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let lib_id = create_character(&d, "librarian", false).await;
+    let stranger_id = create_character(&d, "stranger", false).await;
+    let lib_ctx = register_bound_context(&d, "lib-ctx", lib_id, Some(root_ctx), &worker_binding());
+    let lib = caller_as(lib_id, Some(lib_ctx));
+    let stranger_no_ctx = caller_as(stranger_id, None);
+
+    assert!(
+        d.dispatch(&[s("board"), s("create"), s("locked-room"), s("--policy"), s("locked")], &lib)
+            .await
+            .is_ok()
+    );
+
+    let locked_post = d
+        .dispatch(
+            &[s("board"), s("post"), s("librarian/locked-room"), s("--title"), s("Sneak"), s("body")],
+            &stranger_no_ctx,
+        )
+        .await;
+    assert!(
+        !locked_post.is_ok(),
+        "unprivileged non-root caller with context_id: None must not write to locked board"
+    );
+
+    let foreign_create = d
+        .dispatch(
+            &[s("board"), s("create"), s("hijack"), s("--for"), s("librarian")],
+            &stranger_no_ctx,
+        )
+        .await;
+    assert!(
+        !foreign_create.is_ok(),
+        "unprivileged non-root caller with context_id: None must not create board for another character"
+    );
 }

@@ -132,6 +132,12 @@ impl KernelDb {
                 Err(e) => return Err(e.into()),
             }
         }
+        // Created after the `contexts.board_id` ALTER above so legacy DBs
+        // predating boards do not fail during `SCHEMA` execution.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_contexts_board
+                 ON contexts(board_id) WHERE board_id IS NOT NULL;",
+        )?;
         Self::migrate_embedding_backend_id(conn)?;
         // A database with `contexts.context_type` is from before
         // `type-melt-v1`; the migrations below read `characters.context_type`

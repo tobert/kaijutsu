@@ -1152,6 +1152,14 @@ struct FlowBusStatusReceiver {
     sub: kaijutsu_kernel::flows::Subscription<BlockFlow>,
 }
 
+impl FlowBusStatusReceiver {
+    fn new(flows: &kaijutsu_kernel::flows::SharedBlockFlowBus) -> Self {
+        Self {
+            sub: flows.subscribe("block.*"),
+        }
+    }
+}
+
 impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
     fn recv(
         &mut self,
@@ -1564,9 +1572,7 @@ async fn connect_semantic_index(
                     let idx = Arc::new(idx);
                     // Spawn background watcher for re-indexing on block completion
                     let block_source = Arc::new(BlockStoreSource(documents.clone()));
-                    let status_receiver = FlowBusStatusReceiver {
-                        sub: flows.subscribe("block.status"),
-                    };
+                    let status_receiver = FlowBusStatusReceiver::new(&flows);
 
                     // Automatic synthesis is off: `run_synthesis` embeds
                     // every text block in a context on each call, so one
@@ -10665,6 +10671,96 @@ mod rc_thread_stack_tests {
 #[cfg(test)]
 mod semantic_search_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn flow_bus_status_receiver_delivers_inserted_excluded_and_status_events() {
+        use std::time::Duration;
+        use kaijutsu_index::StatusReceiver;
+        use kaijutsu_kernel::flows::OpSource;
+        use kaijutsu_types::{BlockId, BlockSnapshot, Role, Status};
+
+        let bus = shared_block_flow_bus(16);
+        let mut rx = FlowBusStatusReceiver::new(&bus);
+
+        let ctx_ins = ContextId::new();
+        let ctx_exc = ContextId::new();
+        let ctx_sts = ContextId::new();
+        let author = PrincipalId::new();
+
+        // 1. BlockFlow::Inserted with Status::Done (board post landing directly).
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx_ins, author, 1),
+            None,
+            Role::User,
+            "board post body",
+        );
+        bus.publish(BlockFlow::Inserted {
+            context_id: ctx_ins,
+            block: Arc::new(snap),
+            after_id: None,
+            version: 1,
+            source: OpSource::Local,
+        });
+        let ev1 = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for Inserted event")
+            .expect("receiver closed unexpectedly");
+        assert_eq!(ev1.context_id, ctx_ins);
+        assert_eq!(ev1.status, Status::Done);
+
+        // 2. BlockFlow::ExcludedChanged (board hide/unhide).
+        bus.publish(BlockFlow::ExcludedChanged {
+            context_id: ctx_exc,
+            block_id: BlockId::new(ctx_exc, author, 1),
+            excluded: true,
+            version: 2,
+            source: OpSource::Local,
+        });
+        let ev2 = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for ExcludedChanged event")
+            .expect("receiver closed unexpectedly");
+        assert_eq!(ev2.context_id, ctx_exc);
+        assert_eq!(ev2.status, Status::Done);
+
+        // 3. BlockFlow::StatusChanged with Status::Done (streaming completion / release).
+        bus.publish(BlockFlow::StatusChanged {
+            context_id: ctx_sts,
+            block_id: BlockId::new(ctx_sts, author, 1),
+            status: Status::Done,
+            version: 3,
+            source: OpSource::Local,
+        });
+        let ev3 = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for StatusChanged event")
+            .expect("receiver closed unexpectedly");
+        assert_eq!(ev3.context_id, ctx_sts);
+        assert_eq!(ev3.status, Status::Done);
+
+        // Sanity: non-terminal Inserted (Status::Pending) is skipped.
+        let mut pending = BlockSnapshot::text(
+            BlockId::new(ctx_ins, author, 2),
+            None,
+            Role::User,
+            "held post",
+        );
+        pending.status = Status::Pending;
+        pending.excluded = true;
+        bus.publish(BlockFlow::Inserted {
+            context_id: ctx_ins,
+            block: Arc::new(pending),
+            after_id: None,
+            version: 4,
+            source: OpSource::Local,
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "non-terminal Pending insert must not trigger re-indexing"
+        );
+    }
 
     #[tokio::test]
     async fn unavailable_index_is_an_rpc_error_not_empty_search_results() {
