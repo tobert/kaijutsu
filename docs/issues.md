@@ -496,3 +496,13 @@ A rotation asked for inside a context's own running turn now defers its archive 
 - **The `done` verb and the archive lifecycle can overlap.** The `done` verb is queued while the predecessor is still live and the archive lifecycle then runs inline, so the worker pool may run both scripts for the same context at once. Ordering within each is unchanged.
 - **A deferred rotation has no recovery pass.** A kernel restart between the rotate result and the turn's end leaves the predecessor live and the successor unlabeled; only a fresh `kj context rotate` moves the context on. The kernel logs this when a lease ends holding a rotation it never settled.
 - **The signoff's `done` answers from the registered `builtin.turn` server directly,** not through the broker, so a loadout that omits the instance cannot refuse it and a colliding `done` cannot intercept it. Broker hooks do not run for that call.
+
+### After a cold review of the first land (2026-11-23)
+
+A reviewer that did not write `03a69195` read it and raised nine findings. The three blockers are fixed in `0f790062`: the reservation is taken after authority and before the first side effect, a settle refuses rather than assigning a label to an archived successor, and the pending check no longer tells a caller who may not rotate. What that review leaves open:
+
+- **A deferral can arrive at a turn that is already stopping**, or after the signoff decision but before ingress closes, so the settlement archives with no signoff call even though the command reported one would happen (`src/runtime/turn_state.rs`, `src/runtime/llm_stream.rs`).
+- **Completion is published before the settlement.** The turn drops its liveness lease and publishes completion before the archive lifecycle and the commit, so `kj wait` can return while the predecessor still owns the label, or before a settlement failure is known (`src/runtime/llm_stream.rs`).
+- **A rename or retag during the signoff can disagree with the commit.** The live router keeps the label captured when the rotation began while the transaction transfers the predecessor's current label (`src/kj/context.rs`).
+- **The held-call test does not assert the whole transfer.** It checks the label but not the handoff pointer or the live seat while the signoff call is held, and `ROTATED_HANDOFF` is a flag rather than evidence of the pointer (`src/rc/tests.rs`).
+- **Who asked is still read from the conversation lock** (see the earlier item): a person's separate shell in the same context can trigger a signoff on a turn it did not originate.
