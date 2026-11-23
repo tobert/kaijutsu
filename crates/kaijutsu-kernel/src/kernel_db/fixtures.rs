@@ -29,7 +29,7 @@ impl KernelDb {
                 context_state: ContextState::Live, created_at: now_millis(),
                 created_by: principal_id, forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None,
-                paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
+                paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None, board_id: None,
             },
             workspace,
         )?;
@@ -345,7 +345,7 @@ impl KernelDb {
                     created_at: now_millis(), created_by: reviewer, forked_from: None, fork_kind: None,
                     archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
                     last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                    origin_host: None, performer: None, senpai_ctx: None, persona: None,
+                    origin_host: None, performer: None, senpai_ctx: None, persona: None, board_id: None,
                 };
                 // The reviewer's own senpai is where the context answered
                 // before, so the climb continues where the old walk did.

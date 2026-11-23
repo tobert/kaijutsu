@@ -30,8 +30,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult,
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    BackendId, BlockId, CastId, ContextId, ContextState, DocKind, ForkKind,
-    KernelId, PresetId, PrincipalId, TurnId, WorkspaceId,
+    BackendId, BlockId, BoardId, BoardWritePolicy, CastId, ContextId, ContextState, DocKind,
+    ForkKind, KernelId, PresetId, PrincipalId, TopicStatus, TurnId, WorkspaceId,
 };
 
 use crate::llm::stream::{CacheTarget, CacheTtl};
@@ -66,6 +66,7 @@ mod approvals;
 mod review;
 mod contexts;
 mod context_ring;
+mod boards;
 mod shadows;
 #[cfg(any(test, feature = "test-util"))]
 mod fixtures;
@@ -106,6 +107,7 @@ pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block, record_approval_refusal_turn};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};
 pub use contexts::ContextRow;
+pub use boards::{BoardRow, BoardTopicRow};
 pub use shadows::{IndexKey, Rendition, DESCRIBE as DESCRIBE_SHADOW, JUDGE as JUDGE_SHADOW};
 pub use editor_recovery::{CorruptRecovery, RecoveryEntry, RecoveryFile, RecoveryId, RecoverySession};
 pub use context_ring::{ACTIVE_RING_CAPACITY, Archived, DemoteOutcome, Demotion, PromoteOutcome, Retirement, RotationCommit};
@@ -271,6 +273,31 @@ fn read_opt_cast_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<
                 idx,
                 rusqlite::types::Type::Blob,
                 "invalid CastId bytes".into(),
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
+fn read_board_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<BoardId> {
+    let bytes: Vec<u8> = row.get(idx)?;
+    BoardId::try_from_slice(&bytes).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Blob,
+            "invalid BoardId bytes".into(),
+        )
+    })
+}
+
+fn read_opt_board_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<BoardId>> {
+    let bytes: Option<Vec<u8>> = row.get(idx)?;
+    match bytes {
+        Some(b) => BoardId::try_from_slice(&b).map(Some).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "invalid BoardId bytes".into(),
             )
         }),
         None => Ok(None),
@@ -769,6 +796,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         performer: read_opt_principal_id(row, 17)?,
         senpai_ctx: read_opt_context_id(row, 18)?,
         persona: row.get(19)?,
+        board_id: read_opt_board_id(row, 20)?,
     })
 }
 

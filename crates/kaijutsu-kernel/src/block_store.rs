@@ -6159,7 +6159,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             })
             .unwrap();
 
@@ -7687,7 +7687,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             })
             .unwrap();
 

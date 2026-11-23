@@ -655,7 +655,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -963,7 +963,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {

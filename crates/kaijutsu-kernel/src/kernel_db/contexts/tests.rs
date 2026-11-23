@@ -267,7 +267,7 @@ fn context_row_to_context() {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        performer: None, senpai_ctx: None, persona: None,
+        performer: None, senpai_ctx: None, persona: None, board_id: None,
     };
 
     let ctx = row.to_context();
@@ -304,7 +304,7 @@ fn roundtrip_create_and_recover() {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        performer: None, senpai_ctx: None, persona: None,
+        performer: None, senpai_ctx: None, persona: None, board_id: None,
     };
     insert_context_with_doc(&db, &parent, ws_id);
 
@@ -328,7 +328,7 @@ fn roundtrip_create_and_recover() {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        performer: None, senpai_ctx: None, persona: None,
+        performer: None, senpai_ctx: None, persona: None, board_id: None,
     };
     insert_context_with_doc(&db, &child, ws_id);
 

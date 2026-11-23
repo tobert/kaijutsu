@@ -20,7 +20,7 @@ impl KernelDb {
                     c.system_prompt, c.context_state,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.origin_host, c.performer, c.senpai_ctx, c.persona
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.origin_host, c.performer, c.senpai_ctx, c.persona, c.board_id
              FROM contexts c
              WHERE c.forked_from = ?1 AND c.archived_at IS NULL
              ORDER BY c.created_at, c.context_id",
@@ -90,7 +90,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.origin_host, c.performer, c.senpai_ctx, c.persona, lineage.depth
+                   c.origin_host, c.performer, c.senpai_ctx, c.persona, c.board_id, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -98,7 +98,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(20)?;
+            let depth: i64 = row.get(21)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)

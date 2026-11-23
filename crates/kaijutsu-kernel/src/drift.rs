@@ -1351,7 +1351,7 @@ pub fn ensure_lost_found_context(
                             demoted_at: None,
                             paused_at: None,
                             origin_host: None,
-                            performer: None, senpai_ctx: Some(senpai), persona: None,
+                            performer: None, senpai_ctx: Some(senpai), persona: None, board_id: None,
                         };
                         db.insert_well_known_context(&row, ws, WellKnownRole::LostFound)
                             .map_err(|e| format!("failed to publish lost+found context: {e}"))
@@ -1460,7 +1460,7 @@ pub fn ensure_drift_queue_context(
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    performer: None, senpai_ctx: Some(senpai), persona: None,
+                    performer: None, senpai_ctx: Some(senpai), persona: None, board_id: None,
                 };
                 db.insert_well_known_context(&row, ws, WellKnownRole::DriftQueue)
                     .map_err(|e| format!("failed to publish drift-queue context: {e}"))

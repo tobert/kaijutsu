@@ -378,7 +378,7 @@ impl KjDispatcher {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            performer: None, senpai_ctx: Some(senpai), persona: None,
+            performer: None, senpai_ctx: Some(senpai), persona: None, board_id: None,
         };
         db.insert_placed_context(&row, default_ws)
             .map_err(|e| e.to_string())?;

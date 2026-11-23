@@ -718,7 +718,7 @@ pub(crate) fn shadow_row(db: &crate::kernel_db::KernelDb, seat: &ContextRow, kin
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        performer: None, senpai_ctx: None, persona: None,
+        performer: None, senpai_ctx: None, persona: None, board_id: None,
     })
 }
 

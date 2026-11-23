@@ -123,6 +123,7 @@ impl KernelDb {
             "ALTER TABLE context_slots ADD COLUMN reasoning_summary TEXT CHECK (reasoning_summary IS NULL OR reasoning_summary IN ('none', 'auto', 'concise', 'detailed'))",
             "ALTER TABLE character_models ADD COLUMN replay_phase TEXT CHECK (replay_phase IS NULL OR replay_phase IN ('on', 'off'))",
             "ALTER TABLE context_slots ADD COLUMN replay_phase TEXT CHECK (replay_phase IS NULL OR replay_phase IN ('on', 'off'))",
+            "ALTER TABLE contexts ADD COLUMN board_id BLOB REFERENCES boards(board_id)",
         ];
         for sql in alters {
             match conn.execute(sql, []) {

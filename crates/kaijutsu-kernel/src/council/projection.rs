@@ -260,7 +260,7 @@ pub(super) mod fixtures {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            performer: None, senpai_ctx: None, persona: None,
+            performer: None, senpai_ctx: None, persona: None, board_id: None,
         };
         edit(&mut row);
         // The performer is not a column: it becomes the context's character.

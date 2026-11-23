@@ -687,7 +687,7 @@ impl KjDispatcher {
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    performer: None, senpai_ctx: Some(console), persona: None,
+                    performer: None, senpai_ctx: Some(console), persona: None, board_id: None,
                 };
                 db.insert_placed_context(&row, default_ws)
                     .map_err(|e| format!("could not create the MCP hub '{label}': {e}"))?;
@@ -767,7 +767,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             };
             db.in_transaction(|db| {
                 let default_ws = db.get_or_create_default_workspace(requester)?;

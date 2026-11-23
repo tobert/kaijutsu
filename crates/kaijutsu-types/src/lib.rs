@@ -168,9 +168,9 @@ pub use summary::summarize_thinking;
 pub use cost::format_micro_dollars;
 pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use dag::ConversationDAG;
-pub use enums::{ContextState, DocKind, ForkKind};
+pub use enums::{BoardWritePolicy, ContextState, DocKind, ForkKind, TopicStatus};
 pub use ids::{
-    BackendId, CastId, ContextId, KernelId, PresetId, PrincipalId, SessionId, TurnId,
+    BackendId, BoardId, CastId, ContextId, KernelId, PresetId, PrincipalId, SessionId, TurnId,
     WorkspaceId,
 };
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};

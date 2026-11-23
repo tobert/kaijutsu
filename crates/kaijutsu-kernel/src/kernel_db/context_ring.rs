@@ -260,6 +260,12 @@ impl KernelDb {
         if consoles + hubs > 0 {
             info!(context = %id.short(), consoles, hubs, "archived context: cleared the character pointers that named it");
         }
+        if updated > 0
+            && let Some(board_id) = self.get_context(id)?.and_then(|row| row.board_id)
+            && self.count_live_contexts_for_board(board_id)? == 0
+        {
+            self.archive_board(board_id)?;
+        }
         Ok(updated > 0)
     }
 
@@ -291,6 +297,12 @@ impl KernelDb {
                 "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
+            // Copy predecessor's working board pointer onto successor BEFORE
+            // archiving predecessor so the board stays live while predecessor
+            // keeps its pointer for any kohai not yet reparented.
+            if let Some(board_id) = row.board_id {
+                db.set_context_board_id(successor, board_id)?;
+            }
             let archived = db.archive_with_shadows(predecessor)?;
             if !archived.context {
                 return Err(KernelDbError::Validation(format!(

@@ -1362,7 +1362,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             };
             let db = self.kernel_db().lock();
             let mut row = row;
@@ -1646,7 +1646,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: Some(senpai), persona: None,
+                performer: None, senpai_ctx: Some(senpai), persona: None, board_id: None,
             };
             if let Err(e) = db.insert_placed_context(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
@@ -2482,7 +2482,7 @@ impl KjDispatcher {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            performer: None, senpai_ctx: None, persona: None,
+            performer: None, senpai_ctx: None, persona: None, board_id: None,
             ..predecessor.clone()
         };
         let admission = {
@@ -5997,7 +5997,7 @@ mod tests {
                 context_state: ContextState::Live, created_at: 1, created_by: amy,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
                 concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                origin_host: None, performer: None, senpai_ctx: None, persona: None,
+                origin_host: None, performer: None, senpai_ctx: None, persona: None, board_id: None,
             }, ws).unwrap();
         }
         let caller = caller_with_context(bare).with_actor(amy, None);
@@ -6099,7 +6099,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            performer: None, senpai_ctx: None, persona: None,
+            performer: None, senpai_ctx: None, persona: None, board_id: None,
         };
         let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: None }).unwrap_err();
         assert!(error.to_string().contains("performer must name a live character"), "{error}");
@@ -6142,7 +6142,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            performer: None, senpai_ctx: None, persona: None,
+            performer: None, senpai_ctx: None, persona: None, board_id: None,
         };
         let top = register_context(&d, Some("held-by-performer"), None, amy);
         d.kernel_db().lock().assign_stand_in_character(top, performer).unwrap();
@@ -6190,7 +6190,7 @@ mod tests {
             context_id, label: Some(s("topless-start")), system_prompt: None, context_state: ContextState::Live,
             created_at: 1, created_by: test_reviewer_principal(), forked_from: None,
             fork_kind: None, archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
-            last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
+            last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None, board_id: None,
         };
         let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: None }).unwrap_err();
         assert!(error.to_string().contains("root console"), "{error}");
@@ -6210,7 +6210,7 @@ mod tests {
             context_id: ContextId::new(), label: Some(label.to_string()), system_prompt: None, context_state: ContextState::Live,
             created_at: 1, created_by: amy, forked_from: None, fork_kind: None, archived_at: None,
             workspace_id: None, preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
-            demoted_at: None, paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
+            demoted_at: None, paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None, board_id: None,
         };
         let kohai = row("root-kohai");
         insert_new_context_checked(&d.kernel_db().lock(), &kohai, CharacterPlacement::Start { performer: amy, senpai: Some(root) })

@@ -1386,7 +1386,7 @@ mod tests {
                     origin_host: None,
                     performer: None,
                     senpai_ctx: None,
-                    persona: None,
+                    persona: None, board_id: None,
                 },
                 ws,
             )

@@ -139,6 +139,10 @@ pub enum DocKind {
     /// stays for any document-backed mount that wants it.
     #[strum(serialize = "symlink")]
     Symlink,
+    /// Board topic document — flat chronological discussion inside a board
+    /// (`docs/board.md`). Never hydrates into an LLM conversation.
+    #[strum(serialize = "topic")]
+    Topic,
 }
 
 impl DocKind {
@@ -147,11 +151,83 @@ impl DocKind {
             Self::Conversation => "conversation",
             Self::File => "file",
             Self::Symlink => "symlink",
+            Self::Topic => "topic",
         }
     }
 }
 
 impl fmt::Display for DocKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ============================================================================
+// BoardWritePolicy — write/moderation policy for a board
+// ============================================================================
+
+/// Default write policy for a board (`docs/board.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive)]
+pub enum BoardWritePolicy {
+    /// Posts land directly as `Status::Done`, `excluded = false`.
+    #[default]
+    Open,
+    /// Owner, senpai chain, and root publish directly; others land held for review.
+    Curated,
+    /// Read-only except root or house.
+    Locked,
+}
+
+impl BoardWritePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Curated => "curated",
+            Self::Locked => "locked",
+        }
+    }
+}
+
+impl fmt::Display for BoardWritePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ============================================================================
+// TopicStatus — lifecycle status of a board topic
+// ============================================================================
+
+/// Lifecycle status of a board topic (`docs/board.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive)]
+pub enum TopicStatus {
+    /// Active discussion.
+    #[default]
+    Open,
+    /// Settled without archiving.
+    Resolved,
+    /// Pinned to the top of board topic listings.
+    Pinned,
+    /// Retained as history and hidden from active topic listings.
+    Archived,
+}
+
+impl TopicStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+            Self::Pinned => "pinned",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+impl fmt::Display for TopicStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -296,7 +372,12 @@ mod tests {
 
     #[test]
     fn doc_kind_as_str_roundtrip() {
-        for kind in [DocKind::Conversation, DocKind::File, DocKind::Symlink] {
+        for kind in [
+            DocKind::Conversation,
+            DocKind::File,
+            DocKind::Symlink,
+            DocKind::Topic,
+        ] {
             let s = kind.as_str();
             let parsed = DocKind::from_str(s).unwrap();
             assert_eq!(kind, parsed);
@@ -355,10 +436,80 @@ mod tests {
 
     #[test]
     fn doc_kind_cbor_roundtrip() {
-        for kind in [DocKind::Conversation, DocKind::File, DocKind::Symlink] {
+        for kind in [
+            DocKind::Conversation,
+            DocKind::File,
+            DocKind::Symlink,
+            DocKind::Topic,
+        ] {
             let bytes = crate::codec::encode(&kind).unwrap();
             let parsed: DocKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);
         }
+    }
+
+    // ── BoardWritePolicy ────────────────────────────────────────────────
+
+    #[test]
+    fn board_write_policy_default() {
+        assert_eq!(BoardWritePolicy::default(), BoardWritePolicy::Open);
+    }
+
+    #[test]
+    fn board_write_policy_roundtrip() {
+        for policy in [
+            BoardWritePolicy::Open,
+            BoardWritePolicy::Curated,
+            BoardWritePolicy::Locked,
+        ] {
+            let s = policy.as_str();
+            assert_eq!(format!("{policy}"), s);
+            assert_eq!(BoardWritePolicy::from_str(s).unwrap(), policy);
+            assert_eq!(
+                BoardWritePolicy::from_str(&s.to_ascii_uppercase()).unwrap(),
+                policy
+            );
+            let json = serde_json::to_string(&policy).unwrap();
+            assert_eq!(json, format!("\"{s}\""));
+            let parsed: BoardWritePolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, policy);
+            let cbor = crate::codec::encode(&policy).unwrap();
+            let decoded: BoardWritePolicy = crate::codec::decode(&cbor).unwrap();
+            assert_eq!(decoded, policy);
+        }
+        assert!(BoardWritePolicy::from_str("bogus").is_err());
+    }
+
+    // ── TopicStatus ─────────────────────────────────────────────────────
+
+    #[test]
+    fn topic_status_default() {
+        assert_eq!(TopicStatus::default(), TopicStatus::Open);
+    }
+
+    #[test]
+    fn topic_status_roundtrip() {
+        for status in [
+            TopicStatus::Open,
+            TopicStatus::Resolved,
+            TopicStatus::Pinned,
+            TopicStatus::Archived,
+        ] {
+            let s = status.as_str();
+            assert_eq!(format!("{status}"), s);
+            assert_eq!(TopicStatus::from_str(s).unwrap(), status);
+            assert_eq!(
+                TopicStatus::from_str(&s.to_ascii_uppercase()).unwrap(),
+                status
+            );
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, format!("\"{s}\""));
+            let parsed: TopicStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+            let cbor = crate::codec::encode(&status).unwrap();
+            let decoded: TopicStatus = crate::codec::decode(&cbor).unwrap();
+            assert_eq!(decoded, status);
+        }
+        assert!(TopicStatus::from_str("bogus").is_err());
     }
 }

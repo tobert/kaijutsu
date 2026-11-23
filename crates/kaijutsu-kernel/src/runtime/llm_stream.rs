@@ -6824,7 +6824,7 @@ mod usage_tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             })
             .unwrap();
             seed(&mut db, ctx);
@@ -8124,7 +8124,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             }, ws).unwrap();
             db.insert_context(&crate::ContextRow {
                 context_id: context, label: None, system_prompt: None,
@@ -8133,7 +8133,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             }).unwrap();
             db.update_performer(senpai, Some(reviewer)).unwrap();
             // The performer's slots give its context a `default` slot only
@@ -8168,7 +8168,7 @@ mod lifetime_tests {
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
             preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
             demoted_at: None, paused_at: None, origin_host: None,
-            performer: None, senpai_ctx: None, persona: None,
+            performer: None, senpai_ctx: None, persona: None, board_id: None,
         }, ws).unwrap();
         context
     }
@@ -8910,7 +8910,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             }, ws).unwrap();
             let senpai = db.senpai_of(context).unwrap();
             db.write_context_character(successor, performer, senpai, None).unwrap();
@@ -10193,7 +10193,7 @@ mod lifetime_tests {
                 forked_from: Some(context), fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                performer: Some(actor), senpai_ctx: Some(context), persona: None,
+                performer: Some(actor), senpai_ctx: Some(context), persona: None, board_id: None,
             }, ws).unwrap();
             db.mark_shadow(shadow, crate::kernel_db::DESCRIBE_SHADOW).unwrap();
             drop(db);

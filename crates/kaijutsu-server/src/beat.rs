@@ -460,7 +460,7 @@ impl BeatScheduler {
                 workspace_id: None,
                 preset_id: None,
                 origin_host: None,
-                performer: None, senpai_ctx: Some(senpai), persona: None,
+                performer: None, senpai_ctx: Some(senpai), persona: None, board_id: None,
             };
             db.insert_placed_context(&row, ws).map_err(|e| {
                 format!("beat: creating score context for {}: {e}", track_id.as_str())
@@ -2645,7 +2645,7 @@ mod tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             }, workspace).unwrap();
             db.update_performer(context, Some(performer)).unwrap();
         }
@@ -2688,7 +2688,7 @@ mod tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             }, workspace).unwrap();
             if performer.is_some() {
                 db.update_performer(context, performer).unwrap();
@@ -4294,7 +4294,7 @@ mod tests {
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    performer: None, senpai_ctx: None, persona: None,
+                    performer: None, senpai_ctx: None, persona: None, board_id: None,
                 },
                 ws,
             )
@@ -4350,7 +4350,7 @@ mod tests {
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    performer: None, senpai_ctx: None, persona: None,
+                    performer: None, senpai_ctx: None, persona: None, board_id: None,
                 },
                 workspace,
             )
@@ -5324,7 +5324,7 @@ mod tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                performer: None, senpai_ctx: None, persona: None,
+                performer: None, senpai_ctx: None, persona: None, board_id: None,
             }, workspace).unwrap();
             db.update_performer(context, Some(performer)).unwrap();
         }
@@ -5861,7 +5861,7 @@ mod tests {
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    performer: None, senpai_ctx: None, persona: None,
+                    performer: None, senpai_ctx: None, persona: None, board_id: None,
                 },
                 ws,
             )

@@ -539,6 +539,9 @@ impl KernelDb {
              WHERE principal_id = ?2 AND retired_at IS NULL",
             params![at, blob_param(principal_id.as_bytes())],
         )?;
+        if updated > 0 {
+            self.archive_character_boards(principal_id)?;
+        }
         Ok(updated > 0)
     }
 
@@ -570,7 +573,7 @@ impl KernelDb {
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at,
-             origin_host, performer, senpai_ctx, persona
+             origin_host, performer, senpai_ctx, persona, board_id
              FROM contexts
              WHERE performer = ?1 AND archived_at IS NULL",
         )?;

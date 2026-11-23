@@ -165,7 +165,8 @@ CREATE TABLE IF NOT EXISTS contexts (
     -- console (`characters.root_ctx`); a trigger refuses any other change to
     -- NULL. `kj context set <ctx> --senpai <ctx>` is the one writer after creation.
     senpai_ctx   BLOB REFERENCES contexts(context_id),
-    persona      TEXT
+    persona      TEXT,
+    board_id     BLOB REFERENCES boards(board_id)
 );
 -- Labels are unique among LIVE contexts only. An archived context keeps its
 -- label as history and leaves this index, so the name can be given again.
@@ -173,6 +174,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL AND archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_contexts_board
+    ON contexts(board_id) WHERE board_id IS NOT NULL;
 
 -- Contexts whose senpai the migration did not take from the nearest ancestor
 -- (`docs/senpai-kohai.md`, "Migration"). `kj context info` prints the note until
@@ -1259,6 +1262,50 @@ CREATE TABLE IF NOT EXISTS rendition_index (
     FOREIGN KEY (shadow_context_id, rendition_principal, rendition_seq)
         REFERENCES shadow_renditions(shadow_context_id, rendition_principal, rendition_seq) ON DELETE CASCADE
 );
+
+-- ── Boards and topics (docs/board.md) ────────────────────────────
+CREATE TABLE IF NOT EXISTS boards (
+    board_id        BLOB NOT NULL PRIMARY KEY,
+    -- Non-NULL for character boards; NULL for context boards (referenced by
+    -- `contexts.board_id` across a context's rotation lineage).
+    owner_character BLOB REFERENCES characters(principal_id),
+    slug            TEXT,
+    description     TEXT NOT NULL DEFAULT '',
+    write_policy    TEXT NOT NULL DEFAULT 'open'
+        CHECK (write_policy IN ('open', 'curated', 'locked')),
+    created_by      BLOB NOT NULL,
+    created_at      INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    archived_at     INTEGER,
+    CHECK (
+        (owner_character IS NOT NULL AND slug IS NOT NULL)
+        OR (owner_character IS NULL AND slug IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_character_slug
+    ON boards(owner_character, slug)
+    WHERE owner_character IS NOT NULL AND archived_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS board_topics (
+    document_id     BLOB NOT NULL PRIMARY KEY
+        REFERENCES documents(document_id) ON DELETE CASCADE,
+    board_id        BLOB NOT NULL REFERENCES boards(board_id),
+    slug            TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'resolved', 'pinned', 'archived')),
+    locked          INTEGER NOT NULL DEFAULT 0,
+    tags            TEXT NOT NULL DEFAULT '[]',
+    promoted_from   BLOB REFERENCES board_topics(document_id) ON DELETE SET NULL,
+    created_by      BLOB NOT NULL,
+    created_at      INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    last_post_at    INTEGER NOT NULL,
+    post_count      INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_board_topics_slug
+    ON board_topics(board_id, slug)
+    WHERE status != 'archived';
+CREATE INDEX IF NOT EXISTS idx_board_topics_board_recent
+    ON board_topics(board_id, last_post_at DESC);
 
 -- A retired table is dropped, not left behind. Child before parent: this
 -- foreign-keys onto `gate_actions`, so it must go first.

@@ -120,7 +120,7 @@ pub(super) fn make_context_row(label: Option<&str>) -> ContextRow {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        performer: None, senpai_ctx: None, persona: None,
+        performer: None, senpai_ctx: None, persona: None, board_id: None,
     }
 }
 

@@ -63,6 +63,12 @@ pub struct BackendId(uuid::Uuid);
 #[serde(transparent)]
 pub struct CastId(uuid::Uuid);
 
+/// A board identifier (UUIDv7). A *board* is a shared container of topics
+/// owned by a character or a context (`docs/board.md`).
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BoardId(uuid::Uuid);
+
 // ── Shared behavior ─────────────────────────────────────────────────────────
 
 macro_rules! impl_typed_id {
@@ -208,6 +214,7 @@ impl_typed_id!(WorkspaceId, "WorkspaceId");
 impl_typed_id!(PresetId, "PresetId");
 impl_typed_id!(BackendId, "BackendId");
 impl_typed_id!(CastId, "CastId");
+impl_typed_id!(BoardId, "BoardId");
 
 // ── PrefixResolvable ────────────────────────────────────────────────────────
 
@@ -780,5 +787,24 @@ mod tests {
         let uuid: uuid::Uuid = original.into();
         let roundtripped = KernelId::from(uuid);
         assert_eq!(original, roundtripped);
+    }
+
+    #[test]
+    fn test_board_id_roundtrip_and_display() {
+        let id = BoardId::new();
+        assert_eq!(id.short().len(), 8);
+        assert_eq!(id.to_hex().len(), 32);
+        assert_eq!(BoardId::from_bytes(*id.as_bytes()), id);
+        assert_eq!(BoardId::try_from_slice(id.as_bytes()), Some(id));
+        assert_eq!(BoardId::try_from_slice(&[0u8; 15]), None);
+        assert_eq!(BoardId::parse(&id.to_hex()).unwrap(), id);
+        assert_eq!(BoardId::parse(&id.to_string()).unwrap(), id);
+        assert!(format!("{:?}", id).starts_with("BoardId("));
+        let json = serde_json::to_string(&id).unwrap();
+        let parsed: BoardId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, parsed);
+        let cbor = crate::codec::encode(&id).unwrap();
+        let decoded: BoardId = crate::codec::decode(&cbor).unwrap();
+        assert_eq!(id, decoded);
     }
 }

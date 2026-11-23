@@ -143,7 +143,7 @@ mod tests {
             created_at: kaijutsu_types::now_millis() as i64, created_by: PrincipalId::system(),
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
             concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-            origin_host: None, performer: None, senpai_ctx: None, persona: None,
+            origin_host: None, performer: None, senpai_ctx: None, persona: None, board_id: None,
         }, ws).unwrap();
         if let Some(performer) = played_by {
             db.update_performer(context_id, Some(performer)).unwrap();

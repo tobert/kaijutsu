@@ -63,6 +63,9 @@ pub struct ContextRow {
     pub senpai_ctx: Option<ContextId>,
     /// The performer's persona for this context; `None` until characters have one.
     pub persona: Option<String>,
+    /// This context's working board (`docs/board.md`), lazily created on first
+    /// write to `.` (or `.senpai`) and carried across rotations.
+    pub board_id: Option<BoardId>,
 }
 
 impl ContextRow {
@@ -147,14 +150,14 @@ impl KernelDb {
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at,
-                origin_host, performer, senpai_ctx, persona
+                origin_host, performer, senpai_ctx, persona, board_id
             ) VALUES (
                 ?1, ?2,
                 ?3, ?4,
                 ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20
+                ?17, ?18, ?19, ?20, ?21
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -177,6 +180,7 @@ impl KernelDb {
                     row.performer.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.senpai_ctx.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.persona,
+                    row.board_id.as_ref().map(|id| id.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -196,7 +200,7 @@ impl KernelDb {
                     system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona, board_id
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -314,7 +318,7 @@ impl KernelDb {
                     system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona, board_id
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -331,7 +335,7 @@ impl KernelDb {
                     system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona, board_id
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -408,7 +412,7 @@ impl KernelDb {
                     system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona, board_id
              FROM contexts WHERE label = ?1 AND archived_at IS NULL",
         )?;
 
@@ -418,6 +422,35 @@ impl KernelDb {
         } else {
             Ok(None)
         }
+    }
+
+    /// Set a context's working board pointer (`contexts.board_id`).
+    pub fn set_context_board_id(
+        &self,
+        context_id: ContextId,
+        board_id: BoardId,
+    ) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE contexts SET board_id = ?1 WHERE context_id = ?2",
+            params![blob_param(board_id.as_bytes()), blob_param(context_id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!(
+                "context {}",
+                context_id.short()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Count live (`archived_at IS NULL`) contexts pointing to `board_id`.
+    pub fn count_live_contexts_for_board(&self, board_id: BoardId) -> KernelDbResult<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM contexts WHERE board_id = ?1 AND archived_at IS NULL",
+            params![blob_param(board_id.as_bytes())],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 }
 
