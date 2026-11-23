@@ -41,6 +41,7 @@ fn wire_origin(origin: kaijutsu_types::AskOrigin) -> AskOrigin {
         O::KjVerb => AskOrigin::KjVerb,
         O::Drift => AskOrigin::Drift,
         O::Refusal => AskOrigin::Refusal,
+        O::Board => AskOrigin::Board,
     }
 }
 
@@ -53,6 +54,7 @@ fn origin(origin: AskOrigin) -> kaijutsu_types::AskOrigin {
         AskOrigin::KjVerb => O::KjVerb,
         AskOrigin::Drift => O::Drift,
         AskOrigin::Refusal => O::Refusal,
+        AskOrigin::Board => O::Board,
     }
 }
 

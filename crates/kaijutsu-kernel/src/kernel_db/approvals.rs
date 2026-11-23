@@ -31,6 +31,35 @@ pub(crate) fn record_approval_drift_block(conn: &Connection, request: &str, bloc
     Ok(())
 }
 
+/// Held board post metadata recorded alongside an `Origin::Board` ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalBoardPost {
+    pub document_id: ContextId,
+    pub block_id: BlockId,
+    pub board_id: BoardId,
+}
+
+/// Record the held board post a board ask answers for, in the ask's
+/// transaction.
+pub(crate) fn record_approval_board_post(
+    conn: &Connection,
+    request: &str,
+    document_id: ContextId,
+    block: &BlockId,
+    board_id: BoardId,
+) -> KernelDbResult<()> {
+    conn.execute(
+        "INSERT INTO approval_board_posts(request_id, document_id, block_id, board_id) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            request,
+            super::blob_param(document_id.as_bytes()),
+            block.to_key(),
+            super::blob_param(board_id.as_bytes()),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Record the refused turn a refusal ask answers for, in the ask's
 /// transaction.
 pub(crate) fn record_approval_refusal_turn(conn: &Connection, request: &str, turn: kaijutsu_types::TurnId) -> KernelDbResult<()> {
@@ -350,6 +379,36 @@ impl KernelDb {
         key.map(|key| BlockId::from_key(&key)
             .ok_or_else(|| KernelDbError::Validation(format!("ask {request} records a malformed drift block {key}"))))
             .transpose()
+    }
+
+    /// The held board post recorded with a board ask.
+    pub(crate) fn approval_board_post(&self, request: &str) -> KernelDbResult<Option<ApprovalBoardPost>> {
+        let row: Option<(Vec<u8>, String, Vec<u8>)> = self.conn.query_row(
+            "SELECT document_id, block_id, board_id FROM approval_board_posts WHERE request_id=?1",
+            [request],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        row.map(|(doc_bytes, key, board_bytes)| {
+            let document_id = ContextId::try_from_slice(&doc_bytes).ok_or_else(|| {
+                KernelDbError::Validation(format!("ask {request} records a malformed document id"))
+            })?;
+            let block_id = BlockId::from_key(&key).ok_or_else(|| {
+                KernelDbError::Validation(format!("ask {request} records a malformed board post block {key}"))
+            })?;
+            let board_id = BoardId::try_from_slice(&board_bytes).ok_or_else(|| {
+                KernelDbError::Validation(format!("ask {request} records a malformed board id"))
+            })?;
+            Ok(ApprovalBoardPost { document_id, block_id, board_id })
+        }).transpose()
+    }
+
+    /// The board ask recorded with a held board post block.
+    pub(crate) fn approval_for_board_post(&self, block: &BlockId) -> KernelDbResult<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT request_id FROM approval_board_posts WHERE block_id=?1",
+            [block.to_key()],
+            |row| row.get(0),
+        ).optional()?)
     }
 
     pub(crate) fn approval_pair_expected(&self, request: &str) -> KernelDbResult<bool> {

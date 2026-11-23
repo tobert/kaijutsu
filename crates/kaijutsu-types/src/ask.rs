@@ -29,6 +29,9 @@ pub enum AskOrigin {
     /// A refused context waits for its reviewer. An allow sends its work
     /// again; a deny leaves it held. It never runs source.
     Refusal,
+    /// A held post on a curated board waits for the board's reviewer. An allow
+    /// releases the post; a deny keeps it hidden. It never runs source.
+    Board,
 }
 
 impl AskOrigin {
@@ -40,6 +43,7 @@ impl AskOrigin {
             AskOrigin::KjVerb => "kj_verb",
             AskOrigin::Drift => "drift",
             AskOrigin::Refusal => "refusal",
+            AskOrigin::Board => "board",
         }
     }
 }
@@ -101,10 +105,11 @@ impl AskSummary {
     }
 
     /// Whether `principal` may answer with a standing rule: it may answer,
-    /// and the ask is not a drift or refusal. Those are answered one at a
-    /// time, and the kernel refuses a standing rule for them.
+    /// and the ask is not a drift, refusal, or board post. Those are answered
+    /// one at a time, and the kernel refuses a standing rule for them.
     pub fn can_remember(&self, principal: PrincipalId) -> bool {
-        self.answerable_by(principal) && !matches!(self.origin, AskOrigin::Drift | AskOrigin::Refusal)
+        self.answerable_by(principal)
+            && !matches!(self.origin, AskOrigin::Drift | AskOrigin::Refusal | AskOrigin::Board)
     }
 
     /// Whether `principal` may answer with a standing rule for the

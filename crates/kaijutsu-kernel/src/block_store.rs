@@ -660,6 +660,62 @@ impl BlockStore {
         status: Status,
         content_type: ContentType,
     ) -> BlockStoreResult<BlockId> {
+        self.create_document_with_block_inner(
+            context_id,
+            principal_id,
+            kind,
+            language,
+            role,
+            block_kind,
+            content.into(),
+            status,
+            content_type,
+            false,
+        )
+    }
+
+    /// Create a new document whose opening block is held for review (`Status::Pending`
+    /// and `excluded = true`) in the same accepted creation, so no reader or index
+    /// sees it visible before `settle_held_board_post` releases it.
+    pub fn create_document_with_held_block(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        kind: DocKind,
+        language: Option<String>,
+        role: Role,
+        block_kind: BlockKind,
+        content: impl Into<String>,
+        content_type: ContentType,
+    ) -> BlockStoreResult<BlockId> {
+        self.create_document_with_block_inner(
+            context_id,
+            principal_id,
+            kind,
+            language,
+            role,
+            block_kind,
+            content.into(),
+            Status::Pending,
+            content_type,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_document_with_block_inner(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        kind: DocKind,
+        language: Option<String>,
+        role: Role,
+        block_kind: BlockKind,
+        content: String,
+        status: Status,
+        content_type: ContentType,
+        excluded: bool,
+    ) -> BlockStoreResult<BlockId> {
         use dashmap::mapref::entry::Entry;
 
         // The first op of a document's oplog. `journal_op` derives the same
@@ -680,6 +736,9 @@ impl BlockStore {
                     status,
                     content_type,
                 )?;
+                if excluded {
+                    entry.doc.set_excluded(&block_id, true)?;
+                }
                 let snapshot = entry
                     .doc
                     .get_block_snapshot(&block_id)
@@ -1267,6 +1326,108 @@ impl BlockStore {
         self.insert_block_marked(
             context_id, parent_id, after, role, kind, content, status, content_type, principal_id, false,
         )
+    }
+
+    /// Insert a block held for review (`Status::Pending` and `excluded = true`)
+    /// in the same accepted insert, so no reader or index sees it visible before
+    /// [`Self::settle_held_board_post`] releases it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_held_block_as(
+        &self,
+        context_id: ContextId,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        role: Role,
+        kind: BlockKind,
+        content: impl Into<String>,
+        content_type: ContentType,
+        principal_id: PrincipalId,
+    ) -> BlockStoreResult<BlockId> {
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = after.cloned();
+            entry.doc.set_principal_id(principal_id);
+
+            let block_id = entry.doc.insert_block(
+                parent_id,
+                after,
+                role,
+                kind,
+                content,
+                Status::Pending,
+                content_type,
+            )?;
+            entry.doc.set_excluded(&block_id, true)?;
+            let snapshot = entry
+                .doc
+                .get_block_snapshot(&block_id)
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
+
+            let ops = SyncPayload::from_new_block(snapshot.clone());
+            entry.touch(principal_id);
+            let version = entry.version();
+
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
+
+            Ok((ops, events, block_id))
+        })
+    }
+
+    /// Answer a held board post in one accepted change: a release makes it
+    /// `Done` and included, a dismissal makes it `Done` and leaves it excluded.
+    /// Emits `StatusChanged` (so the semantic index re-embeds on release) and
+    /// `ExcludedChanged` when released. Refuses a block that is not pending+excluded.
+    pub fn settle_held_board_post(
+        &self,
+        document_id: ContextId,
+        block_id: &BlockId,
+        release: bool,
+    ) -> BlockStoreResult<()> {
+        self.accept(document_id, |entry| {
+            let held = entry
+                .doc
+                .get_block_snapshot(block_id)
+                .is_some_and(|b| b.status == Status::Pending && b.excluded);
+            if !held {
+                return Err(BlockStoreError::Validation(format!(
+                    "block {} is not a held board post",
+                    block_id.to_key()
+                )));
+            }
+            entry.doc.set_status(block_id, Status::Done)?;
+            if release {
+                entry.doc.set_excluded(block_id, false)?;
+            }
+            entry.touch(self.principal_id());
+            let version = entry.version();
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            let ops = SyncPayload::from_updated_header(header);
+            let mut events = vec![BlockFlow::StatusChanged {
+                context_id: document_id,
+                block_id: *block_id,
+                status: Status::Done,
+                version,
+                source: OpSource::Local,
+            }];
+            if release {
+                events.push(BlockFlow::ExcludedChanged {
+                    context_id: document_id,
+                    block_id: *block_id,
+                    excluded: false,
+                    version,
+                    source: OpSource::Local,
+                });
+            }
+            Ok((ops, events, ()))
+        })
     }
 
     /// [`Self::insert_block_as`], optionally marking the block a turn-scoped
@@ -2183,6 +2344,20 @@ impl BlockStore {
             if !excluded && entry.doc.get_block_snapshot(block_id).is_some_and(|b| b.is_held_drift()) {
                 return Err(BlockStoreError::Validation(format!(
                     "block {} is a drift held for the console's human; `kj ledger allow` on its ask releases it",
+                    block_id.to_key()
+                )));
+            }
+            // A held board post is included only by its ask's allow
+            // (`settle_held_board_post`); `kj board unhide` cannot bypass review.
+            if !excluded
+                && entry.kind == DocKind::Topic
+                && entry
+                    .doc
+                    .get_block_snapshot(block_id)
+                    .is_some_and(|b| b.status == Status::Pending && b.excluded)
+            {
+                return Err(BlockStoreError::Validation(format!(
+                    "block {} is a board post held pending review; `kj ledger allow` on its ask releases it",
                     block_id.to_key()
                 )));
             }

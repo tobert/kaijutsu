@@ -1737,7 +1737,7 @@ pub(crate) fn eligible(spec: &GateSpec) -> bool {
         Origin::Hook => {
             spec.hook_id.as_deref() == Some(crate::mcp::error::GATE_POLICY_SUBJECT) && spec.tool == SHELL_WRITE
         }
-        Origin::HookResult | Origin::KjVerb | Origin::Drift | Origin::Refusal => false,
+        Origin::HookResult | Origin::KjVerb | Origin::Drift | Origin::Refusal | Origin::Board => false,
     }
 }
 

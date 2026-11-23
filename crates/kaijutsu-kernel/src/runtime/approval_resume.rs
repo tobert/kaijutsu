@@ -971,7 +971,10 @@ pub(crate) fn start(kernel: &Arc<Kernel>) -> Result<(), String> {
     // it is settled whenever it was given.
     let woken = kernel.kernel_db().lock().undelivered_answers()
         .map_err(|error| format!("could not read approval backlog: {error}"))?
-        .into_iter().filter(|answer| answer.origin != approval_ledger::types::Origin::Drift)
+        .into_iter().filter(|answer| !matches!(
+            answer.origin,
+            approval_ledger::types::Origin::Drift | approval_ledger::types::Origin::Board
+        ))
         .map(|answer| answer.request_id).collect();
     let owner = Arc::downgrade(kernel);
     kernel.spawn_runtime_task(move |stop| run_delivery(owner, sub, woken, stop))
@@ -1066,6 +1069,20 @@ async fn run_delivery(
             };
             let principal_id =
                 kaijutsu_types::PrincipalId::from(uuid::Uuid::from_bytes(pbytes));
+
+            // A board ask holds a topic post block (its context_id is the topic's
+            // document_id, which has no row in `contexts`). Normally settled
+            // synchronously by `decide_ask_with_reason`; handle here too for
+            // crash recovery between `decide` and `settle`.
+            if answer.origin == approval_ledger::types::Origin::Board {
+                let allowed = answer.status == crate::ApprovalStatus::Allowed;
+                match crate::kj::board::settle_board_post_answer(kernel, &answer.request_id, allowed) {
+                    Ok(()) => { woken.insert(answer.request_id.clone()); }
+                    Err(error) => tracing::error!(ask = %answer.request_id, %error, "gate-resume: could not settle a board post answer; retrying"),
+                }
+                delivered_this_scan += 1;
+                continue;
+            }
 
 
             // Audit rows outlive their contexts. Only live contexts

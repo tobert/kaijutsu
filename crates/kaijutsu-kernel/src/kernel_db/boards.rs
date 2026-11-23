@@ -562,6 +562,29 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Update `post_count` and advance `last_post_at` when a held post is released.
+    pub fn update_topic_on_post_release(
+        &self,
+        document_id: ContextId,
+        visible_post_count: i64,
+        now_ms: i64,
+    ) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE board_topics
+                SET post_count = MAX(?1, 1),
+                    last_post_at = MAX(last_post_at, ?2)
+             WHERE document_id = ?3",
+            params![visible_post_count, now_ms, blob_param(document_id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!(
+                "topic {}",
+                document_id.short()
+            )));
+        }
+        Ok(())
+    }
+
     /// Update a topic's status.
     pub fn set_topic_status(
         &self,

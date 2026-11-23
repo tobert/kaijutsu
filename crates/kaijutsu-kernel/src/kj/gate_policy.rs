@@ -359,6 +359,14 @@ enum TierVerdict {
     Deny,
 }
 
+/// An explicit per-performer `gate.toml` tier verdict for a command key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigTierOverride {
+    Allow,
+    Ask,
+    Deny,
+}
+
 impl TierVerdict {
     /// Deny beats ask beats allow at equal specificity.
     fn rank(self) -> u8 {
@@ -1360,6 +1368,27 @@ impl GateConfig {
         &self.nobody
     }
 
+    /// Look up an explicit tier override for `candidates` (most specific first)
+    /// across the performer's `gate.toml` sections (`[character.<name>]`,
+    /// `[root]`, `[rc.<dir>]`), narrowest first. Returns `None` when no
+    /// performer section names any candidate key.
+    pub(crate) fn performer_override(
+        &self,
+        performer: Option<&GatePerformer>,
+        candidates: &[String],
+    ) -> Option<ConfigTierOverride> {
+        for (_section, table) in self.performer_tables(performer) {
+            if let Some((_key, verdict)) = table.lookup(candidates).next() {
+                return Some(match verdict {
+                    TierVerdict::Allow => ConfigTierOverride::Allow,
+                    TierVerdict::Ask => ConfigTierOverride::Ask,
+                    TierVerdict::Deny => ConfigTierOverride::Deny,
+                });
+            }
+        }
+        None
+    }
+
     /// Whether the sandbox posture is on for a context `performer` plays —
     /// what `kj ledger rules` states plainly.
     pub(crate) fn allows_uncovered(&self, performer: Option<&GatePerformer>) -> bool {
@@ -1649,6 +1678,26 @@ pub(crate) fn performer_of(db: &KernelDb, context_id: Option<ContextId>) -> Resu
     }
 }
 
+/// Resolve a `GatePerformer` directly from an actor's `PrincipalId` (used by
+/// `kj board`, which may be invoked with or without an active context).
+pub(crate) fn performer_for_actor(
+    db: &KernelDb,
+    actor_id: PrincipalId,
+) -> Result<Option<GatePerformer>, String> {
+    match db.get_character(actor_id) {
+        Ok(Some(sheet)) => Ok(Some(GatePerformer {
+            name: sheet.name,
+            rc_dir: sheet.rc_dir.filter(|dir| !dir.is_empty()),
+            root: sheet.root,
+        })),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!(
+            "gate policy could not read actor {}'s character sheet: {e} (fail-closed)",
+            actor_id.short()
+        )),
+    }
+}
+
 // ── Evaluation ──────────────────────────────────────────────────────────
 
 /// Layers 2–4 over a planned program — what broker PreCall consults before
@@ -1789,7 +1838,7 @@ fn planned_groups(spec: &GateSpec) -> Option<Vec<&[PlannedStatement]>> {
             Some(spec.planned.iter().map(std::slice::from_ref).collect())
         }
         Origin::Hook if n == 1 && !spec.planned.is_empty() => Some(vec![spec.planned.as_slice()]),
-        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb | Origin::Drift | Origin::Refusal => None,
+        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb | Origin::Drift | Origin::Refusal | Origin::Board => None,
     }
 }
 
@@ -2180,7 +2229,7 @@ fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>, edge: &
             let program = spec.planned.iter().map(|s| statement_verdict(s, layers, edge)).collect();
             vec![fold_verdicts(program)]
         }
-        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb | Origin::Drift | Origin::Refusal => {
+        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb | Origin::Drift | Origin::Refusal | Origin::Board => {
             vec![PolicyVerdict::Uncovered; n]
         }
     }

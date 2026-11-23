@@ -34,6 +34,16 @@ CREATE TABLE IF NOT EXISTS approval_drift_blocks (
     block_id TEXT NOT NULL
 );
 
+-- The held board post a board ask releases or dismisses, recorded with it.
+CREATE TABLE IF NOT EXISTS approval_board_posts (
+    request_id  TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    document_id BLOB NOT NULL,
+    block_id    TEXT NOT NULL,
+    board_id    BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_board_posts_block
+    ON approval_board_posts(block_id);
+
 -- The refused turn a refusal ask is about, recorded with it. An answer lifts
 -- the hold of this turn only.
 CREATE TABLE IF NOT EXISTS approval_refusal_turns (

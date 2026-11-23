@@ -100,6 +100,8 @@ enum DistillationPurpose {
     /// The earlier conversation of a context being rotated with `--compact`.
     /// Its instruction is chosen by the rotation, which passes it in.
     Rotation,
+    /// A board topic distilled for `kj board promote --summarize`.
+    BoardPromote,
 }
 
 /// A one-shot call's open `turns` row. Dropped before [`Self::finish`] (the
@@ -137,19 +139,20 @@ impl DistillationPurpose {
             Self::DriftBrief => crate::model_resolution::DISTILL,
             Self::Continuation => "continuation",
             Self::Rotation => "rotation",
+            Self::BoardPromote => "board_promote",
         }
     }
 
     fn word_target_key(self) -> &'static str {
         match self {
-            Self::DriftBrief => DRIFT_WORD_TARGET_ENV,
+            Self::DriftBrief | Self::BoardPromote => DRIFT_WORD_TARGET_ENV,
             Self::Continuation | Self::Rotation => CONTINUATION_WORD_TARGET_ENV,
         }
     }
 
     fn default_word_target(self) -> usize {
         match self {
-            Self::DriftBrief => DEFAULT_DRIFT_WORD_TARGET,
+            Self::DriftBrief | Self::BoardPromote => DEFAULT_DRIFT_WORD_TARGET,
             Self::Continuation | Self::Rotation => DEFAULT_CONTINUATION_WORD_TARGET,
         }
     }
@@ -163,6 +166,12 @@ impl DistillationPurpose {
                 .await
                 .map_err(|e| format!("continuation prompt: {e}")),
             Self::Rotation => Err("a rotation summary runs under an instruction its caller chose".into()),
+            Self::BoardPromote => Ok(
+                "You are distilling a board topic into a concise, durable markdown knowledge entry. \
+                 Preserve concrete decisions, findings, file paths, symbol names, and open questions. \
+                 Omit chatter and repetition. Output markdown directly with no preamble."
+                    .to_string(),
+            ),
         }
     }
 }
@@ -413,6 +422,8 @@ pub struct KjDispatcher {
     /// service. Contextual shells use it for search and synthesis. `None` means
     /// the index is unavailable, either unconfigured or unable to initialize.
     semantic_index: parking_lot::RwLock<Option<Arc<kaijutsu_index::SemanticIndex>>>,
+    /// Per-character sliding-window rate limiter for `open` boards.
+    board_rate_limiter: Arc<board::BoardRateLimiter>,
 }
 
 impl KjDispatcher {
@@ -459,7 +470,13 @@ impl KjDispatcher {
             roster,
             weak_self: parking_lot::RwLock::new(None),
             semantic_index: parking_lot::RwLock::new(None),
+            board_rate_limiter: Arc::new(board::BoardRateLimiter::default()),
         }
+    }
+
+    /// Sliding-window rate limiter for `open` boards.
+    pub(crate) fn board_rate_limiter(&self) -> &board::BoardRateLimiter {
+        &self.board_rate_limiter
     }
 
     /// The live roster's storage half.
@@ -1069,6 +1086,29 @@ impl KjDispatcher {
             Some(instruction),
         )
         .await
+    }
+
+    /// Summarize a board topic's visible blocks on the caller context's `distill`
+    /// slot for `kj board promote --summarize`.
+    pub(crate) async fn summarize_board_topic(
+        &self,
+        caller_context_id: ContextId,
+        blocks: Vec<kaijutsu_types::BlockSnapshot>,
+        topic_title: &str,
+    ) -> Result<String, String> {
+        let directed = format!(
+            "Distill board topic \"{topic_title}\" into a concise, self-contained knowledge entry."
+        );
+        self.summarize_blocks_for_purpose(
+            caller_context_id,
+            blocks,
+            Some(&directed),
+            Some(caller_context_id),
+            DistillationPurpose::BoardPromote,
+            None,
+        )
+        .await
+        .map(|(summary, _)| summary)
     }
 
     async fn summarize_for_caller_purpose(

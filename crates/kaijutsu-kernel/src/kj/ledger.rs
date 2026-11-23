@@ -124,6 +124,8 @@ enum OriginArg {
     Drift,
     /// A refused context waits for its reviewer.
     Refusal,
+    /// A held post on a curated board waits for the board's reviewer.
+    Board,
 }
 
 impl OriginArg {
@@ -135,6 +137,7 @@ impl OriginArg {
             Self::KjVerb => Origin::KjVerb,
             Self::Drift => Origin::Drift,
             Self::Refusal => Origin::Refusal,
+            Self::Board => Origin::Board,
         }
     }
 }
@@ -939,6 +942,36 @@ impl KjDispatcher {
                 "block_id": block.map(|b| b.to_key()), "state": state,
             });
         }
+        if ask.origin == AskOrigin::Board {
+            let post = match self.kernel_db.lock().approval_board_post(request_id) {
+                Ok(post) => post,
+                Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
+            };
+            let state = post.as_ref().and_then(|p| {
+                if !self.block_store().contains(p.document_id) {
+                    let _ = self.block_store().load_one_from_db(p.document_id);
+                }
+                let snapshot = self.block_store().get_block_snapshot(p.document_id, &p.block_id).ok()??;
+                Some(if snapshot.status == kaijutsu_types::Status::Pending && snapshot.excluded {
+                    "held"
+                } else if snapshot.excluded {
+                    "dismissed"
+                } else {
+                    "released"
+                })
+            });
+            lines.push(format!(
+                "board_post: {}",
+                post.as_ref().map_or_else(|| "-".to_string(), |p| p.block_id.to_key())
+            ));
+            lines.push(format!("board:      {}", state.unwrap_or("not found")));
+            data["board"] = serde_json::json!({
+                "document_id": post.as_ref().map(|p| p.document_id.to_hex()),
+                "board_id": post.as_ref().map(|p| p.board_id.to_hex()),
+                "block_id": post.as_ref().map(|p| p.block_id.to_key()),
+                "state": state,
+            });
+        }
         if show_signals {
             data["signals"] = serde_json::Value::Array(signal_rows.iter().map(signal_row_json).collect());
         }
@@ -964,6 +997,11 @@ impl KjDispatcher {
             Ok(row) => {
                 record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
                 tracing::info!("approval ask cancelled");
+                if row.origin == Origin::Board
+                    && let Err(e) = crate::kj::board::settle_board_post_answer(self.kernel(), request_id, false)
+                {
+                    tracing::warn!(ask = %request_id, "could not dismiss held board post on cancel: {e}");
+                }
                 crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
                 KjResult::ok_with_data(
                     format!("cancelled ask {request_id}; nothing ran"),
@@ -1708,7 +1746,7 @@ fn decide_ask_with_reason(
             Err(e) => return Err(refused(e)),
         };
         record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
-        if remember.is_some() && matches!(row.origin, Origin::Drift | Origin::Refusal) {
+        if remember.is_some() && matches!(row.origin, Origin::Drift | Origin::Refusal | Origin::Board) {
             return Err(failure(AskAnswerFailureKind::Refused, format!(
                 "ask {request_id} is a {} ask, answered one at a time; no rule \
                  was learned and the ask is still open. Answer it without --remember", row.origin
@@ -1780,6 +1818,17 @@ fn decide_ask_with_reason(
             Err(e) => Err(refused(e)),
         }
     };
+    if let Ok(ref answered) = result
+        && answered.summary.origin == AskOrigin::Board
+    {
+        if let Err(e) = crate::kj::board::settle_board_post_answer(kernel, request_id, allow) {
+            crate::kj::gate::announce_ledger_change(db_handle, kernel.ledger_flows());
+            return Err(failure(
+                AskAnswerFailureKind::Refused,
+                format!("ask {request_id} was decided, but settling the held board post failed: {e}"),
+            ));
+        }
+    }
     crate::kj::gate::announce_ledger_change(db_handle, kernel.ledger_flows());
     result
 }

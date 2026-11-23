@@ -38,6 +38,12 @@ fn worker_binding() -> ContextToolBinding {
     b
 }
 
+fn senpai_binding() -> ContextToolBinding {
+    let mut b = worker_binding();
+    b.grant(Capability::Senpai);
+    b
+}
+
 fn seed_root(d: &KjDispatcher) -> (PrincipalId, ContextId) {
     let db = d.kernel_db().lock();
     if let Ok(Some(ch)) = db.get_character_by_name("amy")
@@ -197,6 +203,7 @@ fn board_verbs_classify_read_and_write() {
         vec![s("board"), s("unlock"), s("./hi")],
         vec![s("board"), s("hide"), s("./hi#1")],
         vec![s("board"), s("unhide"), s("./hi#1")],
+        vec![s("board"), s("promote"), s("./hi"), s("--to"), s("notes")],
     ] {
         assert_eq!(
             classify(&write_argv).unwrap(),
@@ -555,28 +562,35 @@ async fn moderation_hide_lock_resolve_reopen_pin_archive_and_authority() {
     assert!(!d.dispatch(&[s("board"), s("archive"), s("librarian/notes/topic-one")], &outsider).await.is_ok());
     assert!(d.dispatch(&[s("board"), s("archive"), s("librarian/notes/topic-one")], &owner).await.is_ok());
 
-    // Curated board: owner & senpai publish directly, outsider refused.
+    // Curated board: owner & senpai publish directly, outsider is held with an ask.
     assert!(
         d.dispatch(&[s("board"), s("set"), s("librarian/notes"), s("--policy"), s("curated")], &owner)
             .await
             .is_ok()
     );
-    assert!(
-        !d.dispatch(
-            &[s("board"), s("post"), s("librarian/notes"), s("--title"), s("Denied"), s("body")],
+    let outsider_curated = d
+        .dispatch(
+            &[s("board"), s("post"), s("librarian/notes"), s("--title"), s("Held Topic"), s("body")],
             &outsider,
         )
-        .await
-        .is_ok()
-    );
-    assert!(
-        d.dispatch(
+        .await;
+    assert!(outsider_curated.is_ok(), "outsider post to curated board should hold: {}", outsider_curated.message());
+    if let KjResult::Ok { data: Some(ref v), .. } = outsider_curated {
+        assert_eq!(v["held"], true);
+        assert!(v["ask_id"].as_str().is_some());
+    } else {
+        panic!("expected structured data with held=true, got {outsider_curated:?}");
+    }
+    let senpai_curated = d
+        .dispatch(
             &[s("board"), s("post"), s("librarian/notes"), s("--title"), s("Senpai Ok"), s("body")],
             &senpai,
         )
-        .await
-        .is_ok()
-    );
+        .await;
+    assert!(senpai_curated.is_ok(), "{}", senpai_curated.message());
+    if let KjResult::Ok { data: Some(ref v), .. } = senpai_curated {
+        assert_eq!(v["held"], false);
+    }
 
     // Locked board: owner refused, root allowed.
     assert!(
@@ -735,4 +749,553 @@ fn duration_and_post_ref_parsers_validate_inputs() {
     assert!(parse_post_ref("a1b2c3d4#0").is_err());
     assert!(parse_post_ref("a1b2c3d4").is_err());
     assert!(parse_post_ref("#2").is_err());
+}
+
+#[tokio::test]
+async fn curated_board_held_post_ledger_allow_and_deny_lifecycle() {
+    let d = test_dispatcher().await;
+    let (root_id, root_ctx) = seed_root(&d);
+    let lib_id = create_character(&d, "librarian", false).await;
+    let senpai_id = create_character(&d, "senpai", false).await;
+    let writer_id = create_character(&d, "writer", false).await;
+
+    let senpai_ctx = register_bound_context(&d, "senpai-ctx", senpai_id, Some(root_ctx), &senpai_binding());
+    let lib_ctx = register_bound_context(&d, "lib-ctx", lib_id, Some(senpai_ctx), &senpai_binding());
+    let writer_ctx = register_bound_context(&d, "writer-ctx", writer_id, Some(root_ctx), &worker_binding());
+
+    let lib = caller_as(lib_id, Some(lib_ctx));
+    let senpai = caller_as(senpai_id, Some(senpai_ctx));
+    let writer = caller_as(writer_id, Some(writer_ctx));
+    let root = caller_as(root_id, Some(root_ctx));
+
+    assert!(
+        d.dispatch(
+            &[s("board"), s("create"), s("kb"), s("--policy"), s("curated")],
+            &lib,
+        )
+        .await
+        .is_ok()
+    );
+
+    // Owner, senpai, and root publish directly without opening a ledger ask.
+    for (who, title) in [(&lib, "Owner Direct"), (&senpai, "Senpai Direct"), (&root, "Root Direct")] {
+        let res = d
+            .dispatch(
+                &[s("board"), s("post"), s("librarian/kb"), s("--title"), s(title), s("direct body")],
+                who,
+            )
+            .await;
+        assert!(res.is_ok(), "{title} failed: {}", res.message());
+        let KjResult::Ok { data: Some(data), .. } = res else {
+            panic!("expected data for {title}");
+        };
+        assert_eq!(data["held"], false, "{title} must publish directly");
+    }
+    let pending_before = d.kernel_db().lock().list_pending_asks().unwrap();
+    assert!(pending_before.is_empty(), "direct publishes must open no asks");
+
+    // Non-owner posts to curated board -> held (Status::Pending + excluded=true) + ledger ask.
+    let held_post = d
+        .dispatch(
+            &[
+                s("board"),
+                s("post"),
+                s("librarian/kb"),
+                s("--title"),
+                s("Proposed Entry"),
+                s("unique_curated_needle"),
+            ],
+            &writer,
+        )
+        .await;
+    assert!(held_post.is_ok(), "held post failed: {}", held_post.message());
+    let held_msg = held_post.message().to_string();
+    let KjResult::Ok { data: Some(held_data), .. } = held_post else {
+        panic!("expected structured data");
+    };
+    assert_eq!(held_data["held"], true);
+    let ask_id = held_data["ask_id"].as_str().unwrap().to_string();
+    let doc_id = ContextId::parse(held_data["document_id"].as_str().unwrap()).unwrap();
+    let block_key = held_data["block_id"].as_str().unwrap().to_string();
+    assert!(held_msg.contains(&ask_id), "message must name ask_id:\n{held_msg}");
+    assert!(
+        held_msg.contains(&format!("kj ledger allow '{ask_id}'")),
+        "message must give allow hint:\n{held_msg}"
+    );
+
+    // Underlying block is Status::Pending + excluded=true.
+    let snaps = d.block_store().non_draft_snapshots(doc_id).unwrap();
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0].status, Status::Pending);
+    assert!(snaps[0].excluded);
+
+    // Held-only topic is hidden from default topics, recent, read, and search.
+    let topics_default = d.dispatch(&[s("board"), s("topics"), s("librarian/kb")], &writer).await;
+    assert!(!topics_default.message().contains("proposed-entry"), "{}", topics_default.message());
+    let topics_hidden = d
+        .dispatch(&[s("board"), s("topics"), s("librarian/kb"), s("--include-hidden")], &writer)
+        .await;
+    assert!(topics_hidden.message().contains("proposed-entry"), "{}", topics_hidden.message());
+
+    let recent_default = d
+        .dispatch(&[s("board"), s("recent"), s("--board"), s("librarian/kb")], &writer)
+        .await;
+    assert!(!recent_default.message().contains("proposed-entry"), "{}", recent_default.message());
+    let recent_hidden = d
+        .dispatch(
+            &[s("board"), s("recent"), s("--board"), s("librarian/kb"), s("--include-hidden")],
+            &writer,
+        )
+        .await;
+    assert!(recent_hidden.message().contains("proposed-entry"), "{}", recent_hidden.message());
+
+    let read_before = d
+        .dispatch(&[s("board"), s("read"), s("librarian/kb/proposed-entry")], &writer)
+        .await;
+    assert!(!read_before.message().contains("unique_curated_needle"), "{}", read_before.message());
+
+    let search_before = d
+        .dispatch(&[s("board"), s("search"), s("unique_curated_needle")], &writer)
+        .await;
+    assert!(search_before.message().contains("no matches"), "{}", search_before.message());
+
+    // `kj ledger show` reports `board_post` block id and `held` state.
+    let show_held = d.dispatch(&[s("ledger"), s("show"), ask_id.clone()], &lib).await;
+    assert!(show_held.is_ok(), "{}", show_held.message());
+    assert!(show_held.message().contains(&block_key), "{}", show_held.message());
+    assert!(show_held.message().contains("board:      held"), "{}", show_held.message());
+    if let KjResult::Ok { data: Some(ref v), .. } = show_held {
+        assert_eq!(v["board"]["state"], "held");
+        assert_eq!(v["board"]["block_id"], block_key);
+    }
+
+    // `kj board unhide` refuses to bypass review on a pending held post.
+    let unhide_err = d
+        .dispatch(&[s("board"), s("unhide"), s("librarian/kb/proposed-entry#1")], &lib)
+        .await;
+    assert!(!unhide_err.is_ok(), "unhide must refuse pending held post");
+    assert!(
+        unhide_err.message().contains("kj ledger allow"),
+        "unhide refusal should point to kj ledger allow: {}",
+        unhide_err.message()
+    );
+
+    // `--remember` is refused on a board ask, leaving it open.
+    let remember_err = d
+        .dispatch(
+            &[s("ledger"), s("allow"), ask_id.clone(), s("--remember"), s("always")],
+            &lib,
+        )
+        .await;
+    assert!(!remember_err.is_ok(), "--remember must be refused on board ask");
+
+    // Board owner allows the ask -> block flips to Done + excluded=false, now visible everywhere.
+    let allowed = d.dispatch(&[s("ledger"), s("allow"), ask_id.clone()], &lib).await;
+    assert!(allowed.is_ok(), "ledger allow failed: {}", allowed.message());
+
+    let snaps_after = d.block_store().non_draft_snapshots(doc_id).unwrap();
+    assert_eq!(snaps_after[0].status, Status::Done);
+    assert!(!snaps_after[0].excluded);
+
+    let read_after = d
+        .dispatch(&[s("board"), s("read"), s("librarian/kb/proposed-entry")], &writer)
+        .await;
+    assert!(read_after.message().contains("unique_curated_needle"), "{}", read_after.message());
+
+    let topics_after = d.dispatch(&[s("board"), s("topics"), s("librarian/kb")], &writer).await;
+    assert!(topics_after.message().contains("proposed-entry"), "{}", topics_after.message());
+
+    let search_after = d
+        .dispatch(&[s("board"), s("search"), s("unique_curated_needle")], &writer)
+        .await;
+    assert!(search_after.message().contains("unique_curated_needle"), "{}", search_after.message());
+
+    let show_released = d.dispatch(&[s("ledger"), s("show"), ask_id.clone()], &lib).await;
+    assert!(show_released.message().contains("board:      released"), "{}", show_released.message());
+
+    // Non-owner reply on curated board -> held -> denied -> dismissed & stays hidden.
+    let held_reply = d
+        .dispatch(
+            &[s("board"), s("reply"), s("librarian/kb/proposed-entry"), s("dismissed_reply_token")],
+            &writer,
+        )
+        .await;
+    assert!(held_reply.is_ok(), "{}", held_reply.message());
+    let KjResult::Ok { data: Some(reply_data), .. } = held_reply else {
+        panic!("expected data for held reply");
+    };
+    assert_eq!(reply_data["held"], true);
+    let reply_ask = reply_data["ask_id"].as_str().unwrap().to_string();
+
+    let denied = d
+        .dispatch(
+            &[s("ledger"), s("deny"), reply_ask.clone(), s("--reason"), s("off topic")],
+            &lib,
+        )
+        .await;
+    assert!(denied.is_ok(), "ledger deny failed: {}", denied.message());
+
+    let snaps_denied = d.block_store().non_draft_snapshots(doc_id).unwrap();
+    assert_eq!(snaps_denied.len(), 2);
+    assert_eq!(snaps_denied[1].status, Status::Done);
+    assert!(snaps_denied[1].excluded);
+
+    let read_denied = d
+        .dispatch(&[s("board"), s("read"), s("librarian/kb/proposed-entry")], &writer)
+        .await;
+    assert!(!read_denied.message().contains("dismissed_reply_token"), "{}", read_denied.message());
+
+    let show_dismissed = d.dispatch(&[s("ledger"), s("show"), reply_ask], &lib).await;
+    assert!(show_dismissed.message().contains("board:      dismissed"), "{}", show_dismissed.message());
+    assert!(show_dismissed.message().contains("off topic"), "{}", show_dismissed.message());
+}
+
+#[tokio::test]
+async fn promote_copies_visible_posts_sets_promoted_from_and_respects_curated_policy() {
+    let d = test_dispatcher().await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let lib_id = create_character(&d, "librarian", false).await;
+    let dev_id = create_character(&d, "dev", false).await;
+
+    let lib_ctx = register_bound_context(&d, "lib-ctx", lib_id, Some(root_ctx), &senpai_binding());
+    let dev_ctx = register_bound_context(&d, "dev-ctx", dev_id, Some(root_ctx), &worker_binding());
+    let lib = caller_as(lib_id, Some(lib_ctx));
+    let dev = caller_as(dev_id, Some(dev_ctx));
+
+    assert!(
+        d.dispatch(&[s("board"), s("create"), s("kb"), s("--policy"), s("curated")], &lib)
+            .await
+            .is_ok()
+    );
+
+    // Create a scratch topic on dev's context board with 3 posts, hiding post #2.
+    let src_post = d
+        .dispatch(
+            &[
+                s("board"),
+                s("post"),
+                s("."),
+                s("--title"),
+                s("WAL Checkpoints"),
+                s("--tag"),
+                s("sqlite"),
+                s("Opening finding about WAL."),
+            ],
+            &dev,
+        )
+        .await;
+    assert!(src_post.is_ok(), "{}", src_post.message());
+    let KjResult::Ok { data: Some(src_data), .. } = src_post else {
+        panic!("expected source data");
+    };
+    let src_doc_id = ContextId::parse(src_data["document_id"].as_str().unwrap()).unwrap();
+
+    assert!(
+        d.dispatch(&[s("board"), s("reply"), s("./wal-checkpoints"), s("secret noise to hide")], &dev)
+            .await
+            .is_ok()
+    );
+    assert!(
+        d.dispatch(&[s("board"), s("reply"), s("./wal-checkpoints"), s("Confirmed fix in pragma.")], &dev)
+            .await
+            .is_ok()
+    );
+    assert!(
+        d.dispatch(&[s("board"), s("hide"), s("./wal-checkpoints#2")], &dev)
+            .await
+            .is_ok()
+    );
+
+    // Dev promotes to curated `librarian/kb` -> held + ask + `promoted_from` recorded.
+    let promoted = d
+        .dispatch(
+            &[
+                s("board"),
+                s("promote"),
+                s("./wal-checkpoints"),
+                s("--to"),
+                s("librarian/kb"),
+                s("--title"),
+                s("SQLite WAL Guide"),
+            ],
+            &dev,
+        )
+        .await;
+    assert!(promoted.is_ok(), "promote failed: {}", promoted.message());
+    let KjResult::Ok { data: Some(p_data), .. } = promoted else {
+        panic!("expected promote data");
+    };
+    assert_eq!(p_data["held"], true);
+    assert_eq!(p_data["promoted_from"], src_doc_id.to_hex());
+    let promoted_doc_id = ContextId::parse(p_data["document_id"].as_str().unwrap()).unwrap();
+    let ask_id = p_data["ask_id"].as_str().unwrap().to_string();
+
+    let topic_row = d.kernel_db().lock().get_topic(promoted_doc_id).unwrap().unwrap();
+    assert_eq!(topic_row.promoted_from, Some(src_doc_id));
+    assert_eq!(topic_row.tags, vec!["sqlite".to_string()]);
+
+    // Librarian allows the promoted entry -> visible digest includes #1 and #3, excludes hidden #2.
+    assert!(d.dispatch(&[s("ledger"), s("allow"), ask_id], &lib).await.is_ok());
+    let read = d
+        .dispatch(&[s("board"), s("read"), s("librarian/kb/sqlite-wal-guide")], &dev)
+        .await;
+    assert!(read.is_ok(), "{}", read.message());
+    let body = read.message();
+    assert!(body.contains("Opening finding about WAL."), "{body}");
+    assert!(body.contains("Confirmed fix in pragma."), "{body}");
+    assert!(!body.contains("secret noise to hide"), "hidden post must not be promoted:\n{body}");
+
+    // `--summarize` without a configured `distill` slot fails loudly.
+    let no_distill = d
+        .dispatch(
+            &[
+                s("board"),
+                s("promote"),
+                s("./wal-checkpoints"),
+                s("--to"),
+                s("librarian/kb"),
+                s("--summarize"),
+            ],
+            &dev,
+        )
+        .await;
+    assert!(!no_distill.is_ok(), "--summarize must fail when no distill slot is configured");
+    assert!(
+        no_distill.message().contains("distill"),
+        "error should name the missing distill slot: {}",
+        no_distill.message()
+    );
+}
+
+#[tokio::test]
+async fn promote_summarize_uses_caller_distill_slot() {
+    let d = test_dispatcher().await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let dev_id = create_character(&d, "dev", false).await;
+
+    // Register a mock backend and bind it to dev's `distill` slot before creating dev_ctx.
+    let admin = super::super::test_helpers::test_caller();
+    {
+        let db = d.kernel_db().lock();
+        crate::test_backends::example_backends(&db);
+    }
+    let set_slot = d
+        .dispatch(
+            &[
+                s("character"),
+                s("slot"),
+                s("set"),
+                s("dev"),
+                s("distill"),
+                s("anthropic/claude-haiku-4-5"),
+                s("--max-tokens"),
+                s("512"),
+            ],
+            &admin,
+        )
+        .await;
+    assert!(set_slot.is_ok(), "character slot set failed: {}", set_slot.message());
+
+    let dev_ctx = ContextId::new();
+    {
+        let mut db = d.kernel_db().lock();
+        let ws = db.get_or_create_default_workspace(dev_id).unwrap();
+        let row = ContextRow {
+            context_id: dev_ctx,
+            label: Some("dev-ctx".to_string()),
+            system_prompt: None,
+            context_state: ContextState::Live,
+            created_at: now_millis() as i64,
+            created_by: dev_id,
+            forked_from: None,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+            concluded_at: None,
+            last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            origin_host: None,
+            performer: None,
+            senpai_ctx: Some(root_ctx),
+            persona: None,
+            board_id: None,
+        };
+        db.insert_placed_context(&row, ws).unwrap();
+        db.upsert_context_binding(dev_ctx, &worker_binding()).unwrap();
+        db.write_context_character(dev_ctx, dev_id, Some(root_ctx), None).unwrap();
+    }
+    let dev = caller_as(dev_id, Some(dev_ctx));
+    {
+        let mut llm = d.kernel().llm().write().await;
+        llm.register(
+            "anthropic",
+            Arc::new(crate::llm::Provider::Mock(crate::llm::MockClient::new(
+                "## Distilled Summary\n- Key finding preserved.",
+            ))),
+        );
+    }
+
+    assert!(d.dispatch(&[s("board"), s("create"), s("memory")], &dev).await.is_ok());
+    assert!(
+        d.dispatch(
+            &[s("board"), s("post"), s("."), s("--title"), s("Raw Notes"), s("Long raw discussion.")],
+            &dev,
+        )
+        .await
+        .is_ok()
+    );
+
+    let promoted = d
+        .dispatch(
+            &[
+                s("board"),
+                s("promote"),
+                s("./raw-notes"),
+                s("--to"),
+                s("memory"),
+                s("--summarize"),
+            ],
+            &dev,
+        )
+        .await;
+    assert!(promoted.is_ok(), "promote --summarize failed: {}", promoted.message());
+
+    let read = d.dispatch(&[s("board"), s("read"), s("memory/raw-notes")], &dev).await;
+    assert!(read.is_ok(), "{}", read.message());
+    assert!(
+        read.message().contains("Key finding preserved."),
+        "expected distilled summary:\n{}",
+        read.message()
+    );
+}
+
+#[tokio::test]
+async fn open_board_rate_nudge_refuses_flood_per_character() {
+    let d = test_dispatcher().await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let alice_id = create_character(&d, "alice", false).await;
+    let bob_id = create_character(&d, "bob", false).await;
+    let alice_ctx = register_bound_context(&d, "alice-ctx", alice_id, Some(root_ctx), &worker_binding());
+    let bob_ctx = register_bound_context(&d, "bob-ctx", bob_id, Some(root_ctx), &worker_binding());
+    let alice = caller_as(alice_id, Some(alice_ctx));
+    let bob = caller_as(bob_id, Some(bob_ctx));
+
+    d.board_rate_limiter().configure(3, 60_000);
+    assert!(d.dispatch(&[s("board"), s("create"), s("chat")], &alice).await.is_ok());
+
+    for i in 1..=3 {
+        let res = d
+            .dispatch(
+                &[s("board"), s("post"), s("alice/chat"), s("--title"), format!("Post {i}"), s("hi")],
+                &alice,
+            )
+            .await;
+        assert!(res.is_ok(), "post {i} should succeed: {}", res.message());
+    }
+
+    // 4th post by alice hits the rate limit loudly.
+    let flood = d
+        .dispatch(
+            &[s("board"), s("post"), s("alice/chat"), s("--title"), s("Post 4"), s("flood")],
+            &alice,
+        )
+        .await;
+    assert!(!flood.is_ok(), "4th post must be refused by rate limiter");
+    assert!(
+        flood.message().contains("3 posts per 60s"),
+        "rate limit error must name the limit: {}",
+        flood.message()
+    );
+
+    // Bob has his own window on the same board and succeeds.
+    let bob_post = d
+        .dispatch(
+            &[s("board"), s("post"), s("alice/chat"), s("--title"), s("Bob Post"), s("ok")],
+            &bob,
+        )
+        .await;
+    assert!(bob_post.is_ok(), "bob should not be rate-limited by alice: {}", bob_post.message());
+}
+
+#[tokio::test]
+async fn gate_toml_overrides_curated_and_open_board_policies() {
+    use crate::vfs::VfsOps;
+
+    let d = test_dispatcher().await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let lib_id = create_character(&d, "librarian", false).await;
+    let trusted_id = create_character(&d, "trusted", false).await;
+    let noisy_id = create_character(&d, "noisy", false).await;
+
+    let lib_ctx = register_bound_context(&d, "lib-ctx", lib_id, Some(root_ctx), &senpai_binding());
+    let trusted_ctx = register_bound_context(&d, "trusted-ctx", trusted_id, Some(root_ctx), &worker_binding());
+    let noisy_ctx = register_bound_context(&d, "noisy-ctx", noisy_id, Some(root_ctx), &worker_binding());
+
+    let lib = caller_as(lib_id, Some(lib_ctx));
+    let trusted = caller_as(trusted_id, Some(trusted_ctx));
+    let noisy = caller_as(noisy_id, Some(noisy_ctx));
+
+    assert!(
+        d.dispatch(&[s("board"), s("create"), s("kb"), s("--policy"), s("curated")], &lib)
+            .await
+            .is_ok()
+    );
+    assert!(
+        d.dispatch(&[s("board"), s("create"), s("open-room"), s("--policy"), s("open")], &lib)
+            .await
+            .is_ok()
+    );
+
+    // Write gate.toml: allow `trusted` direct publish to curated boards, deny `noisy` on open boards (puts into held-ask path).
+    let gate_toml = r#"
+[character.trusted]
+allow = ["kj board post", "kj board reply"]
+
+[character.noisy]
+deny = ["kj board post"]
+"#;
+    let gate_path = kaijutsu_types::paths::config_path(crate::kj::gate_policy::GATE_CONFIG_FILE);
+    d.kernel()
+        .vfs()
+        .write_all(std::path::Path::new(&gate_path), gate_toml.as_bytes())
+        .await
+        .expect("write gate.toml");
+
+    // `trusted` publishes directly to curated `librarian/kb` without an ask.
+    let trusted_post = d
+        .dispatch(
+            &[s("board"), s("post"), s("librarian/kb"), s("--title"), s("Trusted Note"), s("direct")],
+            &trusted,
+        )
+        .await;
+    assert!(trusted_post.is_ok(), "{}", trusted_post.message());
+    if let KjResult::Ok { data: Some(ref v), .. } = trusted_post {
+        assert_eq!(v["held"], false, "gate.toml allow must publish directly to curated board");
+    } else {
+        panic!("expected data");
+    }
+
+    // `noisy` posting to open `librarian/open-room` is held with a ledger ask.
+    let noisy_post = d
+        .dispatch(
+            &[s("board"), s("post"), s("librarian/open-room"), s("--title"), s("Noisy Post"), s("held on open")],
+            &noisy,
+        )
+        .await;
+    assert!(noisy_post.is_ok(), "{}", noisy_post.message());
+    let KjResult::Ok { data: Some(noisy_data), .. } = noisy_post else {
+        panic!("expected data");
+    };
+    assert_eq!(noisy_data["held"], true, "gate.toml deny on open board must hold post");
+    let ask_id = noisy_data["ask_id"].as_str().unwrap().to_string();
+
+    // Board owner can release it via `kj ledger allow`.
+    assert!(d.dispatch(&[s("ledger"), s("allow"), ask_id], &lib).await.is_ok());
+    let read = d
+        .dispatch(&[s("board"), s("read"), s("librarian/open-room/noisy-post")], &lib)
+        .await;
+    assert!(read.message().contains("held on open"), "{}", read.message());
 }

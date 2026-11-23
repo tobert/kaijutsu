@@ -81,6 +81,9 @@ pub enum Origin {
     /// The provider declined a context's request; approval lifts the
     /// hold and resumes the context, and never executes source.
     Refusal,
+    /// A held post on a curated board waits for the board's reviewer;
+    /// approval releases the post block and never executes source.
+    Board,
 }
 
 impl Origin {
@@ -92,6 +95,7 @@ impl Origin {
             Self::KjVerb => "kj_verb",
             Self::Drift => "drift",
             Self::Refusal => "refusal",
+            Self::Board => "board",
         }
     }
 }
@@ -841,7 +845,7 @@ mod tests {
         for v in [PairOwner::Turn, PairOwner::Session] {
             assert_eq!(PairOwner::from_str(v.as_str()).unwrap(), v);
         }
-        for v in [Origin::Hook, Origin::ShellGate, Origin::KjVerb, Origin::Drift, Origin::Refusal] {
+        for v in [Origin::Hook, Origin::ShellGate, Origin::KjVerb, Origin::Drift, Origin::Refusal, Origin::Board] {
             assert_eq!(Origin::from_str(v.as_str()).unwrap(), v);
         }
         for v in [

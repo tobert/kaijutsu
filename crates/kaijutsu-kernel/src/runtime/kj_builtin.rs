@@ -721,6 +721,7 @@ fn is_distill_verb(argv: &[String]) -> bool {
         (Some("fork"), _) => has("--compact"),
         (Some("drift"), Some("pull")) | (Some("drift"), Some("merge")) => true,
         (Some("drift"), Some("push")) => has("--summarize"),
+        (Some("board"), Some("promote")) => has("--summarize"),
         _ => false,
     }
 }

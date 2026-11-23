@@ -473,6 +473,8 @@ enum AskOrigin {
   drift @4;
   # A refused context waits for its reviewer; an allow sends its work again.
   refusal @5;
+  # A held post on a curated board waits for the board's reviewer; never runs source.
+  board @6;
 }
 
 # A principal and the name its character sheet gives it now.

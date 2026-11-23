@@ -5,7 +5,7 @@
 //! `.senpai`). Each topic is a `DocKind::Topic` document in `BlockStore` paired
 //! with a `board_topics` row in `KernelDb`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
@@ -16,14 +16,136 @@ use kaijutsu_types::{
 use regex::Regex;
 
 use super::effect::{Classify, Effect};
+use super::gate_policy::ConfigTierOverride;
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::kernel_db::{BoardRow, BoardTopicRow, CharacterRow, KernelDb};
 
 /// Maximum post size in bytes (32 KiB).
 pub(crate) const MAX_POST_BYTES: usize = 32 * 1024;
 
+/// Default sliding-window rate limit on `open` boards: posts per character per board.
+pub(crate) const DEFAULT_BOARD_RATE_LIMIT: usize = 20;
+
+/// Default sliding-window duration on `open` boards (60 seconds).
+pub(crate) const DEFAULT_BOARD_RATE_WINDOW_MS: i64 = 60_000;
+
 /// Maximum preview length (in Unicode scalar values) for backref headers.
 const BACKREF_PREVIEW_CHARS: usize = 60;
+
+/// Per-character sliding-window rate limiter for `open` boards.
+pub(crate) struct BoardRateLimiter {
+    inner: parking_lot::Mutex<BoardRateState>,
+}
+
+struct BoardRateState {
+    limit: usize,
+    window_ms: i64,
+    history: HashMap<(BoardId, PrincipalId), VecDeque<i64>>,
+}
+
+impl Default for BoardRateLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_BOARD_RATE_LIMIT, DEFAULT_BOARD_RATE_WINDOW_MS)
+    }
+}
+
+impl BoardRateLimiter {
+    pub(crate) fn new(limit: usize, window_ms: i64) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(BoardRateState {
+                limit,
+                window_ms,
+                history: HashMap::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure(&self, limit: usize, window_ms: i64) {
+        let mut state = self.inner.lock();
+        state.limit = limit;
+        state.window_ms = window_ms;
+        state.history.clear();
+    }
+
+    pub(crate) fn check_and_record(
+        &self,
+        board_id: BoardId,
+        principal_id: PrincipalId,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let mut state = self.inner.lock();
+        let limit = state.limit;
+        let window_ms = state.window_ms;
+        let cutoff = now_ms.saturating_sub(window_ms);
+        let entries = state.history.entry((board_id, principal_id)).or_default();
+        while entries.front().is_some_and(|&ts| ts < cutoff) {
+            entries.pop_front();
+        }
+        if entries.len() >= limit {
+            let secs = (window_ms / 1000).max(1);
+            return Err(format!(
+                "rate limit exceeded: at most {limit} posts per {secs}s per character on an open board"
+            ));
+        }
+        entries.push_back(now_ms);
+        Ok(())
+    }
+}
+
+/// Settle an answered `Origin::Board` ask: an allow releases the held post
+/// (`Status::Done`, `excluded = false`, emitting `StatusChanged` for the
+/// semantic index and updating `board_topics.last_post_at`), while a denial or
+/// cancellation dismisses it (`Status::Done`, keeping `excluded = true`).
+/// Idempotent if already settled.
+pub(crate) fn settle_board_post_answer(
+    kernel: &crate::Kernel,
+    request_id: &str,
+    allowed: bool,
+) -> Result<(), String> {
+    let post = kernel
+        .kernel_db()
+        .lock()
+        .approval_board_post(request_id)
+        .map_err(|e| format!("could not read the board ask's post: {e}"))?
+        .ok_or_else(|| format!("board ask {request_id} records no post"))?;
+    let blocks = kernel.blocks();
+    if !blocks.contains(post.document_id) {
+        blocks
+            .load_one_from_db(post.document_id)
+            .map_err(|e| format!("could not load topic {}: {e}", post.document_id.short()))?;
+    }
+    let held = blocks
+        .get_block_snapshot(post.document_id, &post.block_id)
+        .map_err(|e| format!("could not read the board post block: {e}"))?
+        .is_some_and(|b| b.status == Status::Pending && b.excluded);
+    if held {
+        blocks
+            .settle_held_board_post(post.document_id, &post.block_id, allowed)
+            .map_err(|e| format!("could not settle the held board post: {e}"))?;
+        if allowed {
+            let visible_count = blocks
+                .non_draft_snapshots(post.document_id)
+                .map(|snaps| snaps.iter().filter(|b| !b.excluded).count() as i64)
+                .unwrap_or(1);
+            kernel
+                .kernel_db()
+                .lock()
+                .update_topic_on_post_release(
+                    post.document_id,
+                    visible_count,
+                    now_millis() as i64,
+                )
+                .map_err(|e| format!("could not update topic stats on release: {e}"))?;
+        }
+    }
+    kernel
+        .kernel_db()
+        .lock()
+        .redeem_ask(request_id)
+        .map_err(|e| format!("could not spend the board ask's answer: {e}"))?;
+    Ok(())
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,6 +181,9 @@ enum BoardCommand {
         /// Maximum number of topics to return. Default 20.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Include topics whose posts are all hidden or held pending review.
+        #[arg(long = "include-hidden")]
+        include_hidden: bool,
     },
     /// Read posts in a topic, numbered #1, #2, ... in log order.
     Read {
@@ -85,6 +210,9 @@ enum BoardCommand {
         /// Maximum number of topics to return. Default 20.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Include topics whose posts are all hidden or held pending review.
+        #[arg(long = "include-hidden")]
+        include_hidden: bool,
     },
     /// Search non-archived topics by regex (default) or semantic similarity.
     Search {
@@ -204,6 +332,20 @@ enum BoardCommand {
         /// Post ref: '<topic>#<n>' (1-based post number).
         post: String,
     },
+    /// Promote a topic to another board, copying its visible posts or distilling them with --summarize.
+    Promote {
+        /// Source topic ref to promote.
+        topic: String,
+        /// Target board ref (lazily creates a context board for . or .senpai).
+        #[arg(long)]
+        to: String,
+        /// Title for the promoted topic (defaults to the source topic's title).
+        #[arg(long)]
+        title: Option<String>,
+        /// Distill the source topic using the caller's `distill` slot instead of copying posts verbatim.
+        #[arg(long)]
+        summarize: bool,
+    },
 }
 
 impl Classify for BoardArgs {
@@ -232,7 +374,8 @@ impl Classify for BoardCommand {
             | Self::Lock { .. }
             | Self::Unlock { .. }
             | Self::Hide { .. }
-            | Self::Unhide { .. } => Effect::Write,
+            | Self::Unhide { .. }
+            | Self::Promote { .. } => Effect::Write,
         }
     }
 }
@@ -265,14 +408,14 @@ impl KjDispatcher {
 
         match parsed.command {
             BoardCommand::List { character } => self.board_list(character.as_deref(), caller),
-            BoardCommand::Topics { board, status, tag, limit } => {
-                self.board_topics(&board, status.as_deref(), tag.as_deref(), limit, caller)
+            BoardCommand::Topics { board, status, tag, limit, include_hidden } => {
+                self.board_topics(&board, status.as_deref(), tag.as_deref(), limit, include_hidden, caller)
             }
             BoardCommand::Read { topic, tail, after, include_hidden } => {
                 self.board_read(&topic, tail, after, include_hidden, caller)
             }
-            BoardCommand::Recent { board, since, limit } => {
-                self.board_recent(board.as_deref(), &since, limit, caller)
+            BoardCommand::Recent { board, since, limit, include_hidden } => {
+                self.board_recent(board.as_deref(), &since, limit, include_hidden, caller)
             }
             BoardCommand::Search { query, board, semantic, regex: _, limit } => {
                 self.board_search(&query, board.as_deref(), semantic, limit, caller).await
@@ -285,11 +428,11 @@ impl KjDispatcher {
             }
             BoardCommand::Post { board, title, tags, content, body } => {
                 let text = resolve_body_text(&body, content.as_deref());
-                self.board_post(&board, &title, tags, &text, caller)
+                self.board_post(&board, &title, tags, &text, caller).await
             }
             BoardCommand::Reply { topic, to, content, body } => {
                 let text = resolve_body_text(&body, content.as_deref());
-                self.board_reply(&topic, to, &text, caller)
+                self.board_reply(&topic, to, &text, caller).await
             }
             BoardCommand::Resolve { topic } => {
                 self.board_set_topic_status(&topic, TopicStatus::Resolved, "resolve", caller)
@@ -308,6 +451,9 @@ impl KjDispatcher {
             BoardCommand::Unlock { topic } => self.board_set_topic_locked(&topic, false, caller),
             BoardCommand::Hide { post } => self.board_set_post_hidden(&post, true, caller),
             BoardCommand::Unhide { post } => self.board_set_post_hidden(&post, false, caller),
+            BoardCommand::Promote { topic, to, title, summarize } => {
+                self.board_promote(&topic, &to, title.as_deref(), summarize, caller).await
+            }
         }
     }
 
@@ -386,35 +532,47 @@ impl KjDispatcher {
         status: Option<&str>,
         tag: Option<&str>,
         limit: usize,
+        include_hidden: bool,
         caller: &KjCaller,
     ) -> KjResult {
-        let db = self.kernel_db().lock();
-        let board = match self.resolve_board_read(board_ref, caller, &db) {
-            Ok(ReadBoard::Found(b)) => b,
-            Ok(ReadBoard::UncreatedContextBoard) => {
-                return KjResult::ok_with_data("(no topics)", serde_json::Value::Array(Vec::new()));
+        let mut topics = {
+            let db = self.kernel_db().lock();
+            let board = match self.resolve_board_read(board_ref, caller, &db) {
+                Ok(ReadBoard::Found(b)) => b,
+                Ok(ReadBoard::UncreatedContextBoard) => {
+                    return KjResult::ok_with_data("(no topics)", serde_json::Value::Array(Vec::new()));
+                }
+                Err(e) => return KjResult::Err(format!("kj board topics: {e}")),
+            };
+
+            let (status_filter, exclude_archived) = match status {
+                None => (None, true),
+                Some("all") => (None, false),
+                Some(s) => match TopicStatus::from_str(s) {
+                    Ok(st) => (Some(st), false),
+                    Err(_) => return KjResult::Err(format!("kj board topics: unknown status '{s}'")),
+                },
+            };
+
+            let query_limit = if exclude_archived || !include_hidden {
+                None
+            } else {
+                Some(limit)
+            };
+            let mut rows = match db.list_topics(board.board_id, status_filter, tag, query_limit) {
+                Ok(rows) => rows,
+                Err(e) => return KjResult::Err(format!("kj board topics: {e}")),
+            };
+            if exclude_archived {
+                rows.retain(|t| t.status != TopicStatus::Archived);
             }
-            Err(e) => return KjResult::Err(format!("kj board topics: {e}")),
+            rows
         };
 
-        let (status_filter, exclude_archived) = match status {
-            None => (None, true),
-            Some("all") => (None, false),
-            Some(s) => match TopicStatus::from_str(s) {
-                Ok(st) => (Some(st), false),
-                Err(_) => return KjResult::Err(format!("kj board topics: unknown status '{s}'")),
-            },
-        };
-
-        let query_limit = if exclude_archived { None } else { Some(limit) };
-        let mut topics = match db.list_topics(board.board_id, status_filter, tag, query_limit) {
-            Ok(rows) => rows,
-            Err(e) => return KjResult::Err(format!("kj board topics: {e}")),
-        };
-        if exclude_archived {
-            topics.retain(|t| t.status != TopicStatus::Archived);
-            topics.truncate(limit);
+        if !include_hidden {
+            topics.retain(|t| self.topic_has_visible_posts(t.document_id));
         }
+        topics.truncate(limit);
 
         if topics.is_empty() {
             return KjResult::ok_with_data("(no topics)", serde_json::Value::Array(Vec::new()));
@@ -564,6 +722,7 @@ impl KjDispatcher {
         board_ref: Option<&str>,
         since: &str,
         limit: usize,
+        include_hidden: bool,
         caller: &KjCaller,
     ) -> KjResult {
         let duration_ms = match parse_duration_ms(since) {
@@ -572,27 +731,36 @@ impl KjDispatcher {
         };
         let since_ms = (now_millis() as i64).saturating_sub(duration_ms);
 
-        let db = self.kernel_db().lock();
-        let board_filter = match board_ref {
-            Some(r) => match self.resolve_board_read(r, caller, &db) {
-                Ok(ReadBoard::Found(b)) => Some(b.board_id),
-                Ok(ReadBoard::UncreatedContextBoard) => {
-                    return KjResult::ok_with_data("(no recent topics)", serde_json::Value::Array(Vec::new()));
-                }
+        let mut topics = {
+            let db = self.kernel_db().lock();
+            let board_filter = match board_ref {
+                Some(r) => match self.resolve_board_read(r, caller, &db) {
+                    Ok(ReadBoard::Found(b)) => Some(b.board_id),
+                    Ok(ReadBoard::UncreatedContextBoard) => {
+                        return KjResult::ok_with_data("(no recent topics)", serde_json::Value::Array(Vec::new()));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj board recent: {e}")),
+                },
+                None => None,
+            };
+
+            let query_limit = if include_hidden { Some(limit) } else { None };
+            match db.list_recent_topics(board_filter, Some(since_ms), query_limit) {
+                Ok(rows) => rows,
                 Err(e) => return KjResult::Err(format!("kj board recent: {e}")),
-            },
-            None => None,
+            }
         };
 
-        let topics = match db.list_recent_topics(board_filter, Some(since_ms), Some(limit)) {
-            Ok(rows) => rows,
-            Err(e) => return KjResult::Err(format!("kj board recent: {e}")),
-        };
+        if !include_hidden {
+            topics.retain(|t| self.topic_has_visible_posts(t.document_id));
+        }
+        topics.truncate(limit);
 
         if topics.is_empty() {
             return KjResult::ok_with_data("(no recent topics)", serde_json::Value::Array(Vec::new()));
         }
 
+        let db = self.kernel_db().lock();
         let mut board_labels: HashMap<BoardId, String> = HashMap::new();
         let mut lines = Vec::with_capacity(topics.len());
         let mut ids = Vec::with_capacity(topics.len());
@@ -902,7 +1070,7 @@ impl KjDispatcher {
         )
     }
 
-    fn board_post(
+    async fn board_post(
         &self,
         board_ref: &str,
         title: &str,
@@ -928,47 +1096,203 @@ impl KjDispatcher {
                 MAX_POST_BYTES,
             ));
         }
+        self.create_board_topic_post(board_ref, title, tags, text, None, "post", caller)
+            .await
+    }
 
-        let (board, slug, board_label) = {
+    async fn board_promote(
+        &self,
+        source_ref: &str,
+        to_board: &str,
+        title_override: Option<&str>,
+        summarize: bool,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let (source_topic, source_board_label) = {
+            let db = self.kernel_db().lock();
+            let topic = match self.resolve_topic(source_ref, caller, &db) {
+                Ok(t) => t,
+                Err(e) => return KjResult::Err(format!("kj board promote: {e}")),
+            };
+            let label = format_board_label(&db, topic.board_id);
+            (topic, label)
+        };
+
+        let target_title = title_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&source_topic.title)
+            .to_string();
+        if let Some(raw) = title_override
+            && raw.trim().is_empty()
+        {
+            return KjResult::Err("kj board promote: --title must not be empty".to_string());
+        }
+
+        let all_blocks = match self.block_store().non_draft_snapshots(source_topic.document_id) {
+            Ok(b) => b,
+            Err(e) => return KjResult::Err(format!("kj board promote: {e}")),
+        };
+        let visible_indexed: Vec<(usize, BlockSnapshot)> = all_blocks
+            .into_iter()
+            .enumerate()
+            .filter(|(_, b)| !b.excluded)
+            .map(|(i, b)| (i + 1, b))
+            .collect();
+        if visible_indexed.is_empty() {
+            return KjResult::Err(format!(
+                "kj board promote: source topic '{}' has no visible posts to promote",
+                source_topic.slug
+            ));
+        }
+
+        let provenance = format!(
+            "_Promoted from `{source_board_label}/{}` ({})_\n\n",
+            source_topic.slug,
+            source_topic.document_id.short()
+        );
+
+        let body = if summarize {
+            let Some(caller_ctx) = caller.context_id else {
+                return KjResult::Err(
+                    "kj board promote --summarize: requires an active context with a configured `distill` slot"
+                        .to_string(),
+                );
+            };
+            let visible_blocks: Vec<BlockSnapshot> =
+                visible_indexed.into_iter().map(|(_, b)| b).collect();
+            let summary = match self
+                .summarize_board_topic(caller_ctx, visible_blocks, &source_topic.title)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => return KjResult::Err(format!("kj board promote --summarize: {e}")),
+            };
+            format!("{provenance}{summary}")
+        } else {
+            let db = self.kernel_db().lock();
+            let mut out = provenance;
+            for (idx, (post_num, snap)) in visible_indexed.iter().enumerate() {
+                if idx > 0 {
+                    out.push('\n');
+                }
+                let author = db.name_for(snap.author());
+                out.push_str(&format!("### #{post_num} @{author}\n\n"));
+                out.push_str(&snap.content);
+                if !snap.content.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            out.trim_end().to_string()
+        };
+
+        if body.len() > MAX_POST_BYTES {
+            return KjResult::Err(format!(
+                "kj board promote: promoted body is {} bytes, exceeding the {} KiB limit ({} bytes); pass --summarize to distill it",
+                body.len(),
+                MAX_POST_BYTES / 1024,
+                MAX_POST_BYTES,
+            ));
+        }
+
+        self.create_board_topic_post(
+            to_board,
+            &target_title,
+            source_topic.tags,
+            &body,
+            Some(source_topic.document_id),
+            "promote",
+            caller,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_board_topic_post(
+        &self,
+        board_ref: &str,
+        title: &str,
+        tags: Vec<String>,
+        text: &str,
+        promoted_from: Option<ContextId>,
+        verb: &str,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let gate_config = match crate::kj::gate_policy::load_config(
+            self.kernel().vfs(),
+            self.kernel_db(),
+        )
+        .await
+        {
+            Ok(cfg) => cfg,
+            Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
+        };
+
+        let (board, slug, board_label, decision) = {
             let db = self.kernel_db().lock();
             let board = match self.resolve_board_write(board_ref, caller, &db) {
                 Ok(b) => b,
-                Err(e) => return KjResult::Err(format!("kj board post: {e}")),
+                Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
             };
             if board.archived_at.is_some() {
                 return KjResult::Err(format!(
-                    "kj board post: board '{}' is archived and read-only",
+                    "kj board {verb}: board '{}' is archived and read-only",
                     format_board_label(&db, board.board_id)
                 ));
             }
-            if let Err(e) = self.publish_or_hold_post(&board, caller, "post", &db) {
-                return KjResult::Err(e);
-            }
+            let decision = match self.publish_or_hold_post(&board, caller, verb, &gate_config, &db) {
+                Ok(d) => d,
+                Err(e) => return KjResult::Err(e),
+            };
             let slug = match unique_topic_slug(&db, board.board_id, title) {
                 Ok(s) => s,
-                Err(e) => return KjResult::Err(format!("kj board post: {e}")),
+                Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
             };
             let label = format_board_label(&db, board.board_id);
-            (board, slug, label)
-        };
-
-        let doc_id = ContextId::new();
-        let block_id = match self.block_store().create_document_with_block(
-            doc_id,
-            caller.actor_id,
-            DocKind::Topic,
-            None,
-            Role::User,
-            BlockKind::Text,
-            text.to_string(),
-            Status::Done,
-            ContentType::Markdown,
-        ) {
-            Ok(id) => id,
-            Err(e) => return KjResult::Err(format!("kj board post: {e}")),
+            (board, slug, label, decision)
         };
 
         let now = now_millis() as i64;
+        if board.write_policy == BoardWritePolicy::Open
+            && matches!(decision, WriteDecision::PublishDirect)
+            && let Err(e) = self
+                .board_rate_limiter()
+                .check_and_record(board.board_id, caller.actor_id, now)
+        {
+            return KjResult::Err(format!("kj board {verb}: {e}"));
+        }
+
+        let doc_id = ContextId::new();
+        let block_id = match decision {
+            WriteDecision::PublishDirect => self.block_store().create_document_with_block(
+                doc_id,
+                caller.actor_id,
+                DocKind::Topic,
+                None,
+                Role::User,
+                BlockKind::Text,
+                text.to_string(),
+                Status::Done,
+                ContentType::Markdown,
+            ),
+            WriteDecision::HoldForReview { .. } => {
+                self.block_store().create_document_with_held_block(
+                    doc_id,
+                    caller.actor_id,
+                    DocKind::Topic,
+                    None,
+                    Role::User,
+                    BlockKind::Text,
+                    text.to_string(),
+                    ContentType::Markdown,
+                )
+            }
+        };
+        let block_id = match block_id {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
+        };
+
         let topic_row = BoardTopicRow {
             document_id: doc_id,
             board_id: board.board_id,
@@ -977,22 +1301,72 @@ impl KjDispatcher {
             status: TopicStatus::Open,
             locked: false,
             tags,
-            promoted_from: None,
+            promoted_from,
             created_by: caller.actor_id,
             created_at: now,
             last_post_at: now,
             post_count: 1,
         };
         if let Err(e) = self.kernel_db().lock().insert_topic(&topic_row) {
-            return KjResult::Err(format!("kj board post: {e}"));
+            return KjResult::Err(format!("kj board {verb}: {e}"));
         }
 
+        if let WriteDecision::HoldForReview { reviewer } = decision {
+            let ask_id = match self.open_board_post_ask(
+                &board,
+                &board_label,
+                doc_id,
+                &slug,
+                title,
+                block_id,
+                text,
+                verb,
+                caller,
+                reviewer,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Err(dismiss) =
+                        self.block_store().settle_held_board_post(doc_id, &block_id, false)
+                    {
+                        tracing::error!(
+                            block = %block_id.to_key(),
+                            "could not dismiss held board post with no ask: {dismiss}"
+                        );
+                    }
+                    return KjResult::Err(format!(
+                        "kj board {verb}: could not hold post for review: {e}"
+                    ));
+                }
+            };
+            return KjResult::ok_with_data(
+                format!(
+                    "held {verb} on '{board_label}/{slug}' ({}) #1 for review (ask '{ask_id}'); release with `kj ledger allow '{ask_id}'`",
+                    doc_id.short()
+                ),
+                serde_json::json!({
+                    "held": true,
+                    "ask_id": ask_id,
+                    "document_id": doc_id.to_hex(),
+                    "short_id": doc_id.short(),
+                    "board_id": board.board_id.to_hex(),
+                    "slug": slug,
+                    "title": title,
+                    "block_id": block_id.to_key(),
+                    "post_number": 1,
+                    "promoted_from": promoted_from.map(|id| id.to_hex()),
+                }),
+            );
+        }
+
+        let verb_past = if verb == "promote" { "promoted" } else { "posted" };
         KjResult::ok_with_data(
             format!(
-                "posted topic '{board_label}/{slug}' ({}) #1",
+                "{verb_past} topic '{board_label}/{slug}' ({}) #1",
                 doc_id.short()
             ),
             serde_json::json!({
+                "held": false,
                 "document_id": doc_id.to_hex(),
                 "short_id": doc_id.short(),
                 "board_id": board.board_id.to_hex(),
@@ -1000,11 +1374,12 @@ impl KjDispatcher {
                 "title": title,
                 "block_id": block_id.to_key(),
                 "post_number": 1,
+                "promoted_from": promoted_from.map(|id| id.to_hex()),
             }),
         )
     }
 
-    fn board_reply(
+    async fn board_reply(
         &self,
         topic_ref: &str,
         to: Option<usize>,
@@ -1026,7 +1401,17 @@ impl KjDispatcher {
             ));
         }
 
-        let (topic, board_label) = {
+        let gate_config = match crate::kj::gate_policy::load_config(
+            self.kernel().vfs(),
+            self.kernel_db(),
+        )
+        .await
+        {
+            Ok(cfg) => cfg,
+            Err(e) => return KjResult::Err(format!("kj board reply: {e}")),
+        };
+
+        let (board, topic, board_label, decision) = {
             let db = self.kernel_db().lock();
             let topic = match self.resolve_topic(topic_ref, caller, &db) {
                 Ok(t) => t,
@@ -1062,11 +1447,12 @@ impl KjDispatcher {
                     topic.slug
                 ));
             }
-            if let Err(e) = self.publish_or_hold_post(&board, caller, "reply", &db) {
-                return KjResult::Err(e);
-            }
+            let decision = match self.publish_or_hold_post(&board, caller, "reply", &gate_config, &db) {
+                Ok(d) => d,
+                Err(e) => return KjResult::Err(e),
+            };
             let label = format_board_label(&db, board.board_id);
-            (topic, label)
+            (board, topic, label, decision)
         };
 
         let existing = match self.block_store().non_draft_snapshots(topic.document_id) {
@@ -1092,27 +1478,98 @@ impl KjDispatcher {
             None => None,
         };
 
-        let block_id = match self.block_store().insert_block_as(
-            topic.document_id,
-            parent_id.as_ref(),
-            None,
-            Role::User,
-            BlockKind::Text,
-            text.to_string(),
-            Status::Done,
-            ContentType::Markdown,
-            Some(caller.actor_id),
-        ) {
+        let now = now_millis() as i64;
+        if board.write_policy == BoardWritePolicy::Open
+            && matches!(decision, WriteDecision::PublishDirect)
+            && let Err(e) = self
+                .board_rate_limiter()
+                .check_and_record(board.board_id, caller.actor_id, now)
+        {
+            return KjResult::Err(format!("kj board reply: {e}"));
+        }
+
+        let block_id = match decision {
+            WriteDecision::PublishDirect => self.block_store().insert_block_as(
+                topic.document_id,
+                parent_id.as_ref(),
+                None,
+                Role::User,
+                BlockKind::Text,
+                text.to_string(),
+                Status::Done,
+                ContentType::Markdown,
+                Some(caller.actor_id),
+            ),
+            WriteDecision::HoldForReview { .. } => self.block_store().insert_held_block_as(
+                topic.document_id,
+                parent_id.as_ref(),
+                None,
+                Role::User,
+                BlockKind::Text,
+                text.to_string(),
+                ContentType::Markdown,
+                caller.actor_id,
+            ),
+        };
+        let block_id = match block_id {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj board reply: {e}")),
         };
 
-        let now = now_millis() as i64;
+        let post_num = existing.len() + 1;
+
+        if let WriteDecision::HoldForReview { reviewer } = decision {
+            let ask_id = match self.open_board_post_ask(
+                &board,
+                &board_label,
+                topic.document_id,
+                &topic.slug,
+                &topic.title,
+                block_id,
+                text,
+                "reply",
+                caller,
+                reviewer,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Err(dismiss) = self
+                        .block_store()
+                        .settle_held_board_post(topic.document_id, &block_id, false)
+                    {
+                        tracing::error!(
+                            block = %block_id.to_key(),
+                            "could not dismiss held board reply with no ask: {dismiss}"
+                        );
+                    }
+                    return KjResult::Err(format!(
+                        "kj board reply: could not hold reply for review: {e}"
+                    ));
+                }
+            };
+            return KjResult::ok_with_data(
+                format!(
+                    "held reply on '{board_label}/{}' ({}) #{post_num} for review (ask '{ask_id}'); release with `kj ledger allow '{ask_id}'`",
+                    topic.slug,
+                    topic.document_id.short()
+                ),
+                serde_json::json!({
+                    "held": true,
+                    "ask_id": ask_id,
+                    "document_id": topic.document_id.to_hex(),
+                    "short_id": topic.document_id.short(),
+                    "slug": topic.slug,
+                    "block_id": block_id.to_key(),
+                    "post_number": post_num,
+                    "parent_number": to,
+                }),
+            );
+        }
+
         if let Err(e) = self.kernel_db().lock().bump_topic_post_stats(topic.document_id, now) {
             return KjResult::Err(format!("kj board reply: {e}"));
         }
 
-        let post_num = existing.len() + 1;
         KjResult::ok_with_data(
             format!(
                 "replied to '{board_label}/{}' ({}) #{post_num}",
@@ -1120,6 +1577,7 @@ impl KjDispatcher {
                 topic.document_id.short()
             ),
             serde_json::json!({
+                "held": false,
                 "document_id": topic.document_id.to_hex(),
                 "short_id": topic.document_id.short(),
                 "slug": topic.slug,
@@ -1305,6 +1763,21 @@ impl KjDispatcher {
                 snaps.len()
             ));
         };
+
+        if !hidden && target.status == Status::Pending && target.excluded {
+            let ask_hint = self
+                .kernel_db()
+                .lock()
+                .approval_for_board_post(&target.id)
+                .ok()
+                .flatten()
+                .map(|ask_id| format!(" (ask '{ask_id}'); release it with `kj ledger allow '{ask_id}'`"))
+                .unwrap_or_else(|| "; release it through `kj ledger allow`".to_string());
+            return KjResult::Err(format!(
+                "kj board unhide: post #{post_num} in topic '{}' is held pending review{ask_hint}",
+                topic.slug
+            ));
+        }
 
         if let Err(e) = self.block_store().set_excluded(topic.document_id, &target.id, hidden) {
             return KjResult::Err(format!("kj board {verb}: {e}"));
@@ -1657,42 +2130,223 @@ impl KjDispatcher {
         ))
     }
 
-    /// Write-policy seam for `post` and `reply`.
+    /// Whether a topic has at least one visible (non-excluded) post.
+    fn topic_has_visible_posts(&self, document_id: ContextId) -> bool {
+        if !self.block_store().contains(document_id) {
+            let _ = self.block_store().load_one_from_db(document_id);
+        }
+        self.block_store()
+            .non_draft_snapshots(document_id)
+            .map(|snaps| snaps.iter().any(|b| !b.excluded))
+            .unwrap_or(false)
+    }
+
+    /// Write-policy decision for `post`, `reply`, and `promote`.
     ///
-    /// - `Open`: publishes directly.
     /// - `Locked`: refuses unless caller is root or `house`.
-    /// - `Curated`: publishes directly for board owner, senpai chain, or
-    ///   root/`house`/`operator`; refuses other callers until held-post review
-    ///   (`Status::Pending` + `approval-ledger`) is wired here.
+    /// - `Open`: publishes directly unless `gate.toml` explicitly denies/asks
+    ///   for this performer, in which case it enters the held-ask path.
+    /// - `Curated`: publishes directly for board owner, senpai chain,
+    ///   root/`house`/`operator`, or an explicit `gate.toml` `Allow` for this
+    ///   performer; holds other callers for ledger review.
     fn publish_or_hold_post(
         &self,
         board: &BoardRow,
         caller: &KjCaller,
         verb: &str,
+        gate_config: &crate::kj::gate_policy::GateConfig,
         db: &KernelDb,
-    ) -> Result<(), String> {
+    ) -> Result<WriteDecision, String> {
+        let performer = crate::kj::gate_policy::performer_for_actor(db, caller.actor_id)?;
+        let candidates = [format!("kj board {verb}"), "kj board".to_string()];
+        let gate_override = gate_config.performer_override(performer.as_ref(), &candidates);
+
         match board.write_policy {
-            BoardWritePolicy::Open => Ok(()),
             BoardWritePolicy::Locked => {
                 if self.caller_is_root_or_house(caller, db)? {
-                    Ok(())
+                    Ok(WriteDecision::PublishDirect)
                 } else {
                     Err(format!(
                         "kj board {verb}: board is locked; only root or house can write to it"
                     ))
                 }
             }
+            BoardWritePolicy::Open => match gate_override {
+                Some(ConfigTierOverride::Deny | ConfigTierOverride::Ask) => {
+                    let reviewer = self.resolve_board_reviewer(board, caller, db)?;
+                    Ok(WriteDecision::HoldForReview { reviewer })
+                }
+                _ => Ok(WriteDecision::PublishDirect),
+            },
             BoardWritePolicy::Curated => {
-                if self.can_moderate_board(board, caller, db)? {
-                    Ok(())
+                if self.can_moderate_board(board, caller, db)?
+                    || gate_override == Some(ConfigTierOverride::Allow)
+                {
+                    Ok(WriteDecision::PublishDirect)
                 } else {
-                    Err(format!(
-                        "kj board {verb}: board is curated; direct posting requires board owner, senpai, house, or operator authority"
-                    ))
+                    let reviewer = self.resolve_board_reviewer(board, caller, db)?;
+                    Ok(WriteDecision::HoldForReview { reviewer })
                 }
             }
         }
     }
+
+    /// Resolve who reviews a held post on `board`: the board's live owning
+    /// character (when distinct from the caller), otherwise its senpai chain,
+    /// otherwise the caller's senpai chain, otherwise any live root character.
+    fn resolve_board_reviewer(
+        &self,
+        board: &BoardRow,
+        caller: &KjCaller,
+        db: &KernelDb,
+    ) -> Result<PrincipalId, String> {
+        if let Some(owner_id) = board.owner_character {
+            if owner_id != caller.actor_id
+                && db
+                    .get_character(owner_id)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|c| c.retired_at.is_none())
+            {
+                return Ok(owner_id);
+            }
+            // Owner is retired or is the caller themselves: climb from any live
+            // context performed by the owner.
+            let contexts = db.list_active_contexts().map_err(|e| e.to_string())?;
+            for ctx in contexts.iter().filter(|c| c.performer == Some(owner_id)) {
+                if let Ok(route) = db.route_review(crate::kernel_db::ReviewQuery::ask(
+                    ctx.context_id,
+                    caller.actor_id,
+                )) {
+                    let reviewer = route.reviewer();
+                    if reviewer != caller.actor_id {
+                        return Ok(reviewer);
+                    }
+                }
+            }
+        } else {
+            // Context board: first live owning context's performer or its senpai.
+            let owners = db
+                .contexts_for_board(board.board_id)
+                .map_err(|e| e.to_string())?;
+            for ctx in owners.iter().filter(|c| !c.is_archived()) {
+                if let Some(perf) = ctx.performer
+                    && perf != caller.actor_id
+                    && db
+                        .get_character(perf)
+                        .map_err(|e| e.to_string())?
+                        .is_some_and(|c| c.retired_at.is_none())
+                {
+                    return Ok(perf);
+                }
+                if let Ok(route) = db.route_review(crate::kernel_db::ReviewQuery::ask(
+                    ctx.context_id,
+                    caller.actor_id,
+                )) {
+                    let reviewer = route.reviewer();
+                    if reviewer != caller.actor_id {
+                        return Ok(reviewer);
+                    }
+                }
+            }
+        }
+
+        if let Some(ctx_id) = caller.context_id
+            && let Ok(route) =
+                db.route_review(crate::kernel_db::ReviewQuery::ask(ctx_id, caller.actor_id))
+        {
+            let reviewer = route.reviewer();
+            if reviewer != caller.actor_id {
+                return Ok(reviewer);
+            }
+        }
+
+        if let Some(root) = db
+            .list_characters(false)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|c| c.is_live_root() && c.principal_id != caller.actor_id)
+        {
+            return Ok(root.principal_id);
+        }
+
+        Err(format!(
+            "no live reviewer is available for board '{}'; ensure its owner or a live root character exists",
+            format_board_label(db, board.board_id)
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_board_post_ask(
+        &self,
+        board: &BoardRow,
+        board_label: &str,
+        document_id: ContextId,
+        slug: &str,
+        topic_title: &str,
+        block_id: BlockId,
+        content: &str,
+        verb: &str,
+        caller: &KjCaller,
+        reviewer: PrincipalId,
+    ) -> Result<String, String> {
+        use approval_ledger::types::{NewAsk, NewOption, Origin};
+        let preview = backref_preview(content);
+        let request_id = {
+            let db = self.kernel_db().lock();
+            let ask = NewAsk {
+                context_id: document_id.as_bytes().to_vec(),
+                actor_id: caller.actor_id.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(),
+                principal_id: caller.principal_id.as_bytes().to_vec(),
+                origin: Origin::Board,
+                instance: Some("builtin.kj".into()),
+                tool: Some(format!("board.{verb}")),
+                hook_id: None,
+                description: format!(
+                    "board {verb} on '{board_label}/{slug}' (\"{topic_title}\"): {preview}"
+                ),
+                statements: vec![],
+                authorized_label: None,
+                rc_run_id: None,
+                expires_at: None,
+                options: vec![
+                    NewOption {
+                        option_id: "allow_once".into(),
+                        label: "Publish post".into(),
+                        kind: "allow_once".into(),
+                    },
+                    NewOption {
+                        option_id: "deny".into(),
+                        label: "Dismiss".into(),
+                        kind: "deny".into(),
+                    },
+                ],
+                signals: vec![],
+                cwd: None,
+                exec_source: None,
+                exec_stdin: None,
+                continuation_epoch: None,
+                env: vec![],
+            };
+            db.create_approval_ask_recorded(&ask, false, |conn, request| {
+                crate::kernel_db::record_approval_board_post(
+                    conn,
+                    request,
+                    document_id,
+                    &block_id,
+                    board.board_id,
+                )
+            })
+            .map_err(|e| format!("could not record the ask: {e}"))?
+        };
+        crate::kj::gate::announce_ledger_change(self.kernel_db(), self.kernel().ledger_flows());
+        Ok(request_id)
+    }
+}
+
+enum WriteDecision {
+    PublishDirect,
+    HoldForReview { reviewer: PrincipalId },
 }
 
 // ============================================================================
