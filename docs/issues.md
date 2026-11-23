@@ -485,3 +485,24 @@ Open after an Opus review of `d80a29ad..HEAD`. The ask's races and the default-o
 - **A context id made only of digits breaks `editor_recovery::a_corrupt_record_refuses_reopen_*`** once in a while; it is the same class of problem as an unquoted id read as a number.
 - **`kj context info` has no drift-queue count:** the router's `staged_len` is not per context. Its gate-judge line is tested only for the no-judge case.
 - **The rc layout** (88 link files, an `S` prefix nothing reads) and the console and banto roles are written up for a decision: layering the shared scripts with per-directory overrides, a phase letter in place of `S`, a sleepy `console` rc, and a banto context created by bootstrap and left unattached.
+
+## The rotation signoff: what is left (2026-11-23)
+
+A rotation asked for inside a context's own running turn now defers its archive to that turn's end: the turn takes one more inference with only `done` offered, then the `archive` lifecycle runs and one transaction archives the predecessor and moves its label, ring seat, and handoff pointer (`docs/contexts.md`, "Rotation, handoffs, and archive"). What that leaves open:
+
+- **A prompt that lands during the signoff call rides it.** The kernel instruction that asks for the signoff delivers with any pending input, so a person's submit becomes part of the farewell and its wake is spent. Only a rotation with `--migrate` carries a conversation forward, so that prompt is not answered by the successor. Decide whether the signoff should deliver no input, leaving the submit to fail loudly instead.
+- **A rotation aimed at another context still archives mid-turn.** A senpai rotating a busy kohai, or a person rotating another context, keeps the immediate path: the target's turn sees an archived context and its next tool call is refused. Deferring those rotations would put the signoff call in a turn whose caller is not the rotation's caller.
+- **Who asked is read from the context lock, not the call's origin.** A shell in the rotating context that is not the turn's own tool call (a person attached to the same context) also asks the running turn for a signoff. `CallContext.tool_call` is `Some` only for a model tool call, and `ShellIdentity` and `KjBuiltin` discard it; threading it through would make the origin exact.
+- **The `done` verb and the archive lifecycle can overlap.** The `done` verb is queued while the predecessor is still live and the archive lifecycle then runs inline, so the worker pool may run both scripts for the same context at once. Ordering within each is unchanged.
+- **A deferred rotation has no recovery pass.** A kernel restart between the rotate result and the turn's end leaves the predecessor live and the successor unlabeled; only a fresh `kj context rotate` moves the context on. The kernel logs this when a lease ends holding a rotation it never settled.
+- **The signoff's `done` answers from the registered `builtin.turn` server directly,** not through the broker, so a loadout that omits the instance cannot refuse it and a colliding `done` cannot intercept it. Broker hooks do not run for that call.
+
+### After a cold review of the first land (2026-11-23)
+
+A reviewer that did not write `03a69195` read it and raised nine findings. The three blockers are fixed in `0f790062`: the reservation is taken after authority and before the first side effect, a settle refuses rather than assigning a label to an archived successor, and the pending check no longer tells a caller who may not rotate. What that review leaves open:
+
+- **A deferral can arrive at a turn that is already stopping**, or after the signoff decision but before ingress closes, so the settlement archives with no signoff call even though the command reported one would happen (`src/runtime/turn_state.rs`, `src/runtime/llm_stream.rs`).
+- **Completion is published before the settlement.** The turn drops its liveness lease and publishes completion before the archive lifecycle and the commit, so `kj wait` can return while the predecessor still owns the label, or before a settlement failure is known (`src/runtime/llm_stream.rs`).
+- **A rename or retag during the signoff can disagree with the commit.** The live router keeps the label captured when the rotation began while the transaction transfers the predecessor's current label (`src/kj/context.rs`).
+- **The held-call test does not assert the whole transfer.** It checks the label but not the handoff pointer or the live seat while the signoff call is held, and `ROTATED_HANDOFF` is a flag rather than evidence of the pointer (`src/rc/tests.rs`).
+- **Who asked is still read from the conversation lock** (see the earlier item): a person's separate shell in the same context can trigger a signoff on a turn it did not originate.

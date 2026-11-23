@@ -222,7 +222,10 @@ enum ContextCommand {
     /// env, and cwd, then runs the `create` rc lifecycle. `ROTATED_FROM`
     /// names the predecessor by id. When the successor has a loadout, it takes
     /// the label and the ring seat, and the predecessor is archived after its
-    /// `archive` rc lifecycle runs, with its judge shadows. The kernel moves
+    /// `archive` rc lifecycle runs, with its judge shadows. A rotation asked
+    /// for from the context's own running turn finishes when that turn ends:
+    /// the turn gets one more call offering only `done`, then the archive
+    /// lifecycle runs and the same commit lands. The kernel moves
     /// no context that answers to the predecessor. The senpai's
     /// character, the lineage root, or the context's own character may
     /// rotate. Rotating a character's handoff log points the character at the
@@ -736,7 +739,17 @@ impl KjDispatcher {
             }
             ContextCommand::Rotate { context, migrate, drop, compact, keep, handoff } => {
                 let compact = compact.then(|| keep.map_or(DEFAULT_ROTATE_KEEP, |keep| keep as usize));
-                self.context_rotate(context.as_deref(), migrate.then_some(drop.as_slice()), compact, handoff.as_deref(), caller).await
+                // Boxed, as create and archive are: the rotation carries the
+                // successor's create lifecycle and its own archive lifecycle,
+                // and every `kj context` dispatch future would hold them.
+                Box::pin(self.context_rotate(
+                    context.as_deref(),
+                    migrate.then_some(drop.as_slice()),
+                    compact,
+                    handoff.as_deref(),
+                    caller,
+                ))
+                .await
             }
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
             ContextCommand::Promote { context } => self.context_promote(&context, caller).await,
@@ -2436,6 +2449,28 @@ impl KjDispatcher {
             Ok(root) => root,
             Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
         };
+        // Claim the context after the authority above and before anything
+        // moves. The check and the claim are one atomic act, so a second
+        // rotation is refused with no successor created and nothing detached,
+        // and only a caller who may rotate learns that one is under way.
+        let Some(reservation) = self.kernel().turns().try_reserve_rotation(predecessor.context_id) else {
+            return KjResult::Err(format!(
+                "kj context rotate: {name} already has a rotation in progress; it must finish first"
+            ));
+        };
+        // The row read above may be stale: an archive can land between it and
+        // this claim. Refuse before any side effect when the predecessor is no
+        // longer live, whatever archived it.
+        match self.kernel_db().lock().get_context(predecessor.context_id) {
+            Ok(Some(row)) if !row.is_archived() => {}
+            Ok(Some(_)) => return KjResult::Err(format!(
+                "kj context rotate: {name} was archived before this rotation could start; nothing changed"
+            )),
+            Ok(None) => return KjResult::Err(format!(
+                "kj context rotate: {name} has no row any more; nothing changed"
+            )),
+            Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
+        }
 
         // Resolve the drop before anything is created, so a bad entry
         // refuses cleanly.
@@ -2605,6 +2640,52 @@ impl KjDispatcher {
             }
         }
 
+        // Boxed: the rotation's tail carries the archive lifecycle and the
+        // signoff branch, and every `kj context` dispatch future would hold
+        // them inline otherwise — the same reason `run_archive_lifecycle` boxes
+        // its lifecycle. A test thread's stack is small.
+        Box::pin(self.rotate_after_successor(
+            &predecessor, successor_id, &name, root_console, is_handoff_log, caller, reservation,
+        ))
+        .await
+    }
+
+    /// The tail of `kj context rotate`, after the successor exists, its
+    /// `create` lifecycle ran, and its handoff brief is written.
+    ///
+    /// A rotation this context starts inside its own running turn defers the
+    /// rest to that turn's end (`docs/contexts.md`, "Rotation, handoffs, and
+    /// archive"): the turn takes one signoff inference with only `done`
+    /// offered, and its end runs the archive lifecycle and commits. Nothing
+    /// moves before then, so the label, ring seat, and handoff pointer never
+    /// name a successor that does not answer yet. Otherwise the archive
+    /// lifecycle runs while the predecessor is live and the rotation commits
+    /// after it, as `kj context archive` would.
+    ///
+    /// The reservation claims the predecessor for this rotation. A turn that
+    /// takes the signoff owns it until its end; the immediate path keeps it
+    /// through the commit and releases it when this returns.
+    #[allow(clippy::too_many_arguments)]
+    async fn rotate_after_successor(
+        &self,
+        predecessor: &ContextRow,
+        successor_id: ContextId,
+        name: &str,
+        root_console: bool,
+        is_handoff_log: bool,
+        caller: &KjCaller,
+        reservation: crate::runtime::turn_state::RotationReservation,
+    ) -> KjResult {
+        use crate::runtime::turn_state::SignoffAsk;
+        let _reservation = match self.ask_running_turn_to_sign_off(
+            predecessor, successor_id, name, root_console, caller, reservation,
+        ) {
+            SignoffAsk::Taken => {
+                return self.rotation_under_way_result(predecessor, successor_id, name, is_handoff_log);
+            }
+            SignoffAsk::Idle(reservation) => reservation,
+        };
+
         // The predecessor's archive lifecycle runs while it is still live,
         // as `kj context archive` runs it; the rotation commits after it.
         if let Err(e) = self.run_archive_lifecycle(predecessor.context_id, caller).await {
@@ -2625,11 +2706,13 @@ impl KjDispatcher {
                  {successor}{name} stays live, and its archive lifecycle already ran"
             ));
         }
-        let committed = self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id);
-        let moved = match committed {
-            Ok(commit) => {
-                self.archived_in_router(commit.shadows.iter().copied());
-                commit.handoffs_moved
+        let moved = match self.hand_over_to_successor(predecessor.context_id, successor_id, predecessor.label.as_deref()) {
+            Ok((moved, None)) => moved,
+            // The row is committed by now; a restart converges the label.
+            Ok((_moved, Some(error))) => {
+                return KjResult::Err(format!(
+                    "kj context rotate: rotated in the database but the live label index failed to update ({error}); a kernel restart will converge"
+                ));
             }
             Err(e) => {
                 let successor = if self.successor_fate(root_console, successor_id).is_empty() {
@@ -2643,17 +2726,6 @@ impl KjDispatcher {
                 ));
             }
         };
-        self.archived_in_router(std::iter::once(predecessor.context_id));
-        {
-            let mut drift = self.drift_router().write();
-            if let Some(label) = &predecessor.label
-                && let Err(e) = drift.rename(successor_id, Some(label))
-            {
-                return KjResult::Err(format!(
-                    "kj context rotate: rotated in the database but the live label index failed to update ({e}); a kernel restart will converge"
-                ));
-            }
-        }
 
         let mut msg = format!("rotated {name}: {} archived, {} replaces it", predecessor.context_id.short(), successor_id.short());
         msg.push_str(&format!(
@@ -2665,15 +2737,7 @@ impl KjDispatcher {
             msg.push_str(" (the character's handoff log now points at it)");
         }
         // Say so when the successor has no model.
-        let no_model = if is_handoff_log {
-            None
-        } else {
-            match crate::model_resolution::context_model(&self.kernel_db().lock(), successor_id) {
-                Ok(crate::model_resolution::ContextModelLookup::None(none)) => none.notice(),
-                Ok(_) => None,
-                Err(e) => Some(format!("could not read the context slots: {e}")),
-            }
-        };
+        let no_model = self.successor_no_model_notice(is_handoff_log, successor_id);
         if let Some(line) = &no_model {
             msg.push('\n');
             msg.push_str(line);
@@ -2703,6 +2767,263 @@ impl KjDispatcher {
                 tracing::error!(successor = %successor.short(), "could not archive the abandoned root-console successor: {e}");
                 ""
             }
+        }
+    }
+
+    /// Ask `predecessor`'s running turn to take a signoff call before the
+    /// rotation commits, and record what that turn's end must settle.
+    ///
+    /// Only a rotation asked from the predecessor's own context defers: the
+    /// signoff call belongs to the turn running there. A rotation asked from
+    /// anywhere else, or with no turn holding that context's conversation
+    /// lock, takes the immediate path under the reservation it passes in. A
+    /// shell in the context that is not the turn's own tool call asks the same
+    /// way — a rotation under a running turn is what the turn cannot see — so
+    /// the deferral follows the lock, not the caller's identity.
+    fn ask_running_turn_to_sign_off(
+        &self,
+        predecessor: &crate::ContextRow,
+        successor: ContextId,
+        name: &str,
+        root_console: bool,
+        caller: &KjCaller,
+        reservation: crate::runtime::turn_state::RotationReservation,
+    ) -> crate::runtime::turn_state::SignoffAsk {
+        if caller.context_id != Some(predecessor.context_id) {
+            return crate::runtime::turn_state::SignoffAsk::Idle(reservation);
+        }
+        self.kernel().turns().begin_rotation_signoff(
+            predecessor.context_id,
+            reservation,
+            crate::runtime::turn_state::PendingRotation {
+                predecessor: predecessor.context_id,
+                successor,
+                label: predecessor.label.clone(),
+                name: name.to_string(),
+                root_console,
+                principal: caller.principal_id,
+                actor: caller.actor_id,
+                reviewer: caller.reviewer_id,
+                session: caller.session_id,
+            },
+        )
+    }
+
+    /// The `kj context rotate` result for a rotation a running turn settles at
+    /// its end: name the successor, what moves then, and what the turn's one
+    /// signoff call offers.
+    fn rotation_under_way_result(
+        &self,
+        predecessor: &crate::ContextRow,
+        successor: ContextId,
+        name: &str,
+        is_handoff_log: bool,
+    ) -> KjResult {
+        let no_model = self.successor_no_model_notice(is_handoff_log, successor);
+        let mut msg = format!(
+            "rotation of {name} is under way: {} is created and takes over when this turn ends, \
+             and {name} is archived then, with its archive lifecycle. The label, ring seat, and \
+             handoff pointer move with it. This turn gets one more call, offering only `done`: \
+             call it with your signoff.",
+            successor.short()
+        );
+        msg.push_str(&format!(
+            "\nfull ids: predecessor {} successor {}",
+            predecessor.context_id.to_hex(),
+            successor.to_hex()
+        ));
+        if let Some(line) = &no_model {
+            msg.push('\n');
+            msg.push_str(line);
+        }
+        KjResult::ok_with_data(msg, serde_json::json!({
+            "context_id": successor.to_hex(),
+            "rotated_from": predecessor.context_id.to_hex(),
+            "pending": true,
+            "no_model": no_model,
+        }))
+    }
+
+    /// Say when a successor has no model, for a rotation's result and the
+    /// notice a deferred rotation writes. A handoff log runs no model.
+    fn successor_no_model_notice(&self, is_handoff_log: bool, successor: ContextId) -> Option<String> {
+        if is_handoff_log {
+            return None;
+        }
+        match crate::model_resolution::context_model(&self.kernel_db().lock(), successor) {
+            Ok(crate::model_resolution::ContextModelLookup::None(none)) => none.notice(),
+            Ok(_) => None,
+            Err(e) => Some(format!("could not read the context slots: {e}")),
+        }
+    }
+
+    /// Archive `predecessor` and hand its place to `successor`: one
+    /// transaction archives it with its shadows and moves the label, ring
+    /// seat, `console_ctx`, `root_ctx`, and `handoff_ctx`, then the live
+    /// router and label index follow.
+    ///
+    /// Returns how many handoff logs moved, and the live label index's failure
+    /// when it has one: the rows are committed by then, and a kernel restart
+    /// converges the index.
+    fn hand_over_to_successor(
+        &self,
+        predecessor: ContextId,
+        successor: ContextId,
+        label: Option<&str>,
+    ) -> Result<(usize, Option<String>), String> {
+        let commit = self.kernel_db().lock().commit_rotation(predecessor, successor).map_err(|e| e.to_string())?;
+        self.archived_in_router(commit.shadows.iter().copied());
+        self.archived_in_router(std::iter::once(predecessor));
+        let label_error = label.and_then(|label| {
+            let mut drift = self.drift_router().write();
+            drift.rename(successor, Some(label)).err().map(|e| e.to_string())
+        });
+        Ok((commit.handoffs_moved, label_error))
+    }
+
+    /// Settle a rotation a turn deferred to its end.
+    ///
+    /// The successor exists, its `create` lifecycle ran, and its handoff brief
+    /// is in place. This runs the predecessor's `archive` lifecycle while it is
+    /// still live, then hands its place to the successor, exactly as an
+    /// immediate rotation does. The turn is over, so the outcome — either way —
+    /// lands as a kernel notice in the predecessor's log, which archive keeps.
+    ///
+    /// The archive lifecycle gets a fresh cancellation token: a turn that was
+    /// cancelled or failed still settles the rotation its caller asked for, and
+    /// the lifecycle's scripts keep their own timeouts.
+    pub(crate) async fn settle_rotation(
+        &self,
+        rotation: crate::runtime::turn_state::PendingRotation,
+    ) -> Result<String, String> {
+        use crate::runtime::turn_state::PendingRotation;
+        let PendingRotation {
+            predecessor, successor, label, name, root_console, principal, actor, reviewer, session,
+        } = rotation;
+        let caller = KjCaller {
+            principal_id: principal,
+            actor_id: actor,
+            reviewer_id: reviewer,
+            context_id: Some(predecessor),
+            session_id: session,
+            confirmed: false,
+            rc_depth: 0,
+            privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let settled = self.settle_rotation_steps(&caller, predecessor, successor, label.as_deref(), &name, root_console).await;
+        match settled {
+            Ok(message) => {
+                self.record_rotation_notice(predecessor, &message);
+                Ok(message)
+            }
+            Err(message) => {
+                self.record_rotation_notice(predecessor, &format!("The rotation of {name} did not settle: {message}"));
+                Err(message)
+            }
+        }
+    }
+
+    /// The steps of [`Self::settle_rotation`], for one place that writes the
+    /// outcome into the log whichever way they end.
+    async fn settle_rotation_steps(
+        &self,
+        caller: &KjCaller,
+        predecessor: ContextId,
+        successor: ContextId,
+        label: Option<&str>,
+        name: &str,
+        root_console: bool,
+    ) -> Result<String, String> {
+        // Another writer archived the predecessor first. The commit refuses a
+        // rotation whose predecessor is gone, so say why before running the
+        // lifecycle. The row is read into a binding first: a match scrutinee's
+        // database guard lives across the arms, and `successor_fate` reads the
+        // database again.
+        let row = self.kernel_db().lock().get_context(predecessor);
+        match row {
+            Ok(Some(row)) if row.is_archived() => {
+                let fate = self.successor_fate(root_console, successor);
+                return Err(format!(
+                    "{fate}{name} was archived before the rotation could settle, so the successor {successor} takes over nothing"
+                ));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(format!("{name} has no row any more, so the successor {successor} takes over nothing")),
+            Err(e) => return Err(format!("could not read {name}: {e}")),
+        }
+        // Skip the predecessor's archive scripts if the successor is already
+        // gone. The commit repeats this check inside the transaction in case
+        // another writer archives the successor while the scripts run.
+        let successor_check = self.kernel_db().lock().require_live_rotation_successor(predecessor, successor);
+        if let Err(e) = successor_check {
+            return Err(format!("{e}; {name} stays live and its archive lifecycle did not run"));
+        }
+        if let Err(e) = self.run_archive_lifecycle(predecessor, caller).await {
+            let successor_fate = self.successor_fate(root_console, successor);
+            return Err(format!(
+                "{successor_fate}{name} stays live and the successor {successor} is unlabeled: {e}. \
+                 Scripts its archive lifecycle already ran keep their effects"
+            ));
+        }
+        match self.hand_over_to_successor(predecessor, successor, label) {
+            Ok((moved, label_error)) => {
+                // A turn queued behind this one would start on a context that
+                // is archived now, and spend an inference its tools would
+                // refuse. Stop it before its first call, as the rotation
+                // stopped this one; input it accepted waits in the log.
+                self.kernel().turns().interrupt(predecessor, false);
+                let mut message = format!(
+                    "Rotated {name}: {} archived, {} replaces it",
+                    predecessor.short(),
+                    successor.short()
+                );
+                message.push_str(&format!(
+                    "\nfull ids: predecessor {} successor {}",
+                    predecessor.to_hex(),
+                    successor.to_hex()
+                ));
+                if moved > 0 {
+                    message.push_str(" (the character's handoff log now points at it)");
+                }
+                if let Some(error) = label_error {
+                    message.push_str(&format!(
+                        "\nThe live label index did not take the new label ({error}); a kernel restart will converge."
+                    ));
+                }
+                Ok(message)
+            }
+            Err(e) => {
+                let fate = self.successor_fate(root_console, successor);
+                Err(format!(
+                    "{fate}{name}'s rotation could not commit: {e}; its archive lifecycle already ran"
+                ))
+            }
+        }
+    }
+
+    /// Write a settled rotation's outcome as a kernel notice in the
+    /// predecessor's log. Archive keeps the log, so this outlives the context.
+    /// A write fault is logged: the turn is over and there is no caller left.
+    fn record_rotation_notice(&self, predecessor: ContextId, text: &str) {
+        let store = self.block_store();
+        if store.get(predecessor).is_none() {
+            // A context with no conversation document has nowhere to write.
+            return;
+        }
+        let after = store.last_block_id(predecessor);
+        if let Err(e) = store.insert_block_as(
+            predecessor,
+            None,
+            after.as_ref(),
+            kaijutsu_types::Role::System,
+            kaijutsu_types::BlockKind::Notification,
+            text,
+            kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain,
+            Some(PrincipalId::system()),
+        ) {
+            tracing::error!(context = %predecessor.short(), "could not record the rotation's outcome: {e}");
         }
     }
 

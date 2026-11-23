@@ -194,7 +194,8 @@ pub struct DoneInfo {
 
 impl DoneInfo {
     /// The facts for a turn's last event, or `None` when the verb should not
-    /// fire: a turn a person prompted, and a cancelled turn.
+    /// fire: a turn a person prompted, and a cancelled turn. A rotation's
+    /// signoff report is the exception ([`Self::from_signoff`]).
     ///
     /// `refused` says the provider declined the turn's request: it reports
     /// `declined` with no feedback, so the provider's words stay out of the
@@ -228,6 +229,16 @@ impl DoneInfo {
             }),
             _ => None,
         }
+    }
+
+    /// The report of a rotation's signoff call.
+    ///
+    /// `done` in that call is the leaving context's last word to its senpai, so
+    /// its verb runs even in a turn a person prompted — the one case
+    /// [`Self::from_ending`] suppresses. Otherwise the mapping is the same: a
+    /// report with an `EndTurn` ending, and nothing for a cancelled turn.
+    pub fn from_signoff(event: &crate::flows::TurnFlow, report: DoneReport) -> Option<Self> {
+        Self::from_ending(event, crate::flows::TurnOrigin::Autonomous, Some(report), false)
     }
 
     /// The script environment: KJ_DONE_STATUS, KJ_DONE_FEEDBACK, KJ_TURN_ID,

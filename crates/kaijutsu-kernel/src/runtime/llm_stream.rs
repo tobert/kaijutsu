@@ -316,6 +316,7 @@ fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
 fn takes_live_input(interrupt: &ContextInterruptState, turn_lease: &TurnLease) -> bool {
     !interrupt.cancel.is_cancelled()
         && !interrupt.stop_after_turn.load(std::sync::atomic::Ordering::Relaxed)
+        && !interrupt.signoff_requested()
         && !turn_lease.owes_timed_delivery()
 }
 
@@ -550,6 +551,58 @@ async fn build_tool_definitions(
             input_schema: schema,
         })
         .collect())
+}
+
+/// The surface a rotation signoff inference offers: `done`, from
+/// `builtin.turn`, whether or not the context's loadout grants that instance.
+///
+/// `*` does not cover `builtin.turn`, so a seat whose rc never opted in (a
+/// senpai's binding script, for one) has no `done` on its ordinary surface.
+/// A context on its way out still gets one call that offers it: the signoff is
+/// how it says how it ended, and a truncated turn says nothing
+/// (`docs/contexts.md`, "Rotation, handoffs, and archive").
+pub(crate) struct SignoffSurface {
+    /// The `done` definition `builtin.turn` advertises for this context.
+    pub done: ToolDefinition,
+    /// The registered `builtin.turn` server the signoff answers `done` from.
+    /// The surface is the rotation's, not the context's loadout, so a loadout
+    /// that omits `builtin.turn` — or another server that happens to offer a
+    /// `done` — cannot intercept the call.
+    pub server: Arc<dyn crate::mcp::McpServerLike>,
+}
+
+/// Build the [`SignoffSurface`] from the registered `builtin.turn` server.
+/// `None` only when the kernel registered no such server, which leaves the
+/// signoff call with no tools at all.
+async fn signoff_surface(
+    kernel: &Arc<Kernel>,
+    context_id: ContextId,
+    tool_ctx: &crate::ExecContext,
+) -> Option<SignoffSurface> {
+    use crate::mcp::{CallContext, InstanceId};
+    let server = kernel
+        .broker()
+        .instances_snapshot()
+        .await
+        .into_iter()
+        .find(|(instance, _)| *instance == InstanceId::new(crate::mcp::servers::BuiltinTurnServer::INSTANCE))
+        .map(|(_, server)| server)?;
+    let ctx = CallContext::new(tool_ctx.principal_id, context_id, tool_ctx.session_id, tool_ctx.kernel_id)
+        .with_actor(tool_ctx.actor_id, tool_ctx.reviewer_id);
+    let done = server
+        .list_tools(&ctx)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|tool| tool.name == DONE_TOOL)?;
+    Some(SignoffSurface {
+        done: ToolDefinition {
+            name: done.name,
+            description: done.description.unwrap_or_default(),
+            input_schema: done.input_schema,
+        },
+        server,
+    })
 }
 
 /// Prepare an admitted turn and transfer its existing lease to inference.
@@ -963,6 +1016,24 @@ async fn instruct(
     deliver_live_input(kernel, documents, kernel_db, media_slots, context_id, turn_id, mailbox, media_cache, messages, write_point,
         carried, Delivery::Instruction).await?;
     Ok(())
+}
+
+/// What the rotation signoff call tells the model: this turn's last inference,
+/// and what it may do in it.
+fn rotation_signoff_notice(successor: Option<ContextId>, offers_done: bool) -> String {
+    let successor = successor
+        .map(|successor| format!("`{}`", successor.to_hex()))
+        .unwrap_or_else(|| "its successor".to_string());
+    let offer = if offers_done {
+        "The only tool is `done`: call it with your signoff, or reply in words."
+    } else {
+        "No tool is offered: reply in words."
+    };
+    format!(
+        "`kj context rotate` is under way here: {successor} takes over when this turn ends, and this \
+         context is then archived with its archive lifecycle. This is your last call. {offer} The \
+         turn ends after it either way."
+    )
 }
 
 /// The file a call writes, when it is a file tool that names one: `edit` or
@@ -2006,6 +2077,69 @@ fn answer_unparsed_call(
     Ok((ToolAnswer { content: detail, is_error: true }, answer))
 }
 
+/// Settle a rotation signoff call the surface did not offer. The signoff call
+/// offers `done` and nothing else, so a sibling the model names anyway is
+/// refused here, before the loadout sees it: an archived context's tool call
+/// would fail later with a protocol error about a context that is leaving.
+fn answer_unoffered_signoff_call(
+    documents: &SharedBlockStore, context_id: ContextId,
+    call: kaijutsu_types::BlockId, answer: kaijutsu_types::BlockId, tool: &str,
+) -> crate::block_store::BlockStoreResult<(ToolAnswer, kaijutsu_types::BlockId)> {
+    let detail = format!(
+        "`{tool}` is not offered in this call: a rotation signoff offers only `done`. \
+         Call `done` with your signoff, or reply in words; the turn ends after this call."
+    );
+    documents.settle_tool_result_as(context_id, &call, &answer, &detail, Default::default(),
+        Status::Error, true, PrincipalId::system(), None, None)?;
+    Ok((ToolAnswer { content: detail, is_error: true }, answer))
+}
+
+/// Answer a rotation signoff's `done` from the `builtin.turn` server itself,
+/// never through the context's binding.
+///
+/// The signoff surface is the rotation's, not the loadout's: `*` does not cover
+/// `builtin.turn`, so a seat whose rc never opted in would have `done` refused
+/// by the binding. Going to the registered server also keeps a loadout's own
+/// `done` (a collision, or a stale grant) from intercepting the report. The
+/// result is an ordinary durable call/result pair, as a bound `done` call's is,
+/// and the turn loop reads the verdict from the call's arguments either way.
+#[allow(clippy::too_many_arguments)]
+async fn answer_signoff_done(
+    documents: &SharedBlockStore, context_id: ContextId,
+    server: &Arc<dyn crate::mcp::McpServerLike>,
+    tool_name: &str, input: &serde_json::Value, tool_ctx: &crate::ExecContext,
+    cancel: tokio_util::sync::CancellationToken,
+    call: kaijutsu_types::BlockId, result: kaijutsu_types::BlockId,
+) -> crate::block_store::BlockStoreResult<(ToolAnswer, kaijutsu_types::BlockId)> {
+    use crate::mcp::{CallContext, InstanceId, KernelCallParams, ToolContent};
+    debug_assert_eq!(tool_name, DONE_TOOL, "only `done` skips the binding for a signoff");
+    let mut ctx = CallContext::new(
+        tool_ctx.principal_id, context_id, tool_ctx.session_id, tool_ctx.kernel_id,
+    )
+    .with_actor(tool_ctx.actor_id, tool_ctx.reviewer_id);
+    ctx.publishes_pair = true;
+    ctx.tool_call = Some(call);
+    let params = KernelCallParams {
+        instance: InstanceId::new(crate::mcp::servers::BuiltinTurnServer::INSTANCE),
+        tool: DONE_TOOL.to_string(),
+        arguments: input.clone(),
+    };
+    let (text, is_error) = match server.call_tool(params, &ctx, cancel).await {
+        Ok(answer) => {
+            let text = answer.content.iter().map(|content| match content {
+                ToolContent::Text(text) => text.clone(),
+                ToolContent::Json(value) => value.to_string(),
+            }).collect::<String>();
+            (text, answer.is_error)
+        }
+        Err(error) => (format!("done: {error}"), true),
+    };
+    let status = if is_error { Status::Error } else { Status::Done };
+    documents.settle_tool_result_as(context_id, &call, &result, &text, Default::default(),
+        status, is_error, PrincipalId::system(), None, None)?;
+    Ok((ToolAnswer { content: text, is_error }, result))
+}
+
 /// Place a model call's Running result after `after`. A batch places every
 /// result, in call order, after the inference's last block before any call
 /// runs, so the log holds the calls and then their answers, as the next request sends
@@ -2691,11 +2825,22 @@ async fn process_llm_stream(
                 record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event, refused);
             }
             drop(idle);
-            let ending = crate::rc::DoneInfo::from_ending(&event, origin, turn_lease.take_done(), turn_lease.refused());
+            // A rotation this turn deferred settles here, after the turn's own
+            // end: its `done` verb is admitted while the predecessor is still
+            // live, and the archive follows. A signoff report runs the verb
+            // even in a turn a person prompted (`DoneInfo::from_signoff`).
+            let rotation = turn_lease.take_rotation();
+            let ending = match (rotation.is_some(), turn_lease.take_done()) {
+                (true, Some(report)) => crate::rc::DoneInfo::from_signoff(&event, report),
+                (_, report) => crate::rc::DoneInfo::from_ending(&event, origin, report, turn_lease.refused()),
+            };
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
             if let Some(ending) = ending {
                 super::rc_lifecycle::fire_done(&kernel, context_id, ending).await;
+            }
+            if let Some((rotation, _settled)) = rotation {
+                settle_rotation(&kernel, rotation).await;
             }
             if let Some(panic) = wake_undelivered_input(&kernel, &documents, context_id, undelivered).await {
                 cleanup_panic.get_or_insert(panic);
@@ -2720,10 +2865,48 @@ async fn process_llm_stream(
                     record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event, false))).is_err() {
                 tracing::error!(%context_id, "recording the turn-end notice after a panic also panicked");
             }
+            // A turn that panicked still settles the rotation it deferred: the
+            // successor exists and its caller asked for the rotation, so
+            // leaving the predecessor live serves nobody. The settled outcome
+            // is written into the predecessor's log.
+            let rotation = turn_lease.take_rotation();
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
+            if let Some((rotation, _settled)) = rotation {
+                settle_rotation(&kernel, rotation).await;
+            }
             std::panic::resume_unwind(panic);
         }
+    }
+}
+
+/// Settle the rotation this turn deferred to its end: run the predecessor's
+/// `archive` lifecycle, then commit — archive it and hand its label, ring
+/// seat, and handoff pointer to the successor.
+///
+/// The turn's outcome is already published, so there is no caller left to
+/// return to: the dispatcher writes the outcome as a kernel notice in the
+/// predecessor's log (which archive keeps), and a failure leaves the
+/// predecessor live with the successor unlabeled for inspection, as a
+/// rotation that stops before its commit does. The turn still holds the
+/// context's conversation lock, so no new turn starts on the predecessor
+/// while this runs. It runs after `fire_done`, which admits the `done` verb
+/// while the predecessor is still live.
+async fn settle_rotation(kernel: &Arc<Kernel>, rotation: crate::runtime::turn_state::PendingRotation) {
+    let (predecessor, successor) = (rotation.predecessor, rotation.successor);
+    let Some(dispatcher) = kernel.broker().kj_dispatcher().await else {
+        tracing::error!(
+            %predecessor, %successor,
+            "no kj dispatcher is wired; the deferred rotation cannot settle, so the predecessor stays live and the successor is unlabeled"
+        );
+        return;
+    };
+    match dispatcher.settle_rotation(rotation).await {
+        Ok(message) => tracing::info!(%predecessor, %successor, "the deferred rotation settled: {message}"),
+        Err(error) => tracing::error!(
+            %predecessor, %successor,
+            "the deferred rotation did not settle: {error}"
+        ),
     }
 }
 
@@ -3034,11 +3217,6 @@ async fn run_llm_stream(
     // Output-ceiling continuations spent by this turn, against
     // `MAX_OUTPUT_CEILING_CONTINUATIONS`.
     let mut ceiling_continuations: u32 = 0;
-    let offers_done = tools.iter().any(|tool| tool.name == DONE_TOOL);
-    // Whether a text-only reply leaves the task open: in an autonomous
-    // turn, or in any turn on a headless kernel, nobody answers it.
-    let runs_to_done = offers_done
-        && (origin == TurnOrigin::Autonomous || kernel.mode() == crate::KernelMode::Headless);
     let mut done_nudges: u32 = 0;
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
@@ -3062,6 +3240,13 @@ async fn run_llm_stream(
     // Input blocks the next request carries, settled once that inference
     // completes; a failed or cancelled inference leaves them pending.
     let mut carried_input: Vec<kaijutsu_types::BlockId> = Vec::new();
+    // The rotation signoff's surface (`done`), built only when a rotation asks
+    // for one: an ordinary turn pays nothing for it.
+    let mut signoff: Option<SignoffSurface> = None;
+    // Whether the next inference is the rotation signoff. A rotation started
+    // inside this turn asks for exactly one (`ContextInterruptState::
+    // request_signoff`); the turn offers only `done` for it and ends after it.
+    let mut signoff_call = false;
 
     // Continue until the model ends its turn or the turn is cancelled. There
     // is no per-turn bound on tool rounds; see docs/issues.md, "Per-cast turn
@@ -3078,6 +3263,20 @@ async fn run_llm_stream(
             step_attempt = 0;
             step_deadline = None;
         }
+
+        // What this inference offers: the turn's surface, or `done` alone for
+        // the rotation signoff. `offers_done` also decides whether a call in
+        // the batch is the `done` that ends the turn.
+        let offered: &[ToolDefinition] = if signoff_call {
+            signoff.as_ref().map(|surface| std::slice::from_ref(&surface.done)).unwrap_or_default()
+        } else {
+            &tools
+        };
+        let offers_done = offered.iter().any(|tool| tool.name == DONE_TOOL);
+        // Whether a text-only reply leaves the task open: in an autonomous
+        // turn, or in any turn on a headless kernel, nobody answers it.
+        let runs_to_done = offers_done
+            && (origin == TurnOrigin::Autonomous || kernel.mode() == crate::KernelMode::Headless);
 
         // Soft interrupt: stop before the next LLM call. The in-flight model
         // call already finished, so the output block is a whole phrase — that
@@ -3140,7 +3339,7 @@ async fn run_llm_stream(
         let build_opts = apply_tunables(
             BuildOpts::with_output_limit(&model_name, max_output_tokens)
                 .with_system(&system_prompt)
-                .with_tools(tools.clone())
+                .with_tools(offered.to_vec())
                 .with_cache_breakpoints(cache_breakpoints)
                 .with_controls(controls)
                 .with_vfs(kernel.vfs().clone()),
@@ -3185,7 +3384,7 @@ async fn run_llm_stream(
                 };
                 match started {
                     Ok(s) => {
-                        mailbox.record_sent(crate::llm::prefix::SentPrefix::of(Some(&system_prompt), &tools, &messages));
+                        mailbox.record_sent(crate::llm::prefix::SentPrefix::of(Some(&system_prompt), offered, &messages));
                         if attempt > 1 {
                             tracing::debug!("LLM stream started on attempt {}", attempt);
                         } else {
@@ -3194,6 +3393,7 @@ async fn run_llm_stream(
                         break s;
                     }
                     Err(e) if attempt <= MAX_LLM_RETRIES
+                        && !signoff_call
                         && retry_disposition(&e) == RetryDisposition::Transient => {
                         let delay = retry_backoff(attempt, backoff_entropy());
                         tracing::warn!(
@@ -3569,6 +3769,7 @@ async fn run_llm_stream(
                     // failure drops it. A step whose total cap has passed gets no resend:
                     // it would hit the same cap at once.
                     if last_block_id == attempt_start_block
+                        && !signoff_call
                         && stream_retries < MAX_LLM_RETRIES
                         && err.kind.retry_disposition() == RetryDisposition::Transient
                         && tokio::time::Instant::now() < total_deadline.deadline()
@@ -3663,6 +3864,42 @@ async fn run_llm_stream(
         // nothing, but its error result is the model's turn back, and it is
         // the one message about a response the output limit cut off.
         if tool_calls.is_empty() {
+            // The rotation signoff is one inference and no more: a reply in
+            // words ends the turn here, whatever it said. No notice asks for a
+            // tool call, no ceiling continuation spends another inference, and
+            // input that arrived meanwhile waits for the successor.
+            if signoff_call {
+                tracing::info!(
+                    %context_id,
+                    "the rotation signoff inference replied; the turn ends and the rotation settles"
+                );
+                break;
+            }
+            // A rotation can be asked for at any point the turn runs, including
+            // under an inference that answered in words. It still earns its one
+            // signoff call: replay the reply, say what is happening, and take
+            // that call before the turn ends.
+            if interrupt.signoff_requested() {
+                signoff_call = true;
+                tracing::info!(%context_id, "a rotation was asked for during this reply; taking one signoff call");
+                if signoff.is_none() {
+                    signoff = signoff_surface(&kernel, context_id, &tool_ctx).await;
+                }
+                if let Some(assistant) = replayed_assistant(
+                    std::mem::take(&mut assistant_reasoning),
+                    &assistant_text,
+                ) {
+                    messages.push(assistant);
+                }
+                let notice = rotation_signoff_notice(
+                    turn_lease.pending_rotation().map(|rotation| rotation.successor),
+                    signoff.is_some(),
+                );
+                instruct(&kernel, &documents, &kernel_db, &media_slots, context_id, turn_id, mailbox,
+                    conversation_cache.media_cache(), &mut messages, &mut last_block_id,
+                    &mut carried_input, &notice).await?;
+                continue 'agentic;
+            }
             // The output ceiling cut this inference off before the model
             // reached a tool call, so the turn has nothing to act on and
             // nobody to ask — a driven worker has no human to say "continue".
@@ -3848,6 +4085,13 @@ async fn run_llm_stream(
             Some((file_turns.insert((instance, path), next), finished))
         }).collect();
 
+        // A rotation signoff batch runs `done` and nothing else: anything the
+        // model names beyond that surface is refused before dispatch, and
+        // `done` answers from the registered `builtin.turn` server, never
+        // through this context's loadout.
+        let signoff_done = signoff_call && offers_done;
+        let signoff_server = signoff.as_ref().map(|surface| surface.server.clone());
+
         // Signal cancellation on the first persistence fault, but join every
         // admitted call before terminal cleanup. Dropping siblings here would
         // leave side effects without their final result.
@@ -3856,6 +4100,9 @@ async fn run_llm_stream(
             let documents = documents.clone();
             let tool_ctx = tool_ctx.clone();
             let interrupt = interrupt.clone();
+            let signoff_call = signoff_call;
+            let signoff_done = signoff_done;
+            let signoff_server = signoff_server.clone();
             async move {
                 let finished = match file_order {
                     Some((before, finished)) => {
@@ -3867,6 +4114,13 @@ async fn run_llm_stream(
                 };
                 let result = match unparsed {
                     Some(detail) => answer_unparsed_call(&documents, context_id, call, placed, detail),
+                    None if signoff_call && !(signoff_done && tool_name == DONE_TOOL) =>
+                        answer_unoffered_signoff_call(&documents, context_id, call, placed, &tool_name),
+                    None if signoff_call => match signoff_server.as_ref() {
+                        Some(server) => answer_signoff_done(&documents, context_id, server, &tool_name, &input,
+                            &tool_ctx, interrupt.cancel.clone(), call, placed).await,
+                        None => answer_unoffered_signoff_call(&documents, context_id, call, placed, &tool_name),
+                    },
                     None => dispatch_recorded_tool_result(&documents, context_id, &kernel, &tool_name, &input,
                         &tool_ctx, interrupt.cancel.clone(), &interrupt, call, placed).await,
                 };
@@ -3907,19 +4161,50 @@ async fn run_llm_stream(
             assistant_tool_uses,
         ));
 
+        // The report of the `done` call that succeeded, for the `done` rc verb.
+        // A sibling's failure does not hide it: a rotation signoff refuses
+        // anything but `done`, and that refusal is not the report's fault.
+        let done_report = done_reports.into_iter().find(|(id, _)| tool_results.iter().any(|result| matches!(result,
+            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == id)))
+            .map(|(_, report)| report);
         // `done` ends the turn only from a batch where nothing failed: the
         // model reads a sibling's failure before it can finish.
-        let done = tool_results.iter().any(|result| matches!(result,
-            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if done_calls.contains(tool_use_id)))
+        let done = done_report.is_some()
             && !tool_results.iter().any(|result| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
-
-        // The report of the `done` call that succeeded, for the `done` rc verb.
-        let done_report = done.then(|| done_reports.into_iter().find(|(id, _)| tool_results.iter().any(|result| matches!(result,
-            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == id)))
-            .map(|(_, report)| report)).flatten();
 
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
+
+        // A rotation requested during this turn asks for one signoff
+        // inference: say so, and take it next with `done` alone offered. A
+        // `done` in the same batch does not shorten the turn — the signoff
+        // call is the report the rotation leaves behind.
+        if !signoff_call && interrupt.signoff_requested() {
+            signoff_call = true;
+            // Built here, not with the turn: only a rotation needs `done` on a
+            // loadout that may never have granted `builtin.turn`.
+            if signoff.is_none() {
+                signoff = signoff_surface(&kernel, context_id, &tool_ctx).await;
+            }
+            let notice = rotation_signoff_notice(
+                turn_lease.pending_rotation().map(|rotation| rotation.successor),
+                signoff.is_some(),
+            );
+            tracing::info!(%context_id, "a rotation was asked for inside this turn; taking one signoff call");
+            instruct(&kernel, &documents, &kernel_db, &media_slots, context_id, turn_id, mailbox,
+                conversation_cache.media_cache(), &mut messages, &mut last_block_id,
+                &mut carried_input, &notice).await?;
+            continue 'agentic;
+        }
+        // The signoff call's batch is the turn's last: record the `done` it
+        // carried, if any, and end, whatever else the model named.
+        if signoff_call {
+            if let Some(report) = done_report {
+                turn_lease.record_done(report);
+            }
+            tracing::info!(%context_id, "the rotation signoff call ran; the turn ends and the rotation settles");
+            break;
+        }
         // The model called `done`, it succeeded, and nothing beside it failed:
         // the task is over, so the turn ends after this batch. Input that arrived meanwhile stays
         // pending for the turn's end, like input after a final inference.

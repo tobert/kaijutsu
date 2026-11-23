@@ -115,6 +115,10 @@ pub struct MockClient {
     /// The `(step, attempt)` of each `Provider::stream` call's request trace,
     /// in call order, when a test asked for it with `recording_traces`.
     traces: Option<Arc<parking_lot::Mutex<Vec<(u32, u32)>>>>,
+    /// The tool names each `Provider::stream` call was offered, in call
+    /// order, when a test asked for it with `recording_tools`. A rotation
+    /// signoff narrows this to `done`, and a test can only see that here.
+    tools: Option<Arc<parking_lot::Mutex<Vec<Vec<String>>>>>,
     /// One `Provider::stream` call, by zero-based index, that waits for the
     /// test to release it; see `holding_call`.
     hold: Option<(usize, Arc<CallHold>)>,
@@ -155,6 +159,7 @@ impl MockClient {
             sent: None,
             sent_systems: None,
             traces: None,
+            tools: None,
             hold: None,
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -194,6 +199,15 @@ impl MockClient {
         let traces = Arc::new(parking_lot::Mutex::new(Vec::new()));
         self.traces = Some(traces.clone());
         (self, traces)
+    }
+
+    /// Builder: record the tool names each `Provider::stream` call was
+    /// offered, in call order. A rotation signoff offers only `done`, so this
+    /// is how a test reads the surface a turn actually sent.
+    pub fn recording_tools(mut self) -> (Self, Arc<parking_lot::Mutex<Vec<Vec<String>>>>) {
+        let tools = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        self.tools = Some(tools.clone());
+        (self, tools)
     }
 
     /// Builder: make each call, a one-shot prompt included, wait `delay`
@@ -1118,6 +1132,9 @@ impl Provider {
                 }
                 if let Some(traces) = &mock.traces {
                     traces.lock().push(opts.trace.as_ref().map_or((0, 0), |t| (t.step, t.attempt)));
+                }
+                if let Some(tools) = &mock.tools {
+                    tools.lock().push(opts.tools.iter().map(|tool| tool.name.clone()).collect());
                 }
                 let call = mock.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some((index, hold)) = &mock.hold

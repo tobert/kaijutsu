@@ -84,7 +84,11 @@ separate batch before using relative paths in that directory.
   predecessor's ID. Runs `create` rc (`S16-handoff.kai` injects recent notes
   from `kj handoff tail`; `S17-predecessor.kai` injects the predecessor tail
   unless `--migrate` is passed). Moves `root_ctx`, `console_ctx`, or
-  `handoff_ctx` pointers atomically and archives the predecessor.
+  `handoff_ctx` pointers atomically and archives the predecessor. When a
+  context rotates itself from its running turn, it gets one final model call
+  with only `done` available. The archive lifecycle runs after that call ends,
+  whether or not the model calls `done`. An idle rotation does not call the
+  model for signoff.
 - **Archive (`kj context archive <id> --confirm`) and promote
   (`kj context promote <id>`).** Contexts are never deleted. Archiving runs the
   performer's `archive` rc lifecycle, abandons pending asks for that context,

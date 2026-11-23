@@ -459,3 +459,39 @@ Live testing across `zorak` (TiMidity++ on `ff4sf2.sf2`) and `moltar`
   4-bar programs leave eight seconds of silence per phrase at 120 BPM, whereas
   8-bar programs (`bass-bars.json`, `pad-bars.json`, `drum-bars.json` with
   `shuffle = 2`) play continuously across the 3-track `lfm3-omni` band.
+
+## The rotation signoff (November 23)
+
+A rotation asked for from inside a context's own turn used to archive the
+predecessor in the middle of that turn. The turn then spent a model call on
+tools its archived context refused, and its last words landed after the
+successor was live. Interrupting the turn is the other fix, and it throws away
+the part worth keeping: the leaving context's own account of what it finished.
+
+So `kj context rotate` now stops before the archive when the context's own turn
+holds its conversation lock. It creates the successor, runs `create`, writes
+the handoff brief, and registers a `PendingRotation` on that turn; nothing else
+moves, so the label, ring seat, and handoff pointer never name a successor that
+does not answer yet. The turn takes exactly one more inference. `builtin.turn`'s
+`done` is the whole surface of that call — built for it on demand, offered
+whether or not the loadout opted into `builtin.turn`, and answered from the
+registered server so a loadout's own `done` cannot intercept it. Anything else
+the model names is refused with an error result rather than left to fail
+against an archived context. The turn ends after that call whether or not the
+model calls `done`; nothing schedules it, and no retry or continuation spends a
+second signoff call.
+
+The turn's end then settles the rotation: the predecessor's `archive` lifecycle
+runs while it is still live, and the same one transaction as an idle rotation
+archives it and hands its place to the successor. The `done` verb is admitted
+first, so the report still drifts to the senpai — for a signoff report it runs
+even in a turn a person prompted, which the ordinary end suppresses. The
+settlement holds a reservation in the turn registry until it finishes, so a
+second rotation refuses rather than racing a commit, and a turn that ends
+holding a rotation it never settled says so in the kernel log.
+
+Idle rotation is unchanged, and so is a rotation aimed at another context. The
+trade is that a rotation is no longer atomic with its command: it is atomic at
+the turn's end instead, and a kernel that dies between the two leaves the
+predecessor live and the successor unlabeled for inspection, as a rotation that
+stops before its commit always did.
