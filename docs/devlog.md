@@ -204,6 +204,9 @@ splits. Dropping that node had discarded its direction and stacked row
 splits vertically. Layout tests cover both directions and nested rebuilds.
 UI camera backgrounds follow theme reloads and screen returns; scene
 backgrounds stay owned by Room and Heroic while those screens are active.
+All 1413 app tests and nine theme-data tests passed. An isolated app verified
+long-token wrapping at 800px, border and camera reloads through the kernel's
+theme file, and side-by-side plus nested splits through input actions.
 
 ## The file cache learns what vim already knew (August 18–20)
 

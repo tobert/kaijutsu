@@ -16,6 +16,14 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 - **`kj board read --include-hidden` and `kj ledger list` previews** show pending held posts to non-moderators (`kj/board.rs`); gate `--include-hidden` or split `--include-held` for moderators/authors if stricter visibility is wanted.
 - **TUI / App board picker** (Phase 2 of `docs/board.md`, "Human perusal and future clients"): topics are `BlockStore` documents, so adding a picker entry unlocks existing rendering, folds, and copy mode.
 
+## App layout follow-ups (2026-11-23)
+
+- **Dock heights shrink with the content area.** North and South request
+  40px and 32px but retain default flex shrink. In a 1280×720 live preview,
+  the conversation received 655px instead of 648px. Check fixed dock
+  heights and content-area sizing together before changing the vertical
+  layout policy.
+
 ## Heroic view follow-ups (2026-11-21)
 
 - Live kernel work updates still poll `kj transport work --track <id>` at 1 Hz via `execute_kj_quiet` (`view/heroic/live.rs`); a dedicated work-status wire event + measured performer lead field remains future work (`docs/newui.md`, "The live driver").
