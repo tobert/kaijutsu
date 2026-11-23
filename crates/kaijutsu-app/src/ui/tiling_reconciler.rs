@@ -79,7 +79,7 @@ pub fn reconcile_tiling_tree(
     mut state: ResMut<ReconcilerState>,
     tiling_root: Query<Entity, With<TilingRoot>>,
     conversation_root: Query<(Entity, Option<&Children>), With<super::state::ConversationRoot>>,
-    existing_panes: Query<Entity, With<PaneMarker>>,
+    existing_panes: Query<(Entity, &ChildOf), With<PaneMarker>>,
 ) {
     let needs_rebuild = !state.initialized || tree.structural_gen != state.last_structural_gen;
     if !needs_rebuild {
@@ -102,8 +102,10 @@ pub fn reconcile_tiling_tree(
         // (contrast the old per-block-cell `BlockCellContainer`, which had
         // to be unparented before despawn or it would take live block
         // entities down with it).
-        for entity in existing_panes.iter() {
-            commands.entity(entity).despawn();
+        for (entity, parent) in existing_panes.iter() {
+            if parent.parent() == conv_root_entity {
+                commands.entity(entity).despawn();
+            }
         }
     }
 
@@ -133,20 +135,7 @@ fn spawn_conversation_content(
     theme: &Theme,
     conv_root: Entity,
 ) {
-    match &tree.root {
-        TileNode::Split {
-            children, ratios, ..
-        } => {
-            for (i, child) in children.iter().enumerate() {
-                let ratio = ratios.get(i).copied().unwrap_or(1.0);
-                spawn_content_subtree(commands, child, theme, conv_root, tree, ratio);
-            }
-        }
-        TileNode::Leaf { .. } => {
-            // Root is a single leaf — spawn it directly
-            spawn_content_subtree(commands, &tree.root, theme, conv_root, tree, 1.0);
-        }
-    }
+    spawn_content_subtree(commands, &tree.root, theme, conv_root, tree, 1.0);
 }
 
 /// Recursively spawn a content subtree as Bevy flex entities.

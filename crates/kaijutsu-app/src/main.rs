@@ -579,50 +579,98 @@ mod layout_tests {
         update::propagate_ui_target_cameras, widget::update_image_content_size_system,
     };
 
+    fn layout_app(scale: f32) -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(TaskPoolPlugin::default());
+        app.add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate));
+        app.add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate));
+        app.init_resource::<UiScale>();
+        app.init_resource::<UiSurface>();
+        app.init_resource::<TextPipeline>();
+        app.init_resource::<FontCx>();
+        app.init_resource::<ScaleCx>();
+        app.init_resource::<RemSize>();
+        app.init_resource::<ui::theme::Theme>();
+        app.init_resource::<Assets<Image>>();
+        app.init_resource::<Assets<TextureAtlasLayout>>();
+        app.init_resource::<Assets<shaders::BlockFxMaterial>>();
+        app.add_systems(Startup, setup_ui);
+        app.add_systems(PostStartup, ui::dock::spawn_docks);
+        app.add_systems(PostUpdate, (
+            ApplyDeferred,
+            propagate_ui_target_cameras,
+            sync_font_size_to_em_size,
+            update_image_content_size_system,
+            ui_layout_system,
+        ).chain());
+        app.configure_sets(PostUpdate,
+            PropagateSet::<ComputedUiTargetCamera>::default()
+                .after(propagate_ui_target_cameras)
+                .before(update_image_content_size_system));
+        app.configure_sets(PostUpdate,
+            PropagateSet::<ComputedUiRenderTargetInfo>::default()
+                .after(propagate_ui_target_cameras)
+                .before(update_image_content_size_system));
+
+        let size = UVec2::new((2347.0 * scale) as u32, (1091.0 * scale) as u32);
+        let camera = app.world_mut().spawn((Camera2d, Camera {
+            computed: ComputedCameraValues {
+                target_info: Some(RenderTargetInfo { physical_size: size, scale_factor: scale }),
+                ..default()
+            },
+            viewport: Some(Viewport { physical_size: size, ..default() }),
+            ..default()
+        })).id();
+        (app, camera)
+    }
+
+    #[test]
+    fn root_splits_and_nested_rebuild_follow_their_directions() {
+        use ui::tiling::{PaneId, PaneMarker, SplitDirection, TilingTree};
+        use ui::tiling_reconciler::{ReconcilerState, reconcile_tiling_tree};
+
+        fn position(app: &mut App, id: PaneId) -> Vec2 {
+            let world = app.world_mut();
+            let mut panes = world.query::<(&PaneMarker, &bevy::ui::UiGlobalTransform)>();
+            panes.iter(world).find(|(marker, _)| marker.pane_id == id)
+                .unwrap().1.to_scale_angle_translation().2
+        }
+
+        for direction in [SplitDirection::Row, SplitDirection::Column] {
+            let (mut app, _) = layout_app(1.0);
+            let mut tree = TilingTree::default_layout();
+            let first = tree.focused;
+            let second = tree.split(first, direction).unwrap();
+            app.insert_resource(tree).init_resource::<ReconcilerState>();
+            app.add_systems(Update, reconcile_tiling_tree);
+            app.update();
+            let (a, b) = (position(&mut app, first), position(&mut app, second));
+            match direction {
+                SplitDirection::Row => assert!(b.x > a.x && (b.y - a.y).abs() < 1.0, "row: {a:?}, {b:?}"),
+                SplitDirection::Column => assert!(b.y > a.y && (b.x - a.x).abs() < 1.0, "column: {a:?}, {b:?}"),
+            }
+
+            let nested_direction = match direction {
+                SplitDirection::Row => SplitDirection::Column,
+                SplitDirection::Column => SplitDirection::Row,
+            };
+            let third = app.world_mut().resource_mut::<TilingTree>().split(first, nested_direction).unwrap();
+            app.update();
+            let (a, b, c) = (position(&mut app, first), position(&mut app, second), position(&mut app, third));
+            match direction {
+                SplitDirection::Row => assert!(b.x > a.x && c.y > a.y && (c.x - a.x).abs() < 1.0, "nested: {a:?}, {b:?}, {c:?}"),
+                SplitDirection::Column => assert!(b.y > a.y && c.x > a.x && (c.y - a.y).abs() < 1.0, "nested: {a:?}, {b:?}, {c:?}"),
+            }
+            let world = app.world_mut();
+            let count = world.query_filtered::<Entity, With<crate::cell::ConversationContainer>>().iter(world).count();
+            assert_eq!(count, 3, "rebuild leaves exactly the current panes");
+        }
+    }
+
     #[test]
     fn stale_dock_images_do_not_expand_the_conversation_after_resize() {
         for scale in [1.0_f32, 2.0] {
-            let mut app = App::new();
-            app.add_plugins(TaskPoolPlugin::default());
-            app.add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate));
-            app.add_plugins(HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate));
-            app.init_resource::<UiScale>();
-            app.init_resource::<UiSurface>();
-            app.init_resource::<TextPipeline>();
-            app.init_resource::<FontCx>();
-            app.init_resource::<ScaleCx>();
-            app.init_resource::<RemSize>();
-            app.init_resource::<ui::theme::Theme>();
-            app.init_resource::<Assets<Image>>();
-            app.init_resource::<Assets<TextureAtlasLayout>>();
-            app.init_resource::<Assets<shaders::BlockFxMaterial>>();
-            app.add_systems(Startup, setup_ui);
-            app.add_systems(PostStartup, ui::dock::spawn_docks);
-            app.add_systems(PostUpdate, (
-                ApplyDeferred,
-                propagate_ui_target_cameras,
-                sync_font_size_to_em_size,
-                update_image_content_size_system,
-                ui_layout_system,
-            ).chain());
-            app.configure_sets(PostUpdate,
-                PropagateSet::<ComputedUiTargetCamera>::default()
-                    .after(propagate_ui_target_cameras)
-                    .before(update_image_content_size_system));
-            app.configure_sets(PostUpdate,
-                PropagateSet::<ComputedUiRenderTargetInfo>::default()
-                    .after(propagate_ui_target_cameras)
-                    .before(update_image_content_size_system));
-
-            let size = UVec2::new((2347.0 * scale) as u32, (1091.0 * scale) as u32);
-            let camera = app.world_mut().spawn((Camera2d, Camera {
-                computed: ComputedCameraValues {
-                    target_info: Some(RenderTargetInfo { physical_size: size, scale_factor: scale }),
-                    ..default()
-                },
-                viewport: Some(Viewport { physical_size: size, ..default() }),
-                ..default()
-            })).id();
+            let (mut app, camera) = layout_app(scale);
             app.update();
 
             let images = {

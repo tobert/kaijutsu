@@ -199,6 +199,9 @@ Long unbroken tokens now use emergency word wrapping in all three text
 shaping paths, preserving glyphs within the conversation column.
 Theme reload also updates existing pane and dock borders without a focus
 change. Compose borders follow the loaded accent instead of a fixed color.
+The outermost tiling split now uses the same subtree renderer as nested
+splits. Dropping that node had discarded its direction and stacked row
+splits vertically. Layout tests cover both directions and nested rebuilds.
 
 ## The file cache learns what vim already knew (August 18–20)
 
