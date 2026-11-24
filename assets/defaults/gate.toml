@@ -113,6 +113,10 @@
 #   [rc.kohai.guardian]
 #   enabled = true
 
+# Pure fd-dup redirects (`2>&1`, `1>&2`) and output discarded to literal
+# `/dev/null` do not disqualify an `allow` entry. Set `false` for strict mode.
+# ignore_inert_redirects = true
+
 [global]
 allow = [
   "kj handoff note",     # recoverable by construction
@@ -159,6 +163,7 @@ allow = [
 [rc.banto]
 allow = [
   "kj context create",     # banto creates its lanes, `kj context create coder --name <lane>`
+  "kj context rotate",     # banto rotates itself and its lanes cleanly
   "kj fork",               # a fork copies this context's own performer
   "kj drive",              # runs a turn on a lane banto directs
   "kj drift push",         # banto messages senpai and other contexts
@@ -174,6 +179,7 @@ allow = [
 [rc.senpai]
 allow = [
   "kj context create",     # senpai creates its lanes, `kj context create kohai --name <lane>`
+  "kj context rotate",     # senpai rotates itself and its lanes cleanly
   "kj fork",               # a fork copies this context's own performer
   "kj drive",              # runs a turn on a lane senpai directs
   "kj drift push",         # senpai messages banto and its kohai
