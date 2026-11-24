@@ -18,6 +18,13 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 
 ## App layout follow-ups (2026-11-23)
 
+- **Border glow does not follow border opacity.** In
+  `assets/shaders/surface_chrome.wgsl`, edge-glow RGB omits the configured
+  color alpha while output alpha includes it, despite the documented
+  premultiplied blend contract. The legacy `block_fx.wesl` uses the same
+  formula. Low-opacity borders can therefore retain bright glow. Decide
+  whether glow is deliberately emissive, then verify opacity sweeps in the
+  rendered conversation before changing the blend.
 - **Dock heights shrink with the content area.** North and South request
   40px and 32px but retain default flex shrink. In a 1280×720 live preview,
   the conversation received 655px instead of 648px. Check fixed dock
