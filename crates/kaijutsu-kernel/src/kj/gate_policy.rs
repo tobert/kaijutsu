@@ -1793,10 +1793,11 @@ pub(crate) fn evaluate(
     }
 
     let family = family_layer_per_gated_statement(db, spec, &caller, &context)?;
+    let ignore_inert = layers.config.ignore_inert_redirects;
     let edge = |cmd: &PlannedCommand| {
-        senpai_edge_drift(db, cmd, &caller)
-            .or_else(|| senpai_edge_archive(db, cmd, &caller))
-            .or_else(|| mcp_session_create(db, cmd, &caller))
+        senpai_edge_drift(db, cmd, &caller, ignore_inert)
+            .or_else(|| senpai_edge_archive(db, cmd, &caller, ignore_inert))
+            .or_else(|| mcp_session_create(db, cmd, &caller, ignore_inert))
     };
     let lower = lower_layers_per_gated_statement(spec, layers, &edge);
     // The acts that always ask, per gated statement: decided over every
@@ -2108,8 +2109,16 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
 /// heredoc), since the decision reads the target out of the arguments. `None`
 /// for anything else; the verb itself still refuses a target that is not
 /// live.
-fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
-    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+fn redirects_ok(cmd: &PlannedCommand, ignore_inert_redirects: bool) -> bool {
+    if ignore_inert_redirects {
+        cmd.redirects.iter().all(is_inert_redirect)
+    } else {
+        cmd.redirects.is_empty()
+    }
+}
+
+fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller, ignore_inert: bool) -> Option<Decision> {
+    if cmd.name != "kj" || !redirects_ok(cmd, ignore_inert) || cmd.background || !cmd.heredocs.is_empty() {
         return None;
     }
     let here = caller.context_id?;
@@ -2170,8 +2179,8 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
 /// decision reads the target out of the arguments. `None` for anything else;
 /// the verb still refuses a target it may not archive, and the archive of a
 /// console still always asks.
-fn senpai_edge_archive(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
-    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+fn senpai_edge_archive(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller, ignore_inert: bool) -> Option<Decision> {
+    if cmd.name != "kj" || !redirects_ok(cmd, ignore_inert) || cmd.background || !cmd.heredocs.is_empty() {
         return None;
     }
     let here = caller.context_id?;
@@ -2698,8 +2707,8 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
 /// redirect, background flag or heredoc), since the decision reads the
 /// parent out of the arguments. `None` for anything else, including a
 /// caller whose lineage has no live root or whose root has no hub.
-fn mcp_session_create(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
-    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+fn mcp_session_create(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller, ignore_inert: bool) -> Option<Decision> {
+    if cmd.name != "kj" || !redirects_ok(cmd, ignore_inert) || cmd.background || !cmd.heredocs.is_empty() {
         return None;
     }
     let here = caller.context_id?;

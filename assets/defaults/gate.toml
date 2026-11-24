@@ -168,6 +168,7 @@ allow = [
   "kj drive",              # runs a turn on a lane banto directs
   "kj drift push",         # banto messages senpai and other contexts
   "kj board create",       # banto manages boards and curates topics
+  "kj board archive",
   "kj board promote",
   "kj board pin",
   "kj board unpin",
@@ -184,6 +185,7 @@ allow = [
   "kj drive",              # runs a turn on a lane senpai directs
   "kj drift push",         # senpai messages banto and its kohai
   "kj board create",       # senpai manages its boards and promotes topics
+  "kj board archive",
   "kj board promote",
   "kj board pin",
   "kj board unpin",
@@ -192,6 +194,7 @@ allow = [
 [root]
 allow = [
   "kj board create",       # console / root manages boards directly
+  "kj board archive",
   "kj board promote",
   "kj board pin",
   "kj board unpin",

@@ -415,11 +415,24 @@ impl KernelDb {
     ) -> KernelDbResult<bool> {
         let Some(seat) = seat.filter(|seat| *seat != target) else { return Ok(false) };
         let Some(row) = self.get_context(target)? else { return Ok(false) };
-        if row.is_archived() || row.senpai_ctx != Some(seat) {
+        if row.is_archived() {
             return Ok(false);
         }
         let Some(senpai) = self.get_context(seat)? else { return Ok(false) };
         if senpai.is_archived() || senpai.performer != Some(actor) {
+            return Ok(false);
+        }
+        let direct_or_rotated_senpai = match row.senpai_ctx {
+            Some(s) if s == seat => true,
+            // A rotation leaves live kohai pointing at the archived predecessor
+            // context; the successor seat played by the same character still
+            // supervises and may archive them.
+            Some(prev) => self
+                .get_context(prev)?
+                .is_some_and(|p| p.is_archived() && p.performer == Some(actor)),
+            None => false,
+        };
+        if !direct_or_rotated_senpai {
             return Ok(false);
         }
         Ok(self.shadow_kind(&row)?.is_none() && !self.is_console(target)?)
