@@ -99,6 +99,7 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // switch-by-prompt (screen's `'` select).
         KeyCode::KeyW => Some(Action::GoToWell),
         KeyCode::KeyK => Some(Action::GoToHeroic),
+        KeyCode::KeyE if !shift => Some(Action::ToggleNeo),
         KeyCode::Quote if shift => Some(Action::GoToWell),
         KeyCode::Quote => Some(Action::PromptContextSwitch),
         // n / p — walk ring-0 seats.
@@ -177,6 +178,13 @@ mod tests {
         assert_eq!(resolve_chord(KeyCode::KeyW, false, false), Some(Action::GoToWell));
         assert_eq!(resolve_chord(KeyCode::Quote, false, true), Some(Action::GoToWell));
         assert_eq!(resolve_chord(KeyCode::KeyK, false, false), Some(Action::GoToHeroic));
+    }
+
+    #[test]
+    fn e_toggles_the_neo_workspace() {
+        for ctrl in [false, true] {
+            assert_eq!(resolve_chord(KeyCode::KeyE, ctrl, false), Some(Action::ToggleNeo));
+        }
     }
 
     #[test]

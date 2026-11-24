@@ -372,7 +372,8 @@ fn context_priority(ctx: InputContext) -> usize {
         | InputContext::RoomNav
         | InputContext::WellZoomed
         | InputContext::StationZoomed
-        | InputContext::Heroic => 1,
+        | InputContext::Heroic
+        | InputContext::Neo => 1,
         // A held quick-context overlay outranks the surface it floats over,
         // so its Esc claims the key outright and no `PopLevel` is emitted for
         // the level underneath. It does NOT outrank a modal: a dialog on

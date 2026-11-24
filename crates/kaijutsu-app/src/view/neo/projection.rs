@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use kaijutsu_types::block::{BlockId, BlockKind, BlockSnapshot, ContentType};
+use kaijutsu_types::block::{BlockId, BlockKind, BlockSnapshot, ContentType, Status};
 
 #[derive(Debug, PartialEq)]
 pub struct NeoEvent {
@@ -22,11 +22,12 @@ pub struct NeoProjection {
     pub dialogue: Vec<NeoEvent>,
     pub tools: Vec<NeoToolEvent>,
     pub artifacts: Vec<NeoEvent>,
+    pub history: Vec<NeoEvent>,
 }
 
 impl NeoProjection {
     pub fn from_blocks<'a>(blocks: impl IntoIterator<Item = &'a BlockSnapshot>) -> Self {
-        let blocks: Vec<_> = blocks.into_iter().collect();
+        let blocks: Vec<_> = blocks.into_iter().filter(|block| block.status != Status::Draft).collect();
         let calls: HashSet<_> = blocks.iter()
             .filter(|block| block.kind == BlockKind::ToolCall)
             .map(|block| block.id)
@@ -38,10 +39,14 @@ impl NeoProjection {
                 created_at: (block.created_at != 0).then_some(block.created_at),
             };
             let artifact = matches!(block.content_type,
-                ContentType::Svg | ContentType::Abc | ContentType::Diff | ContentType::Media);
+                ContentType::Svg | ContentType::Abc | ContentType::Diff | ContentType::Media)
+                || matches!(block.kind, BlockKind::File | BlockKind::Resource);
             let tool = matches!(block.kind, BlockKind::ToolCall | BlockKind::ToolResult);
             if artifact {
                 projection.artifacts.push(event());
+            }
+            if tool || matches!(block.kind, BlockKind::Drift | BlockKind::Error | BlockKind::Notification | BlockKind::Trace | BlockKind::Task) {
+                projection.history.push(event());
             }
             if tool {
                 let tool_call_id = if block.kind == BlockKind::ToolResult {

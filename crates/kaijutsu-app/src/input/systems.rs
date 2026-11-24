@@ -217,15 +217,15 @@ pub fn handle_navigate_blocks(
     // not it currently has an entity (the band respawns it as the scroll
     // catches up).
     use crate::view::geometry::RowKey;
-    let block_rows: Vec<(kaijutsu_types::BlockId, f32, f32)> = geom
+    let block_ids: Vec<kaijutsu_types::BlockId> = geom
         .rows()
         .iter()
         .filter_map(|row| match row.key {
-            RowKey::Block(id) => Some((id, row.y_offset, row.height)),
+            RowKey::Block(id) => Some(id),
             RowKey::Header(_) => None,
         })
         .collect();
-    if block_rows.is_empty() {
+    if block_ids.is_empty() {
         return;
     }
 
@@ -233,20 +233,11 @@ pub fn handle_navigate_blocks(
     let current_idx = focus
         .block_id
         .as_ref()
-        .and_then(|id| block_rows.iter().position(|(bid, _, _)| bid == id));
+        .and_then(|id| block_ids.iter().position(|bid| bid == id));
 
-    let new_idx = next_focus_index(&direction, current_idx, block_rows.len());
-
-    let (new_id, row_y, row_h) = block_rows[new_idx];
-
-    // Update focus resource — the surface path draws its focus ring from
-    // `FocusTarget.block_id` alone (`view::surface::chrome`), so there is no
-    // marker component to move.
-    focus.focus_block(new_id);
-
-    // Scroll to keep the focused block visible — geometry provides the
-    // rect even for entity-less blocks.
-    scroll_to_rect_visible(&mut scroll_state, row_y, row_h);
+    let new_idx = next_focus_index(&direction, current_idx, block_ids.len());
+    let new_id = block_ids[new_idx];
+    reveal_block(geom, &mut focus, &mut scroll_state, new_id);
 
     debug!("Block focus: {:?} (index {})", new_id, new_idx);
 }
@@ -300,16 +291,24 @@ pub fn handle_jump_to_latest_error(
         return;
     };
 
-    let Some(row) = geom.block_row(&target_id) else {
-        return;
+    if reveal_block(geom, &mut focus, &mut scroll_state, target_id) {
+        debug!("Jumped to latest error block: {:?}", target_id);
+    }
+}
+
+/// Focus and reveal the exact block if it still belongs to this transcript.
+pub(crate) fn reveal_block(
+    geometry: &crate::view::geometry::ConversationGeometry,
+    focus: &mut FocusTarget,
+    scroll: &mut ConversationScrollState,
+    id: kaijutsu_types::BlockId,
+) -> bool {
+    let Some(row) = geometry.block_row(&id) else {
+        return false;
     };
-    let (row_y, row_h) = (row.y_offset, row.height);
-
-    focus.focus_block(target_id);
-
-    scroll_to_rect_visible(&mut scroll_state, row_y, row_h);
-
-    debug!("Jumped to latest error block: {:?}", target_id);
+    focus.focus_block(id);
+    scroll_to_rect_visible(scroll, row.y_offset, row.height);
+    true
 }
 
 /// Pure lookup: the last non-excluded `Status::Error` block in document

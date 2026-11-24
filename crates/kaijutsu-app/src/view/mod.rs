@@ -32,7 +32,6 @@ pub mod editor;
 pub mod geometry;
 pub mod heroic;
 pub mod lifecycle;
-#[cfg(test)]
 pub mod neo;
 pub mod overlay;
 pub mod render_store;

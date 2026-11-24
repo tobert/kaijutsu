@@ -18,14 +18,15 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 
 ## App layout follow-ups (2026-11-23)
 
-- **Neo workspace.** The first projection preserves source block IDs and
-  document order across dialogue, tools, and explicitly typed artifacts.
-  The first visible slice should keep `Screen::Conversation`, add workbench
-  and history regions outside the tiling subtree, and reveal exact source
-  blocks through existing navigation. Independent rich artifact surfaces
-  need a rendering input boundary: current panes share the focused
-  `MainCell`, geometry, and scroll. Keep history still while idle; recorded
-  creation time is not an execution duration or a scheduled target.
+- **Neo rich workspace and temporal scene.** The visible workspace now
+  indexes recent artifacts and events and reveals their source blocks.
+  Independent rich artifact surfaces need a rendering input boundary:
+  current panes share the focused `MainCell`, geometry, and scroll. A temporal
+  3D scene and particle flows remain design work. Keep history still while
+  idle; recorded creation time is not an execution duration or scheduled target.
+- **Narrow dock labels collide.** At 640px the header and footer labels overlap
+  even though the conversation and Neo panels fit. Give dock labels a width
+  budget and elide lower-priority status before they cover navigation hints.
 - **Waiting attention.** Amy wants waiting on approval or execution to be
   able to remain animated while blocked, distinct from finite error
   attention. Deferred until the ledger and execution states can drive the

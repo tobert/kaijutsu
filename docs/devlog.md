@@ -249,12 +249,18 @@ An isolated app confirmed user color motion while model and tool pixels stayed
 identical across frames. The integrated suite passes 1441 app tests, nine
 theme-data tests, and 94 presentation tests.
 
-Neo starts with a tested projection of existing block IDs into dialogue,
-tools, and explicitly typed artifacts. It preserves document order and
-interleaved tool relationships without copying content or inventing times.
-The projection remains test-only until a workspace consumes it. The first
-visible slice should retain the existing conversation renderer and input
-path; independent rich workbench surfaces need a rendering input boundary.
+Neo opens with `Ctrl+A e` beside the existing conversation. The first workspace
+indexes recent typed artifacts and events without duplicating the transcript.
+Selection follows source block IDs, and `Shift+Enter` reveals the exact source.
+The panels move below the transcript in narrow windows; leaving Neo restores
+the transcript width. Context switches clear selection. Approval waits remain
+amber in history. The history is still while idle.
+
+The integrated tests cover source reveal, selection across updates, context
+switches, and viewer round trips. The TUI still builds with the shared action
+variants. A running isolated app verified keyboard selection and source reveal,
+plus 1280px side panels and a 640px layout below the transcript. Independent
+rich workbench surfaces and a temporal 3D scene remain future work.
 
 ## The file cache learns what vim already knew (August 18–20)
 

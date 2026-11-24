@@ -211,6 +211,12 @@ pub enum Action {
     GoToWell,
     /// `Ctrl+A k` — enter the heroic view (`Screen::Heroic`).
     GoToHeroic,
+    /// `Ctrl+A e` — toggle the Neo workspace beside the conversation.
+    ToggleNeo,
+    /// Switch between the Neo workbench and event history.
+    NeoSwitchSection,
+    /// Reveal the selected Neo record's source block in the transcript.
+    NeoReveal,
     /// `r` in the heroic view — re-fetch `theme.toml` over RPC for live tuning.
     ReloadTheme,
     /// `Ctrl+A d` — detach: back to the Conversation view from any scene or

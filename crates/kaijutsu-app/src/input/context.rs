@@ -37,6 +37,8 @@ pub enum InputContext {
     StationZoomed,
     /// Screen::Heroic — the 3D anticipation & commitment road (`docs/newui.md`)
     Heroic,
+    /// Neo is visible and the transcript has navigation focus.
+    Neo,
     /// The quick-context overlay is HELD (`Ctrl+A h`, `ui::quick_context`).
     /// Active on top of whatever surface is underneath, and outranked only
     /// by `Dialog` — a modal still owns Esc. Its single binding is Esc →
@@ -240,6 +242,7 @@ pub fn sync_input_context(
     quick: Res<crate::ui::quick_context::QuickContextState>,
     sheet: Res<crate::ui::ask_sheet::AskSheetState>,
     ribbon: Res<crate::ui::ledger_ribbon::LedgerRibbonState>,
+    neo: Option<Res<crate::view::neo::NeoMode>>,
     mut active: ResMut<ActiveInputContexts>,
     mut grab: ResMut<KeyboardGrab>,
 ) {
@@ -250,6 +253,7 @@ pub fn sync_input_context(
         && !quick.is_changed()
         && !sheet.is_changed()
         && !ribbon.is_changed()
+        && !neo.as_ref().is_some_and(|neo| neo.is_changed())
         && !active.is_added()
     {
         return;
@@ -259,8 +263,11 @@ pub fn sync_input_context(
         sheet: sheet.keys_armed(),
         ribbon: ribbon.open,
     };
-    let (contexts, new_grab) =
+    let (mut contexts, new_grab) =
         derive_contexts(*screen.get(), room.zoomed, &focus, quick.held, approval);
+    if contexts.contains(&InputContext::Navigation) && neo.is_some_and(|neo| neo.enabled) {
+        contexts.push(InputContext::Neo);
+    }
     active.0 = contexts;
     // Avoid spurious change-detection on the grab resource.
     if *grab != new_grab {

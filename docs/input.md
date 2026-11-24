@@ -6,6 +6,15 @@ App input flows through a central action table that maps key combinations to `Ac
 - **Vi editor:** Only the vi editor grabs raw keyboard input directly. Vi owns `Esc` where live; elsewhere, an `Esc` triggers a `PopLevel` action.
 - **Muscle memory:** Standard screen/tmux `Ctrl+A` bindings and standard vi keybindings are preserved. `Ctrl+A k` enters the heroic view (`Screen::Heroic` in the app; "not built yet" notice in the tui).
 
+### Neo workspace
+
+In the app, `Ctrl+A e` toggles Neo while the conversation is on screen. The
+workbench lists recent artifact blocks, and the event history lists recent
+tool, diagnostic, and context activity. In conversation navigation, `[` and
+`]` select a record, `\` switches sections, and `Shift+Enter` reveals the exact
+source block in the transcript. Open a revealed diff with `v`. Both panels
+show up to 48 records from the latest 1,024 blocks in the active context.
+
 ## The vi editor and registers
 
 `vi` opens a real vi-like editor on a file or configuration block. The editor is a kernel-owned session driven through a tool-shaped surface; the Bevy app, a model, and headless tests all act as drivers of the same `EditorCore` engine (`kaijutsu-editor` crate).

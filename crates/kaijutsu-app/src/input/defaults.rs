@@ -542,6 +542,12 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
+    // Neo workspace navigation leaves the transcript's vi motions in place.
+    b.push(Binding::key(KeyCode::BracketLeft, InputContext::Neo, Action::StepPrev, "Previous Neo record"));
+    b.push(Binding::key(KeyCode::BracketRight, InputContext::Neo, Action::StepNext, "Next Neo record"));
+    b.push(Binding::key(KeyCode::Backslash, InputContext::Neo, Action::NeoSwitchSection, "Switch Neo section"));
+    b.push(Binding::key_mod(KeyCode::Enter, Modifiers::SHIFT, InputContext::Neo, Action::NeoReveal, "Reveal Neo source"));
+
     // Heroic (Screen::Heroic — full-window 3D road, docs/newui.md)
     // ====================================================================
 
