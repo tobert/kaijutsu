@@ -182,7 +182,7 @@ pub(crate) struct BlockDecoration {
 impl BlockDecoration {
     fn from_inputs(inputs: &BorderInputs) -> Self {
         let error = match inputs.kind {
-            BlockKind::ToolResult if inputs.is_error => Some(ErrorAttention {
+            BlockKind::ToolResult if inputs.is_error && inputs.status != kaijutsu_types::Status::Waiting => Some(ErrorAttention {
                 at_ms: inputs.error_at,
                 routine: true,
             }),
@@ -507,6 +507,7 @@ impl ChromeInstance {
     /// The `BorderKind` → shader constant mapping.
     pub fn kind_of(kind: BorderKind) -> u32 {
         match kind {
+            BorderKind::None => 0,
             BorderKind::Full => CHROME_KIND_FULL,
             BorderKind::TopAccent => CHROME_KIND_TOP_ACCENT,
             BorderKind::Dashed => CHROME_KIND_DASHED,
@@ -589,7 +590,7 @@ pub fn block_chrome_instance(
     theme: &Theme,
     gaps: BorderLabelGaps,
 ) -> ChromeInstance {
-    let (glow_radius, glow_intensity) = if style.kind == BorderKind::CenterLine {
+    let (glow_radius, glow_intensity) = if matches!(style.kind, BorderKind::None | BorderKind::CenterLine) {
         (0.0, 0.0)
     } else {
         (
@@ -1096,6 +1097,7 @@ mod tests {
     /// be compared.
     #[test]
     fn kind_and_animation_map_to_the_shader_constants() {
+        assert_eq!(ChromeInstance::kind_of(BorderKind::None), 0);
         assert_eq!(ChromeInstance::kind_of(BorderKind::Full), 1);
         assert_eq!(ChromeInstance::kind_of(BorderKind::TopAccent), 2);
         assert_eq!(ChromeInstance::kind_of(BorderKind::Dashed), 3);
@@ -1115,10 +1117,12 @@ mod tests {
     fn a_center_line_carries_no_glow() {
         let theme = Theme::default();
         let mut style = style_of(&inputs(BlockKind::Thinking), &theme, false);
-        style.kind = BorderKind::CenterLine;
-        let inst = block_chrome_instance(&style, [0.0, 0.0, 100.0, 20.0], &theme, no_gaps());
-        assert_eq!(inst.params[2], 0.0);
-        assert_eq!(inst.params[3], 0.0);
+        for kind in [BorderKind::None, BorderKind::CenterLine] {
+            style.kind = kind;
+            let inst = block_chrome_instance(&style, [0.0, 0.0, 100.0, 20.0], &theme, no_gaps());
+            assert_eq!(inst.params[2], 0.0);
+            assert_eq!(inst.params[3], 0.0);
+        }
     }
 
     #[test]
@@ -1171,6 +1175,17 @@ mod tests {
         let color = theme.block_border_error;
         assert_eq!(inst.color, color_to_rgba8(color.with_alpha(color.alpha() * 0.65)));
         assert_eq!(inst.anim[0], CHROME_ANIM_NONE);
+    }
+
+    #[test]
+    fn a_waiting_receipt_does_not_replay_error_attention() {
+        let theme = Theme::default();
+        let mut waiting = inputs(BlockKind::ToolResult);
+        waiting.status = Status::Waiting;
+        waiting.is_error = true;
+        waiting.error_at = 10_000;
+        assert_eq!(decorated_block(&waiting, &theme, 10_000), decorated_block(&waiting, &theme, 10_450));
+        assert_eq!(decorated_block(&waiting, &theme, 10_000), decorated_block(&waiting, &theme, 90_000));
     }
 
     fn decorated_block(inputs: &BorderInputs, theme: &Theme, now_ms: u64) -> ChromeInstance {
@@ -1255,6 +1270,7 @@ mod tests {
             &BlockLabels {
                 top: Some(label_run(w, ascent)),
                 bottom: None,
+                command: None,
             },
             400.0,
             80.0,
@@ -1271,6 +1287,7 @@ mod tests {
             &BlockLabels {
                 top: Some(label_run(w, ascent)),
                 bottom: Some(label_run(30.0, ascent)),
+                command: None,
             },
             400.0,
             80.0,

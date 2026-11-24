@@ -116,6 +116,8 @@ impl std::fmt::Debug for RichPayload {
 /// One block's display text and everything the shaper needs to lay it out.
 #[derive(Debug, Clone)]
 pub struct FormattedBlock {
+    /// The source's declared content type.
+    pub content_type: kaijutsu_types::ContentType,
     /// Document version at the moment this block's *shaped form* last
     /// actually changed.
     ///
@@ -292,6 +294,7 @@ impl BlockContentCache {
         self.blocks.insert(
             id,
             FormattedBlock {
+                content_type: kaijutsu_types::ContentType::Plain,
                 version: 1,
                 text: String::new(),
                 color: Color::WHITE,
@@ -328,6 +331,7 @@ impl BlockContentCache {
         self.blocks.insert(
             id,
             FormattedBlock {
+                content_type: kaijutsu_types::ContentType::Plain,
                 version,
                 text: text.to_string(),
                 color,
@@ -493,6 +497,7 @@ pub fn sync_block_content(
         let changed = match cache.blocks.get(&id) {
             Some(prev) => {
                 prev.text != text
+                    || prev.content_type != block.content_type
                     || prev.rich != rich
                     || prev.spans_fingerprint != spans_fp
                     || (rich.is_some_and(RichKindInfo::is_drawn) && prev.fingerprint != fingerprint)
@@ -507,6 +512,7 @@ pub fn sync_block_content(
         cache.blocks.insert(
             id,
             FormattedBlock {
+                content_type: block.content_type,
                 version,
                 text,
                 color,

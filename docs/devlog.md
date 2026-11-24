@@ -237,6 +237,18 @@ make it recent again. Waiting-state animation remains separate work.
 All 1422 app tests passed. An isolated app verified exclusion through the
 kernel, a real failed builtin, and stable pixels after attention settled.
 
+The next reading pass gives model prose its own watery-blue `assistant_fg`
+and restores the slow OKLCH rainbow for plain user text. Rich content and
+receipts stay steady. The rainbow uses a style-table entry and existing GPU
+time, so animation does not reshape text. Tool calls gain caption clearance
+and a separate command glyph; successful results keep status without another
+rule. Violet call accents regain contrast without restoring glow. Waiting
+receipts use amber even when their transport envelope carries an error flag;
+they do not replay error attention. Empty waiting receipts retain their caption.
+An isolated app confirmed user color motion while model and tool pixels stayed
+identical across frames. The integrated suite passes 1441 app tests, nine
+theme-data tests, and 94 presentation tests.
+
 Neo starts with a tested projection of existing block IDs into dialogue,
 tools, and explicitly typed artifacts. It preserves document order and
 interleaved tool relationships without copying content or inventing times.

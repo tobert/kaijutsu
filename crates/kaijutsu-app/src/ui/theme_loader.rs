@@ -42,14 +42,23 @@ mod tests {
 
     #[test]
     fn test_font_rainbow_param() {
-        // Sustained reading uses static text colors by default.
+        // Plain user prose receives the flowing color effect.
         let td: ThemeData = parse_theme_data(DEFAULT_THEME_TOML).unwrap();
-        assert!(!td.font_rainbow);
+        assert!(td.font_rainbow);
 
-        // Themes can still opt into rainbow text.
-        let modified = DEFAULT_THEME_TOML.replace("font_rainbow = false", "font_rainbow = true");
+        // Themes can disable the effect.
+        let modified = DEFAULT_THEME_TOML.replace("font_rainbow = true", "font_rainbow = false");
         let theme = Theme::from(parse_theme_data(&modified).unwrap());
-        assert!(theme.font_rainbow);
+        assert!(!theme.font_rainbow);
+    }
+
+    #[test]
+    fn assistant_foreground_is_loaded_independently() {
+        let mut data: toml::Value = toml::from_str(DEFAULT_THEME_TOML).unwrap();
+        data["assistant_fg"] = toml::Value::String("#336699".into());
+        let theme = Theme::from(parse_theme_data(&toml::to_string(&data).unwrap()).unwrap());
+        assert_eq!(theme.block_assistant, bevy::prelude::Color::srgb(0.2, 0.4, 0.6));
+        assert_ne!(theme.block_assistant, theme.fg);
     }
 
     #[test]

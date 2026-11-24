@@ -89,6 +89,8 @@ pub struct BorderLabelMetrics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
 pub enum BorderKind {
+    /// No stroke; layout and captions remain visible.
+    None,
     /// Complete rectangle border.
     #[default]
     Full,
@@ -212,7 +214,7 @@ impl BorderInputs {
     /// the status caption instead of its call.
     pub fn is_visible_tool_result(&self) -> bool {
         self.kind == BlockKind::ToolResult
-            && (!self.content_empty || self.has_output || self.is_error)
+            && (!self.content_empty || self.has_output || self.is_error || self.status == Status::Waiting)
     }
 }
 
@@ -291,7 +293,7 @@ pub fn compute_border_style(
                 color,
                 thickness: theme.block_border_thickness,
                 corner_radius: theme.block_border_corner_radius,
-                padding,
+                padding: BorderPadding { top: base * 1.5, left: base * 2.0, ..padding },
                 animation,
                 top_label: Some(top_label),
                 bottom_label: status_label,
@@ -303,7 +305,9 @@ pub fn compute_border_style(
             }
 
             let has_paired_call = block.tool_call_id.is_some();
-            let color = if block.is_error {
+            let color = if block.status == Status::Waiting {
+                theme.warning
+            } else if block.is_error {
                 theme.block_border_error
             } else {
                 theme.block_border_tool_result
@@ -321,7 +325,7 @@ pub fn compute_border_style(
             };
 
             Some(BlockBorderStyle {
-                kind: BorderKind::TopAccent,
+                kind: if block.is_error && block.status != Status::Waiting { BorderKind::TopAccent } else { BorderKind::None },
                 color,
                 thickness: theme.block_border_thickness,
                 corner_radius: theme.block_border_corner_radius,
@@ -494,6 +498,9 @@ pub fn apply_focus_style(
     }
     match style {
         Some(mut style) => {
+            if style.kind == BorderKind::None {
+                style.kind = BorderKind::TopAccent;
+            }
             style.color = theme.block_border_focus;
             Some(style)
         }
@@ -605,7 +612,7 @@ mod tests {
             result.tool_call_id = paired.then(|| block_id(1));
             let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
             assert_eq!(style.color, theme.block_border_tool_result);
-            assert_eq!(style.kind, BorderKind::TopAccent);
+            assert_eq!(style.kind, BorderKind::None);
             assert_eq!(style.animation, BorderAnimation::None);
             result.is_error = true;
             let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
@@ -613,6 +620,52 @@ mod tests {
             assert_eq!(style.animation, BorderAnimation::None);
             result.is_error = false;
         }
+    }
+
+    #[test]
+    fn focus_makes_a_strokeless_result_visible_without_reflow() {
+        let theme = Theme::default();
+        let mut result = call_inputs(block_id(2), Status::Done);
+        result.kind = BlockKind::ToolResult;
+        let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
+        let focused = apply_focus_style(Some(style.clone()), true, &theme).unwrap();
+        assert_eq!(focused.kind, BorderKind::TopAccent);
+        assert_eq!(focused.padding, style.padding);
+        assert_eq!(focused.bottom_label, style.bottom_label);
+    }
+
+    #[test]
+    fn empty_waiting_result_keeps_its_caption() {
+        let theme = Theme::default();
+        let mut result = call_inputs(block_id(2), Status::Waiting);
+        result.kind = BlockKind::ToolResult;
+        result.tool_call_id = Some(block_id(1));
+        result.content_empty = true;
+        assert!(!result.has_output && !result.is_error);
+        let style = compute_border_style(&result, &theme, &BorderContext::default(), true, 14.0)
+            .expect("a waiting result must keep its caption even without output");
+        assert_eq!(style.bottom_label.as_deref(), Some("waiting"));
+        assert_eq!(style.color, theme.warning);
+    }
+
+    #[test]
+    fn waiting_error_result_is_amber_and_does_not_pulse() {
+        let theme = Theme::default();
+        let mut result = call_inputs(block_id(2), Status::Waiting);
+        result.kind = BlockKind::ToolResult;
+        result.is_error = true;
+        let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
+        assert_eq!(style.color, theme.warning);
+        assert_eq!(style.animation, BorderAnimation::None);
+        assert_eq!(style.bottom_label.as_deref(), Some("waiting"));
+    }
+
+    #[test]
+    fn tool_call_caption_has_room_above_the_command() {
+        let theme = Theme::default();
+        let call = call_inputs(block_id(1), Status::Done);
+        let style = compute_border_style(&call, &theme, &BorderContext::default(), false, 14.0).unwrap();
+        assert!(style.padding.top >= theme.block_border_padding * 14.0 * 1.5);
     }
 
     #[test]

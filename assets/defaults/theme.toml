@@ -9,6 +9,7 @@
 bg = "#17141f"
 panel_bg = "#1d1926ff"
 fg = "#cec8d8"
+assistant_fg = "#a7c9df"
 fg_dim = "#a29aad"
 accent = "#b58ba7"
 accent2 = "#8bbbc4"
@@ -21,14 +22,14 @@ row_result = "#9c8bb2"
 
 # Semantic colors
 error = "#e28c99"
-warning = "#c9ab7d"
+warning = "#dfbd82"
 success = "#8fb5a1"
 
 # Mode colors (vim-style indicator text)
 mode_normal = "#9c8bb2"
 mode_insert = "#8fb5a1"
 mode_chat = "#8fb5a1"
-mode_shell = "#c9ab7d"
+mode_shell = "#dfbd82"
 mode_visual = "#b58ba7"
 
 # Mode labels (dock HUD text)
@@ -95,7 +96,7 @@ input_overlay_width_pct = 0.6
 input_backdrop_color = "#17141fd9"
 
 # Font configuration
-font_rainbow = false
+font_rainbow = true
 font_mono = "Cascadia Code NF"
 font_serif = "Noto Serif"
 font_sans = "Noto Sans CJK JP"
@@ -116,7 +117,7 @@ constellation_base_radius = 500.0
 constellation_ring_spacing = 550.0
 
 # Block borders
-block_border_tool_call = "#9c8bb259"
+block_border_tool_call = "#b49aeb99"
 block_border_tool_result = "#9c8bb233"
 block_border_error = "#e28c99b3"
 block_border_thinking = "#a29aad33"

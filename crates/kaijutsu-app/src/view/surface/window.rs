@@ -47,6 +47,11 @@ pub struct SurfaceRun {
     /// label's inset.
     pub x_offset: f32,
     pub glyphs: std::sync::Arc<Vec<PositionedGlyph>>,
+    pub rainbow: bool,
+}
+
+fn user_prose_rainbow(role: kaijutsu_types::block::Role, kind: kaijutsu_types::block::BlockKind, styled: bool) -> bool {
+    role == kaijutsu_types::block::Role::User && kind == kaijutsu_types::block::BlockKind::Text && !styled
 }
 
 /// One drawable run of flat-colored triangles in **document space**.
@@ -126,6 +131,7 @@ pub fn assemble_runs(
     shaped: &ShapedBlockCache,
     headers: &HeaderLabelCache,
     chrome: &BlockChromeCache,
+    content: &super::content::BlockContentCache,
     theme: &Theme,
     metrics_epoch: u64,
     row_range: std::ops::Range<usize>,
@@ -150,9 +156,21 @@ pub fn assemble_runs(
                             doc_y: y,
                             x_offset: block.x_offset,
                             glyphs: chunk.glyphs.clone(),
+                            rainbow: content.get(&id).is_some_and(|block| user_prose_rainbow(
+                                block.border.role, block.border.kind,
+                                block.content_type != kaijutsu_types::ContentType::Plain || !block.spans.is_empty() || !block.style_spans.is_empty() || block.rich.is_some(),
+                            )),
                         });
                     }
                     y += chunk.height;
+                }
+                if let Some(command) = block.labels.command.as_ref() {
+                    runs.push(SurfaceRun {
+                        doc_y: row.y_offset + block.y_offset,
+                        x_offset: block.x_offset - command.width - theme.label_pad,
+                        glyphs: command.glyphs.clone(),
+                        rainbow: false,
+                    });
                 }
                 if let Some(entry) = chrome.get(&id) {
                     push_label_runs(
@@ -174,6 +192,7 @@ pub fn assemble_runs(
                     doc_y: row.y_offset + label.y_offset,
                     x_offset: label.x_offset,
                     glyphs: label.glyphs.clone(),
+                    rainbow: false,
                 });
             }
         }
@@ -203,6 +222,7 @@ fn push_label_runs(
             doc_y: rect_y + p.y,
             x_offset: rect_x + p.x,
             glyphs: top.glyphs.clone(),
+            rainbow: false,
         });
     }
     if let Some(bottom) = labels.bottom.as_ref() {
@@ -218,6 +238,7 @@ fn push_label_runs(
             doc_y: rect_y + p.y,
             x_offset: rect_x + p.x,
             glyphs: bottom.glyphs.clone(),
+            rainbow: false,
         });
     }
 }
@@ -439,6 +460,30 @@ mod tests {
     use crate::view::geometry::{EstimateParams, RowSeed};
     use crate::view::surface::shape_cache::{ShapeKey, ShapedBlock, ShapedChunk, ShapedLabel};
 
+    #[test]
+    fn rainbow_only_marks_unstyled_user_prose() {
+        assert!(user_prose_rainbow(Role::User, BlockKind::Text, false));
+        assert!(!user_prose_rainbow(Role::Model, BlockKind::Text, false));
+        assert!(!user_prose_rainbow(Role::User, BlockKind::ToolCall, false));
+        assert!(!user_prose_rainbow(Role::User, BlockKind::ToolResult, false));
+        assert!(!user_prose_rainbow(Role::User, BlockKind::Text, true));
+    }
+
+    #[test]
+    fn user_prose_marks_assembled_text_but_not_captions() {
+        let geom = strip(2);
+        let mut shaped = ShapedBlockCache::default();
+        shaped.insert_for_test(bid(1), shaped_block(0.0, &[10.0]));
+        let snapshot = kaijutsu_types::block::BlockSnapshotBuilder::new(bid(1), BlockKind::Text)
+            .role(Role::User).build();
+        let mut content = super::super::content::BlockContentCache::default();
+        content.insert_for_test(bid(1), crate::cell::block_border::BorderInputs::from_snapshot(&snapshot));
+        let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(),
+            &no_chrome(), &content, &Theme::default(), 0, 1..2);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].rainbow);
+    }
+
     fn bid(seq: u64) -> BlockId {
         use std::sync::OnceLock;
         static IDS: OnceLock<(ContextId, PrincipalId)> = OnceLock::new();
@@ -577,7 +622,7 @@ mod tests {
         let headers = HeaderLabelCache::default();
 
         // Row 1 is block 1, at y=24.
-        let runs = assemble_runs(&geom, &shaped, &headers, &no_chrome(), &Theme::default(), 0, 1..2);
+        let runs = assemble_runs(&geom, &shaped, &headers, &no_chrome(), &super::super::content::BlockContentCache::default(), &Theme::default(), 0, 1..2);
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].doc_y, 24.0);
         assert_eq!(runs[1].doc_y, 34.0);
@@ -600,6 +645,7 @@ mod tests {
             &shaped,
             &HeaderLabelCache::default(),
             &no_chrome(),
+            &super::super::content::BlockContentCache::default(),
             &Theme::default(),
             0,
             1..2,
@@ -618,6 +664,7 @@ mod tests {
             &shaped,
             &HeaderLabelCache::default(),
             &no_chrome(),
+            &super::super::content::BlockContentCache::default(),
             &Theme::default(),
             0,
             1..2,
@@ -638,6 +685,7 @@ mod tests {
             &shaped,
             &HeaderLabelCache::default(),
             &no_chrome(),
+            &super::super::content::BlockContentCache::default(),
             &Theme::default(),
             0,
             2..3,
@@ -655,6 +703,7 @@ mod tests {
             &shaped,
             &HeaderLabelCache::default(),
             &no_chrome(),
+            &super::super::content::BlockContentCache::default(),
             &Theme::default(),
             0,
             0..999,
@@ -679,14 +728,14 @@ mod tests {
         );
 
         // Row 0 is the header, at y=0.
-        let runs = assemble_runs(&geom, &shaped, &headers, &no_chrome(), &Theme::default(), 3, 0..1);
+        let runs = assemble_runs(&geom, &shaped, &headers, &no_chrome(), &super::super::content::BlockContentCache::default(), &Theme::default(), 3, 0..1);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].doc_y, 4.0);
         assert_eq!(runs[0].x_offset, 18.0);
 
         // A different metrics epoch has no label cached — nothing is drawn
         // rather than something stale.
-        assert!(assemble_runs(&geom, &shaped, &headers, &no_chrome(), &Theme::default(), 4, 0..1).is_empty());
+        assert!(assemble_runs(&geom, &shaped, &headers, &no_chrome(), &super::super::content::BlockContentCache::default(), &Theme::default(), 4, 0..1).is_empty());
     }
 
     #[test]
@@ -697,6 +746,7 @@ mod tests {
             &ShapedBlockCache::default(),
             &HeaderLabelCache::default(),
             &no_chrome(),
+            &super::super::content::BlockContentCache::default(),
             &Theme::default(),
             0,
             0..4,
@@ -737,6 +787,7 @@ mod tests {
         block.labels = BlockLabels {
             top: Some(run(top_w, ascent)),
             bottom: Some(run(bottom_w, ascent)),
+            command: Some(run(7.0, ascent)),
         };
         let mut shaped = ShapedBlockCache::default();
         shaped.insert_for_test(bid(1), block);
@@ -746,19 +797,22 @@ mod tests {
             &shaped,
             &HeaderLabelCache::default(),
             &chrome,
+            &super::super::content::BlockContentCache::default(),
             &theme,
             0,
             1..2,
         );
-        // One text chunk, then top and bottom captions.
-        assert_eq!(runs.len(), 3);
+        // The command glyph sits on the first text line, before the captions.
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[1].x_offset, layout.text_x - 7.0 - theme.label_pad);
+        assert_eq!(runs[1].doc_y, runs[0].doc_y);
 
         let inset = labels::fieldset_inset(ascent);
-        let top = &runs[1];
+        let top = &runs[2];
         assert_eq!(top.x_offset, layout.rect_x + theme.label_inset + theme.label_pad);
         assert!((top.doc_y - (row.y_offset + inset - ascent * 0.5)).abs() < 1e-4);
 
-        let bottom = &runs[2];
+        let bottom = &runs[3];
         assert_eq!(
             bottom.x_offset,
             layout.rect_x + layout.rect_width - theme.label_inset - theme.label_pad - bottom_w,
@@ -777,7 +831,7 @@ mod tests {
         let mut shaped = ShapedBlockCache::default();
         shaped.insert_for_test(bid(1), shaped_block(0.0, &[10.0]));
         let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(),
-            &BlockChromeCache::default(), &theme, 0, 1..2);
+            &BlockChromeCache::default(), &super::super::content::BlockContentCache::default(), &theme, 0, 1..2);
         assert_eq!(runs.len(), 1, "only the block text is drawn");
     }
 
@@ -808,6 +862,7 @@ mod tests {
             &shaped,
             &HeaderLabelCache::default(),
             &no_chrome(),
+            &super::super::content::BlockContentCache::default(),
             &Theme::default(),
             0,
             1..2,

@@ -172,9 +172,8 @@ impl Default for SurfaceUniforms {
 /// Layout is mirrored by `StyleEntry` in `msdf_surface.wgsl` — 32 bytes,
 /// vec4-aligned. Entry 0 is the identity (no flags, no effect); entries
 /// 1..=256 are the ANSI palette (slot `i - 1`), fg-override entries rebuilt
-/// from the theme whenever it changes. Effect kinds are reserved for the
-/// rainbow/blink/CRT revival: nothing reads `effect`/`param` yet, but the
-/// slots shipping now is what makes those a table write later.
+/// from the theme whenever it changes. Entry 257 enables the user-prose
+/// rainbow when the theme requests it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable, ShaderType)]
 pub struct StyleEntry {
@@ -184,7 +183,7 @@ pub struct StyleEntry {
     pub fg: [f32; 4],
     /// Bit 0 (`STYLE_FLAG_USE_FG`): replace the instance color with `fg`.
     pub flags: u32,
-    /// Effect kind — 0 none. Reserved (rainbow/blink/CRT phosphor).
+    /// Effect kind — 0 none, 1 rainbow.
     pub effect: u32,
     /// Effect parameter. Reserved.
     pub param: f32,
@@ -194,15 +193,15 @@ pub struct StyleEntry {
 /// `StyleEntry::flags` bit: take fg from the table instead of the instance.
 pub const STYLE_FLAG_USE_FG: u32 = 1;
 
-/// Number of entries in the fixed head of the style table: identity + 256
-/// ANSI palette slots. A glyph's `style_index` for ANSI palette slot `n` is
-/// `n + 1`.
-pub const STYLE_TABLE_FIXED_LEN: usize = 257;
+/// Index for the theme-controlled rainbow effect.
+pub const STYLE_RAINBOW_INDEX: u32 = 257;
+/// Identity, 256 ANSI slots, and the rainbow effect.
+pub const STYLE_TABLE_FIXED_LEN: usize = 258;
 
 /// Build the fixed style table from a resolved 256-color palette (straight
 /// RGBA, 0.0–1.0). Entry 0 is identity; entry `n + 1` overrides fg with
 /// palette slot `n`.
-pub fn build_style_table(palette: &[[f32; 4]; 256]) -> Vec<StyleEntry> {
+pub fn build_style_table(palette: &[[f32; 4]; 256], rainbow: bool) -> Vec<StyleEntry> {
     let mut table = Vec::with_capacity(STYLE_TABLE_FIXED_LEN);
     table.push(StyleEntry {
         fg: [0.0; 4],
@@ -220,6 +219,7 @@ pub fn build_style_table(palette: &[[f32; 4]; 256]) -> Vec<StyleEntry> {
             _pad: 0.0,
         });
     }
+    table.push(StyleEntry { fg: [0.0; 4], flags: 0, effect: u32::from(rainbow), param: 0.0, _pad: 0.0 });
     table
 }
 
@@ -980,7 +980,7 @@ pub fn build_instances(
                 uv_rect: region.uv_rect(atlas.width, atlas.height),
                 color: glyph.color,
                 importance: glyph.importance,
-                style_index: glyph.style_index,
+                style_index: if run.rainbow { STYLE_RAINBOW_INDEX } else { glyph.style_index },
             });
         }
     }
@@ -1124,7 +1124,32 @@ mod tests {
             doc_y,
             x_offset,
             glyphs: Arc::new(glyphs),
+            rainbow: false,
         }
+    }
+
+    #[test]
+    fn rainbow_run_uses_effect_slot_without_changing_glyph_color() {
+        let key = GlyphKey::new(FontId::for_test(1), 42);
+        let atlas = atlas_with_region(key, AtlasRegion {
+            x: 0, y: 0, width: 32, height: 32, anchor_x: 0.0, anchor_y: 0.0,
+        });
+        let mut colored = run(0.0, 0.0, vec![glyph(key, 0.0, 0.0, 16.0)]);
+        colored.rainbow = true;
+        let steady = run(0.0, 0.0, vec![glyph(key, 0.0, 0.0, 16.0)]);
+        let mut instances = Vec::new();
+        build_instances(&[colored, steady], &atlas, &mut instances);
+        assert_eq!(instances[0].style_index, STYLE_RAINBOW_INDEX);
+        assert_eq!(instances[1].style_index, 0);
+        assert_eq!(instances[0].color, instances[1].color);
+    }
+
+    #[test]
+    fn surface_shader_parses_and_validates() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/msdf_surface.wgsl"));
+        let module = naga::front::wgsl::parse_str(source).expect("surface shader parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module).expect("surface shader validates");
     }
 
     /// Apply the WGSL vertex shader's math in Rust for one corner, so the
@@ -1306,13 +1331,14 @@ mod tests {
 
         let mut palette = [[0.0f32; 4]; 256];
         palette[196] = [1.0, 0.25, 0.25, 1.0];
-        let table = build_style_table(&palette);
+        let table = build_style_table(&palette, true);
         assert_eq!(table.len(), STYLE_TABLE_FIXED_LEN);
         assert_eq!(table[0].flags, 0, "entry 0 is the identity");
         assert_eq!(table[0].effect, 0);
         assert_eq!(table[197].fg, [1.0, 0.25, 0.25, 1.0], "slot n lives at n + 1");
-        assert!(table[1..].iter().all(|e| e.flags == STYLE_FLAG_USE_FG));
-        assert!(table.iter().all(|e| e.effect == 0), "effects are reserved");
+        assert!(table[1..257].iter().all(|e| e.flags == STYLE_FLAG_USE_FG));
+        assert_eq!(table[STYLE_RAINBOW_INDEX as usize].effect, 1);
+        assert_eq!(build_style_table(&palette, false)[STYLE_RAINBOW_INDEX as usize].effect, 0);
     }
 
     /// The instance stride and attribute offsets are a contract with the

@@ -404,6 +404,7 @@ pub fn extract_conversation_surfaces(
     geometries: Extract<Query<&ConversationGeometry>>,
     entities: Extract<Res<EditorEntities>>,
     shaped: Extract<Res<ShapedBlockCache>>,
+    content: Extract<Res<super::content::BlockContentCache>>,
     rasters: Extract<Res<SvgRasterCache>>,
     headers: Extract<Res<HeaderLabelCache>>,
     // Border captions are placed against the border box, so assembly needs
@@ -422,7 +423,7 @@ pub fn extract_conversation_surfaces(
     // startup). Before the early returns below: the table must exist even on
     // frames with nothing else to extract, or the first drawn frame races it.
     if theme.is_changed() {
-        style_table.entries = Some(build_style_table(&theme.ansi.palette_256()));
+        style_table.entries = Some(build_style_table(&theme.ansi.palette_256(), theme.font_rainbow));
     }
 
     let Some(main_ent) = entities.main_cell else {
@@ -468,6 +469,7 @@ pub fn extract_conversation_surfaces(
                     &shaped,
                     &headers,
                     &chrome_cache,
+                    &content,
                     &theme,
                     metrics_epoch,
                     surface.window.row_range.clone(),

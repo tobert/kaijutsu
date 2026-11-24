@@ -1382,13 +1382,21 @@ pub fn shape_visible_blocks(
                     caches.chrome.get(&id).and_then(|c| c.style.as_ref()),
                     formatted.border.excluded,
                 );
-                let labels = caches.labels.shape_block(
+                let mut labels = caches.labels.shape_block(
                     font,
                     &label_spec,
                     theme.label_font_size,
                     &mut atlas,
                     &mut font_data,
                 );
+                if formatted.border.kind == crate::view::BlockKind::ToolCall {
+                    let color = caches.chrome.get(&id).and_then(|c| c.style.as_ref())
+                        .map_or(theme.fg_dim, |style| style.color.with_alpha(1.0));
+                    labels.command = caches.labels.shape(
+                        font, &super::labels::LabelSpec { text: ">", color },
+                        theme.label_font_size, &mut atlas, &mut font_data,
+                    );
+                }
                 // A drawn rich kind bakes theme colors into vertices, and so
                 // does an ANSI-spanned block (its background quads and its
                 // underlines), so both take the theme epoch in their key and

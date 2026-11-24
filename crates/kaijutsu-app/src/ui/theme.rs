@@ -140,8 +140,7 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Block text colors (per-block-type for semantic distinction)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Assistant message text color — the user's same readable foreground,
-    /// kept as its own token so a theme can tint model replies.
+    /// Model reply foreground, independent of human and tool text.
     pub block_assistant: Color,
     /// Thinking block text color (dim gray for de-emphasis)
     pub block_thinking: Color,
@@ -494,6 +493,11 @@ impl Theme {
     /// A block's text color: its tone (`kaijutsu_present::format::block_tone`)
     /// resolved against this theme.
     pub fn block_color(&self, block: &BlockSnapshot) -> Color {
+        if block.kind == kaijutsu_types::BlockKind::ToolResult
+            && block.status == kaijutsu_types::Status::Waiting
+        {
+            return self.warning;
+        }
         self.color_for(block_tone(block))
     }
 
@@ -532,12 +536,12 @@ impl Default for Theme {
             row_result: hex_to_color("#9c8bb2"),
 
             // Block text colors
-            block_assistant: hex_to_color("#cec8d8"),
+            block_assistant: hex_to_color("#a7c9df"),
             block_thinking: hex_to_color("#a29aad"),
             block_tool_call: hex_to_color("#8bbbc4"),
             block_tool_result: hex_to_color("#cec8d8"),
             block_tool_error: hex_to_color("#e28c99"),
-            block_error_warning: hex_to_color("#c9ab7d"),
+            block_error_warning: hex_to_color("#dfbd82"),
             block_error_severity: hex_to_color("#e28c99"),
             block_error_fatal: Color::srgb(0.769, 0.118, 0.227), // #c41e3a dark red
             block_drift_push: Color::srgb(0.490, 0.878, 1.000), // #7de0ff cyan
@@ -548,14 +552,14 @@ impl Default for Theme {
 
             // Semantic
             error: hex_to_color("#e28c99"),
-            warning: hex_to_color("#c9ab7d"),
+            warning: hex_to_color("#dfbd82"),
             success: hex_to_color("#8fb5a1"),
 
             // Mode colors (vim-style)
             mode_normal: hex_to_color("#9c8bb2"),
             mode_insert: hex_to_color("#8fb5a1"),
             mode_chat: hex_to_color("#8fb5a1"),
-            mode_shell: hex_to_color("#c9ab7d"),
+            mode_shell: hex_to_color("#dfbd82"),
             mode_visual: hex_to_color("#b58ba7"),
 
             // Mode labels (dock HUD, overridable via theme.toml)
@@ -674,7 +678,7 @@ impl Default for Theme {
             sparkline_fill_color: Some(Color::srgba(0.490, 0.812, 1.00, 0.15)), // cyan 15% alpha
 
             // Font configuration
-            font_rainbow: false,
+            font_rainbow: true,
             font_mono: "Cascadia Code NF".into(),
             // MSDF text rendering quality
             msdf_hint_amount: 0.8,
@@ -691,7 +695,7 @@ impl Default for Theme {
             constellation_ring_spacing: 550.0,
 
             // Block borders
-            block_border_tool_call: hex_to_color("#9c8bb259"),
+            block_border_tool_call: hex_to_color("#b49aeb99"),
             block_border_tool_result: hex_to_color("#9c8bb233"),
             block_border_error: hex_to_color("#e28c99b3"),
             block_border_error_warning: Color::srgba(1.000, 0.706, 0.369, 0.7), // #ffb45e amber
@@ -805,7 +809,7 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
 
         // Conversation text follows the loaded palette; success is a state,
         // not a tint applied to every line of tool output.
-        theme.block_assistant = theme.fg;
+        theme.block_assistant = hex_to_color(&td.assistant_fg);
         theme.block_thinking = theme.fg_dim;
         theme.block_tool_call = theme.accent2;
         theme.block_tool_result = theme.fg;
@@ -959,14 +963,29 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn waiting_tool_receipts_use_waiting_color_even_with_an_error_envelope() {
+        let theme = Theme::default();
+        let block = kaijutsu_types::BlockSnapshotBuilder::new(
+            kaijutsu_types::BlockId::new(
+                kaijutsu_types::ContextId::new(),
+                kaijutsu_types::PrincipalId::new(),
+                1,
+            ),
+            kaijutsu_types::BlockKind::ToolResult,
+        ).is_error(true).status(kaijutsu_types::Status::Waiting).build();
+        assert_eq!(theme.block_color(&block), theme.warning);
+    }
+
+    #[test]
     fn conversation_text_follows_the_loaded_palette() {
         let mut data = kaijutsu_types::theme::ThemeData::default();
         data.fg = "#c4bfce".into();
+        data.assistant_fg = "#a7c9df".into();
         data.fg_dim = "#9f96ad".into();
         data.accent2 = "#89b2bc".into();
         data.error = "#dd8899".into();
         let theme = Theme::from(data);
-        assert_eq!(theme.block_assistant, theme.fg);
+        assert_eq!(theme.block_assistant, hex_to_color("#a7c9df"));
         assert_eq!(theme.block_tool_result, theme.fg);
         assert_eq!(theme.block_thinking, theme.fg_dim);
         assert_eq!(theme.block_tool_call, theme.accent2);
@@ -1013,18 +1032,11 @@ mod tests {
         }
     }
 
-    /// Model prose and the user's own text share one readable foreground. The
-    /// token stays separate from `fg` so a theme can tint model replies without
-    /// moving every line of the conversation.
     #[test]
-    fn assistant_prose_matches_the_user_foreground() {
+    fn assistant_prose_has_an_independent_foreground() {
         let t = Theme::default();
-        assert_eq!(t.block_assistant, t.fg, "assistant prose is body text");
-        assert_eq!(
-            t.color_for(BlockTone::Assistant),
-            t.color_for(BlockTone::User),
-            "the same body color through the tone resolver",
-        );
+        assert_eq!(t.block_assistant, Theme::from(kaijutsu_types::theme::ThemeData::default()).block_assistant);
+        assert_ne!(t.color_for(BlockTone::Assistant), t.color_for(BlockTone::User));
     }
 
     /// A human's own shell keeps the human's own color, end to end through

@@ -58,6 +58,10 @@ fn default_block_border_focus() -> String {
     "#00f0ffcc".into()
 }
 
+fn default_assistant_fg() -> String {
+    "#a7c9df".into()
+}
+
 /// Framework-agnostic theme data.
 ///
 /// Colors are hex strings (`"#rrggbb"` or `"#rrggbbaa"`).
@@ -69,6 +73,9 @@ pub struct ThemeData {
     pub bg: String,
     pub panel_bg: String,
     pub fg: String,
+    /// Model reply foreground, independent of human and tool text.
+    #[serde(default = "default_assistant_fg")]
+    pub assistant_fg: String,
     pub fg_dim: String,
     pub accent: String,
     pub accent2: String,
@@ -244,6 +251,7 @@ impl Default for ThemeData {
             bg: "#17141f".into(),
             panel_bg: "#1d1926ff".into(),
             fg: "#cec8d8".into(),
+            assistant_fg: default_assistant_fg(),
             fg_dim: "#a29aad".into(),
             accent: "#b58ba7".into(),
             accent2: "#8bbbc4".into(),
@@ -256,14 +264,14 @@ impl Default for ThemeData {
 
             // Semantic
             error: "#e28c99".into(),
-            warning: "#c9ab7d".into(),
+            warning: "#dfbd82".into(),
             success: "#8fb5a1".into(),
 
             // Mode colors
             mode_normal: "#9c8bb2".into(),
             mode_insert: "#8fb5a1".into(),
             mode_chat: "#8fb5a1".into(),
-            mode_shell: "#c9ab7d".into(),
+            mode_shell: "#dfbd82".into(),
             mode_visual: "#b58ba7".into(),
 
             // Mode labels
@@ -329,7 +337,7 @@ impl Default for ThemeData {
             input_backdrop_color: "#17141fd9".into(),
 
             // Font configuration
-            font_rainbow: false,
+            font_rainbow: true,
             font_mono: "Cascadia Code NF".into(),
             font_serif: "Noto Serif".into(),
             font_sans: "Noto Sans CJK JP".into(),
@@ -347,7 +355,7 @@ impl Default for ThemeData {
             constellation_ring_spacing: 550.0,
 
             // Block borders
-            block_border_tool_call: "#9c8bb259".into(),
+            block_border_tool_call: "#b49aeb99".into(),
             block_border_tool_result: "#9c8bb233".into(),
             block_border_error: "#e28c99b3".into(),
             block_border_thinking: "#a29aad33".into(),

@@ -26,8 +26,7 @@
 // mirrors the Rust struct in surface_renderer.rs, and the style table at
 // @binding(3) is how per-glyph styling stays dynamic without instance
 // rebuilds — ANSI palette colors resolve here (retheme = table rewrite), and
-// the reserved effect/param fields are the landing site for the rainbow/
-// blink/CRT revival (docs/ansi-and-beyond.md).
+// the effect field controls the user-prose rainbow (docs/ansi-and-beyond.md).
 
 struct Uniforms {
     viewport_phys: vec2<f32>,   // render target size, PHYSICAL px
@@ -51,12 +50,12 @@ struct Uniforms {
 // One entry in the glyph style table — mirrors `StyleEntry` in
 // surface_renderer.rs (32 bytes, vec4-aligned). Entry 0 is identity; entries
 // 1..=256 are ANSI palette slots (index - 1), rewritten on retheme so themed
-// terminal colors never require an instance rebuild. `effect`/`param` are
-// reserved for the rainbow/blink/CRT revival.
+// terminal colors never require an instance rebuild. Entry 257 controls the
+// user-prose rainbow without rebuilding glyph instances.
 struct StyleEntry {
     fg: vec4<f32>,
     flags: u32,     // bit 0: replace instance color with fg
-    effect: u32,    // reserved, 0 = none
+    effect: u32,    // 0 = none, 1 = rainbow
     param: f32,     // reserved
     _pad: f32,
 }
@@ -86,6 +85,7 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) importance: f32,
+    @location(3) @interpolate(flat) effect: u32,
 }
 
 // ============================================================================
@@ -146,6 +146,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, inst: InstanceInput) -> Vert
         inst.color.a,
     );
     out.importance = inst.importance;
+    out.effect = style.effect;
     return out;
 }
 
@@ -209,6 +210,48 @@ fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32, importance: f32) -> f32 {
 // FRAGMENT SHADER
 // ============================================================================
 
+const TAU: f32 = 6.28318530718;
+
+/// OKLCH rainbow ramp (matches `assets/shaders/kaijutsu/color.wesl`).
+/// Outputs linear RGB (`rainbow_color` converts to sRGB for the post-tonemap UI pass).
+fn oklch_rainbow_linear(t: f32, lightness: f32, chroma: f32) -> vec3<f32> {
+    let h = fract(t) * TAU;
+    let a = chroma * cos(h);
+    let b = chroma * sin(h);
+
+    let l_ = lightness + 0.3963377774 * a + 0.2158037573 * b;
+    let m_ = lightness - 0.1055613458 * a - 0.0638541728 * b;
+    let s_ = lightness - 0.0894841775 * a - 1.2914855480 * b;
+
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+
+    let r = max(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s, 0.0);
+    let g = max(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s, 0.0);
+    let b_out = max(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s, 0.0);
+    return vec3<f32>(r, g, b_out);
+}
+
+fn linear_to_srgb_channel(c: f32) -> f32 {
+    let clamped = clamp(c, 0.0, 1.0);
+    if clamped <= 0.0031308 {
+        return clamped * 12.92;
+    }
+    return 1.055 * pow(clamped, 1.0 / 2.4) - 0.055;
+}
+
+/// Generate rainbow color based on screen position and time.
+fn rainbow_color(screen_x: f32, time: f32) -> vec3<f32> {
+    let hue = fract(screen_x * 0.002 + time * 0.06);
+    let lin = oklch_rainbow_linear(hue, 0.78, 0.16);
+    return vec3<f32>(
+        linear_to_srgb_channel(lin.r),
+        linear_to_srgb_channel(lin.g),
+        linear_to_srgb_channel(lin.b),
+    );
+}
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let text_alpha = msdf_alpha_hinted(in.uv, uniforms.text_bias, in.importance);
@@ -216,7 +259,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Premultiplied alpha output — the pipeline blends One / OneMinusSrcAlpha
     // over the surface's opaque background clear.
     let final_alpha = text_alpha * in.color.a;
-    let premul_rgb = in.color.rgb * final_alpha;
+    let color = select(in.color.rgb, rainbow_color(in.clip_position.x, uniforms.time), in.effect == 1u);
+    let premul_rgb = color * final_alpha;
 
     if final_alpha < 0.004 {
         discard;

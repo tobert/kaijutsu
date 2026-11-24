@@ -217,6 +217,7 @@ impl LabelRun {
 pub struct BlockLabels {
     pub top: Option<LabelRun>,
     pub bottom: Option<LabelRun>,
+    pub command: Option<LabelRun>,
 }
 
 impl BlockLabels {
@@ -231,13 +232,13 @@ impl BlockLabels {
                 _ => false,
             }
         }
-        same(&self.top, &other.top) && same(&self.bottom, &other.bottom)
+        same(&self.top, &other.top) && same(&self.bottom, &other.bottom) && same(&self.command, &other.command)
     }
 
     /// Whether any caption is here to draw.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.top.is_none() && self.bottom.is_none()
+        self.top.is_none() && self.bottom.is_none() && self.command.is_none()
     }
 }
 
@@ -383,6 +384,7 @@ impl LabelRunCache {
         font_data: &mut FontDataMap,
     ) -> BlockLabels {
         BlockLabels {
+            command: None,
             top: spec
                 .top
                 .as_ref()
@@ -747,6 +749,7 @@ mod tests {
         let with_a = BlockLabels {
             top: Some(a.clone()),
             bottom: None,
+            command: None,
         };
         assert!(with_a.same_runs(&with_a.clone()));
 

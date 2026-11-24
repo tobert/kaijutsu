@@ -96,7 +96,7 @@ fn sync_block_fx(
                     theme.compose_palette_glow_radius,
                     theme.compose_palette_glow_intensity,
                 )
-            } else if style.kind == BorderKind::CenterLine {
+            } else if matches!(style.kind, BorderKind::None | BorderKind::CenterLine) {
                 // Role-group divider: a plain rule, not a glowing box — the
                 // shader's glow pass SDFs the *whole node rect*, independent
                 // of border kind, so a box glow would ring the entire header
@@ -125,6 +125,7 @@ fn sync_block_fx(
 
             // Border stroke uniforms
             let border_kind = match style.kind {
+                BorderKind::None => 0.0,
                 BorderKind::Full => 1.0,
                 BorderKind::TopAccent => 2.0,
                 BorderKind::Dashed => 3.0,
