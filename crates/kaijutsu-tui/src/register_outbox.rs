@@ -70,6 +70,21 @@ pub fn spawn_local(sink: impl RegisterSink) -> (RegisterOutbox, mpsc::UnboundedR
     (RegisterOutbox { tx: Some(tx) }, failed_rx)
 }
 
+/// Start the writer on the multi-threaded Tokio runtime using an `ActorHandle`.
+pub fn spawn(actor: ActorHandle) -> (RegisterOutbox, mpsc::UnboundedReceiver<Failed>) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<RegisterWrite>>();
+    let (failed_tx, failed_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(writes) = rx.recv().await {
+            let count = writes.len();
+            if let Err(error) = actor.put(writes).await {
+                let _ = failed_tx.send(Failed { writes: count, error });
+            }
+        }
+    });
+    (RegisterOutbox { tx: Some(tx) }, failed_rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

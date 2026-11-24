@@ -114,10 +114,8 @@ A player's text registers are shared through the kernel's register store: compos
 - **`:regpull` replaces recorded macros** in `"a`–`"z`.
 - **The app sends writes made before it connected** once its writer starts, so they reach the kernel without being asked for.
 - **A refused `registersPut` leaves the kernel's copy behind** the client's registers until the next write or a `:regpull`.
-- **A lagging client loses pushed writes for good.** The client's event broadcast holds 256 events and drops on lag with a log line.
 - **A `ZZ` whose flush fails drops the batch's yank** from the reply.
 - **The app feeds `Esc` and `i` outside its register lending.**
-- **No test types `dd` in a kernel vi session and `p` in client compose.**
 - **A recovered buffer's dirty test compares normalized text.** The checkpoint and the buffer drop one trailing newline.
 - **A `:e` whose load fails after the path resolved leaves the path in the list.**
 - **A recovered cursor never rests past the last character.**
@@ -139,11 +137,9 @@ The footer line grows leftward over the badge cluster when a request is pending 
 
 `contrib/headless-app.sh start` runs end to end on gamescope's headless backend (about 10 fps with a debug build), at the size `--size` names (the app takes it as `--window-size`, since gamescope sends no size); `--compositor labwc` keeps the old path. `contrib/headless-smoke.sh` checks start, `act`, `state`, and a screenshot. The harness's `text` and `keys` now return only after the frames their input needs have run (two per typed character, from `get_diagnostics`' frame counter), so a following key cannot overtake the typing. A 54-character `type_text` at 12 fps arrived whole; the earlier drop after a surface switch was not reproduced and is unexplained. Key names are BRP key codes such as `KeyW`. The draft is not readable by design, so no test asserts what was typed. `kaijutsu/act` and `kaijutsu/state` (`docs/input.md`, "Agent control over BRP") now replace most key synthesis; move the harness's `keys` users onto `act`.
 
-## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
+## The tui's picker switch and compose edge cases (2026-11-10)
 
-- **The tui's local tasks sometimes do not run for hundreds of milliseconds.** The draft outbox writer, the actor and the RPC system are `spawn_local` tasks inside `local.run_until` (`main.rs`).
 - **The picker failure is unexplained.** After Enter on the picker row, `switch_seat` never reached the kernel.
-- **A sibling's submit leaves our compose text behind.**
 - **A draft that survives a shell submit is hidden from its submitter.**
 
 ## App and tui tune-up: what the first pass leaves open (2026-11-10)
@@ -153,7 +149,6 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Four tui tests read the `run` module's source as text.**
 - **Logic both clients carry.** Ask-to-tool join, short age/count formatting, picker head/tail lines.
 - **Two layouts of tool output** (`compute_output_layout` vs `layout_output`).
-- **The tui's `:kj` completion draws no popup.**
 - **`Ctrl+O` in the tui's draft is the fold toggle.**
 - **In the app:** `ui/tiling.rs`, `cell/mod.rs`, `bindings.toml` parsing duplication, and large files like `ui/dock.rs`.
 
@@ -410,7 +405,6 @@ Feedback retains its original source anchor when available and retries missing a
 - **4.6 Block Tools Scope:** Block and task tools edit any context a caller's `BlockId` names, breaking focus boundaries.
 - **4.7b Hydration Splitting:** Notification, Resource, Task, Error, and Drift blocks inside open model batches flush during hydration.
 - **2.2 File Caching:** Clean cached files keep serving after delete or rename; `MountBackend` never invalidates caches.
-- **5.2 Actor Lifecycles:** `spawn_editor_reconciler` holds an `Arc` cycle preventing kernel drops.
 - **5.3c Block Copying:** `cherry_pick_block` drops metadata; correct copying requires dedicated block-store minting APIs.
 - **3.1 Council Synchronization:** Council shadow's `CREATE` lock drops before `run_create_lifecycle`, priming shadows twice per call.
 - **6.3 MIDI Cues:** CAS-backed ABC cues do not play because `dispatch_midi_cue` has no prefetch path.

@@ -455,6 +455,10 @@ pub(super) async fn act(
         }
     }
 
+    if !matches!(intent, Intent::Tab | Intent::Ignored | Intent::LegendChanged) {
+        app.completion = None;
+    }
+
     match intent {
         Intent::Ignored | Intent::LegendChanged => {}
         Intent::Interrupt => {
@@ -527,7 +531,7 @@ pub(super) async fn act(
         },
         Intent::OpenLedger => asks::request_ledger(app),
         Intent::Tab => {
-            if app.compose.kj_typed().is_some() {
+            if app.completion.is_some() || app.compose.kj_typed().is_some() {
                 apply_kj_completion(app);
             } else {
                 // The key as it arrived, modifiers and all, not a

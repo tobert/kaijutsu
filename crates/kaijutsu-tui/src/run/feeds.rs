@@ -63,9 +63,10 @@ impl Feeds {
     /// it. A second call for the same context replaces the first task.
     fn pump(&mut self, context_id: ContextId, mut rx: mpsc::Receiver<FeedEvent>) {
         let tx = self.tx.clone();
-        // `spawn_local`: the actor's Cap'n Proto types are `!Send`, so this
-        // task belongs to the caller's `LocalSet`.
-        let task = tokio::task::spawn_local(async move {
+        // `tokio::spawn`: both channels are `Send`, so feed forwarding runs on
+        // the worker pool without contending with `Terminal::draw` on the
+        // main thread's `LocalSet`.
+        let task = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 if tx.send((context_id, event)).await.is_err() {
                     break;
@@ -493,15 +494,24 @@ pub(super) fn abandon_rehydrate(app: &mut App, feeds: &mut Feeds, context_id: Co
 
 /// Draw the compose line from kernel state rather than from the local buffer
 /// alone. The draft is an ordinary block on the same change feed, so a
-/// sibling typing into it arrives here with every other block edit.
+/// sibling typing into it — or submitting it, leaving no draft block for this
+/// principal — arrives here with every other block edit.
 fn reconcile_draft(app: &mut App, context_id: ContextId) {
-    if app.current != Some(context_id) {
+    if app.current != Some(context_id) || app.principal.is_none() {
         return;
     }
-    let Some((text, version)) = app.current_draft() else {
+    let Some(view) = app.views.get(&context_id) else {
         return;
     };
-    app.compose.reconcile(&text, version);
+    let version = view.mirror.version();
+    match app.current_draft() {
+        Some((text, v)) => {
+            app.compose.reconcile(&text, v);
+        }
+        None => {
+            app.compose.reconcile("", version);
+        }
+    }
 }
 
 /// Mark a context as having moved since it was last on screen — screen's `@`
@@ -1030,5 +1040,49 @@ pub(super) mod tests {
         let mut app = App::new("amy");
         let event = ServerEvent::ContextSwitched { context_id: id };
         assert!(!mark_turn_liveness(&mut app, &event));
+    }
+
+    /// When a sibling client submits our shared draft (promoting the draft
+    /// block out of `Status::Draft` or deleting it), the mirror has no draft
+    /// block for our principal anymore; reconciling against that version must
+    /// clear our idle compose buffer instead of leaving the submitted text.
+    #[test]
+    fn a_siblings_submit_clears_our_compose_text() {
+        let id = ContextId::new();
+        let me = PrincipalId::new();
+        let draft_id = BlockId::new(id, me, 1);
+
+        let mut app = App::new("amy");
+        app.principal = Some(me);
+        let mut draft = BlockSnapshot::text(draft_id, None, Role::User, "hello from sibling");
+        draft.status = kaijutsu_types::Status::Draft;
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(vec![draft], 1).unwrap();
+        app.views.insert(id, ContextView::new(mirror));
+        app.switch_to(id);
+        app.compose = Compose::over("hello from sibling");
+        app.compose.reconcile("hello from sibling", 1);
+        assert_eq!(app.compose.text(), "hello from sibling");
+
+        // Sibling submits the draft: its status transitions to Done at version 2.
+        let (actor, _cmds) = ActorHandle::never_answers_for_test();
+        let mut feeds = Feeds::new(mpsc::channel(4).0, mpsc::channel(4).0, actor);
+        let delivery = ContextDelivery {
+            context_id: id,
+            events: vec![VersionedChange {
+                version: 2,
+                change: ContextChange::StatusChanged {
+                    block_id: draft_id,
+                    status: kaijutsu_types::Status::Done,
+                },
+            }],
+            version: 2,
+        };
+        apply_delivery(&mut app, &mut feeds, id, FeedEvent::Changed(delivery));
+        assert_eq!(
+            app.compose.text(),
+            "",
+            "a sibling's submit must clear our idle compose buffer"
+        );
     }
 }

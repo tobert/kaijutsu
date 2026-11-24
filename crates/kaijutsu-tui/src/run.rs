@@ -155,11 +155,11 @@ pub async fn run(
     app.identity = identity.display_name;
     app.principal = Some(identity.principal_id);
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
-    let (drafts, draft_landed) = draft_outbox::spawn_local(bridge.actor().clone());
+    let (drafts, draft_landed) = draft_outbox::spawn(bridge.actor().clone());
     app.drafts = drafts;
-    let (editor_keys, editor_landed) = editor_outbox::spawn_local(bridge.actor().clone());
+    let (editor_keys, editor_landed) = editor_outbox::spawn(bridge.actor().clone());
     app.editor_keys = editor_keys;
-    let (register_puts, register_failed) = crate::register_outbox::spawn_local(bridge.actor().clone());
+    let (register_puts, register_failed) = crate::register_outbox::spawn(bridge.actor().clone());
     app.register_puts = register_puts;
 
     // A panic on this thread, outside any task, past this point unwinds

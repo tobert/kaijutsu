@@ -315,17 +315,18 @@ fn clear_draft(app: &mut App, ctx: ContextId) {
 /// rewrite the bar to the selected candidate. Purely local — the bar is not
 /// a kernel-mirrored block, unlike the compose draft, so no RPC is needed.
 pub(super) fn apply_kj_completion(app: &mut App) {
-    let Some(typed) = app.compose.kj_typed() else {
-        return;
-    };
-    let fresh = completion::complete(&typed, &app.kj_catalog);
-    app.completion = match (app.completion.take(), fresh) {
-        (Some(mut prev), Some(next)) if prev.prefix == next.prefix => {
+    if let Some(mut prev) = app.completion.take() {
+        if app.compose.command_line().is_some() && !prev.candidates.is_empty() {
             prev.cycle();
-            Some(prev)
+            app.completion = Some(prev);
         }
-        (_, next) => next,
-    };
+    }
+    if app.completion.is_none() {
+        let Some(typed) = app.compose.kj_typed() else {
+            return;
+        };
+        app.completion = completion::complete(&typed, &app.kj_catalog);
+    }
     let Some(candidate) = app.completion.as_ref().and_then(|c| c.current()) else {
         return;
     };
@@ -355,6 +356,35 @@ mod tests {
         assert!(!close_confirms(armed, here, at + CLOSE_CONFIRM_WINDOW));
         assert!(!close_confirms(armed, there, at + Duration::from_secs(1)));
         assert!(!close_confirms(None, here, at));
+    }
+
+    #[test]
+    fn repeated_tab_cycles_kj_completion_even_after_trailing_space() {
+        let mut app = App::new("amy");
+        app.kj_catalog = vec![
+            kaijutsu_client::rpc::KjCommandInfo {
+                name: "stage".into(),
+                description: "stage blocks".into(),
+                input_hint: "<verb>".into(),
+                argv_prefix: vec!["stage".into()],
+            },
+            kaijutsu_client::rpc::KjCommandInfo {
+                name: "status".into(),
+                description: "show status".into(),
+                input_hint: String::new(),
+                argv_prefix: vec!["status".into()],
+            },
+        ];
+        app.compose.open_command("kj st");
+
+        apply_kj_completion(&mut app);
+        assert_eq!(app.compose.command_line().as_deref(), Some(":kj stage "));
+        assert_eq!(app.completion.as_ref().unwrap().selected_index(), 0);
+
+        // Second Tab must cycle to `status` even though `kj stage ` has a trailing space.
+        apply_kj_completion(&mut app);
+        assert_eq!(app.compose.command_line().as_deref(), Some(":kj status"));
+        assert_eq!(app.completion.as_ref().unwrap().selected_index(), 1);
     }
 
     /// An edit the writer lost when it stopped lands as a failure the player

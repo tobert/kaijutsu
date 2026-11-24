@@ -171,6 +171,13 @@ pub fn spawn_local(sink: impl EditorSink) -> (EditorOutbox, mpsc::UnboundedRecei
     (outbox, landed)
 }
 
+/// Start the writer on the multi-threaded Tokio runtime using an `ActorHandle`.
+pub fn spawn(actor: ActorHandle) -> (EditorOutbox, mpsc::UnboundedReceiver<Landed>) {
+    let (outbox, writer, landed) = channel(actor);
+    tokio::spawn(writer);
+    (outbox, landed)
+}
+
 impl EditorOutbox {
     /// Queue keys, in the kernel's vim notation, behind everything already
     /// sent.

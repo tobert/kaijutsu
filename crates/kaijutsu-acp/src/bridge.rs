@@ -14,7 +14,6 @@ use kaijutsu_client::{
 };
 use kaijutsu_client::rpc::{KjCommandInfo, KjExecutionResult};
 use kaijutsu_types::{BlockId, ContextId};
-use kaijutsu_types::BlockQuery;
 use tokio::sync::mpsc;
 
 /// Per-process subscription identity.

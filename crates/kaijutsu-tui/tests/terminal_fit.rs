@@ -2753,6 +2753,61 @@ fn a_write_from_another_client_is_put_by_p_in_compose() {
     assert!(session.clipboard().is_empty(), "a push never reaches the clipboard: {:?}", session.clipboard());
 }
 
+/// Deleting a line with `dd` in a kernel vi session reaches compose's shared
+/// vi registers so `p` in compose puts that line after leaving vi.
+#[test]
+fn a_dd_in_a_kernel_vi_session_is_put_by_p_in_compose() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    session.send(":!vi /config/rc/lib/create/S16-handoff.kai\r");
+    let in_editor = |screen: &vt100::Screen| {
+        screen_contains_str(screen, "S16-handoff.kai") && !screen_contains(screen, '\u{276f}')
+    };
+    assert!(
+        session.wait_until(Duration::from_secs(15), in_editor),
+        "vi never opened: {}",
+        session.dump("vi")
+    );
+    assert!(
+        session.wait_until(Duration::from_secs(15), |screen| {
+            screen_contains_str(screen, "inject a character")
+        }),
+        "the editor never drew the file: {}",
+        session.dump("vi loaded")
+    );
+
+    // Delete the first line (`dd`) and quit without saving (`:q!`).
+    session.send("ggdd");
+    std::thread::sleep(Duration::from_millis(250));
+    session.send(":q!\r");
+    assert!(
+        session.wait_until(Duration::from_secs(10), |screen| screen_contains(screen, '\u{276f}')),
+        "the editor did not close: {}",
+        session.dump("quit")
+    );
+
+    // `p` in compose must put the line deleted in kernel vi.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let put = loop {
+        session.send("p");
+        if session.wait_until(Duration::from_millis(700), |screen| {
+            screen_contains_str(screen, "inject a character")
+        }) {
+            break true;
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+    };
+    assert!(
+        put,
+        "`p` in compose never put the line deleted with `dd` in kernel vi: {}",
+        session.dump("after p")
+    );
+}
+
 /// `:regpull` replaces compose's registers with the kernel's copy and says
 /// how many came back.
 #[test]
