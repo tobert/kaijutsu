@@ -91,6 +91,35 @@ pub(crate) fn ask_summary(reader: wire::ask_summary::Reader<'_>) -> Result<AskSu
     })
 }
 
+/// Decode a list of ask cards, skipping any card whose wire enum (`origin` or
+/// `status`) is unknown to this build (`capnp::NotInSchema`). A newer server
+/// adding an ask kind must not hide every other pending ask on an older client.
+/// Other decode errors still fail the list loudly.
+pub(crate) fn ask_summaries(
+    list: capnp::struct_list::Reader<'_, wire::ask_summary::Owned>,
+) -> Result<Vec<AskSummary>, RpcError> {
+    let mut out = Vec::with_capacity(list.len() as usize);
+    for reader in list.iter() {
+        match ask_summary(reader) {
+            Ok(card) => out.push(card),
+            Err(RpcError::NotInSchema(raw)) => {
+                let request_id = reader
+                    .get_request_id()
+                    .ok()
+                    .and_then(|t| t.to_str().ok())
+                    .unwrap_or("<unreadable>");
+                tracing::warn!(
+                    request_id,
+                    raw_enum = raw.0,
+                    "skipping ask card with unknown wire enumerant (newer server)"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn ask_detail(reader: wire::ask_detail::Reader<'_>) -> Result<AskDetail, RpcError> {
     let opt = |has: bool, t: capnp::Result<capnp::text::Reader<'_>>| -> Result<Option<String>, RpcError> {
         if has { Ok(Some(text(t)?)) } else { Ok(None) }
@@ -235,5 +264,81 @@ mod tests {
         bare.init_root::<wire::ask_summary::Builder<'_>>().set_request_id("r");
         let card = ask_summary(bare.get_root_as_reader().unwrap()).unwrap();
         assert_eq!((card.tool_call_block_id, card.lineage_root, card.has_exec_source), (None, None, false));
+    }
+
+    /// Build a serialized `LedgerEvents::onAsks` params buffer with three cards
+    /// whose middle card has its `AskOrigin` ordinal patched to `99` (outside
+    /// this client's schema), simulating a newer server adding an ask kind.
+    pub(crate) fn on_asks_bytes_with_unknown_origin() -> Vec<u8> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut p = msg.init_root::<wire::ledger_events::on_asks_params::Builder<'_>>();
+            p.set_generation(7);
+            let mut asks = p.init_asks(3);
+            {
+                let mut a = asks.reborrow().get(0);
+                a.set_request_id("keep-1");
+                a.set_status(wire::AskStatus::Pending);
+                a.set_origin(wire::AskOrigin::ShellGate);
+            }
+            {
+                let mut b = asks.reborrow().get(1);
+                b.set_request_id("future-origin");
+                b.set_status(wire::AskStatus::Pending);
+                b.set_origin(wire::AskOrigin::Board);
+                b.set_created_at_ms(0x55AA_1234_5678_9ABC);
+            }
+            {
+                let mut c = asks.reborrow().get(2);
+                c.set_request_id("keep-2");
+                c.set_status(wire::AskStatus::Pending);
+                c.set_origin(wire::AskOrigin::Refusal);
+            }
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+
+        // Locate the middle card's data section via its distinctive timestamp,
+        // then patch the `AskOrigin::Board` (6u16) field in that card to 99u16.
+        let marker = 0x55AA_1234_5678_9ABCu64.to_le_bytes();
+        let marker_pos = bytes
+            .windows(8)
+            .position(|w| w == marker)
+            .expect("marker timestamp present in serialized message");
+        // In AskSummary, `status` and `origin` are u16 fields in the word
+        // immediately before `created_at_ms` (or within the preceding 8 bytes).
+        let search_start = marker_pos.saturating_sub(16);
+        let board_u16 = (wire::AskOrigin::Board as u16).to_le_bytes();
+        let rel = bytes[search_start..marker_pos]
+            .chunks_exact(2)
+            .rposition(|c| c == board_u16)
+            .expect("AskOrigin::Board ordinal found before created_at_ms");
+        let patch_at = search_start + rel * 2;
+        bytes[patch_at..patch_at + 2].copy_from_slice(&99u16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn ask_summaries_skips_unknown_origin_card_and_keeps_valid_ones() {
+        let bytes = on_asks_bytes_with_unknown_origin();
+        let reader = capnp::serialize::read_message(
+            &mut bytes.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let p = reader
+            .get_root::<wire::ledger_events::on_asks_params::Reader<'_>>()
+            .unwrap();
+        let list = p.get_asks().unwrap();
+
+        // Confirm the middle card really triggers NotInSchema(99).
+        assert!(matches!(
+            ask_summary(list.get(1)),
+            Err(RpcError::NotInSchema(capnp::NotInSchema(99)))
+        ));
+
+        let cards = ask_summaries(list).expect("unknown origin card must be skipped, not fail the list");
+        let ids: Vec<&str> = cards.iter().map(|c| c.request_id.as_str()).collect();
+        assert_eq!(ids, vec!["keep-1", "keep-2"]);
     }
 }

@@ -331,21 +331,10 @@ pub(crate) struct BlockEventsForwarder {
     /// is most of them — and an empty slot REFUSES loudly rather than
     /// pretending the device was silent.
     pub midi_exchange: std::sync::Arc<crate::midi_exchange::MidiExchangeSlot>,
-    /// Set once [`Self::forward`] first sees `event_tx` with no receivers.
-    /// Latched, not resampled: every push on this forwarder shares the one
-    /// `event_tx`, so "no receivers" is a single closed/open state for the
-    /// whole forwarder, not per event kind. Re-warning per event bought a
-    /// reader nothing — the 2026-09-18 benchmark saw ~15 identical "Event
-    /// channel closed, dropping BlockInserted event" lines in one ACP run,
-    /// one per trailing push after the subscriber had already gone away.
-    /// A fresh forwarder — built on every reconnect and every
-    /// `resubscribe_blocks` re-scope — gets a fresh, unlatched flag, so an
-    /// earlier closure never silences a later, healthy subscription. Note the
-    /// limit of that: the flag is never cleared, and
-    /// `ActorHandle::subscribe_events` adds a receiver to the same `event_tx`
-    /// without rebuilding the forwarder, so a subscriber attaching to a
-    /// latched forwarder would receive nothing. Every caller today
-    /// re-subscribes through a new actor or a re-scope.
+    /// Set once [`Self::forward`] sees `event_tx` with no receivers.
+    /// Suppresses per-event warnings while `receiver_count() == 0`; if a new
+    /// receiver later attaches via `ActorHandle::subscribe_events`, `forward`
+    /// clears this flag and resumes delivery.
     pub closed: std::sync::atomic::AtomicBool,
     /// Events this forwarder has dropped since `closed` latched. Counted
     /// whether or not the warning fired, so the total in that one warning
@@ -889,7 +878,7 @@ impl ledger_events::Server for LedgerEventsForwarder {
             let p = params.get()?;
             Ok(crate::ledger::LedgerPush {
                 generation: p.get_generation(),
-                asks: p.get_asks()?.iter().map(crate::ledger_wire::ask_summary).collect::<Result<_, _>>()?,
+                asks: crate::ledger_wire::ask_summaries(p.get_asks()?)?,
             })
         })();
         match push {
@@ -949,18 +938,25 @@ impl BlockEventsForwarder {
     /// own `Debug` is not used — it can carry a full `BlockSnapshot`, too
     /// much for a log line).
     ///
-    /// The first send that finds no receivers latches `closed` and warns,
-    /// naming how many pushes this forwarder has dropped so far. Every push
-    /// after that skips the send entirely — `closed` already answers the
-    /// question — and only increments the counter, so the fact reaches a
-    /// reader once instead of once per event. See `closed`'s doc comment for
-    /// why a forwarder-scoped latch is safe: a fresh forwarder replaces this
-    /// one on every reconnect and re-scope.
+    /// The first send that finds no receivers sets `closed` and warns once.
+    /// While no receivers are attached (`receiver_count() == 0`), further
+    /// pushes skip the send and increment `dropped_since_closed` without
+    /// spamming logs. If a new receiver later attaches (e.g. via
+    /// `ActorHandle::subscribe_events`), `closed` clears and delivery resumes.
     fn forward(&self, event: ServerEvent, kind: &str) {
         use std::sync::atomic::Ordering;
         if self.closed.load(Ordering::Relaxed) {
-            self.dropped_since_closed.fetch_add(1, Ordering::Relaxed);
-            return;
+            if self.event_tx.receiver_count() == 0 {
+                self.dropped_since_closed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let dropped = self.dropped_since_closed.swap(0, Ordering::Relaxed);
+            self.closed.store(false, Ordering::Relaxed);
+            tracing::debug!(
+                kind,
+                dropped,
+                "Event channel receiver attached — resuming block event forwarding"
+            );
         }
         if self.event_tx.send(event).is_err() {
             self.closed.store(true, Ordering::Relaxed);
@@ -968,8 +964,8 @@ impl BlockEventsForwarder {
             tracing::warn!(
                 kind,
                 dropped,
-                "Event channel closed — no receivers; dropping this and every \
-                 further block event on this subscription (further drops are \
+                "Event channel closed — no receivers; dropping this and further \
+                 block events until a receiver attaches (further drops are \
                  counted, not logged one by one)"
             );
         }
@@ -2169,6 +2165,56 @@ mod block_forwarder_closed_channel_tests {
             assert!(matches!(rx.try_recv(), Ok(ServerEvent::BlockDeleted { .. })));
             assert!(!fwd.closed.load(Ordering::Relaxed));
             assert_eq!(fwd.dropped_since_closed.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// A forwarder that saw zero receivers (latching `closed`) must resume
+    /// delivering once a new receiver subscribes to the same `event_tx`
+    /// (for example via `ActorHandle::subscribe_events`).
+    #[test]
+    fn closed_forwarder_recovers_when_new_receiver_attaches() {
+        run_local(async {
+            let (fwd, client) = closed_forwarder();
+            let context = ContextId::new();
+
+            // Drive one drop while receiver_count == 0 to latch `closed`.
+            let mut req1 = client.on_block_deleted_request();
+            {
+                let mut params = req1.get();
+                params.set_sub_seq(1);
+                params.set_context_id(context.as_bytes());
+                let mut id = params.reborrow().init_block_id();
+                id.set_context_id(context.as_bytes());
+                id.set_principal_id(kaijutsu_types::PrincipalId::new().as_bytes());
+                id.set_seq(1);
+            }
+            req1.send().promise.await.expect("callback delivered");
+            assert!(fwd.closed.load(Ordering::Relaxed));
+            assert_eq!(fwd.dropped_since_closed.load(Ordering::Relaxed), 1);
+
+            // A new subscriber attaches to the same broadcast channel.
+            let mut rx = fwd.event_tx.subscribe();
+
+            let mut req2 = client.on_block_deleted_request();
+            {
+                let mut params = req2.get();
+                params.set_sub_seq(2);
+                params.set_context_id(context.as_bytes());
+                let mut id = params.reborrow().init_block_id();
+                id.set_context_id(context.as_bytes());
+                id.set_principal_id(kaijutsu_types::PrincipalId::new().as_bytes());
+                id.set_seq(2);
+            }
+            req2.send().promise.await.expect("callback delivered");
+
+            assert!(
+                !fwd.closed.load(Ordering::Relaxed),
+                "closed flag must clear once a receiver is present again"
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(ServerEvent::BlockDeleted { .. })),
+                "new receiver must receive events after earlier zero-receiver window"
+            );
         });
     }
 }
