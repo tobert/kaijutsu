@@ -18,6 +18,18 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 
 ## App layout follow-ups (2026-11-23)
 
+- **Neo workspace.** The first projection preserves source block IDs and
+  document order across dialogue, tools, and explicitly typed artifacts.
+  The first visible slice should keep `Screen::Conversation`, add workbench
+  and history regions outside the tiling subtree, and reveal exact source
+  blocks through existing navigation. Independent rich artifact surfaces
+  need a rendering input boundary: current panes share the focused
+  `MainCell`, geometry, and scroll. Keep history still while idle; recorded
+  creation time is not an execution duration or a scheduled target.
+- **Waiting attention.** Amy wants waiting on approval or execution to be
+  able to remain animated while blocked, distinct from finite error
+  attention. Deferred until the ledger and execution states can drive the
+  treatment consistently across captions and panels.
 - **Border glow does not follow border opacity.** In
   `assets/shaders/surface_chrome.wgsl`, edge-glow RGB omits the configured
   color alpha while output alpha includes it, despite the documented
