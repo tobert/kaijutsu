@@ -81,7 +81,6 @@ A player's text registers are shared through the kernel's register store: compos
 - **`:regpull` replaces recorded macros** in `"a`–`"z`.
 - **The app sends writes made before it connected** once its writer starts, so they reach the kernel without being asked for.
 - **A refused `registersPut` leaves the kernel's copy behind** the client's registers until the next write or a `:regpull`.
-- **A lagging client loses pushed writes for good.** The client's event broadcast holds 256 events and drops on lag with a log line.
 - **A `ZZ` whose flush fails drops the batch's yank** from the reply.
 - **The app feeds `Esc` and `i` outside its register lending.**
 - **No test types `dd` in a kernel vi session and `p` in client compose.**
@@ -109,7 +108,6 @@ The footer line grows leftward over the badge cluster when a request is pending 
 ## The tui's picker switch and compose edge cases (2026-11-10)
 
 - **The picker failure is unexplained.** After Enter on the picker row, `switch_seat` never reached the kernel.
-- **A sibling's submit leaves our compose text behind.**
 - **A draft that survives a shell submit is hidden from its submitter.**
 
 ## App and tui tune-up: what the first pass leaves open (2026-11-10)

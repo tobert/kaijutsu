@@ -148,7 +148,10 @@ pub(super) async fn on_server_event(
         // forget rather than carry a flag nothing will clear.
         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
             app.forget_turn_liveness();
-            app.note(format!("{n} kernel events lost; turn liveness reset"));
+            if let Ok(cells) = bridge.actor().registers_get().await {
+                let _ = app.compose.replace_registers(&cells);
+            }
+            app.note(format!("{n} kernel events lost; turn liveness and registers resynced"));
             frame.dirty = true;
             return;
         }

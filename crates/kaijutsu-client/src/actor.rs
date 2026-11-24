@@ -104,7 +104,7 @@ use crate::{ConnectError, KernelHandle, RpcClient, SshConfig, connect_ssh};
 const CHANNEL_CAPACITY: usize = 32;
 
 /// Broadcast capacity for server events.
-const EVENT_BROADCAST_CAPACITY: usize = 256;
+const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
 /// Broadcast capacity for connection status events.
 const STATUS_BROADCAST_CAPACITY: usize = 16;
