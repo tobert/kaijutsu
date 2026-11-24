@@ -106,8 +106,8 @@ fn band_contains(band: (f32, f32), offset: f32) -> bool {
 ///
 /// Pure — no ECS — so the assembly the extractor performs is testable without
 /// a render world. Block rows contribute one run per shaped chunk, stacked by
-/// chunk height from the row's `y_offset`, plus their border captions and
-/// gutter checkbox; header rows contribute their cached role label,
+/// chunk height from the row's `y_offset`, plus their border captions;
+/// header rows contribute their cached role label,
 /// positioned inside the header row.
 ///
 /// Rows with nothing shaped yet are simply absent from the output: on the
@@ -181,7 +181,7 @@ pub fn assemble_runs(
     runs
 }
 
-/// Append one block's captions and its gutter checkbox to `runs`.
+/// Append one block's captions to `runs`.
 ///
 /// `rect_*` is the block's border box: `rect_x` / `rect_y` its document
 /// origin, `rect_width` / `rect_height` its size. Every placement is
@@ -218,15 +218,6 @@ fn push_label_runs(
             doc_y: rect_y + p.y,
             x_offset: rect_x + p.x,
             glyphs: bottom.glyphs.clone(),
-        });
-    }
-    if let Some(checkbox) = labels.checkbox.as_ref() {
-        let p =
-            labels::checkbox_placement(checkbox.width, checkbox.height, rect_width, rect_height);
-        runs.push(SurfaceRun {
-            doc_y: rect_y + p.y,
-            x_offset: rect_x + p.x,
-            glyphs: checkbox.glyphs.clone(),
         });
     }
 }
@@ -713,14 +704,12 @@ mod tests {
         assert!(runs.is_empty());
     }
 
-    /// A block's captions and its checkbox are placed against its **border
-    /// box**, not against its text origin — and the checkbox draws even on a
-    /// block with no captions at all, because that is where exclusion shows.
+    /// A block's captions are placed against its border box.
     ///
     /// The positions here are the ones `chrome::border_label_gaps` cuts its
     /// hole from; if the two ever disagree, the stroke runs through the words.
     #[test]
-    fn captions_and_the_checkbox_land_on_the_blocks_border_box() {
+    fn captions_land_on_the_blocks_border_box() {
         let theme = Theme::default();
         let geom = strip(2);
         let row = geom.block_row(&bid(1)).unwrap();
@@ -739,6 +728,7 @@ mod tests {
             crate::view::surface::chrome::BlockChrome {
                 style: None,
                 layout,
+                decoration: Default::default(),
             },
         );
 
@@ -747,7 +737,6 @@ mod tests {
         block.labels = BlockLabels {
             top: Some(run(top_w, ascent)),
             bottom: Some(run(bottom_w, ascent)),
-            checkbox: Some(run(11.0, 12.0)),
         };
         let mut shaped = ShapedBlockCache::default();
         shaped.insert_for_test(bid(1), block);
@@ -761,8 +750,8 @@ mod tests {
             0,
             1..2,
         );
-        // One text chunk, then top caption, bottom caption, checkbox.
-        assert_eq!(runs.len(), 4);
+        // One text chunk, then top and bottom captions.
+        assert_eq!(runs.len(), 3);
 
         let inset = labels::fieldset_inset(ascent);
         let top = &runs[1];
@@ -779,60 +768,17 @@ mod tests {
             "the bottom caption rides the box's bottom stroke, not its top",
         );
 
-        let checkbox = &runs[3];
-        let cb = run(11.0, 12.0);
-        assert_eq!(
-            checkbox.x_offset,
-            layout.rect_x + layout.rect_width - cb.width - labels::CHECKBOX_RIGHT_MARGIN,
-        );
-        assert_eq!(
-            checkbox.doc_y,
-            row.y_offset + (row.height - cb.height) * 0.5,
-            "the checkbox is centred on the whole block, not on a stroke",
-        );
     }
 
-    /// A borderless block still marks its inclusion — that mark is the only
-    /// place exclusion is visible on plain text, which is most of a
-    /// conversation.
     #[test]
-    fn a_borderless_block_still_draws_its_checkbox() {
+    fn included_borderless_block_draws_no_gutter_glyph() {
         let theme = Theme::default();
         let geom = strip(2);
-        let layout = crate::view::surface::chrome::surface_block_layout(
-            800.0,
-            0,
-            theme.indent_width,
-            10.0,
-            None,
-        );
-        let mut chrome = BlockChromeCache::default();
-        chrome.insert_for_test(
-            bid(1),
-            crate::view::surface::chrome::BlockChrome {
-                style: None,
-                layout,
-            },
-        );
-        let mut block = shaped_block(0.0, &[10.0]);
-        block.labels.checkbox = Some(run(11.0, 12.0));
         let mut shaped = ShapedBlockCache::default();
-        shaped.insert_for_test(bid(1), block);
-
-        let runs = assemble_runs(
-            &geom,
-            &shaped,
-            &HeaderLabelCache::default(),
-            &chrome,
-            &theme,
-            0,
-            1..2,
-        );
-        assert_eq!(runs.len(), 2, "the text chunk and the checkbox");
-        assert_eq!(
-            runs[1].x_offset,
-            800.0 - 11.0 - labels::CHECKBOX_RIGHT_MARGIN,
-        );
+        shaped.insert_for_test(bid(1), shaped_block(0.0, &[10.0]));
+        let runs = assemble_runs(&geom, &shaped, &HeaderLabelCache::default(),
+            &BlockChromeCache::default(), &theme, 0, 1..2);
+        assert_eq!(runs.len(), 1, "only the block text is drawn");
     }
 
     // ---- assemble_geometry / assemble_quads ------------------------------

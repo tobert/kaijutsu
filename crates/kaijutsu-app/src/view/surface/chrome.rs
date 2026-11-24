@@ -39,10 +39,8 @@
 //!
 //! # Where the words are
 //!
-//! Block border **labels** ("TOOL CALL kaish", "running") and the gutter
-//! inclusion checkbox are glyph runs, not quads, so they live in
-//! [`super::labels`] and are drawn by the glyph pass. What this module owns of
-//! them is the *hole*: [`border_label_gaps`] turns a block's shaped captions
+//! Block border captions live in [`super::labels`] and are drawn by the
+//! glyph pass. [`border_label_gaps`] turns a block's shaped captions
 //! into the stroke-suppressed ranges and fieldset insets its
 //! [`ChromeInstance`] carries, using `labels`' own placement arithmetic so the
 //! gap and the letters in it are never computed twice.
@@ -52,11 +50,11 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use bytemuck::{Pod, Zeroable};
-use kaijutsu_types::BlockId;
+use kaijutsu_types::{BlockId, BlockKind, ErrorSeverity};
 
 use crate::cell::block_border::{
-    BlockBorderStyle, BorderAnimation, BorderContext, BorderKind, BorderPadding, apply_focus_style,
-    compute_border_style,
+    BlockBorderStyle, BorderAnimation, BorderContext, BorderInputs, BorderKind, BorderPadding,
+    apply_focus_style, compute_border_style,
 };
 use crate::cell::{ConversationScrollState, EditorEntities};
 use crate::connection::RpcConnectionState;
@@ -172,6 +170,67 @@ pub struct BlockChrome {
     /// padding by construction.
     pub style: Option<BlockBorderStyle>,
     pub layout: BlockLayout,
+    pub(crate) decoration: BlockDecoration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BlockDecoration {
+    excluded: bool,
+    error: Option<ErrorAttention>,
+}
+
+impl BlockDecoration {
+    fn from_inputs(inputs: &BorderInputs) -> Self {
+        let error = match inputs.kind {
+            BlockKind::ToolResult if inputs.is_error => Some(ErrorAttention {
+                at_ms: inputs.error_at,
+                routine: true,
+            }),
+            BlockKind::Error if !matches!(inputs.error, Some((_, ErrorSeverity::Warning))) => {
+                Some(ErrorAttention {
+                    at_ms: inputs.error_at,
+                    routine: false,
+                })
+            }
+            _ => None,
+        };
+        Self { excluded: inputs.excluded, error }
+    }
+
+    fn apply(&self, instance: &mut ChromeInstance, color: Color, now_ms: u64) {
+        if self.excluded {
+            instance.anim = [CHROME_ANIM_NONE, 0.0];
+        } else if let Some(error) = self.error {
+            instance.anim = [CHROME_ANIM_NONE, 0.0];
+            instance.color = color_to_rgba8(color.with_alpha(error.opacity(color.alpha(), now_ms)));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ErrorAttention {
+    at_ms: u64,
+    routine: bool,
+}
+
+impl ErrorAttention {
+    const DURATION_MS: u64 = 3_000;
+
+    fn opacity(self, configured_alpha: f32, now_ms: u64) -> f32 {
+        let steady = if self.routine { configured_alpha * 0.65 } else { configured_alpha };
+        let Some(age_ms) = now_ms.checked_sub(self.at_ms) else {
+            return steady;
+        };
+        if self.at_ms == 0 || age_ms >= Self::DURATION_MS {
+            return steady;
+        }
+
+        let peak = if self.routine { configured_alpha } else { (configured_alpha * 1.28).min(1.0) };
+        let life = 1.0 - age_ms as f32 / Self::DURATION_MS as f32;
+        let phase = age_ms as f32 * std::f32::consts::TAU / 900.0;
+        let pulse = 0.55 + 0.45 * phase.cos();
+        steady + (peak - steady) * life * life * pulse
+    }
 }
 
 /// Border style + layout for every block the surface might draw.
@@ -347,7 +406,11 @@ pub fn sync_block_chrome(
             theme.block_border_glow_radius,
             style.as_ref().map(|s| s.padding),
         );
-        cache.blocks.insert(id, BlockChrome { style, layout });
+        cache.blocks.insert(id, BlockChrome {
+            style,
+            layout,
+            decoration: BlockDecoration::from_inputs(&formatted.border),
+        });
     }
 }
 
@@ -387,6 +450,7 @@ pub const CHROME_KIND_DASHED: u32 = 3;
 pub const CHROME_KIND_OPEN_BOTTOM: u32 = 4;
 pub const CHROME_KIND_OPEN_TOP: u32 = 5;
 pub const CHROME_KIND_CENTER_LINE: u32 = 6;
+pub const CHROME_KIND_EXCLUDED_STRIPE: u32 = 7;
 
 /// Animation mode, as `block_fx.wesl`'s `anim_mode`.
 pub const CHROME_ANIM_NONE: f32 = 0.0;
@@ -549,6 +613,32 @@ pub fn block_chrome_instance(
     }
 }
 
+fn excluded_stripe_instance(
+    layout: BlockLayout,
+    row_y: f32,
+    row_height: f32,
+    theme: &Theme,
+) -> Option<ChromeInstance> {
+    const RIGHT_INSET: f32 = 2.0;
+    const VERTICAL_INSET: f32 = 3.0;
+    const MAX_WIDTH: f32 = 4.0;
+
+    let right = layout.rect_x + layout.rect_width - RIGHT_INSET;
+    let text_right = layout.text_x + layout.wrap_width;
+    let width = (right - text_right).min(MAX_WIDTH);
+    let height = row_height - 2.0 * VERTICAL_INSET;
+    if width < 1.0 || height <= 0.0 {
+        return None;
+    }
+
+    Some(ChromeInstance {
+        rect_doc: [right - width, row_y + VERTICAL_INSET, width, height],
+        color: color_to_rgba8(theme.fg_dim.with_alpha(theme.fg_dim.alpha() * 0.30)),
+        kind: CHROME_KIND_EXCLUDED_STRIPE,
+        ..ChromeInstance::zeroed()
+    })
+}
+
 /// The role-group divider for a header row: one full-width rule with a gap
 /// where the label sits.
 ///
@@ -623,8 +713,8 @@ pub struct ChromeInstances {
 /// a `memcmp`; the expensive thing (the GPU upload) is still gated on the
 /// comparison. Revisit if a profile ever shows it.
 ///
-/// Scroll is not an input at all: instances are document-space, so scrolling
-/// inside the built band changes nothing here.
+/// Instances are document-space. The wall clock affects opacity only during
+/// a recorded error's attention window.
 pub fn build_chrome_instances(
     entities: Res<EditorEntities>,
     geometries: Query<&ConversationGeometry>,
@@ -645,6 +735,7 @@ pub fn build_chrome_instances(
     };
     let metrics_epoch = metrics_epoch.get();
     let container_width = chrome.container_width();
+    let now_ms = kaijutsu_types::now_millis();
 
     for (surface, mut instances) in surfaces.iter_mut() {
         scratch.clear();
@@ -657,6 +748,7 @@ pub fn build_chrome_instances(
             &focus,
             &theme,
             container_width,
+            now_ms,
             surface.window.row_range.clone(),
             &mut scratch,
         );
@@ -689,6 +781,7 @@ pub fn collect_chrome_instances(
     focus: &FocusTarget,
     theme: &Theme,
     container_width: f32,
+    now_ms: u64,
     row_range: std::ops::Range<usize>,
     out: &mut Vec<ChromeInstance>,
 ) {
@@ -710,8 +803,9 @@ pub fn collect_chrome_instances(
                 // takes ownership (its other caller, before slice 5, was an
                 // entity `insert`, which also wanted ownership), and this
                 // runs over every in-window row every frame.
+                let focused = focus.is_block_focused(&id);
                 let focused_style;
-                let style = if focus.is_block_focused(&id) {
+                let style = if focused {
                     focused_style = apply_focus_style(entry.style.clone(), true, theme);
                     focused_style.as_ref()
                 } else {
@@ -741,7 +835,16 @@ pub fn collect_chrome_instances(
                         )
                     })
                     .unwrap_or_default();
-                out.push(block_chrome_instance(style, rect, theme, gaps));
+                let mut instance = block_chrome_instance(style, rect, theme, gaps);
+                if !focused {
+                    entry.decoration.apply(&mut instance, style.color, now_ms);
+                }
+                out.push(instance);
+                if entry.decoration.excluded
+                    && let Some(stripe) = excluded_stripe_instance(entry.layout, row.y_offset, row.height, theme)
+                {
+                    out.push(stripe);
+                }
             }
             RowKey::Header(_) => {
                 if container_width <= 0.0 {
@@ -866,6 +969,7 @@ mod tests {
             excluded: false,
             drift_kind: None,
             error: None,
+            error_at: 0,
         }
     }
 
@@ -1017,8 +1121,6 @@ mod tests {
         assert_eq!(inst.params[3], 0.0);
     }
 
-    /// A running tool call chases, an error pulses — the two animations a
-    /// live conversation actually shows, carried end to end.
     #[test]
     fn status_reaches_the_instance_as_an_animation_mode() {
         let theme = Theme::default();
@@ -1031,16 +1133,6 @@ mod tests {
             no_gaps(),
         );
         assert_eq!(inst.anim[0], CHROME_ANIM_CHASE);
-
-        let mut failed = inputs(BlockKind::Error);
-        failed.error = Some((ErrorCategory::Tool, ErrorSeverity::Fatal));
-        let inst = block_chrome_instance(
-            &style_of(&failed, &theme, false),
-            [0.0, 0.0, 10.0, 10.0],
-            &theme,
-            no_gaps(),
-        );
-        assert_eq!(inst.anim[0], CHROME_ANIM_PULSE);
     }
 
     /// Exclusion dims the stroke and stops the animation — the same
@@ -1068,6 +1160,76 @@ mod tests {
         assert!(dim.color[3] < lit.color[3], "excluded must dim the stroke");
     }
 
+    #[test]
+    fn a_failed_tool_without_a_timestamp_has_a_quiet_steady_edge() {
+        let theme = Theme::default();
+        let mut failed = inputs(BlockKind::ToolResult);
+        failed.status = Status::Error;
+        failed.is_error = true;
+        let inst = decorated_block(&failed, &theme, 1_000);
+
+        let color = theme.block_border_error;
+        assert_eq!(inst.color, color_to_rgba8(color.with_alpha(color.alpha() * 0.65)));
+        assert_eq!(inst.anim[0], CHROME_ANIM_NONE);
+    }
+
+    fn decorated_block(inputs: &BorderInputs, theme: &Theme, now_ms: u64) -> ChromeInstance {
+        let style = style_of(inputs, theme, false);
+        let mut instance = block_chrome_instance(&style, [0.0, 0.0, 100.0, 20.0], theme, no_gaps());
+        BlockDecoration::from_inputs(inputs).apply(&mut instance, style.color, now_ms);
+        instance
+    }
+
+    #[test]
+    fn a_recent_failed_tool_pulses_and_recent_opens_join_the_same_fade() {
+        let theme = Theme::default();
+        let mut failed = inputs(BlockKind::ToolResult);
+        failed.is_error = true;
+        failed.error_at = 10_000;
+        let when = |age| decorated_block(&failed, &theme, failed.error_at + age);
+        let opacity = |age| when(age).color[3];
+
+        assert_eq!(when(0).color, color_to_rgba8(theme.block_border_error));
+        assert!(opacity(450) < opacity(900));
+        assert!(opacity(900) < opacity(0));
+        assert_eq!(when(3_000), when(90_000));
+        assert_eq!(decorated_block(&failed, &theme, 9_999), when(3_000));
+    }
+
+    #[test]
+    fn fatal_errors_settle_at_configured_strength_and_excluded_errors_stay_still() {
+        let theme = Theme::default();
+        let mut fatal = inputs(BlockKind::Error);
+        fatal.error = Some((ErrorCategory::Tool, ErrorSeverity::Fatal));
+        fatal.error_at = 10_000;
+        let peak = decorated_block(&fatal, &theme, 10_000);
+        let settled = decorated_block(&fatal, &theme, 17_000);
+        assert!(peak.color[3] > settled.color[3]);
+        assert_eq!(settled.color, color_to_rgba8(theme.block_border_error_fatal));
+
+        fatal.excluded = true;
+        let excluded = decorated_block(&fatal, &theme, 10_000);
+        assert_eq!(excluded, decorated_block(&fatal, &theme, 17_000));
+        assert!(excluded.color[3] < settled.color[3]);
+    }
+
+    #[test]
+    fn failure_timestamps_come_from_the_recorded_mutation_or_creation() {
+        let mut snapshot = kaijutsu_types::BlockSnapshotBuilder::new(bid(1), BlockKind::ToolResult)
+            .build();
+        snapshot.is_error = true;
+        snapshot.created_at = 1_000;
+        snapshot.updated_at = 2_000;
+        assert_eq!(BorderInputs::from_snapshot(&snapshot).error_at, 2_000);
+
+        snapshot.updated_at = 0;
+        assert_eq!(BorderInputs::from_snapshot(&snapshot).error_at, 1_000);
+
+        snapshot.kind = BlockKind::Error;
+        snapshot.updated_at = 3_000;
+        assert_eq!(BorderInputs::from_snapshot(&snapshot).error_at, 1_000);
+    }
+
     // ---- label gaps ------------------------------------------------------
 
     /// A hand-built caption run, so the gap arithmetic can be checked without
@@ -1093,7 +1255,6 @@ mod tests {
             &BlockLabels {
                 top: Some(label_run(w, ascent)),
                 bottom: None,
-                checkbox: Some(label_run(11.0, 11.0)),
             },
             400.0,
             80.0,
@@ -1105,25 +1266,11 @@ mod tests {
         assert_eq!([gaps.gap[2], gaps.gap[3]], [0.0, 0.0]);
         assert_eq!(gaps.insets, [labels::fieldset_inset(ascent), 0.0]);
 
-        // The checkbox lives inside the box and must never cut the stroke.
-        let checkbox_only = border_label_gaps(
-            &BlockLabels {
-                top: None,
-                bottom: None,
-                checkbox: Some(label_run(11.0, 11.0)),
-            },
-            400.0,
-            80.0,
-            &theme,
-        );
-        assert_eq!(checkbox_only, BorderLabelGaps::default());
-
         // A bottom caption fills the other pair and the other inset.
         let both = border_label_gaps(
             &BlockLabels {
                 top: Some(label_run(w, ascent)),
                 bottom: Some(label_run(30.0, ascent)),
-                checkbox: None,
             },
             400.0,
             80.0,
@@ -1156,6 +1303,7 @@ mod tests {
             &focus,
             &theme,
             800.0,
+            0,
             2..3,
             &mut out,
         );
@@ -1191,7 +1339,7 @@ mod tests {
 
         out.clear();
         collect_chrome_instances(
-            &geom, &cache, &headers, &shaped, 0, &focus, &theme, 800.0, 2..3, &mut out,
+            &geom, &cache, &headers, &shaped, 0, &focus, &theme, 800.0, 0, 2..3, &mut out,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].label_gap[0], theme.label_inset);
@@ -1275,9 +1423,66 @@ mod tests {
                 theme.block_border_glow_radius,
                 style.as_ref().map(|s| s.padding),
             );
-            cache.blocks.insert(*id, BlockChrome { style, layout });
+            cache.blocks.insert(*id, BlockChrome {
+                style,
+                layout,
+                decoration: BlockDecoration::from_inputs(&inputs),
+            });
         }
         cache
+    }
+
+    #[test]
+    fn focus_and_exclusion_stripes_stay_steady_and_outside_text() {
+        let theme = Theme::default();
+        let geom = strip(2);
+        let id = bid(1);
+        let mut failed = inputs(BlockKind::ToolResult);
+        failed.is_error = true;
+        failed.error_at = 1_000;
+        failed.excluded = true;
+        let mut cache = chrome_cache(&theme, &[(id, failed.kind)]);
+        let entry = cache.blocks.get_mut(&id).unwrap();
+        entry.style = Some(style_of(&failed, &theme, false));
+        entry.decoration = BlockDecoration::from_inputs(&failed);
+        let layout = entry.layout;
+        let mut focus = FocusTarget::default();
+        focus.focus_block(id);
+        let collect = |cache: &BlockChromeCache, now_ms| {
+            let mut out = Vec::new();
+            collect_chrome_instances(
+                &geom,
+                cache,
+                &HeaderLabelCache::default(),
+                &ShapedBlockCache::default(),
+                0,
+                &focus,
+                &theme,
+                800.0,
+                now_ms,
+                1..2,
+                &mut out,
+            );
+            out
+        };
+        let excluded = collect(&cache, 1_000);
+        assert_eq!(excluded, collect(&cache, 5_000));
+        let [stroke, stripe] = excluded.as_slice() else {
+            panic!("an excluded block should draw a stroke and stripe");
+        };
+        assert_eq!(stroke.color, color_to_rgba8(theme.block_border_focus));
+        assert_eq!(stripe.kind, CHROME_KIND_EXCLUDED_STRIPE);
+        assert_eq!(stripe.anim, [CHROME_ANIM_NONE, 0.0]);
+        assert!(stripe.rect_doc[0] >= layout.text_x + layout.wrap_width);
+        assert!(stripe.rect_doc[0] + stripe.rect_doc[2] <= layout.rect_x + layout.rect_width);
+
+        failed.excluded = false;
+        let entry = cache.blocks.get_mut(&id).unwrap();
+        entry.style = Some(style_of(&failed, &theme, false));
+        entry.decoration = BlockDecoration::from_inputs(&failed);
+        let focused = collect(&cache, 1_000);
+        assert_eq!(focused, [*stroke]);
+        assert_eq!(focused, collect(&cache, 5_000));
     }
 
     /// The focus ring's rect comes from the geometry row (its `y_offset` and
@@ -1303,6 +1508,7 @@ mod tests {
             &focus,
             &theme,
             800.0,
+            0,
             2..3,
             &mut out,
         );
@@ -1318,6 +1524,7 @@ mod tests {
             &focus,
             &theme,
             800.0,
+            0,
             2..3,
             &mut out,
         );
@@ -1343,6 +1550,7 @@ mod tests {
             &FocusTarget::default(),
             &theme,
             800.0,
+            0,
             0..1,
             &mut out,
         );
@@ -1365,6 +1573,7 @@ mod tests {
             &FocusTarget::default(),
             &theme,
             800.0,
+            0,
             0..999,
             &mut out,
         );

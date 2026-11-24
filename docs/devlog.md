@@ -226,6 +226,24 @@ opacity independently of the stroke. The behavior tests failed before the
 fix; all 1416 app tests and nine theme-data tests passed. A 1280×720 isolated
 app confirmed the palette on prose, tool calls, results, and inline notation.
 
+Tool frames became horizontal rules with inline captions. Exclusion now has
+an explicit caption and a static striped gutter; ordinary rows no longer
+carry an ambiguous `x`. Error attention lasts at most three seconds, then
+failed tool accents settle at 65% of their configured opacity. Severe errors
+keep their strength, focus stays steady, and diagnostic text stays readable.
+Timing uses recorded creation or update stamps, so unchanged historical
+errors do not replay attention. A later edit to a failed receipt can briefly
+make it recent again. Waiting-state animation remains separate work.
+All 1422 app tests passed. An isolated app verified exclusion through the
+kernel, a real failed builtin, and stable pixels after attention settled.
+
+Neo starts with a tested projection of existing block IDs into dialogue,
+tools, and explicitly typed artifacts. It preserves document order and
+interleaved tool relationships without copying content or inventing times.
+The projection remains test-only until a workspace consumes it. The first
+visible slice should retain the existing conversation renderer and input
+path; independent rich workbench surfaces need a rendering input boundary.
+
 ## The file cache learns what vim already knew (August 18–20)
 
 Disk is the source of truth; file buffers operate like vim swaps. Dirty buffers

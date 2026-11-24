@@ -1,12 +1,10 @@
-//! Block border labels and the gutter inclusion checkbox — the chrome that is
+//! Block border labels — the chrome that is
 //! *glyphs* rather than quads.
 //!
 //! `chrome.rs` draws the border box; this module draws the words on it. A
 //! fieldset label ("TOOL CALL kaish", "thinking", "running") straddles the
 //! stroke: the border moves inward by half the label's ascent, and the stroke
-//! is suppressed across the label's x-range so the two never overlap. The
-//! checkbox (`x`/`-`) sits in the right gutter the border's extra right
-//! padding already reserves.
+//! is suppressed across the label's x-range so the two never overlap.
 //!
 //! # Three pieces, and why they are separate
 //!
@@ -16,8 +14,8 @@
 //!    "thinking", …) is testable without a font. The *strings themselves* are
 //!    not restated here: `compute_border_style` owns them, both paths call it,
 //!    and a second copy is exactly the A/B difference nobody can attribute.
-//! 2. **Placement** ([`top_label_placement`], [`bottom_label_placement`],
-//!    [`checkbox_placement`]) — pure arithmetic over a measured run and a
+//! 2. **Placement** ([`top_label_placement`], [`bottom_label_placement`]) —
+//!    pure arithmetic over a measured run and a
 //!    border rect, ported from the deleted per-block-cell renderer's label
 //!    placement (see `docs/conversation-surface.md`). The same
 //!    functions feed *both* consumers: `window::assemble_runs` positions the
@@ -56,21 +54,6 @@ use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 // DERIVATION
 // ============================================================================
 
-/// Clearance between the checkbox glyph and the border box's right edge.
-///
-/// A named constant rather than a bare literal, so a future change to the
-/// clearance is a one-line diff instead of a grep for `4.0`.
-pub const CHECKBOX_RIGHT_MARGIN: f32 = 4.0;
-
-/// Alpha the checkbox draws at — dimmer when the block is *included*, because
-/// an included block is the unremarkable case and the mark is a reassurance,
-/// not a warning.
-const CHECKBOX_ALPHA_INCLUDED: f32 = 0.3;
-const CHECKBOX_ALPHA_EXCLUDED: f32 = 0.5;
-
-/// The checkbox color for a block with no border of its own.
-const CHECKBOX_FALLBACK: Color = Color::srgb(0.5, 0.55, 0.65);
-
 /// One label to shape: its text and the color it bakes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LabelSpec<'a> {
@@ -80,49 +63,10 @@ pub struct LabelSpec<'a> {
 
 /// Everything a block draws in glyphs *outside* its own text.
 ///
-/// The checkbox is not `Option`: every block draws one, bordered or not, and
-/// a checkbox that appeared only on tool calls would make exclusion
-/// invisible on exactly the blocks people exclude most.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlockLabelSpec<'a> {
     pub top: Option<LabelSpec<'a>>,
     pub bottom: Option<LabelSpec<'a>>,
-    pub checkbox: LabelSpec<'static>,
-}
-
-/// The gutter mark for an inclusion state: `x` for included, `-` for
-/// excluded.
-///
-/// `☑`/`☐` are not in the shipped `NotoMono-Regular` font: both shape to
-/// glyph id `0` (`.notdef`) at the same advance, so the two states draw the
-/// identical hollow box and are distinguishable only by alpha
-/// ([`checkbox_color`]). ASCII shapes to real glyphs instead.
-///
-/// One glyph, not the bracketed `[x]`/`[ ]`: at `label_font_size` 11.0 that
-/// pair measures 19.8px wide in NotoMono, which together with
-/// [`CHECKBOX_RIGHT_MARGIN`] (4.0) exceeds the 18.0px the border reserves
-/// for the gutter at the default `cell_font_size` (`base * 1.5` right
-/// padding in `compute_border_style`, sized for one glyph) — it would
-/// render into the block's own wrapped text. A single glyph keeps the exact
-/// width the old marks used; see
-/// `the_checkbox_mark_fits_the_gutter_the_border_reserves_for_it`.
-pub fn checkbox_mark(excluded: bool) -> &'static str {
-    if excluded { "-" } else { "x" }
-}
-
-/// The gutter mark's color: the block's own border color at a fixed alpha, or
-/// a neutral gray for a borderless block.
-///
-/// `border` is the **unfocused** style color, which already carries the
-/// exclusion dim `compute_border_style` applies — so an excluded block's
-/// checkbox is both hollow *and* dimmer.
-pub fn checkbox_color(border: Option<Color>, excluded: bool) -> Color {
-    let alpha = if excluded {
-        CHECKBOX_ALPHA_EXCLUDED
-    } else {
-        CHECKBOX_ALPHA_INCLUDED
-    };
-    border.unwrap_or(CHECKBOX_FALLBACK).with_alpha(alpha)
 }
 
 /// Read a block's label set off its computed border style.
@@ -147,10 +91,6 @@ pub fn block_label_spec(style: Option<&BlockBorderStyle>, excluded: bool) -> Blo
                 color: s.color.with_alpha(if excluded { 0.45 } else { 1.0 }),
             })
         }),
-        checkbox: LabelSpec {
-            text: checkbox_mark(excluded),
-            color: checkbox_color(style.map(|s| s.color), excluded),
-        },
     }
 }
 
@@ -169,7 +109,7 @@ pub struct LabelPlacement {
     /// Top edge of the label's text box.
     pub y: f32,
     /// Stroke-suppressed range, or `(0, 0)` for a label that does not
-    /// straddle a stroke (the checkbox).
+    /// straddle a stroke.
     pub gap_x0: f32,
     pub gap_x1: f32,
     /// How far the stroke moves inward from the box edge so the label can
@@ -237,29 +177,6 @@ pub fn bottom_label_placement(
     }
 }
 
-/// Place the gutter checkbox: against the box's right edge, vertically
-/// centered on the whole block.
-///
-/// **Right edge, not top-left.** `cb_x = width - cb_w -
-/// CHECKBOX_RIGHT_MARGIN`, `cb_y = (total_height - cb_h) / 2` — matching the
-/// border's extra right padding (`base * 1.5` in `compute_border_style`),
-/// which exists to reserve room for it. It carries no gap: the checkbox sits
-/// inside the box, not on its stroke.
-pub fn checkbox_placement(
-    glyph_width: f32,
-    glyph_height: f32,
-    rect_width: f32,
-    rect_height: f32,
-) -> LabelPlacement {
-    LabelPlacement {
-        x: (rect_width - glyph_width - CHECKBOX_RIGHT_MARGIN).max(0.0),
-        y: ((rect_height - glyph_height) * 0.5).max(0.0),
-        gap_x0: 0.0,
-        gap_x1: 0.0,
-        border_inset: 0.0,
-    }
-}
-
 // ============================================================================
 // SHAPED RUNS
 // ============================================================================
@@ -268,8 +185,7 @@ pub fn checkbox_placement(
 /// [`LabelPlacement`] needs to position them.
 ///
 /// Glyphs are shaped at the origin so a single run can be placed anywhere —
-/// left-aligned on a top border, right-aligned on a bottom one, or in the
-/// gutter. Placement is the caller's arithmetic, not baked into the glyphs,
+/// left-aligned on a top border or right-aligned on a bottom one. Placement is the caller's arithmetic, not baked into the glyphs,
 /// which is what lets the `Arc` be shared.
 #[derive(Debug, Clone)]
 pub struct LabelRun {
@@ -301,7 +217,6 @@ impl LabelRun {
 pub struct BlockLabels {
     pub top: Option<LabelRun>,
     pub bottom: Option<LabelRun>,
-    pub checkbox: Option<LabelRun>,
 }
 
 impl BlockLabels {
@@ -316,17 +231,13 @@ impl BlockLabels {
                 _ => false,
             }
         }
-        same(&self.top, &other.top)
-            && same(&self.bottom, &other.bottom)
-            && same(&self.checkbox, &other.checkbox)
+        same(&self.top, &other.top) && same(&self.bottom, &other.bottom)
     }
 
-    /// Whether anything is here to draw. A borderless block still has a
-    /// checkbox, so this is false only before the first shape pass reaches
-    /// the block.
+    /// Whether any caption is here to draw.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.top.is_none() && self.bottom.is_none() && self.checkbox.is_none()
+        self.top.is_none() && self.bottom.is_none()
     }
 }
 
@@ -480,7 +391,6 @@ impl LabelRunCache {
                 .bottom
                 .as_ref()
                 .and_then(|s| self.shape(font, s, font_size, atlas, font_data)),
-            checkbox: self.shape(font, &spec.checkbox, font_size, atlas, font_data),
         }
     }
 
@@ -500,6 +410,19 @@ mod tests {
     use crate::cell::block_border::{
         BorderContext, BorderInputs, BorderKind, compute_border_style,
     };
+
+    #[test]
+    fn included_borderless_block_has_no_caption_glyphs() {
+        let spec = block_label_spec(None, false);
+        let font = crate::text::shaping::load_into_font_context(
+            std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/NotoMono-Regular.ttf")).unwrap(),
+        );
+        let mut images = bevy::asset::Assets::<bevy::image::Image>::default();
+        let mut atlas = MsdfAtlas::new(&mut images, 256, 256);
+        let mut cache = LabelRunCache::default();
+        let mut font_data = FontDataMap::default();
+        assert!(cache.shape_block(&font, &spec, 11.0, &mut atlas, &mut font_data).is_empty());
+    }
     use crate::text::msdf::glyph::{FontId, GlyphKey};
     use crate::ui::theme::Theme;
     use crate::view::{BlockKind, DriftKind, Role};
@@ -528,6 +451,7 @@ mod tests {
             is_error: false,
             collapsed: false,
             excluded: false,
+            error_at: 0,
             drift_kind: None,
             error: None,
         }
@@ -671,51 +595,6 @@ mod tests {
             dim_label.top.unwrap().color.alpha() < bright_label.top.unwrap().color.alpha(),
             "exclusion must dim the caption, not only the stroke"
         );
-    }
-
-    // ---- checkbox --------------------------------------------------------
-
-    /// Char and color per inclusion state, and the rule that every block gets
-    /// one — a borderless block included.
-    #[test]
-    fn the_checkbox_marks_inclusion_on_every_block() {
-        assert_eq!(checkbox_mark(false), "x");
-        assert_eq!(checkbox_mark(true), "-");
-
-        // Borderless: neutral gray, and still present.
-        let none = block_label_spec(None, false);
-        assert_eq!(none.checkbox.text, "x");
-        assert_eq!(none.checkbox.color, CHECKBOX_FALLBACK.with_alpha(0.3));
-        assert!(none.top.is_none() && none.bottom.is_none());
-
-        // Bordered: the border's color, and excluded reads *stronger* than
-        // included so the mark you need to notice is the one you can see.
-        let theme = Theme::default();
-        let style = compute_border_style(&inputs(BlockKind::Thinking), &theme, &ctx(), false, 14.0)
-            .expect("thinking draws a border");
-        let included = block_label_spec(Some(&style), false);
-        let excluded = block_label_spec(Some(&style), true);
-        assert_eq!(included.checkbox.color, style.color.with_alpha(0.3));
-        assert_eq!(excluded.checkbox.color, style.color.with_alpha(0.5));
-        assert!(excluded.checkbox.color.alpha() > included.checkbox.color.alpha());
-        assert_ne!(included.checkbox.text, excluded.checkbox.text);
-    }
-
-    /// The checkbox rides the box's right edge, vertically centered — the
-    /// gutter the border's extra right padding reserves.
-    #[test]
-    fn the_checkbox_sits_in_the_right_gutter() {
-        let p = checkbox_placement(10.0, 12.0, 400.0, 60.0);
-        assert_eq!(p.x, 400.0 - 10.0 - CHECKBOX_RIGHT_MARGIN);
-        assert_eq!(p.y, (60.0 - 12.0) * 0.5);
-        // It sits inside the box, so it must never cut the stroke.
-        assert_eq!(p.gap_width(), 0.0);
-        assert_eq!(p.border_inset, 0.0);
-
-        // A box narrower than its own mark clamps rather than going negative.
-        let tiny = checkbox_placement(10.0, 12.0, 4.0, 2.0);
-        assert_eq!(tiny.x, 0.0);
-        assert_eq!(tiny.y, 0.0);
     }
 
     // ---- placement -------------------------------------------------------
@@ -868,7 +747,6 @@ mod tests {
         let with_a = BlockLabels {
             top: Some(a.clone()),
             bottom: None,
-            checkbox: Some(a.clone()),
         };
         assert!(with_a.same_runs(&with_a.clone()));
 
@@ -948,7 +826,7 @@ mod tests {
                 .is_none()
         );
 
-        // A whole block's set comes back in one call, checkbox included.
+        // A whole block's captions come back in one call.
         let theme = Theme::default();
         let mut running = inputs(BlockKind::ToolCall);
         running.status = Status::Running;
@@ -963,7 +841,6 @@ mod tests {
         );
         assert!(labels.top.is_some(), "TOOL CALL …");
         assert!(labels.bottom.is_some(), "running");
-        assert!(labels.checkbox.is_some());
     }
 
     // ---- invalidation ----------------------------------------------------
@@ -974,7 +851,7 @@ mod tests {
     /// `ShapedBlockCache::touch()`.
     ///
     /// A tool call finishing has to stop saying "running"; excluding a block
-    /// has to hollow its checkbox. Both go: block field → `compute_border_style`
+    /// adds its caption. Both go: block field → `compute_border_style`
     /// → `block_label_spec` → shaped run → `same_runs() == false`. If any link
     /// stops noticing, the window never re-assembles and the screen keeps the
     /// stale caption.
@@ -1025,7 +902,7 @@ mod tests {
             "an unchanged block must reuse its runs, or every frame re-uploads",
         );
 
-        // Excluding a block hollows the checkbox and dims everything.
+        // Excluding a block changes its caption.
         let included = shape(&call);
         call.excluded = true;
         let excluded = shape(&call);
@@ -1034,12 +911,12 @@ mod tests {
             "an exclusion toggle must reach the glyph buffer",
         );
         assert!(
-            !included
-                .checkbox
-                .as_ref()
-                .unwrap()
-                .same_run(excluded.checkbox.as_ref().unwrap()),
-            "specifically: the checkbox itself changes",
+            !included.top.as_ref().unwrap().same_run(excluded.top.as_ref().unwrap()),
+            "the exclusion caption must reshape",
+        );
+        assert!(
+            excluded.top.as_ref().unwrap().glyphs.len() > included.top.as_ref().unwrap().glyphs.len(),
+            "the exclusion caption must add text",
         );
     }
 
@@ -1067,7 +944,6 @@ mod tests {
         // What the shape pass reads is the unfocused style, both times.
         let unfocused_spec = block_label_spec(Some(&style), false);
         assert_eq!(unfocused_spec.top.unwrap().color, style.color.with_alpha(1.0));
-        assert_eq!(unfocused_spec.checkbox.color, style.color.with_alpha(0.3));
     }
 
     /// The one border kind that must never get a fieldset inset: the role
@@ -1091,114 +967,4 @@ mod tests {
         assert!(spec.top.is_none() && spec.bottom.is_none());
     }
 
-    /// The bug this module exists to close: `☑`/`☐` are absent from the
-    /// shipped font, so both shape to glyph id `0` (`.notdef`) at the same
-    /// advance — the two inclusion states drew the identical hollow box, and
-    /// only alpha told them apart. Shapes both marks through the real font
-    /// the same way the shape pass does, and asserts the defect can never
-    /// recur: neither mark is `.notdef`, and the two states shape to
-    /// different glyphs.
-    #[test]
-    fn the_checkbox_marks_shape_to_distinct_real_glyphs() {
-        let font = crate::text::shaping::load_into_font_context(
-            std::fs::read(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/fonts/NotoMono-Regular.ttf"
-            ))
-            .expect("shipped test font must be present"),
-        );
-        let mut images = bevy::asset::Assets::<bevy::image::Image>::default();
-        let mut atlas = MsdfAtlas::new(&mut images, 256, 256);
-        let mut font_data = FontDataMap::default();
-        let mut cache = LabelRunCache::default();
-
-        let mut shape = |text: &'static str| {
-            cache
-                .shape(
-                    &font,
-                    &LabelSpec {
-                        text,
-                        color: Color::WHITE,
-                    },
-                    11.0,
-                    &mut atlas,
-                    &mut font_data,
-                )
-                .expect("a checkbox mark is never empty text")
-        };
-
-        let included = shape(checkbox_mark(false));
-        let excluded = shape(checkbox_mark(true));
-
-        let notdef = |run: &LabelRun| run.glyphs.iter().any(|g| g.key.glyph_id == 0);
-        assert!(
-            !notdef(&included),
-            "included mark {:?} must resolve to a real glyph, not .notdef",
-            checkbox_mark(false),
-        );
-        assert!(
-            !notdef(&excluded),
-            "excluded mark {:?} must resolve to a real glyph, not .notdef",
-            checkbox_mark(true),
-        );
-
-        let ids = |run: &LabelRun| -> Vec<u16> { run.glyphs.iter().map(|g| g.key.glyph_id).collect() };
-        assert_ne!(
-            ids(&included),
-            ids(&excluded),
-            "included and excluded must shape to different glyphs, not the same mark at a different alpha",
-        );
-    }
-
-    /// The gutter's reserved width (`base * 1.5` right padding in
-    /// `compute_border_style`) is sized to fit *one* glyph plus
-    /// [`CHECKBOX_RIGHT_MARGIN`] — see [`checkbox_placement`]'s doc comment.
-    /// A checkbox mark that grows past that budget would render into the
-    /// block's own wrapped text instead of the gutter reserved for it. Pins
-    /// the fit at the real production font sizes (`label_font_size` for the
-    /// mark, `cell_font_size`'s default for the border padding) so a future
-    /// change to either constant, or to the mark itself, is caught here
-    /// rather than in a screenshot.
-    #[test]
-    fn the_checkbox_mark_fits_the_gutter_the_border_reserves_for_it() {
-        let font = crate::text::shaping::load_into_font_context(
-            std::fs::read(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/fonts/NotoMono-Regular.ttf"
-            ))
-            .expect("shipped test font must be present"),
-        );
-        let mut images = bevy::asset::Assets::<bevy::image::Image>::default();
-        let mut atlas = MsdfAtlas::new(&mut images, 256, 256);
-        let mut font_data = FontDataMap::default();
-        let mut cache = LabelRunCache::default();
-        let theme = Theme::default();
-
-        // The gutter is reserved at the conversation's cell font size, which
-        // the tests elsewhere in this module stand in for at 14.0 — use the
-        // production default (`TextMetrics::cell_font_size`) directly so this
-        // pins the real budget, not a test convenience value.
-        let style = compute_border_style(&inputs(BlockKind::Thinking), &theme, &ctx(), false, 20.0)
-            .expect("thinking draws a border");
-
-        for excluded in [false, true] {
-            let spec = LabelSpec {
-                text: checkbox_mark(excluded),
-                color: Color::WHITE,
-            };
-            let run = cache
-                .shape(&font, &spec, theme.label_font_size, &mut atlas, &mut font_data)
-                .expect("a checkbox mark is never empty text");
-            assert!(
-                run.width + CHECKBOX_RIGHT_MARGIN <= style.padding.right,
-                "checkbox mark {:?} (width {}) plus its margin ({}) must fit inside the \
-                 border's reserved right padding ({}), or it renders over the block's own text",
-                spec.text,
-                run.width,
-                CHECKBOX_RIGHT_MARGIN,
-                style.padding.right,
-            );
-        }
-    }
 }
-

@@ -92,7 +92,7 @@ pub enum BorderKind {
     /// Complete rectangle border.
     #[default]
     Full,
-    /// Top line only (short results).
+    /// Horizontal rule along the top edge.
     TopAccent,
     /// Dashed rectangle (thinking).
     Dashed,
@@ -180,6 +180,8 @@ pub struct BorderInputs {
     pub drift_kind: Option<DriftKind>,
     /// `(category, severity)` from a structured error payload.
     pub error: Option<(ErrorCategory, ErrorSeverity)>,
+    /// Unix milliseconds used to time error attention. Zero means unknown.
+    pub error_at: u64,
 }
 
 impl BorderInputs {
@@ -198,12 +200,16 @@ impl BorderInputs {
             excluded: block.excluded,
             drift_kind: block.drift_kind,
             error: block.error.as_ref().map(|e| (e.category, e.severity)),
+            error_at: match block.kind {
+                BlockKind::Error => block.created_at,
+                BlockKind::ToolResult if block.is_error => block.updated_at.max(block.created_at),
+                _ => 0,
+            },
         }
     }
 
-    /// Whether this block is a *visible* tool result — the predicate that
-    /// decides whether the call above it joins to it (`OpenBottom`) or closes
-    /// itself off (`Full`).
+    /// Whether this block is a visible tool result. A paired result carries
+    /// the status caption instead of its call.
     pub fn is_visible_tool_result(&self) -> bool {
         self.kind == BlockKind::ToolResult
             && (!self.content_empty || self.has_output || self.is_error)
@@ -280,15 +286,8 @@ pub fn compute_border_style(
                 }
             };
 
-            // Use OpenBottom when paired with a result block
-            let kind = if has_result {
-                BorderKind::OpenBottom
-            } else {
-                BorderKind::Full
-            };
-
             Some(BlockBorderStyle {
-                kind,
+                kind: BorderKind::TopAccent,
                 color,
                 thickness: theme.block_border_thickness,
                 corner_radius: theme.block_border_corner_radius,
@@ -299,7 +298,7 @@ pub fn compute_border_style(
             })
         }
         BlockKind::ToolResult => {
-            if !block.is_visible_tool_result() {
+            if !block.is_visible_tool_result() && !block.excluded {
                 return None; // empty success — no border
             }
 
@@ -309,19 +308,6 @@ pub fn compute_border_style(
             } else {
                 theme.block_border_tool_result
             };
-            let animation = if block.is_error {
-                BorderAnimation::Pulse
-            } else {
-                BorderAnimation::None
-            };
-
-            // Connected to call above → OpenTop, standalone → Full
-            let kind = if has_paired_call {
-                BorderKind::OpenTop
-            } else {
-                BorderKind::Full
-            };
-
             // Status label on the bottom
             let status_label = match block.status {
                 Status::Running => Some("running".to_string()),
@@ -335,7 +321,7 @@ pub fn compute_border_style(
             };
 
             Some(BlockBorderStyle {
-                kind,
+                kind: BorderKind::TopAccent,
                 color,
                 thickness: theme.block_border_thickness,
                 corner_radius: theme.block_border_corner_radius,
@@ -347,7 +333,7 @@ pub fn compute_border_style(
                     },
                     ..padding
                 },
-                animation,
+                animation: BorderAnimation::None,
                 top_label: None, // divider line, no label
                 bottom_label: status_label,
             })
@@ -398,11 +384,7 @@ pub fn compute_border_style(
                 Role::User => theme.block_border_user,
                 _ => theme.block_border_assistant,
             };
-            // Skip if fully transparent (default)
-            if color.alpha() < 0.01 {
-                return None;
-            }
-            Some(BlockBorderStyle {
+            (color.alpha() >= 0.01).then_some(BlockBorderStyle {
                 kind: BorderKind::TopAccent,
                 color,
                 thickness: theme.block_border_thickness,
@@ -422,12 +404,12 @@ pub fn compute_border_style(
                 ),
                 Some(ErrorSeverity::Fatal) => (
                     theme.block_border_error_fatal,
-                    BorderAnimation::Pulse,
+                    BorderAnimation::None,
                     BorderKind::Full,
                 ),
                 _ => (
                     theme.block_border_error,
-                    BorderAnimation::Pulse,
+                    BorderAnimation::None,
                     BorderKind::Full,
                 ),
             };
@@ -454,7 +436,25 @@ pub fn compute_border_style(
         _ => None,
     };
 
-    // Post-process: dim excluded blocks (gutter indicator is shader-driven)
+    // Every excluded block names its state, including borderless prose.
+    if block.excluded {
+        let style = result.get_or_insert_with(|| BlockBorderStyle {
+            kind: BorderKind::TopAccent,
+            color: theme.fg_dim,
+            thickness: theme.block_border_thickness,
+            corner_radius: 0.0,
+            padding,
+            animation: BorderAnimation::None,
+            top_label: None,
+            bottom_label: None,
+        });
+        style.top_label = Some(match style.top_label.take() {
+            Some(label) => format!("{label} · excluded"),
+            None => "excluded".to_string(),
+        });
+    }
+
+    // Excluded blocks stay quiet; the gutter stripe identifies their state.
     if block.excluded
         && let Some(ref mut style) = result
     {
@@ -565,6 +565,7 @@ mod tests {
             excluded: false,
             drift_kind: None,
             error: None,
+            error_at: 0,
         }
     }
 
@@ -588,7 +589,7 @@ mod tests {
         let call = call_inputs(block_id(1), Status::Done);
         let style = compute_border_style(&call, &theme, &BorderContext::default(), true, 14.0).unwrap();
         assert_eq!(style.color, theme.block_border_tool_call);
-        assert_eq!(style.kind, BorderKind::OpenBottom);
+        assert_eq!(style.kind, BorderKind::TopAccent);
         assert_eq!(style.animation, BorderAnimation::None);
     }
 
@@ -604,14 +605,30 @@ mod tests {
             result.tool_call_id = paired.then(|| block_id(1));
             let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
             assert_eq!(style.color, theme.block_border_tool_result);
-            assert_eq!(style.kind, if paired { BorderKind::OpenTop } else { BorderKind::Full });
+            assert_eq!(style.kind, BorderKind::TopAccent);
             assert_eq!(style.animation, BorderAnimation::None);
             result.is_error = true;
             let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
             assert_eq!(style.color, theme.block_border_error);
-            assert_eq!(style.animation, BorderAnimation::Pulse);
+            assert_eq!(style.animation, BorderAnimation::None);
             result.is_error = false;
         }
+    }
+
+    #[test]
+    fn exclusion_is_named_even_on_otherwise_borderless_text() {
+        let mut block = call_inputs(block_id(8), Status::Done);
+        block.kind = BlockKind::Text;
+        let theme = Theme::default();
+        let ctx = BorderContext::default();
+        assert!(compute_border_style(&block, &theme, &ctx, false, 14.0).is_none());
+        block.excluded = true;
+        let style = compute_border_style(&block, &theme, &ctx, false, 14.0).unwrap();
+        assert_eq!(style.top_label.as_deref(), Some("excluded"));
+        assert_eq!(style.animation, BorderAnimation::None);
+        block.kind = BlockKind::ToolCall;
+        let style = compute_border_style(&block, &theme, &ctx, false, 14.0).unwrap();
+        assert_eq!(style.top_label.as_deref(), Some("TOOL CALL · excluded"));
     }
 
     /// A call held on an ask names the ask; one with no known ask keeps the

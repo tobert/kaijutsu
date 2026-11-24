@@ -345,7 +345,7 @@ pub struct ShapedBlock {
     /// stream, which is exactly the final Running→Done reconcile the plan
     /// calls for.
     pub streaming: bool,
-    /// The block's fieldset captions and its gutter checkbox, shaped and
+    /// The block's fieldset captions, shaped and
     /// shared ([`super::labels`]).
     ///
     /// # Why they live here and not in a cache of their own
@@ -1331,7 +1331,7 @@ pub fn shape_visible_blocks(
     // them — dropping the lot on a theme swap is cheaper than teaching every
     // consumer a wider cache key.
     caches.headers.sync_theme(theme_epoch);
-    // Block captions and the gutter checkbox bake colors the same way, and
+    // Block captions bake colors the same way, and
     // their advance widths move with `label_font_size` — so both epochs clear
     // them. Dropped runs are re-shaped by the walk below, in the same pass.
     caches.labels.sync_epochs(metrics_epoch, theme_epoch);
@@ -1371,7 +1371,7 @@ pub fn shape_visible_blocks(
                         .chrome
                         .layout(&id, container_width, row.indent_level, theme.indent_width);
                 let wrap_width = layout.wrap_width;
-                // Captions and the gutter checkbox, shaped from the block's
+                // Captions, shaped from the block's
                 // *unfocused* border style and shared by `(text, color)`. This
                 // happens before the key comparison below because it is
                 // independent of it: a tool call that finishes changes its
@@ -3392,6 +3392,7 @@ mod tests {
             is_error: false,
             collapsed: false,
             excluded,
+            error_at: 0,
             drift_kind: None,
             error: None,
         }
@@ -3599,7 +3600,7 @@ mod tests {
         };
         app.world_mut()
             .resource_mut::<BlockChromeCache>()
-            .insert_for_test(bid(1), BlockChrome { style: None, layout: layout_a });
+            .insert_for_test(bid(1), BlockChrome { style: None, layout: layout_a, decoration: Default::default() });
         app.update();
         let gen1 = app.world().resource::<ShapedBlockCache>().generation();
         assert_eq!(
@@ -3613,7 +3614,7 @@ mod tests {
         let layout_b = BlockLayout { text_y: 20.0, ..layout_a };
         app.world_mut()
             .resource_mut::<BlockChromeCache>()
-            .insert_for_test(bid(1), BlockChrome { style: None, layout: layout_b });
+            .insert_for_test(bid(1), BlockChrome { style: None, layout: layout_b, decoration: Default::default() });
         app.update();
 
         let shaped = app.world().resource::<ShapedBlockCache>();
@@ -3688,14 +3689,14 @@ mod tests {
     }
 
     /// The label branch's own generation bookkeeping: toggling exclusion
-    /// changes the gutter checkbox glyph without changing a byte of the
+    /// changes the exclusion caption without changing a byte of the
     /// block's own text, and that has to bump the generation too.
     ///
     /// Falsified by dropping the `mutated = true;` inside the
-    /// `!existing.labels.same_runs(&labels)` arm: the checkbox still
+    /// `!existing.labels.same_runs(&labels)` arm: the caption still
     /// updates, but untracked, and the generation assertion catches it.
     #[test]
-    fn a_checkbox_label_change_bumps_the_generation() {
+    fn an_exclusion_caption_change_bumps_the_generation() {
         let mut app = shape_app();
         install_geometry(&mut app, strip(1));
         install_container(&mut app, 800.0, 600.0, 1.0);
@@ -3705,13 +3706,26 @@ mod tests {
         let gen1 = app.world().resource::<ShapedBlockCache>().generation();
 
         seed_content(&mut app, bid(1), "hello there", Color::WHITE, vec![], Status::Done, true, 1);
+        let theme = app.world().resource::<Theme>();
+        let style = crate::cell::block_border::compute_border_style(
+            &border_inputs(bid(1), Status::Done, true), theme,
+            &crate::cell::block_border::BorderContext::default(), false, 20.0,
+        );
+        assert_eq!(style.as_ref().and_then(|s| s.top_label.as_deref()), Some("excluded"));
+        let layout = crate::view::surface::chrome::surface_block_layout(
+            800.0, 0, theme.indent_width, theme.block_border_glow_radius, None,
+        );
+        app.world_mut().resource_mut::<BlockChromeCache>().insert_for_test(
+            bid(1), BlockChrome { style, layout, decoration: Default::default() },
+        );
         app.update();
 
         let gen2 = app.world().resource::<ShapedBlockCache>().generation();
+        assert!(app.world().resource::<ShapedBlockCache>().get(&bid(1)).unwrap().labels.top.is_some());
         assert_eq!(
             gen2,
             gen1 + 1,
-            "a caption/checkbox change must bump the generation, or the window keeps stale glyphs",
+            "a caption change must bump the generation, or the window keeps stale glyphs",
         );
     }
 

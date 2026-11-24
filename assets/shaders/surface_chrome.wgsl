@@ -1,7 +1,7 @@
 // Conversation-Surface Chrome Shader (instanced SDF quads)
 //
-// One instance per border box: block borders, the focus ring, and the
-// role-group divider rule. Instances carry DOCUMENT-SPACE LOGICAL rects and
+// Instances draw block borders, the focus ring, role dividers, and exclusion
+// stripes. Instances carry DOCUMENT-SPACE LOGICAL rects and
 // never change while you scroll — same contract as msdf_surface.wgsl, same
 // uniforms, same pass. See view/surface/chrome.rs.
 //
@@ -91,6 +91,7 @@ const BK_DASHED: u32 = 3u;
 const BK_OPEN_BOTTOM: u32 = 4u;
 const BK_OPEN_TOP: u32 = 5u;
 const BK_CENTER_LINE: u32 = 6u;
+const BK_EXCLUDED_STRIPE: u32 = 7u;
 
 // ============================================================================
 // VERTEX SHADER
@@ -294,6 +295,17 @@ fn border_stroke_alpha(
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if in.kind == BK_NONE {
         discard;
+    }
+
+    if in.kind == BK_EXCLUDED_STRIPE {
+        let p = in.local_px;
+        let edge = abs(p) - in.half_size;
+        // Fade only inside the strip so no part of it reaches the text.
+        let inside = 1.0 - smoothstep(-0.75, 0.0, max(edge.x, edge.y));
+        let diagonal = abs(fract((p.x + p.y) / 6.0 + 0.5) - 0.5) * 6.0;
+        let stripes = 1.0 - smoothstep(0.6, 1.5, diagonal);
+        let alpha = in.color.a * inside * stripes;
+        return vec4<f32>(in.color.rgb * alpha, alpha);
     }
 
     let corner_r = in.params.x;
