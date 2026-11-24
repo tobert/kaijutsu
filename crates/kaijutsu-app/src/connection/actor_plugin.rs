@@ -29,44 +29,6 @@ fn app_peer_instance() -> &'static str {
     INSTANCE.get_or_init(|| format!("kaijutsu-app-{}", uuid::Uuid::new_v4()))
 }
 
-/// Subscribe to a context's change feed and hydrate a fresh `ContextMirror`
-/// over it — docs/change-feed.md rules 21-26. Subscribe FIRST (so nothing
-/// published between the subscribe and the fetch is lost), then fetch the
-/// snapshot with `getBlocks`, then apply it.
-///
-/// No `select!` race against the receiver is needed here: `ContextMirror`
-/// itself discards a delivery the fetch's own snapshot already covers
-/// (`ContextMirror::receive`'s doc comment), so a caller may fetch first and
-/// drain the receiver afterward without a spurious error.
-///
-/// Used both for a context's first join (`poll_bootstrap_results`) and for
-/// the `FeedEvent::Terminated` recovery, which needs a brand-new receiver
-/// exactly the way a first join does (`view::sync::drain_context_feeds`).
-pub(crate) async fn hydrate_context(
-    handle: &ActorHandle,
-    context_id: ContextId,
-) -> Result<
-    (
-        kaijutsu_client::ContextMirror,
-        mpsc::Receiver<kaijutsu_client::FeedEvent>,
-    ),
-    String,
-> {
-    let rx = handle
-        .subscribe_context(context_id)
-        .await
-        .map_err(|e| format!("subscribe_context: {e}"))?;
-    let mut mirror = kaijutsu_client::ContextMirror::new(context_id);
-    let (blocks, version) = handle
-        .get_blocks_versioned(context_id, kaijutsu_types::BlockQuery::All)
-        .await
-        .map_err(|e| format!("get_blocks_versioned: {e}"))?;
-    mirror
-        .apply_snapshot(blocks, version)
-        .map_err(|e| format!("apply_snapshot: {e}"))?;
-    Ok((mirror, rx))
-}
-
 // ============================================================================
 // Resources
 // ============================================================================
@@ -191,20 +153,26 @@ impl RpcResultChannel {
 /// dedicated, drain-once channel instead (the same shape as
 /// `peers::PeerInvocationChannel`), so ownership genuinely transfers to
 /// whichever system drains it.
+/// Used both for a context's first join (`poll_bootstrap_results`) and for
+/// the `FeedEvent::Terminated` recovery (`view::sync::drain_context_feeds`),
+/// delegating to `ActorHandle::hydrate_context`.
 pub enum ContextHydration {
-    /// A context's first join, or the `FeedEvent::Terminated` recovery: a
-    /// brand-new mirror AND receiver, installed wholesale
-    /// (`DocumentStore::install`).
+    /// A context's first join (`expected_epoch: None`), or the
+    /// `FeedEvent::Terminated` recovery (`expected_epoch: Some(epoch)`): a
+    /// brand-new mirror AND receiver, installed via
+    /// `DocumentStore::install_for_epoch`.
     Joined {
         context_id: ContextId,
+        expected_epoch: Option<u64>,
         mirror: kaijutsu_client::ContextMirror,
         feed: mpsc::Receiver<kaijutsu_client::FeedEvent>,
     },
     /// The `FeedEvent::Resubscribed`/`Desynced` recovery: a fresh snapshot
-    /// for a mirror whose existing receiver is still good
-    /// (`DocumentStore::apply_snapshot`).
+    /// for a mirror whose existing receiver is still good, applied via
+    /// `DocumentStore::apply_snapshot_for_epoch`.
     Snapshot {
         context_id: ContextId,
+        epoch: u64,
         blocks: Vec<kaijutsu_types::BlockSnapshot>,
         version: u64,
     },
@@ -1220,10 +1188,11 @@ fn poll_bootstrap_results(
                             // Travels on `ContextHydrationChannel`, not
                             // `RpcResultMessage` — see that channel's doc
                             // comment for why.
-                            match hydrate_context(&h, ctx_id).await {
+                            match h.hydrate_context(ctx_id).await {
                                 Ok((mirror, feed)) => {
                                     let _ = hydration_tx.send(ContextHydration::Joined {
                                         context_id: ctx_id,
+                                        expected_epoch: None,
                                         mirror,
                                         feed,
                                     });

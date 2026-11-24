@@ -411,6 +411,18 @@ impl std::fmt::Display for MirrorError {
 
 impl std::error::Error for MirrorError {}
 
+/// Failure while subscribing to a context's change feed and hydrating its
+/// initial snapshot via [`crate::ActorHandle::hydrate_context`].
+#[derive(Debug, thiserror::Error)]
+pub enum HydrateError {
+    #[error("subscribe context feed: {0}")]
+    Subscribe(#[source] crate::CallError),
+    #[error("fetch context snapshot: {0}")]
+    Snapshot(#[source] crate::CallError),
+    #[error("apply context snapshot: {0}")]
+    Mirror(#[from] MirrorError),
+}
+
 /// A client's view of one context, maintained from the change feed.
 ///
 /// # The recovery dance, and why its order is not negotiable

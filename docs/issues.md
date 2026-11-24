@@ -395,7 +395,6 @@ Feedback retains its original source anchor when available and retries missing a
 
 - **Idle conversation reset policy:** LRU eviction resets semantic conversation history, making stored edits visible on next turns.
 - **Turn execution & shell settlement:** Durable per-audit records lack edit actors; failed doc acceptances poison contexts until restart; async shell results can store empty envelopes.
-- **Shared client recovery:** `kaijutsu-client` needs ownership of subscription, mirror, snapshot recovery, and rejection of obsolete responses across app, TUI, and ACP.
 - **Render live mirror:** Separate selection state from folds so the app can render its mirror over both without rebuilding `RenderBlockStore` per version.
 - **Per-cast turn token budget:** Replace the removed iteration cap with a per-cast/model cumulative input+output token budget across turn model calls.
 - **Lazy file documents:** Ordinary reads should not require durable documents; persist unsaved editor content with recovery metadata.
@@ -411,8 +410,7 @@ Feedback retains its original source anchor when available and retries missing a
 - **4.6 Block Tools Scope:** Block and task tools edit any context a caller's `BlockId` names, breaking focus boundaries.
 - **4.7b Hydration Splitting:** Notification, Resource, Task, Error, and Drift blocks inside open model batches flush during hydration.
 - **2.2 File Caching:** Clean cached files keep serving after delete or rename; `MountBackend` never invalidates caches.
-- **5.1 Client Subscriptions:** Client refuses subscribe while connecting, failed resubscribe freezes views, and `BlockEventsForwarder::closed` latches.
-- **5.2 Actor Lifecycles:** `run_context_feed` wakes on every context's events; `spawn_editor_reconciler` holds an `Arc` cycle preventing kernel drops.
+- **5.2 Actor Lifecycles:** `spawn_editor_reconciler` holds an `Arc` cycle preventing kernel drops.
 - **5.3c Block Copying:** `cherry_pick_block` drops metadata; correct copying requires dedicated block-store minting APIs.
 - **3.1 Council Synchronization:** Council shadow's `CREATE` lock drops before `run_create_lifecycle`, priming shadows twice per call.
 - **6.3 MIDI Cues:** CAS-backed ABC cues do not play because `dispatch_midi_cue` has no prefetch path.
@@ -512,7 +510,6 @@ An Opus review of `8b346f61..HEAD` found these open. Claude's own findings (the 
 
 Open after an Opus review of `d80a29ad..HEAD`. The ask's races and the default-on `phase` are being fixed on their branches; these are the rest.
 
-- **An older client cannot decode the new ask origin.** The capnp `AskOrigin` gained `refusal @5`. A GUI or terminal client built before it gets `NotInSchema` on that ordinal, and its list and push paths collect with `Result`, so it loses every ask, not only the refusal ask, while one is pending. Deploy the server and the clients together, or decode an unknown origin to a fallback and skip only that card. A new client sending `--origin refusal` to an old server also errors.
 - **A refusal whose ask cannot open leaves a held context with nothing to answer.** No performer, a failed reviewer route (retired senpai, no reviewer above, a cycle), or a failed error-block write is only logged. A prompt or `kj context rotate` still moves the context; nothing tells the senpai.
 - **A plain `kj drive` can queue behind a person's prompt.** If an allow settles while that prompt's turn is admitted but has not reached `begin_turn`, the latest turn still reads `refused`, the release succeeds, and the non-idle drive queues a second turn.
 - **Derived `phase` differs from the model's own.** A text-only reply with no reasoning hydrates as plain text and is never tagged, so the same position is `final_answer` or nothing depending on whether reasoning preceded it; an autonomous text-only reply followed by a kernel nudge and more tool calls is tagged `commentary`; `partial_answer` is never produced. Whether the server tokenizes `phase` into its cached prefix is unknown. A continuation over the WebSocket is unaffected (it compares role and content).

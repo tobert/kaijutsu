@@ -2966,10 +2966,13 @@ impl kernel::Server for KernelImpl {
 
         // Cap'n Proto callbacks are not Send, so spawn_local.
         tokio::task::spawn_local(async move {
-            // `block.*` is a superset: the feed's own filter decides what it
-            // carries, and filtering by pattern here would silently drop an
-            // event kind the feed later learns to carry.
-            let sub = block_flows.subscribe("block.*");
+            // `block.*` is a superset: the feed's own filter decides which
+            // event kinds it carries, while scoping by `context_id` at the bus
+            // prevents other contexts' traffic from waking or overflowing this
+            // feed.
+            let sub = block_flows.subscribe_filtered("block.*", move |flow| {
+                flow.context_id() == context_id
+            });
             crate::context_feed::run_context_feed(
                 observer,
                 context_id,

@@ -243,16 +243,24 @@ pub async fn run_pump(
                 }
                 Some(FeedEvent::Resubscribed) => {
                     // The actor already re-subscribed on `feed_rx`'s behalf;
-                    // nothing published during the outage rides it. Throw the
-                    // mirror away and rehydrate on the SAME receiver.
+                    // nothing published during the outage rides it. Switch the
+                    // mirror to buffering mode and rehydrate on the SAME receiver.
                     tracing::warn!(
                         session = %session_id,
                         "context feed resubscribed after a reconnect; rehydrating"
                     );
+                    mirror.begin_rehydrate();
                     match bridge.rehydrate_context(context_id).await {
-                        Ok(fresh) => {
-                            mirror = fresh;
-                            catch_up(&bridge, &session, &session_id, &cx, &mirror, "reconnected").await;
+                        Ok((blocks, version)) => {
+                            if let Err(e) = mirror.apply_snapshot(blocks, version) {
+                                tracing::error!(
+                                    session = %session_id,
+                                    error = %e,
+                                    "snapshot apply after resubscribe failed; this session's stream is now stale"
+                                );
+                            } else {
+                                catch_up(&bridge, &session, &session_id, &cx, &mirror, "reconnected").await;
+                            }
                         }
                         Err(e) => tracing::error!(
                             session = %session_id,

@@ -874,6 +874,8 @@ struct SubscriberSlot<T> {
     topics: Vec<&'static str>,
     /// The pattern, kept for diagnostics.
     pattern: String,
+    /// Optional payload predicate evaluated before enqueueing.
+    filter: Option<Box<dyn Fn(&T) -> bool + Send + Sync>>,
     ordered_capacity: usize,
     timing_capacity: usize,
     state: Mutex<SlotState<T>>,
@@ -883,6 +885,10 @@ struct SubscriberSlot<T> {
 impl<T: Clone> SubscriberSlot<T> {
     fn matches(&self, topic: &str) -> bool {
         self.topics.contains(&topic)
+    }
+
+    fn matches_message(&self, msg: &FlowMessage<T>) -> bool {
+        self.matches(msg.topic) && self.filter.as_ref().is_none_or(|f| f(&msg.payload))
     }
 
     /// Enqueue one message. Returns true if it was accepted (a drop-oldest
@@ -1055,6 +1061,27 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
     /// the historical behaviour, kept so a typo'd pattern fails visibly in a
     /// test rather than looking like an idle bus.
     pub fn subscribe(&self, pattern: &str) -> Subscription<T> {
+        self.subscribe_inner(pattern, None)
+    }
+
+    /// Subscribe to messages matching `pattern` AND satisfying `filter`.
+    ///
+    /// `filter` runs synchronously at publish time before enqueueing into this
+    /// subscriber's ring, so non-matching events never wake the subscriber or
+    /// consume its ordered queue capacity.
+    pub fn subscribe_filtered(
+        &self,
+        pattern: &str,
+        filter: impl Fn(&T) -> bool + Send + Sync + 'static,
+    ) -> Subscription<T> {
+        self.subscribe_inner(pattern, Some(Box::new(filter)))
+    }
+
+    fn subscribe_inner(
+        &self,
+        pattern: &str,
+        filter: Option<Box<dyn Fn(&T) -> bool + Send + Sync>>,
+    ) -> Subscription<T> {
         let topics: Vec<&'static str> = self
             .inner
             .topics
@@ -1073,6 +1100,7 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
         let slot = Arc::new(SubscriberSlot {
             topics,
             pattern: pattern.to_string(),
+            filter,
             ordered_capacity: self.inner.ordered_capacity,
             timing_capacity: self.inner.timing_capacity,
             state: Mutex::new(SlotState {
@@ -1160,7 +1188,7 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
                 let Some(slot) = weak.upgrade() else {
                     return false;
                 };
-                let mut matching = messages.iter().filter(|m| slot.matches(m.topic)).peekable();
+                let mut matching = messages.iter().filter(|m| slot.matches_message(m)).peekable();
                 if matching.peek().is_none() { return true; }
                 let mut accepted = true;
                 while let Some(message) = matching.next() {
@@ -3091,6 +3119,34 @@ mod tests {
         assert_eq!(FLOW_QUEUE_DEPTH_ENV, "KAIJUTSU_FLOW_QUEUE_DEPTH");
         // Unset in the test process → the default.
         assert!(configured_queue_depth() >= 1);
+    }
+
+    /// A predicate-filtered subscription never enqueues or overflows on
+    /// non-matching traffic, while delivering matching events normally.
+    #[test]
+    fn subscribe_filtered_ignores_other_contexts_without_overflow() {
+        let bus: FlowBus<BlockFlow> = FlowBus::new(4);
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+        let id_a = BlockId::new(ctx_a, PrincipalId::new(), 1);
+        let id_b = BlockId::new(ctx_b, PrincipalId::new(), 1);
+
+        let mut sub_a = bus.subscribe_filtered("block.*", move |flow| flow.context_id() == ctx_a);
+
+        // Flood ctx_b with far more events than sub_a's capacity (4).
+        for i in 0..32u8 {
+            bus.publish(text_op(ctx_b, id_b, i));
+        }
+
+        // sub_a must still be empty (never woken) and live (not terminated).
+        assert!(sub_a.try_recv().is_none());
+        assert!(!sub_a.is_terminated());
+
+        // Now publish for ctx_a — arrives cleanly.
+        bus.publish(text_op(ctx_a, id_a, 7));
+        let msg = sub_a.try_recv().expect("matching event must be delivered");
+        assert_eq!(msg.payload.context_id(), ctx_a);
+        assert!(msg.group_end);
     }
 
     // ====================================================================

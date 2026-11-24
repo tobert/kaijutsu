@@ -1685,7 +1685,7 @@ impl KernelHandle {
         let r = response.get()?;
         Ok(AskListing {
             generation: r.get_generation(),
-            asks: r.get_asks()?.iter().map(crate::ledger_wire::ask_summary).collect::<Result<_, _>>()?,
+            asks: crate::ledger_wire::ask_summaries(r.get_asks()?)?,
             total: r.get_total(),
         })
     }
