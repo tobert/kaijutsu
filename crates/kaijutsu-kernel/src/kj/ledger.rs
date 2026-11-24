@@ -313,6 +313,9 @@ enum LedgerCommand {
         /// Attach each ask's signal rows and nest output under `{ask, signals}`.
         #[arg(long)]
         signals: bool,
+        /// Only include asks the caller is authorized to answer (excludes self-authored asks and asks routed to another reviewer).
+        #[arg(long)]
+        answerable: bool,
     },
     /// Show one pending or decided ask, its statement, identities, decision
     /// and any denial reason, execution inputs, publication abandonment, and
@@ -521,8 +524,8 @@ impl KjDispatcher {
             }
         };
         match parsed.command {
-            LedgerCommand::List { history, limit, since, origin, status, signals } => {
-                self.ledger_list(history, limit, since.as_deref(), origin, status, signals)
+            LedgerCommand::List { history, limit, since, origin, status, signals, answerable } => {
+                self.ledger_list(history, limit, since.as_deref(), origin, status, signals, answerable, caller)
             }
             LedgerCommand::Show { request_id, signals } => self.ledger_show(&request_id, signals),
             LedgerCommand::Allow { request_id, remember, family } => {
@@ -584,6 +587,7 @@ impl KjDispatcher {
     /// `--status`, the bare `--history` flag picks between the two modes
     /// this command has always had: the default pending-only queue, or
     /// the four-terminal-status history view.
+    #[allow(clippy::too_many_arguments)]
     fn ledger_list(
         &self,
         history: bool,
@@ -592,6 +596,8 @@ impl KjDispatcher {
         origin: Option<OriginArg>,
         status: Option<StatusArg>,
         show_signals: bool,
+        answerable_only: bool,
+        caller: &KjCaller,
     ) -> KjResult {
         let since_ms = match since {
             Some(s) => match parse_since_duration_ms(s) {
@@ -606,7 +612,7 @@ impl KjDispatcher {
             status: status.map(|s| crate::kj::gate::ask_status(s.to_ledger())),
             origin: origin.map(|o| crate::ledger_view::ask_origin(o.to_ledger())),
             since_ms,
-            limit: Some(limit),
+            limit: if answerable_only { None } else { Some(limit) },
         };
         let newest_first = match status {
             Some(s) => s.to_ledger().is_terminal(),
@@ -616,7 +622,38 @@ impl KjDispatcher {
         let (rows, total) = {
             let db = self.kernel_db.lock();
             match crate::ledger_view::list_asks(&db, &filter) {
-                Ok(listing) => (listing.asks, listing.total),
+                Ok(listing) => {
+                    if answerable_only {
+                        let caller_is_root = caller.privileged
+                            || db
+                                .get_character(caller.actor_id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|c| c.is_live_root());
+                        let mut filtered: Vec<_> = listing
+                            .asks
+                            .into_iter()
+                            .filter(|r| {
+                                let self_authored = r.performer.as_ref().map(|p| p.id) == Some(caller.actor_id);
+                                if self_authored {
+                                    return false;
+                                }
+                                if caller_is_root {
+                                    return true;
+                                }
+                                let is_reviewer = r.reviewer.as_ref().map(|p| p.id) == Some(caller.actor_id);
+                                let unassigned = r.reviewer.is_none();
+                                let is_lineage_root = r.lineage_root.as_ref().map(|p| p.id) == Some(caller.actor_id);
+                                is_reviewer || unassigned || is_lineage_root
+                            })
+                            .collect();
+                        let total = filtered.len() as u64;
+                        filtered.truncate(limit as usize);
+                        (filtered, total)
+                    } else {
+                        (listing.asks, listing.total)
+                    }
+                }
                 Err(e) => return KjResult::Err(format!("kj ledger list: {e}")),
             }
         };

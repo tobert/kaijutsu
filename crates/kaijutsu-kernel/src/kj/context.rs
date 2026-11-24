@@ -3646,27 +3646,30 @@ impl KjDispatcher {
             };
             rows.into_iter()
                 .map(|row| {
-                    let policy = match db.get_track(&row.track_id) {
-                        Ok(Some(t)) => crate::hyoushigi::BeatPolicy {
-                            period: std::time::Duration::from_millis(t.period_ms),
-                            beats_per_phrase: t.beats_per_phrase,
-                        },
-                        Ok(None) => crate::hyoushigi::BeatPolicy::musician_default(),
+                    let (policy, was_playing) = match db.get_track(&row.track_id) {
+                        Ok(Some(t)) => (
+                            crate::hyoushigi::BeatPolicy {
+                                period: std::time::Duration::from_millis(t.period_ms),
+                                beats_per_phrase: t.beats_per_phrase,
+                            },
+                            t.playing,
+                        ),
+                        Ok(None) => (crate::hyoushigi::BeatPolicy::musician_default(), false),
                         Err(e) => {
                             tracing::warn!(
                                 context = %successor.short(),
                                 track = %row.track_id,
                                 "could not read track policy for successor handoff; using default: {e}"
                             );
-                            crate::hyoushigi::BeatPolicy::musician_default()
+                            (crate::hyoushigi::BeatPolicy::musician_default(), false)
                         }
                     };
-                    (row, policy)
+                    (row, policy, was_playing)
                 })
                 .collect()
         };
 
-        for (row, policy) in entries {
+        for (row, policy, was_playing) in entries {
             let track = match kaijutsu_types::TrackId::new(row.track_id.clone()) {
                 Ok(track) => track,
                 Err(e) => {
@@ -3685,11 +3688,14 @@ impl KjDispatcher {
                 pulse: 0,
             };
             self.kernel().send_beat_command(crate::hyoushigi::BeatCommand::Attach {
-                track,
+                track: track.clone(),
                 context_id: successor,
                 attachment,
                 policy,
             });
+            if was_playing {
+                self.kernel().send_beat_command(crate::hyoushigi::BeatCommand::Play(track));
+            }
         }
     }
 }

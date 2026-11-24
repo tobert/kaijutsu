@@ -116,7 +116,7 @@ async fn apply_boards_outcome(bridge: &KernelBridge, app: &mut App, outcome: Boa
         BoardsOutcome::None => {}
         BoardsOutcome::Dismiss => app.boards = None,
         BoardsOutcome::LoadBoards => {
-            let argv = vec!["board".into(), "list".into()];
+            let argv = vec!["board".into(), "list".into(), "--all".into()];
             match bridge.execute_kj(ctx, argv).await {
                 Ok(res) if res.exit_code == 0 => {
                     let parsed = boards::parse_board_list(&res.stdout);

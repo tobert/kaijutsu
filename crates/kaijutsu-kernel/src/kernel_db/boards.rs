@@ -211,6 +211,45 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
+    /// List all character boards across all characters, returning `(character_name, BoardRow)`.
+    pub fn list_all_character_boards(
+        &self,
+        include_archived: bool,
+    ) -> KernelDbResult<Vec<(String, BoardRow)>> {
+        let sql = if include_archived {
+            "SELECT c.name, b.board_id, b.owner_character, b.slug, b.description,
+                    b.write_policy, b.created_by, b.created_at, b.archived_at
+             FROM boards b
+             JOIN characters c ON c.principal_id = b.owner_character
+             WHERE b.owner_character IS NOT NULL
+             ORDER BY c.name, b.slug, b.created_at"
+        } else {
+            "SELECT c.name, b.board_id, b.owner_character, b.slug, b.description,
+                    b.write_policy, b.created_by, b.created_at, b.archived_at
+             FROM boards b
+             JOIN characters c ON c.principal_id = b.owner_character
+             WHERE b.owner_character IS NOT NULL AND b.archived_at IS NULL
+             ORDER BY c.name, b.slug, b.created_at"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            let name: String = row.get(0)?;
+            let policy_str: String = row.get(5)?;
+            let board = BoardRow {
+                board_id: read_board_id(row, 1)?,
+                owner_character: read_opt_principal_id(row, 2)?,
+                slug: row.get(3)?,
+                description: row.get(4)?,
+                write_policy: board_write_policy_from_sql(&policy_str, 5)?,
+                created_by: read_principal_id(row, 6)?,
+                created_at: row.get(7)?,
+                archived_at: row.get(8)?,
+            };
+            Ok((name, board))
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
     /// Return the working board for `context_id`, lazily creating one and
     /// attaching `contexts.board_id` atomically if it is currently `NULL`.
     pub fn ensure_context_board(

@@ -474,7 +474,7 @@ pub fn parse_board_list(stdout: &str) -> Vec<BoardEntry> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed == "(no boards)" {
+        if trimmed.is_empty() || trimmed.starts_with("(no boards") {
             continue;
         }
         let parts: Vec<&str> = trimmed.split("  ").map(str::trim).filter(|s| !s.is_empty()).collect();

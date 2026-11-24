@@ -1637,3 +1637,42 @@ async fn board_vi_sessions_edit_reply_post_and_cancel_cleanly() {
     assert!(new_topic.is_ok(), "new topic should exist: {new_topic:?}");
     assert!(new_topic.message().contains("hello from vi"), "{}", new_topic.message());
 }
+
+#[tokio::test]
+async fn board_list_all_and_empty_hint_and_compact_read_data() {
+    let d = test_dispatcher().await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let alice_id = create_character(&d, "alice", false).await;
+    let bob_id = create_character(&d, "bob", false).await;
+    let alice_ctx = register_bound_context(&d, "alice-ctx", alice_id, Some(root_ctx), &worker_binding());
+    let bob_ctx = register_bound_context(&d, "bob-ctx", bob_id, Some(root_ctx), &worker_binding());
+    let alice = caller_as(alice_id, Some(alice_ctx));
+    let bob = caller_as(bob_id, Some(bob_ctx));
+
+    assert!(d.dispatch(&[s("board"), s("create"), s("notes")], &alice).await.is_ok());
+    assert!(
+        d.dispatch(&[s("board"), s("post"), s("alice/notes"), s("--title"), s("Hello"), s("body text")], &alice)
+            .await
+            .is_ok()
+    );
+
+    // Bob owns no boards: bare `kj board list` gives a helpful hint pointing to --all / recent.
+    let bob_empty = d.dispatch(&[s("board"), s("list")], &bob).await;
+    assert!(bob_empty.is_ok());
+    assert!(bob_empty.message().contains("kj board list --all"), "{}", bob_empty.message());
+
+    // `kj board list --all` discovers alice/notes from bob's context.
+    let all = d.dispatch(&[s("board"), s("list"), s("--all")], &bob).await;
+    assert!(all.is_ok());
+    assert!(all.message().contains("alice/notes"), "{}", all.message());
+
+    // `kj board read` keeps structured post metadata without duplicating full body text in `data`.
+    let read = d.dispatch(&[s("board"), s("read"), s("alice/notes/hello")], &bob).await;
+    let KjResult::Ok { message, data: Some(data), .. } = read else {
+        panic!("expected ok-with-data");
+    };
+    assert!(message.contains("body text"), "{message}");
+    let post0 = &data["posts"].as_array().unwrap()[0];
+    assert_eq!(post0["number"].as_u64(), Some(1));
+    assert!(post0.get("content").is_none(), "post content should not be duplicated in data: {post0}");
+}

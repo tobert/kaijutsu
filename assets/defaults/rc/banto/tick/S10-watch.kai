@@ -44,7 +44,7 @@ age_hrs=$(( (now - born_epoch) / 3600 ))
 urgent=0
 
 set +e
-raw_asks="$(kj ledger list --json)"
+raw_asks="$(kj ledger list --answerable --json)"
 rc_asks=$?
 set -e
 if [[ "$rc_asks" -ne 0 ]]; then

@@ -162,11 +162,14 @@ pub(crate) struct BoardArgs {
 
 #[derive(Subcommand, Debug)]
 enum BoardCommand {
-    /// List boards owned by a character (defaults to the caller's character).
+    /// List boards owned by a character (defaults to the caller's character), or all boards with `--all`.
     #[command(alias = "ls")]
     List {
         /// Character name; defaults to the caller's character.
         character: Option<String>,
+        /// List live boards across all characters (plus `.` if the current context has one).
+        #[arg(long, conflicts_with = "character")]
+        all: bool,
     },
     /// List topics on a board, pinned first then most recently posted.
     Topics {
@@ -428,7 +431,7 @@ impl KjDispatcher {
         };
 
         match parsed.command {
-            BoardCommand::List { character } => self.board_list(character.as_deref(), caller),
+            BoardCommand::List { character, all } => self.board_list(character.as_deref(), all, caller),
             BoardCommand::Topics { board, status, tag, limit, include_hidden } => {
                 self.board_topics(&board, status.as_deref(), tag.as_deref(), limit, include_hidden, caller)
             }
@@ -498,23 +501,8 @@ impl KjDispatcher {
     // Read verbs
     // ========================================================================
 
-    fn board_list(&self, character: Option<&str>, caller: &KjCaller) -> KjResult {
+    fn board_list(&self, character: Option<&str>, all: bool, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let target_char = match character {
-            Some(name) => match db.get_character_by_name(name) {
-                Ok(Some(row)) => Some(row),
-                Ok(None) => {
-                    return KjResult::Err(format!(
-                        "kj board list: no character named '{name}'; run `kj character list` to see who exists"
-                    ));
-                }
-                Err(e) => return KjResult::Err(format!("kj board list: {e}")),
-            },
-            None => match db.get_character(caller.actor_id) {
-                Ok(row) => row,
-                Err(e) => return KjResult::Err(format!("kj board list: {e}")),
-            },
-        };
 
         let mut lines = Vec::new();
         let mut handles = Vec::new();
@@ -535,7 +523,44 @@ impl KjDispatcher {
             handles.push(serde_json::Value::String(".".to_string()));
         }
 
-        if let Some(ch) = target_char {
+        if all {
+            let boards = match db.list_all_character_boards(false) {
+                Ok(rows) => rows,
+                Err(e) => return KjResult::Err(format!("kj board list: {e}")),
+            };
+            for (char_name, board) in boards {
+                let slug = board.slug.as_deref().unwrap_or("-");
+                let handle = format!("{char_name}/{slug}");
+                if board.description.is_empty() {
+                    lines.push(format!("{handle}  [{}]", board.write_policy));
+                } else {
+                    lines.push(format!("{handle}  [{}]  {}", board.write_policy, board.description));
+                }
+                handles.push(serde_json::Value::String(handle));
+            }
+            if lines.is_empty() {
+                return KjResult::ok_with_data("(no boards)", serde_json::Value::Array(handles));
+            }
+            return KjResult::ok_with_data(lines.join("\n"), serde_json::Value::Array(handles));
+        }
+
+        let target_char = match character {
+            Some(name) => match db.get_character_by_name(name) {
+                Ok(Some(row)) => Some(row),
+                Ok(None) => {
+                    return KjResult::Err(format!(
+                        "kj board list: no character named '{name}'; run `kj character list` to see who exists"
+                    ));
+                }
+                Err(e) => return KjResult::Err(format!("kj board list: {e}")),
+            },
+            None => match db.get_character(caller.actor_id) {
+                Ok(row) => row,
+                Err(e) => return KjResult::Err(format!("kj board list: {e}")),
+            },
+        };
+
+        if let Some(ref ch) = target_char {
             let boards = match db.list_character_boards(ch.principal_id, false) {
                 Ok(rows) => rows,
                 Err(e) => return KjResult::Err(format!("kj board list: {e}")),
@@ -552,13 +577,20 @@ impl KjDispatcher {
             }
         } else if lines.is_empty() {
             return KjResult::Err(format!(
-                "kj board list: principal {} has no character; pass a character name or run `kj character create '<name>'`",
+                "kj board list: principal {} has no character; pass `--all`, pass a character name, or run `kj character create '<name>'`",
                 caller.actor_id.short()
             ));
         }
 
         if lines.is_empty() {
-            return KjResult::ok_with_data("(no boards)", serde_json::Value::Array(handles));
+            let hint = match target_char {
+                Some(ch) => format!(
+                    "(no boards owned by {}; try `kj board list --all` or `kj board recent`)",
+                    ch.name
+                ),
+                None => "(no boards; try `kj board list --all` or `kj board recent`)".to_string(),
+            };
+            return KjResult::ok_with_data(hint, serde_json::Value::Array(handles));
         }
         KjResult::ok_with_data(lines.join("\n"), serde_json::Value::Array(handles))
     }
@@ -727,6 +759,8 @@ impl KjDispatcher {
                     out.push('\n');
                 }
 
+                // Metadata only in structured `data` (full markdown body is in
+                // `stdout`) so MCP/shell JSON envelopes do not double payload size.
                 posts_json.push(serde_json::json!({
                     "number": post.number,
                     "block_id": post.snap.id.to_key(),
@@ -735,7 +769,6 @@ impl KjDispatcher {
                     "created_at": post.snap.created_at,
                     "excluded": post.snap.excluded,
                     "parent_number": parent_number,
-                    "content": post.snap.content,
                 }));
             }
         }
