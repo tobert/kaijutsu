@@ -6,6 +6,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Approval UX and `gate.toml` ergonomics (2026-11-24)
+
+- **Frequent `'t a'` approvals in interactive use.** Amy is hitting too many manual `'t a'` approvals during normal banto/senpai/kohai work; needs a design discussion on how to reduce approval friction (e.g., broader safe defaults, scoped standing rules, or board/handoff scoping across senpai/kohai) without weakening the turn-identity / auth model (`docs/approval-identity.md`).
+
+---
+
 ## Boards: what Slices 1–3 leave open (2026-11-22)
 
 From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):

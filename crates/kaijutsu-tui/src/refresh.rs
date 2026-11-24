@@ -46,12 +46,25 @@ pub async fn fetch(bridge: KernelBridge, epoch: u64) -> Refreshed {
 
 /// Fold a finished round into the app. No await: this runs on the loop.
 pub fn apply(app: &mut App, refreshed: Refreshed) {
+    // Remember the current context's live label before replacing the listing so
+    // we can detect a rotation (the current context became archived and a live
+    // successor now carries its label) and prime `:kj context switch <id>`.
+    let prev_live_label = app.current.and_then(|cur| {
+        app.contexts
+            .iter()
+            .find(|c| c.id == cur && !c.archived && !c.label.is_empty())
+            .map(|c| (cur, c.label.clone()))
+    });
+
     // A listing stored while this round ran (the context a `Ctrl+Z` create
     // just made) is newer than the round's; the next round picks it up.
     if let Some(contexts) = refreshed.contexts
         && refreshed.epoch == app.listing_epoch()
     {
         app.set_contexts(contexts);
+        if let Some((cur, label)) = prev_live_label {
+            maybe_prime_rotation_switch(app, cur, &label);
+        }
     }
     if let Some(error) = refreshed.context_error {
         app.note(error);
@@ -60,6 +73,46 @@ pub fn apply(app: &mut App, refreshed: Refreshed) {
         app.tracks = tracks.iter().map(picker::track_row_from).collect();
     }
     app.refresh_picker(kaijutsu_types::now_millis());
+}
+
+/// If `cur` was just archived and a live successor took over its `label`,
+/// prime `:kj context switch <successor_hex>` once so one `Enter` follows it.
+fn maybe_prime_rotation_switch(app: &mut App, cur: kaijutsu_types::ContextId, label: &str) {
+    if app.current != Some(cur) || app.rotation_primed.contains(&cur) {
+        return;
+    }
+    let cur_still_live = app.contexts.iter().any(|c| c.id == cur && !c.archived);
+    if cur_still_live {
+        return;
+    }
+    let Some(successor) = app
+        .contexts
+        .iter()
+        .find(|c| c.id != cur && !c.archived && c.label == label)
+        .cloned()
+    else {
+        return;
+    };
+    app.rotation_primed.insert(cur);
+    let can_prime = !app.screen.is_full_screen()
+        && app.picker.is_none()
+        && app.boards.is_none()
+        && app.compose.command_line().is_none()
+        && app.compose.text().is_empty();
+    if can_prime {
+        let _ = app
+            .compose
+            .open_command(&format!("kj context switch {}", successor.id.to_hex()));
+        app.note(format!(
+            "{label} rotated — press Enter to switch to {}",
+            successor.id.short()
+        ));
+    } else {
+        app.note(format!(
+            "{label} rotated — successor is {}",
+            successor.id.to_hex()
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -154,5 +207,54 @@ mod tests {
         );
         assert_eq!(app.contexts, vec![kept], "a failed round never blanks the rank");
         assert_eq!(app.notice(), Some("cannot refresh the context rank: kernel unreachable"));
+    }
+
+    /// When the current context rotates (becomes archived while a live
+    /// successor takes its label), the command bar is primed once with
+    /// `:kj context switch <successor_hex>` so one Enter jumps to it, and
+    /// dismissing the bar does not re-prime on later refreshes.
+    #[test]
+    fn rotating_current_context_primes_switch_command_once() {
+        let mut app = App::new("amy");
+        let old = context_row("banto");
+        app.set_contexts(vec![old.clone()]);
+        app.current = Some(old.id);
+
+        let mut archived_old = old.clone();
+        archived_old.archived = true;
+        archived_old.label.clear();
+        let successor = context_row("banto");
+
+        let epoch = app.listing_epoch();
+        apply(
+            &mut app,
+            Refreshed {
+                contexts: Some(vec![archived_old.clone(), successor.clone()]),
+                epoch,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            app.compose.command_line().as_deref(),
+            Some(format!(":kj context switch {}", successor.id.to_hex()).as_str())
+        );
+
+        // User hits Esc to stay and read the archived transcript; a later
+        // refresh must not re-open the command bar.
+        app.compose.press(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.compose.command_line(), None);
+        let epoch2 = app.listing_epoch();
+        apply(
+            &mut app,
+            Refreshed {
+                contexts: Some(vec![archived_old, successor]),
+                epoch: epoch2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(app.compose.command_line(), None);
     }
 }

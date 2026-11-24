@@ -118,6 +118,7 @@ allow = [
   "kj handoff note",     # recoverable by construction
   "kj board post",       # board write policy (open/curated/locked) still governs publish vs ledger review
   "kj board reply",
+  "kj board edit",
   "kj board resolve",
   "kj board reopen",
   "kj block create",

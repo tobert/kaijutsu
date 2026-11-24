@@ -295,6 +295,9 @@ pub struct App {
     /// client that assumed the worst would stop animating everywhere it is
     /// not supported (`docs/tui.md`, "What owning the screen lets us use").
     pub focused: bool,
+    /// Contexts whose rotation successor we already primed `:kj context switch`
+    /// for, so dismissing the prompt with `Esc` does not re-prime on later ticks.
+    pub rotation_primed: HashSet<ContextId>,
     /// The playing track's beat envelope, sampled against `Instant::now()`
     /// once per redraw tick in [`crate::run`] — the only place this module
     /// reads a live clock. [`Self::track_figure`] projects it; nothing here
@@ -345,6 +348,7 @@ impl App {
             boards: None,
             track_pulse: false,
             focused: true,
+            rotation_primed: HashSet::new(),
             roster_changed: false,
         }
     }

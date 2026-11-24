@@ -2727,14 +2727,13 @@ impl KjDispatcher {
             }
         };
 
-        let mut msg = format!("rotated {name}: {} archived, {} replaces it", predecessor.context_id.short(), successor_id.short());
-        msg.push_str(&format!(
-            "\nfull ids: predecessor {} successor {}",
+        let mut msg = format!(
+            "Rotated {name}: predecessor {} is now archived.\nSuccessor: {}",
             predecessor.context_id.to_hex(),
             successor_id.to_hex()
-        ));
+        );
         if moved > 0 {
-            msg.push_str(" (the character's handoff log now points at it)");
+            msg.push_str("\nThe character's handoff log now points at the successor.");
         }
         // Say so when the successor has no model.
         let no_model = self.successor_no_model_notice(is_handoff_log, successor_id);
@@ -2821,17 +2820,12 @@ impl KjDispatcher {
     ) -> KjResult {
         let no_model = self.successor_no_model_notice(is_handoff_log, successor);
         let mut msg = format!(
-            "rotation of {name} is under way: {} is created and takes over when this turn ends, \
-             and {name} is archived then, with its archive lifecycle. The label, ring seat, and \
-             handoff pointer move with it. This turn gets one more call, offering only `done`: \
-             call it with your signoff.",
-            successor.short()
+            "Rotation of {name} is under way: successor {} is created and takes over when this turn ends, \
+             archiving {} with its archive lifecycle. The label, ring seat, and handoff pointer move with it. \
+             This turn gets one more call, offering only `done`: call it with your signoff.",
+            successor.to_hex(),
+            predecessor.context_id.to_hex()
         );
-        msg.push_str(&format!(
-            "\nfull ids: predecessor {} successor {}",
-            predecessor.context_id.to_hex(),
-            successor.to_hex()
-        ));
         if let Some(line) = &no_model {
             msg.push('\n');
             msg.push_str(line);
@@ -2976,17 +2970,12 @@ impl KjDispatcher {
                 // stopped this one; input it accepted waits in the log.
                 self.kernel().turns().interrupt(predecessor, false);
                 let mut message = format!(
-                    "Rotated {name}: {} archived, {} replaces it",
-                    predecessor.short(),
-                    successor.short()
-                );
-                message.push_str(&format!(
-                    "\nfull ids: predecessor {} successor {}",
+                    "--- End of context (archived) ---\nRotated {name}: predecessor {} is now archived.\nSuccessor: {}",
                     predecessor.to_hex(),
                     successor.to_hex()
-                ));
+                );
                 if moved > 0 {
-                    message.push_str(" (the character's handoff log now points at it)");
+                    message.push_str("\nThe character's handoff log now points at the successor.");
                 }
                 if let Some(error) = label_error {
                     message.push_str(&format!(
@@ -5969,8 +5958,11 @@ mod tests {
         let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
         assert!(rotated.is_ok(), "{}", rotated.message());
         let successor = successor_of(&rotated);
-        let last = rotated.message().lines().last().unwrap().to_string();
-        assert_eq!(last, format!("full ids: predecessor {} successor {}", f.seat.to_hex(), successor.to_hex()));
+        let msg = rotated.message();
+        assert_eq!(msg.matches(&f.seat.to_hex()).count(), 1, "predecessor full id once: {msg}");
+        assert_eq!(msg.matches(&successor.to_hex()).count(), 1, "successor full id once: {msg}");
+        assert!(msg.contains("is now archived"), "{msg}");
+        assert!(msg.contains(&format!("Successor: {}", successor.to_hex())), "{msg}");
         let info = f.d.dispatch(&[s("context"), s("info"), successor.to_hex()], &rotation_caller(successor, f.banto)).await;
         assert!(info.is_ok(), "{}", info.message());
         assert!(info.message().contains(&format!("(full {})", f.seat.to_hex())), "{}", info.message());
