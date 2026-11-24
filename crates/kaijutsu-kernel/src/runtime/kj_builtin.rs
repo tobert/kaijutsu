@@ -699,6 +699,7 @@ fn wants_stdin_content(argv: &[String]) -> bool {
             | (Some("block"), Some("create"))
             | (Some("board"), Some("post"))
             | (Some("board"), Some("reply"))
+            | (Some("board"), Some("edit"))
     )
 }
 

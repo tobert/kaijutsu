@@ -190,6 +190,12 @@ pub struct Kernel {
     /// sync mutex because every editor op is synchronous — modalkit's `!Send`
     /// `EditorCore` never crosses an await (see [`crate::editor::SendSessions`]).
     editor_sessions: parking_lot::Mutex<crate::editor::SendSessions>,
+    /// Board-backed editor sessions (`kj board edit|reply|post --vi`).
+    /// Sessions present here bypass `file_cache` pin/dirty/flush/unpin and
+    /// commit to the board on `:w` instead, dropping their scratch document on close.
+    board_editors: parking_lot::Mutex<
+        std::collections::HashMap<crate::editor::EditorSessionId, crate::editor::BoardEditorBinding>,
+    >,
     /// FlowBus for editor-session state changes — the push channel the app
     /// renders from. `editor_keys`/`editor_save` publish `StateChanged`,
     /// `editor_quit` publishes `Closed`; the server's `subscribe_editor` bridge
@@ -501,6 +507,7 @@ impl Kernel {
                 sessions.set_register_loader(Self::register_loader(db.clone()));
                 sessions
             })),
+            board_editors: parking_lot::Mutex::new(std::collections::HashMap::new()),
             editor_flows: shared_editor_flow_bus(default_flow_capacity()),
             ledger_flows: shared_ledger_flow_bus(default_flow_capacity()),
             shell_operations: {
@@ -1615,6 +1622,166 @@ impl Kernel {
 
     // ── Editor sessions ───────────────────────────────────────────────────
 
+    /// Open an in-app vi session backed by an ephemeral scratch buffer that
+    /// commits to a board post/reply/topic on `:w` / `:wq` / `ZZ` and drops
+    /// the scratch document on close.
+    pub(crate) async fn editor_open_board_signaled(
+        &self,
+        display_path: &str,
+        initial_text: &str,
+        target: crate::editor::BoardEditorTarget,
+        caller: crate::kj::KjCaller,
+        opener: Option<crate::editor::EditorOpener>,
+    ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        let scratch_doc = ContextId::new();
+        let scratch_block = self
+            .blocks()
+            .create_document_with_block(
+                scratch_doc,
+                caller.actor_id,
+                kaijutsu_types::DocKind::File,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                initial_text.to_string(),
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Markdown,
+            )
+            .map_err(|e| format!("open board editor: {e}"))?;
+        let editor_target = crate::editor::EditorTarget {
+            context_id: scratch_doc,
+            block_id: scratch_block,
+        };
+        let paths = [display_path.to_string()];
+        let (id, state) = match self
+            .editor_sessions
+            .lock()
+            .0
+            .open(&paths, editor_target, self.blocks(), opener)
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = self.blocks().delete_document(scratch_doc);
+                return Err(e);
+            }
+        };
+        self.board_editors.lock().insert(
+            id,
+            crate::editor::BoardEditorBinding {
+                scratch_doc,
+                scratch_block,
+                target,
+                caller,
+            },
+        );
+        self.signal_open_editor(id, &state, opener.map(|o| o.principal))
+            .await;
+        Ok((id, state))
+    }
+
+    fn is_board_editor(&self, id: crate::editor::EditorSessionId) -> bool {
+        self.board_editors.lock().contains_key(&id)
+    }
+
+    /// Commit a board-backed editor buffer's current text, updating the binding
+    /// target on first publish so subsequent `:w` calls edit the created post
+    /// instead of duplicating it.
+    async fn flush_board_editor(
+        &self,
+        id: crate::editor::EditorSessionId,
+        text: &str,
+    ) -> Result<String, String> {
+        let binding = self
+            .board_editors
+            .lock()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "board editor session missing binding".to_string())?;
+        let (msg, next_target) = self.commit_board_editor_binding(&binding, text).await?;
+        if let Some(next) = next_target
+            && let Some(entry) = self.board_editors.lock().get_mut(&id)
+        {
+            entry.target = next;
+        }
+        Ok(msg)
+    }
+
+    async fn commit_board_editor_binding(
+        &self,
+        binding: &crate::editor::BoardEditorBinding,
+        text: &str,
+    ) -> Result<(String, Option<crate::editor::BoardEditorTarget>), String> {
+        use crate::editor::BoardEditorTarget;
+        let dispatcher = self
+            .broker
+            .kj_dispatcher()
+            .await
+            .ok_or_else(|| "kj dispatcher is not registered".to_string())?;
+        match &binding.target {
+            BoardEditorTarget::EditPost { post_ref } => {
+                match dispatcher.board_edit(post_ref, text, &binding.caller).await {
+                    crate::kj::KjResult::Ok { message, .. } => Ok((message, None)),
+                    crate::kj::KjResult::Err(e) => Err(e),
+                    other => Err(other.message().to_string()),
+                }
+            }
+            BoardEditorTarget::NewReply { topic_ref, to } => {
+                match dispatcher
+                    .board_reply(topic_ref, *to, text, &binding.caller)
+                    .await
+                {
+                    crate::kj::KjResult::Ok { message, data, .. } => {
+                        let next = data.as_ref().and_then(|d| {
+                            if d.get("held").and_then(|v| v.as_bool()) == Some(true) {
+                                let ask_id = d.get("ask_id")?.as_str()?.to_string();
+                                Some(BoardEditorTarget::SubmittedForReview { ask_id })
+                            } else {
+                                let short = d.get("short_id")?.as_str()?;
+                                let num = d.get("post_number")?.as_u64()?;
+                                Some(BoardEditorTarget::EditPost {
+                                    post_ref: format!("{short}#{num}"),
+                                })
+                            }
+                        });
+                        Ok((message, next))
+                    }
+                    crate::kj::KjResult::Err(e) => Err(e),
+                    other => Err(other.message().to_string()),
+                }
+            }
+            BoardEditorTarget::NewTopic {
+                board_ref,
+                title,
+                tags,
+            } => {
+                match dispatcher
+                    .board_post(board_ref, title, tags.clone(), text, &binding.caller)
+                    .await
+                {
+                    crate::kj::KjResult::Ok { message, data, .. } => {
+                        let next = data.as_ref().and_then(|d| {
+                            if d.get("held").and_then(|v| v.as_bool()) == Some(true) {
+                                let ask_id = d.get("ask_id")?.as_str()?.to_string();
+                                Some(BoardEditorTarget::SubmittedForReview { ask_id })
+                            } else {
+                                let short = d.get("short_id")?.as_str()?;
+                                Some(BoardEditorTarget::EditPost {
+                                    post_ref: format!("{short}#1"),
+                                })
+                            }
+                        });
+                        Ok((message, next))
+                    }
+                    crate::kj::KjResult::Err(e) => Err(e),
+                    other => Err(other.message().to_string()),
+                }
+            }
+            BoardEditorTarget::SubmittedForReview { ask_id } => Err(format!(
+                "already submitted for review (ask '{ask_id}'); close with :q!"
+            )),
+        }
+    }
+
     /// Open an in-app editor on `path`, binding to the kernel file-doc that
     /// owns its text. Returns the session handle + initial state; fails loud
     /// if the path names no editable document.
@@ -1960,37 +2127,26 @@ impl Kernel {
                         Err(msg) => message = Some(msg),
                     }
                 }
-                // Mark dirty BEFORE any same-batch flush is attempted below —
-                // not just on the plain-edit path. `flush_one` treats a
-                // cache entry it never saw `mark_dirty` on as "clean,
-                // nothing to flush" and silently no-ops (P1: a single batch
-                // like `iX<Esc>:w<CR>` mirrors the edit onto the block, then
-                // went straight to the flush branch below without ever
-                // recording the entry as dirty first — the checkpoint
-                // advanced, the caller saw success, and disk never moved).
-                if self.editor_sessions.lock().0.buffer_dirty(id, update.buffer)? {
+                let is_board = self.is_board_editor(id);
+                if !is_board && self.editor_sessions.lock().0.buffer_dirty(id, update.buffer)? {
                     self.file_cache
                         .mark_dirty(fp)
                         .map_err(|e| format!("editor keys: failed to mark {fp} dirty: {e}"))?;
                 }
                 if update.saved {
-                    // The buffer still reads dirty here — `EditorSessions`
-                    // deferred the checkpoint (see `KeysUpdate`). Flush to
-                    // disk FIRST; the checkpoint must not advance unless the
-                    // bytes actually landed. Guarded (docs/file-buffers.md
-                    // rule 3, W12): a plain `:w` refuses when disk moved
-                    // under the buffer, `:w!` overrides via `update.forced`.
-                    if let Err(e) = self.file_cache.flush_one_guarded(fp, update.forced).await {
-                        // Leave the swap row and the cache entry alone — the
-                        // entry is legitimately dirty and the block IS the
-                        // player's live buffer, not a speculative write with
-                        // nothing else reading it. Invalidating (as
-                        // `mount_backend.rs`'s *external*-write rollback
-                        // correctly does) would turn a retry `:w` into a
-                        // cold miss that recovers as an unacknowledged swap
-                        // — the wrong error for a player retrying a write
-                        // that just failed. A `:wn` whose write failed does
-                        // not move.
+                    if is_board {
+                        let text = self.editor_sessions.lock().0.state(id)?.text;
+                        match self.flush_board_editor(id, &text).await {
+                            Ok(saved_msg) => {
+                                self.editor_sessions.lock().0.save_at(id, update.buffer)?;
+                                message = join_notes(message, Some(saved_msg));
+                            }
+                            Err(e) => {
+                                message = Some(e);
+                                go = None;
+                            }
+                        }
+                    } else if let Err(e) = self.file_cache.flush_one_guarded(fp, update.forced).await {
                         message = Some(flush_error_message(fp, &e, self.id()));
                         go = None;
                     } else {
@@ -2001,6 +2157,28 @@ impl Kernel {
                 Ok(EditorBatchEnd::Open { message, go, rest: update.rest, yank: update.yank })
             }
             crate::editor::KeysOutcome::Closed(update) => {
+                let board_binding = self.board_editors.lock().remove(&id);
+                if let Some(binding) = board_binding {
+                    let flush_err = if update.saved {
+                        self.commit_board_editor_binding(&binding, &update.state.text)
+                            .await
+                            .err()
+                    } else {
+                        None
+                    };
+                    let _ = self.blocks().delete_document(binding.scratch_doc);
+                    self.editor_flows.publish(crate::flows::EditorFlow::Closed {
+                        session_id: id.as_u64(),
+                    });
+                    return match flush_err {
+                        Some(e) => Err(e),
+                        None => {
+                            let mut state = update.state;
+                            state.message = join_notes(state.message.take(), register_error);
+                            Ok(EditorBatchEnd::Closed(state, update.yank))
+                        }
+                    };
+                }
                 // The session is already gone (ZZ/`:wq`/`:x`/ZQ dropped it
                 // inside `EditorSessions::keys`, checkpointing before it did —
                 // see `run_commands`) — there is no open session left to
@@ -2106,7 +2284,8 @@ impl Kernel {
         let file_path = sessions.0.session_path(id);
         let state = sessions.0.insert_at_cursor(id, text, blocks, actor)?;
         drop(sessions);
-        if let Some(fp) = file_path.as_deref()
+        if !self.is_board_editor(id)
+            && let Some(fp) = file_path.as_deref()
             && state.dirty
         {
             self.file_cache
@@ -2199,10 +2378,16 @@ impl Kernel {
         // The current file at the call: a move while the flush awaits must
         // not checkpoint a different buffer.
         let (fp, index) = self.editor_sessions.lock().0.current_file(id)?;
-        // Guarded, unforced: this direct-call path (the wire `editorSave`,
-        // `kj vi save`) carries no bang, so it is a plain `:w` and refuses on
-        // the W12 changed-under-us condition (docs/file-buffers.md rule 3).
-        let message = if let Err(e) = self.file_cache.flush_one_guarded(&fp, false).await {
+        let message = if self.is_board_editor(id) {
+            let text = self.editor_sessions.lock().0.state(id)?.text;
+            match self.flush_board_editor(id, &text).await {
+                Ok(saved_msg) => {
+                    self.editor_sessions.lock().0.save_at(id, index)?;
+                    Some(saved_msg)
+                }
+                Err(e) => Some(e),
+            }
+        } else if let Err(e) = self.file_cache.flush_one_guarded(&fp, false).await {
             Some(flush_error_message(&fp, &e, self.id()))
         } else {
             self.editor_sessions.lock().0.save_at(id, index)?;
@@ -2238,6 +2423,14 @@ impl Kernel {
         actor: PrincipalId,
     ) -> Result<crate::editor::QuitReport, String> {
         let mut report = self.editor_sessions.lock().0.quit(id, self.blocks(), actor)?;
+        if let Some(binding) = self.board_editors.lock().remove(&id) {
+            let _ = self.blocks().delete_document(binding.scratch_doc);
+            report.rolled_back.clear();
+            self.editor_flows.publish(crate::flows::EditorFlow::Closed {
+                session_id: id.as_u64(),
+            });
+            return Ok(report);
+        }
         // Any close deletes the session's recovery record.
         report.recovery_error = report.recovery.and_then(|rid| self.delete_editor_recovery(rid));
         let mut mark_err = None;

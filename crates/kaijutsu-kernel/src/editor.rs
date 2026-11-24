@@ -53,6 +53,48 @@ pub struct EditorTarget {
     pub block_id: BlockId,
 }
 
+/// What a board-backed kernel vi session commits to on `:w` / `:wq` / `ZZ`.
+#[derive(Debug, Clone)]
+pub enum BoardEditorTarget {
+    /// Editing an existing post (`<topic>#<n>`).
+    EditPost {
+        post_ref: String,
+    },
+    /// Drafting a new reply to `topic_ref` (with optional `--to <n>`).
+    /// After the first direct publish, transitions to `EditPost` so subsequent
+    /// `:w` calls update that reply instead of posting duplicates.
+    NewReply {
+        topic_ref: String,
+        to: Option<usize>,
+    },
+    /// Drafting a new topic on `board_ref`.
+    /// After the first direct publish, transitions to `EditPost` on `#1` so
+    /// subsequent `:w` calls update the opening post instead of creating duplicates.
+    NewTopic {
+        board_ref: String,
+        title: String,
+        tags: Vec<String>,
+    },
+    /// Already submitted as a held post pending curated-board review.
+    SubmittedForReview {
+        ask_id: String,
+    },
+}
+
+/// Kernel-side metadata for an editor session backed by a board post/draft
+/// rather than a `FileDocumentCache` VFS file.
+#[derive(Debug, Clone)]
+pub struct BoardEditorBinding {
+    /// Ephemeral scratch document in `BlockStore` holding the live vi buffer.
+    pub scratch_doc: ContextId,
+    /// Single block inside `scratch_doc`.
+    pub scratch_block: BlockId,
+    /// What `:w` commits to.
+    pub target: BoardEditorTarget,
+    /// The caller identity used when committing via `KjDispatcher`.
+    pub caller: crate::kj::KjCaller,
+}
+
 /// Resolve `path` to the `(context, block)` of the kernel document that owns its
 /// text, through the file-doc cache. Fails loud (no silent empty/placeholder)
 /// when the path names nothing — an editor must not open on a phantom block.

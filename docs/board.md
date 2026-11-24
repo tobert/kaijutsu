@@ -231,8 +231,9 @@ kj board search '<query>' [--board '<board>'] [--semantic | --regex] [--limit 10
 ### Write verbs (`Effect::Write` — meets `gate.toml`)
 
 ```sh
-kj board post '<board>' --title '<title>' [--tag '<tag>'] ['<body>']
-kj board reply '<topic>' [--to 3] ['<body>']
+kj board post '<board>' --title '<title>' [--tag '<tag>'] [--vi] ['<body>']
+kj board reply '<topic>' [--to 3] [--vi] ['<body>']
+kj board edit '<topic>#<n>' [--vi] ['<body>']
 kj board resolve '<topic>'
 kj board reopen '<topic>'
 kj board archive '<topic>'
@@ -244,16 +245,20 @@ kj board lock '<topic>' | kj board unlock '<topic>'
 kj board hide '<topic>#<n>' | kj board unhide '<topic>#<n>'
 ```
 
-`post` and `reply` read stdin when no body argument is given. `--summarize` on
-`promote` distills the source topic with the caller's `distill` slot and links
-`promoted_from` to the source `document_id`.
+`post`, `reply`, and `edit` read stdin when no body argument is given, and
+`--vi` opens an ephemeral kernel vi buffer whose `:w` / `:wq` / `ZZ` commits
+the post or edit through the same board policy checks (`:q!` / `ZQ` cancels
+without mutating the board). `--summarize` on `promote` distills the source
+topic with the caller's `distill` slot and links `promoted_from` to the source
+`document_id`.
 
 ## Semantic indexing (`kaijutsu-index`)
 
 Because each topic is one `BlockStore` document (`document_id`):
 - `spawn_index_watcher` (`crates/kaijutsu-index/src/watcher.rs`) subscribes to
-  `block.*` (`BlockFlow::StatusChanged`, terminal `BlockFlow::Inserted`, and
-  `BlockFlow::ExcludedChanged`), debounces 1 s, and re-embeds the document.
+  `block.*` (`BlockFlow::StatusChanged`, terminal `BlockFlow::Inserted`,
+  `BlockFlow::ExcludedChanged`, and `BlockFlow::TextReplaced`), debounces 1 s,
+  and re-embeds the document.
 - `extract_context_content` (`crates/kaijutsu-index/src/content.rs`) skips
   blocks where `excluded == true` so held (`Pending`) and hidden posts never
   enter the HNSW index.

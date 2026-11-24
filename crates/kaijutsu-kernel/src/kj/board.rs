@@ -266,6 +266,9 @@ enum BoardCommand {
         /// Topic tag (repeatable).
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Draft the opening post in the kernel vi editor; `:w` posts it.
+        #[arg(long)]
+        vi: bool,
         /// Body text injected from stdin in kaish; explicit positional body takes precedence.
         #[arg(long, hide = true)]
         content: Option<String>,
@@ -280,10 +283,27 @@ enum BoardCommand {
         /// 1-based post number to reference in a backref header.
         #[arg(long)]
         to: Option<usize>,
+        /// Draft the reply in the kernel vi editor; `:w` posts it.
+        #[arg(long)]
+        vi: bool,
         /// Body text injected from stdin in kaish; explicit positional body takes precedence.
         #[arg(long, hide = true)]
         content: Option<String>,
         /// Reply text (all remaining words joined with spaces; reads stdin when omitted).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        body: Vec<String>,
+    },
+    /// Replace the text of an existing post (max 32 KiB; reads stdin when body is omitted).
+    Edit {
+        /// Post ref: '<topic>#<n>' (1-based post number).
+        post: String,
+        /// Edit the post in the kernel vi editor; `:w` saves the edit.
+        #[arg(long)]
+        vi: bool,
+        /// Body text injected from stdin in kaish; explicit positional body takes precedence.
+        #[arg(long, hide = true)]
+        content: Option<String>,
+        /// Replacement post text (all remaining words joined with spaces; reads stdin when omitted).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         body: Vec<String>,
     },
@@ -366,6 +386,7 @@ impl Classify for BoardCommand {
             | Self::Set { .. }
             | Self::Post { .. }
             | Self::Reply { .. }
+            | Self::Edit { .. }
             | Self::Resolve { .. }
             | Self::Reopen { .. }
             | Self::Archive { .. }
@@ -426,13 +447,29 @@ impl KjDispatcher {
             BoardCommand::Set { board, policy, desc } => {
                 self.board_set(&board, policy.as_deref(), desc.as_deref(), caller)
             }
-            BoardCommand::Post { board, title, tags, content, body } => {
+            BoardCommand::Post { board, title, tags, vi, content, body } => {
                 let text = resolve_body_text(&body, content.as_deref());
-                self.board_post(&board, &title, tags, &text, caller).await
+                if vi {
+                    self.board_post_vi(&board, &title, tags, &text, caller).await
+                } else {
+                    self.board_post(&board, &title, tags, &text, caller).await
+                }
             }
-            BoardCommand::Reply { topic, to, content, body } => {
+            BoardCommand::Reply { topic, to, vi, content, body } => {
                 let text = resolve_body_text(&body, content.as_deref());
-                self.board_reply(&topic, to, &text, caller).await
+                if vi {
+                    self.board_reply_vi(&topic, to, &text, caller).await
+                } else {
+                    self.board_reply(&topic, to, &text, caller).await
+                }
+            }
+            BoardCommand::Edit { post, vi, content, body } => {
+                if vi {
+                    self.board_edit_vi(&post, caller).await
+                } else {
+                    let text = resolve_body_text(&body, content.as_deref());
+                    self.board_edit(&post, &text, caller).await
+                }
             }
             BoardCommand::Resolve { topic } => {
                 self.board_set_topic_status(&topic, TopicStatus::Resolved, "resolve", caller)
@@ -1109,7 +1146,7 @@ impl KjDispatcher {
         )
     }
 
-    async fn board_post(
+    pub(crate) async fn board_post(
         &self,
         board_ref: &str,
         title: &str,
@@ -1427,7 +1464,7 @@ impl KjDispatcher {
         )
     }
 
-    async fn board_reply(
+    pub(crate) async fn board_reply(
         &self,
         topic_ref: &str,
         to: Option<usize>,
@@ -1643,6 +1680,347 @@ impl KjDispatcher {
                 "parent_number": to,
             }),
         )
+    }
+
+    /// Resolve a post ref and verify the caller is allowed to edit it.
+    /// Returns `(board_label, topic, post_num, target_snapshot)`.
+    async fn resolve_editable_post(
+        &self,
+        post_ref: &str,
+        caller: &KjCaller,
+    ) -> Result<(String, BoardTopicRow, usize, BlockSnapshot), String> {
+        let (topic_part, post_num) = parse_post_ref(post_ref)?;
+        let gate_config = crate::kj::gate_policy::load_config(
+            self.kernel().vfs(),
+            self.kernel_db(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let (board, topic, board_label) = {
+            let db = self.kernel_db().lock();
+            let topic = self.resolve_topic(topic_part, caller, &db)?;
+            let board = db
+                .get_board(topic.board_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("board {} not found", topic.board_id.short()))?;
+            if board.archived_at.is_some() {
+                return Err(format!(
+                    "board '{}' is archived and read-only",
+                    format_board_label(&db, board.board_id)
+                ));
+            }
+            if topic.status == TopicStatus::Archived {
+                return Err(format!(
+                    "topic '{}' is archived; reopen it first with `kj board reopen '{}'`",
+                    topic.slug,
+                    topic.document_id.short()
+                ));
+            }
+            if topic.locked {
+                return Err(format!(
+                    "topic '{}' is locked; unlock it first with `kj board unlock '{}'`",
+                    topic.slug,
+                    topic.document_id.short()
+                ));
+            }
+            let label = format_board_label(&db, board.board_id);
+            (board, topic, label)
+        };
+
+        let snaps = self
+            .block_store()
+            .non_draft_snapshots(topic.document_id)
+            .map_err(|e| e.to_string())?;
+        let target = snaps.get(post_num - 1).cloned().ok_or_else(|| {
+            format!(
+                "post #{post_num} does not exist in topic '{}' (has {} posts)",
+                topic.slug,
+                snaps.len()
+            )
+        })?;
+
+        if target.status == Status::Pending && target.excluded {
+            return Err(format!(
+                "post #{post_num} in topic '{}' is held pending review and cannot be edited",
+                topic.slug
+            ));
+        }
+
+        {
+            let db = self.kernel_db().lock();
+            match board.write_policy {
+                BoardWritePolicy::Locked => {
+                    if !self.caller_is_root_or_house(caller, &db).unwrap_or(false) {
+                        return Err(format!(
+                            "board '{board_label}' is locked; only root or house can edit posts"
+                        ));
+                    }
+                }
+                BoardWritePolicy::Curated => {
+                    let is_mod = self.require_board_moderator(&board, caller, "edit", &db).is_ok();
+                    let can_direct_author = target.author() == caller.actor_id
+                        && matches!(
+                            self.publish_or_hold_post(&board, caller, "edit", &gate_config, &db),
+                            Ok(WriteDecision::PublishDirect)
+                        );
+                    if !is_mod && !can_direct_author {
+                        return Err(format!(
+                            "editing posts on curated board '{board_label}' requires board owner, senpai, root, or direct-publish authority"
+                        ));
+                    }
+                }
+                BoardWritePolicy::Open => {
+                    let is_author = target.author() == caller.actor_id;
+                    if !is_author
+                        && let Err(e) = self.require_board_moderator(&board, caller, "edit", &db)
+                    {
+                        return Err(e.trim_start_matches("kj board edit: ").to_string());
+                    }
+                }
+            }
+        }
+
+        Ok((board_label, topic, post_num, target))
+    }
+
+    pub(crate) async fn board_edit(
+        &self,
+        post_ref: &str,
+        text: &str,
+        caller: &KjCaller,
+    ) -> KjResult {
+        if text.trim().is_empty() {
+            return KjResult::Err(
+                "kj board edit: replacement body must not be empty; pass body text or pipe stdin"
+                    .to_string(),
+            );
+        }
+        if text.len() > MAX_POST_BYTES {
+            return KjResult::Err(format!(
+                "kj board edit: replacement body is {} bytes, exceeding the {} KiB limit ({} bytes)",
+                text.len(),
+                MAX_POST_BYTES / 1024,
+                MAX_POST_BYTES,
+            ));
+        }
+
+        let (board_label, topic, post_num, target) = match self.resolve_editable_post(post_ref, caller).await {
+            Ok(resolved) => resolved,
+            Err(e) => return KjResult::Err(format!("kj board edit: {e}")),
+        };
+
+        let old_chars = target.content.chars().count();
+        if let Err(e) = self.block_store().edit_text_as(
+            topic.document_id,
+            &target.id,
+            0,
+            text,
+            old_chars,
+            Some(caller.actor_id),
+        ) {
+            return KjResult::Err(format!("kj board edit: {e}"));
+        }
+
+        KjResult::ok_with_data(
+            format!(
+                "edited post #{post_num} in '{board_label}/{}' ({})",
+                topic.slug,
+                topic.document_id.short()
+            ),
+            serde_json::json!({
+                "document_id": topic.document_id.to_hex(),
+                "short_id": topic.document_id.short(),
+                "slug": topic.slug,
+                "post_number": post_num,
+                "block_id": target.id.to_key(),
+            }),
+        )
+    }
+
+    fn editor_opener_for(caller: &KjCaller) -> Option<crate::editor::EditorOpener> {
+        caller.context_id.map(|context_id| crate::editor::EditorOpener {
+            principal: caller.principal_id,
+            performer: caller.actor_id,
+            reviewer: caller.reviewer_id,
+            context_id,
+            session_id: caller.session_id,
+        })
+    }
+
+    async fn board_edit_vi(&self, post_ref: &str, caller: &KjCaller) -> KjResult {
+        let (board_label, topic, post_num, target) = match self.resolve_editable_post(post_ref, caller).await {
+            Ok(resolved) => resolved,
+            Err(e) => return KjResult::Err(format!("kj board edit: {e}")),
+        };
+        let display_path = format!("board://{board_label}/{}#{post_num}", topic.slug);
+        let canonical_ref = format!("{}#{post_num}", topic.document_id.short());
+        let opener = Self::editor_opener_for(caller);
+        match self
+            .kernel()
+            .editor_open_board_signaled(
+                &display_path,
+                &target.content,
+                crate::editor::BoardEditorTarget::EditPost { post_ref: canonical_ref },
+                caller.clone(),
+                opener,
+            )
+            .await
+        {
+            Ok((id, st)) => KjResult::ok_with_data(
+                format!("opened editor session {} on {}", id.as_u64(), st.path),
+                st.to_json(id),
+            ),
+            Err(e) => KjResult::Err(format!("kj board edit --vi: {e}")),
+        }
+    }
+
+    async fn board_reply_vi(
+        &self,
+        topic_ref: &str,
+        to: Option<usize>,
+        initial_text: &str,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let (board_label, topic) = {
+            let db = self.kernel_db().lock();
+            let topic = match self.resolve_topic(topic_ref, caller, &db) {
+                Ok(t) => t,
+                Err(e) => return KjResult::Err(format!("kj board reply: {e}")),
+            };
+            let board = match db.get_board(topic.board_id) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    return KjResult::Err(format!(
+                        "kj board reply: board {} not found",
+                        topic.board_id.short()
+                    ));
+                }
+                Err(e) => return KjResult::Err(format!("kj board reply: {e}")),
+            };
+            if board.archived_at.is_some() {
+                return KjResult::Err(format!(
+                    "kj board reply: board '{}' is archived and read-only",
+                    format_board_label(&db, board.board_id)
+                ));
+            }
+            if topic.status == TopicStatus::Archived {
+                return KjResult::Err(format!(
+                    "kj board reply: topic '{}' is archived; reopen it first with `kj board reopen '{}'`",
+                    topic.slug,
+                    topic.document_id.short()
+                ));
+            }
+            if topic.locked {
+                return KjResult::Err(format!(
+                    "kj board reply: topic '{}' is locked and accepts no new replies",
+                    topic.slug
+                ));
+            }
+            (format_board_label(&db, board.board_id), topic)
+        };
+
+        if let Some(n) = to {
+            if n == 0 {
+                return KjResult::Err(
+                    "kj board reply: --to post numbers are 1-based (start at 1)".to_string(),
+                );
+            }
+            let count = self
+                .block_store()
+                .non_draft_snapshots(topic.document_id)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            if n > count {
+                return KjResult::Err(format!(
+                    "kj board reply: post #{n} does not exist in topic '{}' (has {count} posts)",
+                    topic.slug
+                ));
+            }
+        }
+
+        let display_path = match to {
+            Some(n) => format!("board://{board_label}/{}#re-{n}", topic.slug),
+            None => format!("board://{board_label}/{}#new", topic.slug),
+        };
+        let opener = Self::editor_opener_for(caller);
+        match self
+            .kernel()
+            .editor_open_board_signaled(
+                &display_path,
+                initial_text,
+                crate::editor::BoardEditorTarget::NewReply {
+                    topic_ref: topic.document_id.short(),
+                    to,
+                },
+                caller.clone(),
+                opener,
+            )
+            .await
+        {
+            Ok((id, st)) => KjResult::ok_with_data(
+                format!("opened editor session {} on {}", id.as_u64(), st.path),
+                st.to_json(id),
+            ),
+            Err(e) => KjResult::Err(format!("kj board reply --vi: {e}")),
+        }
+    }
+
+    async fn board_post_vi(
+        &self,
+        board_ref: &str,
+        title: &str,
+        tags: Vec<String>,
+        initial_text: &str,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let title = title.trim();
+        if title.is_empty() {
+            return KjResult::Err("kj board post: --title must not be empty".to_string());
+        }
+        let board_label = {
+            let db = self.kernel_db().lock();
+            let board = match self.resolve_board_read(board_ref, caller, &db) {
+                Ok(ReadBoard::Found(b)) => {
+                    if b.archived_at.is_some() {
+                        return KjResult::Err(format!(
+                            "kj board post: board '{}' is archived and read-only",
+                            format_board_label(&db, b.board_id)
+                        ));
+                    }
+                    Some(b)
+                }
+                Ok(ReadBoard::UncreatedContextBoard) => None,
+                Err(e) => return KjResult::Err(format!("kj board post: {e}")),
+            };
+            board
+                .map(|b| format_board_label(&db, b.board_id))
+                .unwrap_or_else(|| board_ref.to_string())
+        };
+        let slug_preview = slugify_title(title);
+        let display_path = format!("board://{board_label}/{slug_preview}#1");
+        let opener = Self::editor_opener_for(caller);
+        match self
+            .kernel()
+            .editor_open_board_signaled(
+                &display_path,
+                initial_text,
+                crate::editor::BoardEditorTarget::NewTopic {
+                    board_ref: board_ref.to_string(),
+                    title: title.to_string(),
+                    tags,
+                },
+                caller.clone(),
+                opener,
+            )
+            .await
+        {
+            Ok((id, st)) => KjResult::ok_with_data(
+                format!("opened editor session {} on {}", id.as_u64(), st.path),
+                st.to_json(id),
+            ),
+            Err(e) => KjResult::Err(format!("kj board post --vi: {e}")),
+        }
     }
 
     fn board_set_topic_status(

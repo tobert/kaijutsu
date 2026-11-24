@@ -1200,7 +1200,8 @@ impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
                             status: block.status,
                         });
                     }
-                    BlockFlow::ExcludedChanged { context_id, .. } => {
+                    BlockFlow::ExcludedChanged { context_id, .. }
+                    | BlockFlow::TextReplaced { context_id, .. } => {
                         return Some(kaijutsu_index::StatusEvent {
                             context_id,
                             status: kaijutsu_types::Status::Done,
@@ -10757,6 +10758,22 @@ mod semantic_search_tests {
             .expect("receiver closed unexpectedly");
         assert_eq!(ev3.context_id, ctx_sts);
         assert_eq!(ev3.status, Status::Done);
+
+        // 4. BlockFlow::TextReplaced (board post edit).
+        let ctx_edit = ContextId::new();
+        bus.publish(BlockFlow::TextReplaced {
+            context_id: ctx_edit,
+            block_id: BlockId::new(ctx_edit, author, 1),
+            content: Arc::from("edited post body"),
+            version: 4,
+            source: OpSource::Local,
+        });
+        let ev4 = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for TextReplaced event")
+            .expect("receiver closed unexpectedly");
+        assert_eq!(ev4.context_id, ctx_edit);
+        assert_eq!(ev4.status, Status::Done);
 
         // Sanity: non-terminal Inserted (Status::Pending) is skipped.
         let mut pending = BlockSnapshot::text(

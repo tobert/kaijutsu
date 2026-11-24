@@ -194,6 +194,7 @@ fn board_verbs_classify_read_and_write() {
         vec![s("board"), s("set"), s("notes"), s("--policy"), s("curated")],
         vec![s("board"), s("post"), s("."), s("--title"), s("hi"), s("body")],
         vec![s("board"), s("reply"), s("./hi"), s("more")],
+        vec![s("board"), s("edit"), s("./hi#1"), s("updated")],
         vec![s("board"), s("resolve"), s("./hi")],
         vec![s("board"), s("reopen"), s("./hi")],
         vec![s("board"), s("archive"), s("./hi")],
@@ -1411,4 +1412,228 @@ async fn unprivileged_no_context_caller_is_not_treated_as_root() {
         !foreign_create.is_ok(),
         "unprivileged non-root caller with context_id: None must not create board for another character"
     );
+}
+
+#[tokio::test]
+async fn board_edit_updates_post_with_policy_and_lock_checks() {
+    let d = test_dispatcher().await;
+    let (root_id, root_ctx) = seed_root(&d);
+    let owner_id = create_character(&d, "alice", false).await;
+    let writer_id = create_character(&d, "bob", false).await;
+    let outsider_id = create_character(&d, "carol", false).await;
+    let owner_ctx = register_bound_context(&d, "alice-ctx", owner_id, Some(root_ctx), &worker_binding());
+    let writer_ctx = register_bound_context(&d, "bob-ctx", writer_id, Some(root_ctx), &worker_binding());
+    let outsider_ctx = register_bound_context(&d, "carol-ctx", outsider_id, Some(root_ctx), &worker_binding());
+
+    let root = caller_as(root_id, Some(root_ctx));
+    let owner = caller_as(owner_id, Some(owner_ctx));
+    let writer = caller_as(writer_id, Some(writer_ctx));
+    let outsider = caller_as(outsider_id, Some(outsider_ctx));
+
+    assert!(d.dispatch(&[s("board"), s("create"), s("notes")], &owner).await.is_ok());
+    assert!(
+        d.dispatch(
+            &[s("board"), s("post"), s("alice/notes"), s("--title"), s("Guide"), s("v1 text")],
+            &writer,
+        )
+        .await
+        .is_ok()
+    );
+
+    // Author can edit their own post on an open board.
+    let edited = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("v2 text")], &writer)
+        .await;
+    assert!(edited.is_ok(), "author edit should succeed: {edited:?}");
+    let read = d.dispatch(&[s("board"), s("read"), s("alice/notes/guide")], &owner).await;
+    assert!(read.message().contains("v2 text"), "{}", read.message());
+    assert!(!read.message().contains("v1 text"), "{}", read.message());
+
+    // Outsider cannot edit someone else's post.
+    let denied = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("hijack")], &outsider)
+        .await;
+    assert!(!denied.is_ok(), "outsider edit must be refused");
+
+    // Board owner (moderator) can edit another author's post.
+    let mod_edit = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("v3 curated")], &owner)
+        .await;
+    assert!(mod_edit.is_ok(), "board owner edit should succeed: {mod_edit:?}");
+
+    // Empty body and missing post number fail cleanly.
+    let empty = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("   ")], &owner)
+        .await;
+    assert!(!empty.is_ok(), "empty edit must fail");
+    let missing = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#99"), s("nope")], &owner)
+        .await;
+    assert!(!missing.is_ok(), "missing post edit must fail");
+
+    // Locked topic refuses edits until unlocked.
+    assert!(d.dispatch(&[s("board"), s("lock"), s("alice/notes/guide")], &owner).await.is_ok());
+    let locked_edit = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("while locked")], &owner)
+        .await;
+    assert!(!locked_edit.is_ok(), "locked topic edit must be refused");
+    assert!(d.dispatch(&[s("board"), s("unlock"), s("alice/notes/guide")], &owner).await.is_ok());
+
+    // Curated board: non-moderator author cannot silently edit after publish; owner can.
+    assert!(
+        d.dispatch(&[s("board"), s("set"), s("alice/notes"), s("--policy"), s("curated")], &owner)
+            .await
+            .is_ok()
+    );
+    let curated_author_edit = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("sneak")], &writer)
+        .await;
+    assert!(!curated_author_edit.is_ok(), "non-moderator cannot directly edit curated board post");
+    let curated_owner_edit = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("v4 owner")], &owner)
+        .await;
+    assert!(curated_owner_edit.is_ok(), "curated board owner edit should succeed: {curated_owner_edit:?}");
+
+    // Locked board: only root can edit.
+    assert!(
+        d.dispatch(&[s("board"), s("set"), s("alice/notes"), s("--policy"), s("locked")], &owner)
+            .await
+            .is_ok()
+    );
+    let locked_board_owner = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("owner locked")], &owner)
+        .await;
+    assert!(!locked_board_owner.is_ok(), "locked board refuses non-root owner");
+    let locked_board_root = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("v5 root")], &root)
+        .await;
+    assert!(locked_board_root.is_ok(), "root can edit on locked board: {locked_board_root:?}");
+}
+
+#[tokio::test]
+async fn board_vi_sessions_edit_reply_post_and_cancel_cleanly() {
+    let d = std::sync::Arc::new(test_dispatcher().await);
+    d.kernel().broker().set_kj_dispatcher(&d).await;
+    let (_root_id, root_ctx) = seed_root(&d);
+    let alice_id = create_character(&d, "alice", false).await;
+    let mut binding = worker_binding();
+    binding.grant(Capability::Editor);
+    let alice_ctx = register_bound_context(&d, "alice-ctx", alice_id, Some(root_ctx), &binding);
+    let alice = caller_as(alice_id, Some(alice_ctx));
+
+    assert!(d.dispatch(&[s("board"), s("create"), s("notes")], &alice).await.is_ok());
+    assert!(
+        d.dispatch(
+            &[s("board"), s("post"), s("alice/notes"), s("--title"), s("Guide"), s("original line")],
+            &alice,
+        )
+        .await
+        .is_ok()
+    );
+
+    // 1. Edit existing post via --vi: typing does not mutate board before :w, :w commits, ZQ discards unsaved tail.
+    let opened = d
+        .dispatch(&[s("board"), s("edit"), s("alice/notes/guide#1"), s("--vi")], &alice)
+        .await;
+    let KjResult::Ok { data: Some(open_data), .. } = &opened else {
+        panic!("expected ok-with-data from board edit --vi, got {opened:?}");
+    };
+    let sid = open_data["session"].as_u64().expect("session id");
+    assert_eq!(open_data["text"].as_str(), Some("original line"));
+    assert_eq!(open_data["path"].as_str(), Some("board://alice/notes/guide#1"));
+
+    // Type without saving: live board post must stay unchanged.
+    assert!(
+        d.dispatch(&[s("vi"), s("keys"), sid.to_string(), s("iUPDATED <Esc>")], &alice)
+            .await
+            .is_ok()
+    );
+    let mid_read = d.dispatch(&[s("board"), s("read"), s("alice/notes/guide")], &alice).await;
+    assert!(mid_read.message().contains("original line"), "{}", mid_read.message());
+    assert!(!mid_read.message().contains("UPDATED"), "unsaved edit must not leak to board");
+
+    // :w commits the edit.
+    assert!(
+        d.dispatch(&[s("vi"), s("keys"), sid.to_string(), s(":w<CR>")], &alice)
+            .await
+            .is_ok()
+    );
+    let saved_read = d.dispatch(&[s("board"), s("read"), s("alice/notes/guide")], &alice).await;
+    assert!(saved_read.message().contains("UPDATED original line"), "{}", saved_read.message());
+
+    // Further unsaved edit + ZQ discards and leaves saved text intact.
+    assert!(
+        d.dispatch(&[s("vi"), s("keys"), sid.to_string(), s("iNOPE <Esc>ZQ")], &alice)
+            .await
+            .is_ok()
+    );
+    let after_zq = d.dispatch(&[s("board"), s("read"), s("alice/notes/guide")], &alice).await;
+    assert!(after_zq.message().contains("UPDATED original line"), "{}", after_zq.message());
+    assert!(!after_zq.message().contains("NOPE"), "{}", after_zq.message());
+
+    // 2. Reply via --vi: :w creates #2, editing more + :wq updates #2 without duplicating #3.
+    let reply_open = d
+        .dispatch(&[s("board"), s("reply"), s("alice/notes/guide"), s("--vi")], &alice)
+        .await;
+    let KjResult::Ok { data: Some(reply_data), .. } = &reply_open else {
+        panic!("expected ok-with-data from board reply --vi, got {reply_open:?}");
+    };
+    let rsid = reply_data["session"].as_u64().expect("reply session id");
+    assert!(
+        d.dispatch(&[s("vi"), s("keys"), rsid.to_string(), s("ifirst draft<Esc>:w<CR>")], &alice)
+            .await
+            .is_ok()
+    );
+    assert!(
+        d.dispatch(&[s("vi"), s("keys"), rsid.to_string(), s("A plus more<Esc>:wq<CR>")], &alice)
+            .await
+            .is_ok()
+    );
+    let after_reply = d.dispatch(&[s("board"), s("read"), s("alice/notes/guide")], &alice).await;
+    let KjResult::Ok { data: Some(topic_data), message: reply_msg, .. } = &after_reply else {
+        panic!("read failed: {after_reply:?}");
+    };
+    assert_eq!(topic_data["posts"].as_array().unwrap().len(), 2, "second :w must update #2, not create #3");
+    assert!(reply_msg.contains("first draft plus more"), "{reply_msg}");
+
+    // 3. Cancel reply via :q! posts nothing.
+    let cancel_open = d
+        .dispatch(&[s("board"), s("reply"), s("alice/notes/guide"), s("--vi")], &alice)
+        .await;
+    let KjResult::Ok { data: Some(cancel_data), .. } = &cancel_open else {
+        panic!("expected ok-with-data, got {cancel_open:?}");
+    };
+    let csid = cancel_data["session"].as_u64().expect("cancel session id");
+    assert!(
+        d.dispatch(&[s("vi"), s("keys"), csid.to_string(), s("inever mind<Esc>:q!<CR>")], &alice)
+            .await
+            .is_ok()
+    );
+    let after_cancel = d.dispatch(&[s("board"), s("read"), s("alice/notes/guide")], &alice).await;
+    let KjResult::Ok { data: Some(topic_data2), .. } = &after_cancel else {
+        panic!("read failed: {after_cancel:?}");
+    };
+    assert_eq!(topic_data2["posts"].as_array().unwrap().len(), 2, "cancelled reply must not post");
+
+    // 4. New topic via --vi: ZZ creates topic with #1.
+    let post_open = d
+        .dispatch(
+            &[s("board"), s("post"), s("alice/notes"), s("--title"), s("Drafted in Vi"), s("--vi")],
+            &alice,
+        )
+        .await;
+    let KjResult::Ok { data: Some(post_data), .. } = &post_open else {
+        panic!("expected ok-with-data from board post --vi, got {post_open:?}");
+    };
+    let psid = post_data["session"].as_u64().expect("post session id");
+    assert!(
+        d.dispatch(&[s("vi"), s("keys"), psid.to_string(), s("ihello from vi<Esc>ZZ")], &alice)
+            .await
+            .is_ok()
+    );
+    let new_topic = d
+        .dispatch(&[s("board"), s("read"), s("alice/notes/drafted-in-vi")], &alice)
+        .await;
+    assert!(new_topic.is_ok(), "new topic should exist: {new_topic:?}");
+    assert!(new_topic.message().contains("hello from vi"), "{}", new_topic.message());
 }

@@ -153,56 +153,33 @@ async fn apply_boards_outcome(bridge: &KernelBridge, app: &mut App, outcome: Boa
         BoardsOutcome::LoadPosts { topic_id } => {
             load_topic_posts(bridge, app, ctx, &topic_id).await;
         }
-        BoardsOutcome::Reply { topic_id, body } => {
-            let argv = vec!["board".into(), "reply".into(), topic_id.clone(), body];
-            match bridge.execute_kj(ctx, argv).await {
-                Ok(res) if res.exit_code == 0 => {
-                    load_topic_posts(bridge, app, ctx, &topic_id).await;
-                    if let Some(m) = app.boards.as_mut() {
-                        m.status = Some("reply posted".to_string());
-                    }
-                }
-                Ok(res) => {
-                    let why = res.stderr.lines().next().unwrap_or("reply failed").trim().to_string();
-                    if let Some(m) = app.boards.as_mut() {
-                        m.status = Some(why);
-                    }
-                }
-                Err(e) => {
-                    if let Some(m) = app.boards.as_mut() {
-                        m.status = Some(format!("reply failed: {e}"));
-                    }
-                }
-            }
+        BoardsOutcome::EditPostInVi { topic_id, post_number } => {
+            let argv = vec![
+                "board".into(),
+                "edit".into(),
+                format!("{topic_id}#{post_number}"),
+                "--vi".into(),
+            ];
+            run_board_vi_open(bridge, app, ctx, argv, "edit").await;
         }
-        BoardsOutcome::NewTopic { board, title, body } => {
+        BoardsOutcome::ReplyInVi { topic_id, to } => {
+            let mut argv = vec!["board".into(), "reply".into(), topic_id, "--vi".into()];
+            if let Some(n) = to {
+                argv.push("--to".into());
+                argv.push(n.to_string());
+            }
+            run_board_vi_open(bridge, app, ctx, argv, "reply").await;
+        }
+        BoardsOutcome::NewTopicInVi { board, title } => {
             let argv = vec![
                 "board".into(),
                 "post".into(),
-                board.clone(),
+                board,
                 "--title".into(),
                 title,
-                body,
+                "--vi".into(),
             ];
-            match bridge.execute_kj(ctx, argv).await {
-                Ok(res) if res.exit_code == 0 => {
-                    load_board_topics(bridge, app, ctx, &board).await;
-                    if let Some(m) = app.boards.as_mut() {
-                        m.status = Some("topic posted".to_string());
-                    }
-                }
-                Ok(res) => {
-                    let why = res.stderr.lines().next().unwrap_or("post failed").trim().to_string();
-                    if let Some(m) = app.boards.as_mut() {
-                        m.status = Some(why);
-                    }
-                }
-                Err(e) => {
-                    if let Some(m) = app.boards.as_mut() {
-                        m.status = Some(format!("post failed: {e}"));
-                    }
-                }
-            }
+            run_board_vi_open(bridge, app, ctx, argv, "post").await;
         }
         BoardsOutcome::ToggleResolve { topic_id, currently_resolved } => {
             let verb = if currently_resolved { "reopen" } else { "resolve" };
@@ -259,6 +236,56 @@ async fn apply_boards_outcome(bridge: &KernelBridge, app: &mut App, outcome: Boa
     }
 }
 
+async fn run_board_vi_open(
+    bridge: &KernelBridge,
+    app: &mut App,
+    ctx: kaijutsu_types::ContextId,
+    argv: Vec<String>,
+    verb: &str,
+) {
+    match bridge.execute_kj(ctx, argv).await {
+        Ok(res) if res.exit_code == 0 => {
+            // The kernel's `open_editor` peer signal switches `app.screen` to `ScreenMode::Editor`.
+            if let Some(m) = app.boards.as_mut() {
+                m.status = None;
+            }
+        }
+        Ok(res) => {
+            let why = res
+                .stderr
+                .lines()
+                .next()
+                .unwrap_or("could not open vi")
+                .trim()
+                .to_string();
+            if let Some(m) = app.boards.as_mut() {
+                m.status = Some(why);
+            }
+        }
+        Err(e) => {
+            if let Some(m) = app.boards.as_mut() {
+                m.status = Some(format!("{verb} in vi failed: {e}"));
+            }
+        }
+    }
+}
+
+/// Reload the active board's topics and selected topic's posts when a kernel
+/// vi session closes back to the board browser.
+pub(super) async fn refresh_boards_after_editor(bridge: &KernelBridge, app: &mut App) {
+    let Some(ctx) = app.current else {
+        return;
+    };
+    let board = app
+        .boards
+        .as_ref()
+        .and_then(|m| m.selected_board())
+        .map(|b| b.handle.clone());
+    if let Some(board) = board {
+        load_board_topics(bridge, app, ctx, &board).await;
+    }
+}
+
 async fn load_board_topics(
     bridge: &KernelBridge,
     app: &mut App,
@@ -281,11 +308,13 @@ async fn load_board_topics(
     match bridge.execute_kj(ctx, argv).await {
         Ok(res) if res.exit_code == 0 => {
             let parsed = boards::parse_topic_list(&res.stdout);
-            let first_topic = parsed.first().map(|t| t.id.clone());
-            if let Some(m) = app.boards.as_mut() {
+            let selected_topic = if let Some(m) = app.boards.as_mut() {
                 m.set_topics(parsed);
-            }
-            if let Some(topic_id) = first_topic {
+                m.selected_topic().map(|t| t.id.clone())
+            } else {
+                None
+            };
+            if let Some(topic_id) = selected_topic {
                 load_topic_posts(bridge, app, ctx, &topic_id).await;
             }
         }

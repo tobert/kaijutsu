@@ -41,6 +41,17 @@ pub struct TopicEntry {
     pub summary: String,
 }
 
+/// One parsed post in the posts pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostEntry {
+    /// 1-based post number (`#1`, `#2`, ...).
+    pub number: usize,
+    /// Header line as emitted by `kj board read` (e.g. `#1 @amy (4m)`).
+    pub header: String,
+    /// Body text (including any `[re #N ...]` backref header).
+    pub body: String,
+}
+
 /// Which pane currently owns navigation keys (`j`/`k`, `PgUp`/`PgDn`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
@@ -71,9 +82,7 @@ impl Focus {
 /// Inline compose prompt at the foot of the posts pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoardCompose {
-    Reply { topic_id: String, body: String },
     NewTopicTitle { board: String, title: String },
-    NewTopicBody { board: String, title: String, body: String },
 }
 
 /// What a keystroke asks the event loop to run against the kernel.
@@ -84,8 +93,9 @@ pub enum BoardsOutcome {
     LoadBoards,
     LoadTopics { board: String },
     LoadPosts { topic_id: String },
-    Reply { topic_id: String, body: String },
-    NewTopic { board: String, title: String, body: String },
+    EditPostInVi { topic_id: String, post_number: usize },
+    ReplyInVi { topic_id: String, to: Option<usize> },
+    NewTopicInVi { board: String, title: String },
     ToggleResolve { topic_id: String, currently_resolved: bool },
     TogglePin { topic_id: String, currently_pinned: bool },
 }
@@ -98,6 +108,9 @@ pub struct BoardsModel {
     pub topics: Vec<TopicEntry>,
     pub topic_idx: usize,
     pub posts_text: String,
+    pub posts_header: String,
+    pub posts: Vec<PostEntry>,
+    pub post_idx: usize,
     pub posts_scroll: usize,
     pub focus: Focus,
     pub compose: Option<BoardCompose>,
@@ -120,6 +133,10 @@ impl BoardsModel {
         self.topics.get(self.topic_idx)
     }
 
+    pub fn selected_post(&self) -> Option<&PostEntry> {
+        self.posts.get(self.post_idx)
+    }
+
     pub fn set_boards(&mut self, boards: Vec<BoardEntry>) {
         let prev = self.selected_board().map(|b| b.handle.clone());
         self.boards = boards;
@@ -139,13 +156,24 @@ impl BoardsModel {
             .min(self.topics.len().saturating_sub(1));
         if self.topics.is_empty() {
             self.posts_text.clear();
+            self.posts_header.clear();
+            self.posts.clear();
+            self.post_idx = 0;
             self.posts_scroll = 0;
         }
         self.status = None;
     }
 
     pub fn set_posts(&mut self, text: String) {
+        let prev_num = self.selected_post().map(|p| p.number);
+        let (header, posts) = parse_post_list(&text);
         self.posts_text = text;
+        self.posts_header = header;
+        self.posts = posts;
+        self.post_idx = prev_num
+            .and_then(|n| self.posts.iter().position(|p| p.number == n))
+            .unwrap_or(0)
+            .min(self.posts.len().saturating_sub(1));
         self.posts_scroll = 0;
         self.status = None;
     }
@@ -191,8 +219,9 @@ impl BoardsModel {
                         .map(|t| BoardsOutcome::LoadPosts { topic_id: t.id.clone() })
                         .unwrap_or(BoardsOutcome::None)
                 }
-                Focus::Posts => BoardsOutcome::None,
+                Focus::Posts => self.edit_selected_post(),
             },
+            KeyCode::Char('e') => self.edit_selected_post(),
             KeyCode::Char('r') => match self.focus {
                 Focus::Boards => BoardsOutcome::LoadBoards,
                 Focus::Topics => self
@@ -206,15 +235,17 @@ impl BoardsModel {
             },
             KeyCode::Char('R') => {
                 if let Some(topic) = self.selected_topic() {
-                    self.compose = Some(BoardCompose::Reply {
+                    let to = (self.focus == Focus::Posts)
+                        .then(|| self.selected_post().map(|p| p.number))
+                        .flatten();
+                    BoardsOutcome::ReplyInVi {
                         topic_id: topic.id.clone(),
-                        body: String::new(),
-                    });
-                    self.focus = Focus::Posts;
+                        to,
+                    }
                 } else {
                     self.status = Some("select a topic to reply to".to_string());
+                    BoardsOutcome::None
                 }
-                BoardsOutcome::None
             }
             KeyCode::Char('n') => {
                 if let Some(board) = self.selected_board() {
@@ -250,6 +281,21 @@ impl BoardsModel {
         }
     }
 
+    fn edit_selected_post(&mut self) -> BoardsOutcome {
+        let Some(topic) = self.selected_topic() else {
+            self.status = Some("select a topic to edit".to_string());
+            return BoardsOutcome::None;
+        };
+        let Some(post) = self.selected_post() else {
+            self.status = Some("no post selected to edit".to_string());
+            return BoardsOutcome::None;
+        };
+        BoardsOutcome::EditPostInVi {
+            topic_id: topic.id.clone(),
+            post_number: post.number,
+        }
+    }
+
     fn handle_compose_key(&mut self, key: KeyEvent) -> BoardsOutcome {
         let Some(compose) = self.compose.take() else {
             return BoardsOutcome::None;
@@ -260,46 +306,19 @@ impl BoardsModel {
                 BoardsOutcome::None
             }
             KeyCode::Enter => match compose {
-                BoardCompose::Reply { topic_id, body } => {
-                    let body = body.trim().to_string();
-                    if body.is_empty() {
-                        self.status = Some("reply body is empty".to_string());
-                        BoardsOutcome::None
-                    } else {
-                        BoardsOutcome::Reply { topic_id, body }
-                    }
-                }
                 BoardCompose::NewTopicTitle { board, title } => {
                     let title = title.trim().to_string();
                     if title.is_empty() {
                         self.status = Some("topic title is empty".to_string());
                         BoardsOutcome::None
                     } else {
-                        self.compose = Some(BoardCompose::NewTopicBody {
-                            board,
-                            title,
-                            body: String::new(),
-                        });
-                        BoardsOutcome::None
-                    }
-                }
-                BoardCompose::NewTopicBody { board, title, body } => {
-                    let body = body.trim().to_string();
-                    if body.is_empty() {
-                        self.status = Some("topic body is empty".to_string());
-                        BoardsOutcome::None
-                    } else {
-                        BoardsOutcome::NewTopic { board, title, body }
+                        BoardsOutcome::NewTopicInVi { board, title }
                     }
                 }
             },
             KeyCode::Backspace => {
                 let mut next = compose;
                 match &mut next {
-                    BoardCompose::Reply { body, .. }
-                    | BoardCompose::NewTopicBody { body, .. } => {
-                        body.pop();
-                    }
                     BoardCompose::NewTopicTitle { title, .. } => {
                         title.pop();
                     }
@@ -310,10 +329,6 @@ impl BoardsModel {
             KeyCode::Char(c) => {
                 let mut next = compose;
                 match &mut next {
-                    BoardCompose::Reply { body, .. }
-                    | BoardCompose::NewTopicBody { body, .. } => {
-                        body.push(c);
-                    }
                     BoardCompose::NewTopicTitle { title, .. } => {
                         title.push(c);
                     }
@@ -361,9 +376,14 @@ impl BoardsModel {
                 }
             }
             Focus::Posts => {
-                let total = self.posts_text.lines().count();
-                let max = total.saturating_sub(1);
-                self.posts_scroll = (self.posts_scroll as isize + delta).clamp(0, max as isize) as usize;
+                if !self.posts.is_empty() {
+                    let max = self.posts.len() - 1;
+                    self.post_idx = (self.post_idx as isize + delta).clamp(0, max as isize) as usize;
+                } else {
+                    let total = self.posts_text.lines().count();
+                    let max = total.saturating_sub(1);
+                    self.posts_scroll = (self.posts_scroll as isize + delta).clamp(0, max as isize) as usize;
+                }
                 BoardsOutcome::None
             }
         }
@@ -374,6 +394,7 @@ impl BoardsModel {
             Focus::Boards => self.step(-(self.board_idx as isize)),
             Focus::Topics => self.step(-(self.topic_idx as isize)),
             Focus::Posts => {
+                self.post_idx = 0;
                 self.posts_scroll = 0;
                 BoardsOutcome::None
             }
@@ -385,11 +406,66 @@ impl BoardsModel {
             Focus::Boards => self.step(self.boards.len() as isize),
             Focus::Topics => self.step(self.topics.len() as isize),
             Focus::Posts => {
+                self.post_idx = self.posts.len().saturating_sub(1);
                 self.posts_scroll = self.posts_text.lines().count().saturating_sub(1);
                 BoardsOutcome::None
             }
         }
     }
+}
+
+/// Parse `kj board read` stdout into `(topic_header, Vec<PostEntry>)`.
+pub fn parse_post_list(stdout: &str) -> (String, Vec<PostEntry>) {
+    let mut topic_header = String::new();
+    let mut posts: Vec<PostEntry> = Vec::new();
+    let mut current: Option<(usize, String, Vec<&str>)> = None;
+
+    for line in stdout.lines() {
+        if let Some(num) = parse_post_header_number(line) {
+            if let Some((n, h, body_lines)) = current.take() {
+                posts.push(PostEntry {
+                    number: n,
+                    header: h,
+                    body: trim_trailing_blank_lines(&body_lines),
+                });
+            }
+            current = Some((num, line.to_string(), Vec::new()));
+        } else if let Some((_, _, ref mut body_lines)) = current {
+            body_lines.push(line);
+        } else if topic_header.is_empty() && !line.trim().is_empty() {
+            topic_header = line.to_string();
+        }
+    }
+    if let Some((n, h, body_lines)) = current {
+        posts.push(PostEntry {
+            number: n,
+            header: h,
+            body: trim_trailing_blank_lines(&body_lines),
+        });
+    }
+    (topic_header, posts)
+}
+
+fn parse_post_header_number(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix('#')?;
+    let (digits, tail) = rest.split_once(' ')?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // `kj board read` emits `#<N> @<author> (<age>)` (tests may omit `@`).
+    if tail.trim().is_empty() {
+        return None;
+    }
+    let num: usize = digits.parse().ok()?;
+    (num >= 1).then_some(num)
+}
+
+fn trim_trailing_blank_lines(lines: &[&str]) -> String {
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    lines[..end].join("\n")
 }
 
 /// Parse `kj board list` stdout into [`BoardEntry`] rows, always appending the
@@ -475,8 +551,8 @@ pub fn parse_topic_list(stdout: &str) -> Vec<TopicEntry> {
 // RENDER
 // ============================================================================
 
-const HINTS_FULL: &str = "Tab pane  j/k move  Enter open  R reply  n new topic  x resolve/reopen  p pin  r refresh  q/Esc close";
-const HINTS_SHORT: &str = "Tab pane  j/k move  R reply  n new  r refresh  q close";
+const HINTS_FULL: &str = "Tab pane  j/k move  Enter/e edit in vi  R reply  n new topic  x resolve  p pin  r refresh  q/Esc close";
+const HINTS_SHORT: &str = "Tab pane  j/k move  e edit  R reply  n new  r refresh  q close";
 
 /// Draw the full-screen Message Board browser onto `frame`.
 pub fn draw_fullscreen(
@@ -560,9 +636,7 @@ pub fn draw_fullscreen(
 
     if let Some(compose) = &model.compose {
         let (prompt, value) = match compose {
-            BoardCompose::Reply { topic_id, body } => (format!("Reply to {topic_id}: "), body.as_str()),
-            BoardCompose::NewTopicTitle { board, title } => (format!("New topic on {board} — title: "), title.as_str()),
-            BoardCompose::NewTopicBody { title, body, .. } => (format!("Body for \"{title}\": "), body.as_str()),
+            BoardCompose::NewTopicTitle { board, title } => (format!("New topic on {board} — title (Enter opens vi): "), title.as_str()),
         };
         let rw = usize::from(compose_area.width.max(1));
         let rule = Line::from(Span::styled("─".repeat(rw), palette.divider()));
@@ -705,16 +779,68 @@ fn render_posts_pane(model: &BoardsModel, width: usize, height: usize, palette: 
         lines.push(Line::from(Span::styled("  (select a topic to read)", palette.divider())));
         return lines;
     }
-    for line in model.posts_text.lines().skip(model.posts_scroll).take(body_h) {
-        let style = if line.starts_with('#') || line.starts_with("──") {
-            palette.status().add_modifier(Modifier::BOLD)
-        } else if line.starts_with('>') {
-            palette.divider()
-        } else {
-            palette.compose()
-        };
-        lines.push(Line::from(Span::styled(truncate_chars(line, width), style)));
+    if model.posts.is_empty() {
+        for line in model.posts_text.lines().skip(model.posts_scroll).take(body_h) {
+            let style = if line.starts_with('#') || line.starts_with("──") {
+                palette.status().add_modifier(Modifier::BOLD)
+            } else if line.starts_with('>') {
+                palette.divider()
+            } else {
+                palette.compose()
+            };
+            lines.push(Line::from(Span::styled(truncate_chars(line, width), style)));
+        }
+        return lines;
     }
+
+    let mut rendered: Vec<Line<'static>> = Vec::new();
+    let mut selected_start = 0usize;
+    if !model.posts_header.is_empty() {
+        rendered.push(Line::from(Span::styled(
+            truncate_chars(&model.posts_header, width),
+            palette.status().add_modifier(Modifier::BOLD),
+        )));
+    }
+    for (i, post) in model.posts.iter().enumerate() {
+        rendered.push(Line::from(String::new()));
+        let selected = i == model.post_idx;
+        if selected {
+            selected_start = rendered.len();
+        }
+        let marker = if selected { "› " } else { "  " };
+        let header_raw = format!("{marker}{}", post.header);
+        let clipped = truncate_chars(&header_raw, width);
+        let fill = width.saturating_sub(display_width(&clipped));
+        let header_style = if selected && model.focus == Focus::Posts {
+            palette.copy_selection()
+        } else if selected {
+            palette.status().add_modifier(Modifier::BOLD)
+        } else {
+            palette.status()
+        };
+        rendered.push(Line::from(Span::styled(
+            format!("{clipped}{}", " ".repeat(fill)),
+            header_style,
+        )));
+        for body_line in post.body.lines() {
+            let indented = format!("  {body_line}");
+            let style = if body_line.starts_with("[re #") || body_line.starts_with('>') {
+                palette.divider()
+            } else {
+                palette.compose()
+            };
+            rendered.push(Line::from(Span::styled(truncate_chars(&indented, width), style)));
+        }
+    }
+
+    let scroll = if rendered.len() <= body_h {
+        0
+    } else {
+        selected_start
+            .saturating_sub(body_h / 3)
+            .min(rendered.len().saturating_sub(body_h))
+    };
+    lines.extend(rendered.into_iter().skip(scroll).take(body_h));
     lines
 }
 
@@ -789,39 +915,60 @@ mod tests {
     }
 
     #[test]
-    fn reply_and_new_topic_compose_flows_emit_expected_outcomes() {
+    fn parses_posts_and_navigates_to_edit_reply_and_new_topic_in_vi() {
         let mut model = BoardsModel::new();
         model.set_boards(parse_board_list(".  [open]  (context board)\n"));
-        model.set_topics(parse_topic_list("a1b2c3d4  [open    ]    1p    1m  slug  \"Hello\"\n"));
+        model.set_topics(parse_topic_list("a1b2c3d4  [open    ]    2p    1m  slug  \"Hello\"\n"));
+        model.set_posts(
+            "# Hello [open]  a1b2c3d4\n\n#1 @amy (4m)\nOpening post\nline two\n\n#2 @sol (1m)\n[re #1 @amy: \"Opening post\"]\nReply body\n"
+                .to_string(),
+        );
+        assert_eq!(model.posts.len(), 2);
+        assert_eq!(model.posts[0].number, 1);
+        assert_eq!(model.posts[0].body, "Opening post\nline two");
+        assert_eq!(model.posts[1].number, 2);
 
-        // Reply flow
-        assert_eq!(model.handle_key(press(KeyCode::Char('R'))), BoardsOutcome::None);
-        for c in "sounds good".chars() {
-            model.handle_key(press(KeyCode::Char(c)));
-        }
+        // Move into Posts pane, select post #2, Enter opens vi edit on #2.
+        model.focus = Focus::Posts;
+        assert_eq!(model.handle_key(press(KeyCode::Char('j'))), BoardsOutcome::None);
+        assert_eq!(model.selected_post().map(|p| p.number), Some(2));
         assert_eq!(
             model.handle_key(press(KeyCode::Enter)),
-            BoardsOutcome::Reply {
+            BoardsOutcome::EditPostInVi {
                 topic_id: "a1b2c3d4".to_string(),
-                body: "sounds good".to_string(),
+                post_number: 2,
             }
         );
 
-        // New topic flow (title -> body -> submit)
+        // `R` in Posts pane replies in vi targeting the selected post #2.
+        assert_eq!(
+            model.handle_key(press(KeyCode::Char('R'))),
+            BoardsOutcome::ReplyInVi {
+                topic_id: "a1b2c3d4".to_string(),
+                to: Some(2),
+            }
+        );
+
+        // `R` in Topics pane replies to the topic without `--to`.
+        model.focus = Focus::Topics;
+        assert_eq!(
+            model.handle_key(press(KeyCode::Char('R'))),
+            BoardsOutcome::ReplyInVi {
+                topic_id: "a1b2c3d4".to_string(),
+                to: None,
+            }
+        );
+
+        // New topic flow: `n` prompts for title, Enter launches vi for the body.
         assert_eq!(model.handle_key(press(KeyCode::Char('n'))), BoardsOutcome::None);
         for c in "My Title".chars() {
             model.handle_key(press(KeyCode::Char(c)));
         }
-        assert_eq!(model.handle_key(press(KeyCode::Enter)), BoardsOutcome::None);
-        for c in "First post".chars() {
-            model.handle_key(press(KeyCode::Char(c)));
-        }
         assert_eq!(
             model.handle_key(press(KeyCode::Enter)),
-            BoardsOutcome::NewTopic {
+            BoardsOutcome::NewTopicInVi {
                 board: ".".to_string(),
                 title: "My Title".to_string(),
-                body: "First post".to_string(),
             }
         );
     }
