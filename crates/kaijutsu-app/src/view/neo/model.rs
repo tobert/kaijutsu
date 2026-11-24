@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 use kaijutsu_client::ContextMirror;
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, Status};
+
+use crate::view::surface::chrome::pending_tool_ask;
 
 use super::projection::NeoProjection;
 
@@ -46,7 +50,7 @@ pub(super) struct Records {
 }
 
 impl Records {
-    pub(super) fn from_mirror(mirror: &ContextMirror) -> Self {
+    pub(super) fn from_mirror(mirror: &ContextMirror, waiting_on: &HashMap<BlockId, String>) -> Self {
         let blocks = mirror.blocks();
         let projection = NeoProjection::from_blocks(&blocks[blocks.len().saturating_sub(LOOKBACK)..]);
         let collect = |events: Vec<super::projection::NeoEvent>, section| {
@@ -56,7 +60,7 @@ impl Records {
                     let call = mirror.block(&block.tool_call_id?)?;
                     (call.kind == BlockKind::ToolCall).then_some(call.tool_name.as_deref()).flatten()
                 });
-                Some(record(block, tool, section))
+                Some(record(block, tool, section, pending_tool_ask(block, waiting_on)))
             }).collect()
         };
         Self {
@@ -117,7 +121,7 @@ impl Workspace {
     }
 }
 
-fn record(block: &BlockSnapshot, tool: Option<&str>, section: Section) -> Record {
+fn record(block: &BlockSnapshot, tool: Option<&str>, section: Section, ask: Option<&str>) -> Record {
     let kind = match section {
         Section::Workbench => match block.content_type {
             ContentType::Abc => "Score",
@@ -149,17 +153,26 @@ fn record(block: &BlockSnapshot, tool: Option<&str>, section: Section) -> Record
         None if summary.is_empty() => kind.to_string(),
         None => format!("{kind}  {}", bounded(summary)),
     };
-    let status = if block.excluded { "excluded" } else { block.status.as_str() };
-    let summary = if subject.is_some() && !summary.is_empty() {
-        format!("{status} · {}", bounded(summary))
+    let status = if ask.is_some() { Status::Waiting } else { block.status };
+    let waiting;
+    let status_label = if block.excluded {
+        "excluded"
+    } else if let Some(ask) = ask {
+        waiting = format!("waiting on ask {ask}");
+        &waiting
     } else {
-        status.to_string()
+        status.as_str()
+    };
+    let summary = if subject.is_some() && !summary.is_empty() {
+        format!("{status_label} · {}", bounded(summary))
+    } else {
+        status_label.to_string()
     };
     Record {
         id: block.id,
         title,
         summary,
-        state: if block.status == Status::Waiting {
+        state: if status == Status::Waiting {
             RecordState::Waiting
         } else if block.kind == BlockKind::Error || block.status == Status::Error || block.is_error {
             RecordState::Failed
@@ -245,7 +258,7 @@ mod tests {
         let (call_id, result_id) = (call.id, result.id);
         let mut mirror = ContextMirror::new(context);
         mirror.apply_snapshot(vec![call, result, draft], 1).unwrap();
-        let records = Records::from_mirror(&mirror);
+        let records = Records::from_mirror(&mirror, &HashMap::new());
 
         assert_eq!(records.workbench.len(), 1);
         assert_eq!(records.workbench[0].id, result_id);
@@ -261,7 +274,7 @@ mod tests {
             .status(Status::Waiting)
             .build();
         block.is_error = true;
-        let waiting = record(&block, Some("kaish"), Section::History);
+        let waiting = record(&block, Some("kaish"), Section::History, None);
         assert_eq!(waiting.state, RecordState::Waiting);
         assert_eq!(waiting.summary, "waiting");
     }

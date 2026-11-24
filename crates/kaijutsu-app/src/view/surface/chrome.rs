@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use bytemuck::{Pod, Zeroable};
-use kaijutsu_types::{BlockId, BlockKind, ErrorSeverity};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ErrorSeverity};
 
 use crate::cell::block_border::{
     BlockBorderStyle, BorderAnimation, BorderContext, BorderInputs, BorderKind, BorderPadding,
@@ -436,14 +436,26 @@ pub fn waiting_on_asks(open: &[kaijutsu_types::AskSummary]) -> std::collections:
     held.into_iter().map(|(block, (_, short))| (block, short)).collect()
 }
 
+/// The open ask that holds this tool call or its result.
+pub(crate) fn pending_tool_ask<'a>(
+    block: &BlockSnapshot,
+    waiting_on: &'a HashMap<BlockId, String>,
+) -> Option<&'a str> {
+    let call = match block.kind {
+        BlockKind::ToolCall => block.id,
+        BlockKind::ToolResult => block.tool_call_id?,
+        _ => return None,
+    };
+    waiting_on.get(&call).map(String::as_str)
+}
+
 // ============================================================================
 // INSTANCES
 // ============================================================================
 
 /// Border kind, as the shader's `BK_*` constants. Same numbering as
 /// `block_fx.wesl` so the two shaders can be read side by side.
-// The shader's `BK_NONE` (0) has no Rust counterpart: a block with no border
-// never reaches the instance buffer at all, so nothing on this side emits it.
+// `BorderKind::None` keeps a block's captions without emitting a stroke.
 pub const CHROME_KIND_FULL: u32 = 1;
 pub const CHROME_KIND_TOP_ACCENT: u32 = 2;
 pub const CHROME_KIND_DASHED: u32 = 3;

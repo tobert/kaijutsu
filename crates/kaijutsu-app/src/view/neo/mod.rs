@@ -3,10 +3,12 @@
 use bevy::prelude::*;
 use kaijutsu_types::ContextId;
 
+use crate::connection::ledger::LedgerMirror;
 use crate::input::{Action, InputPhase, context::InputContext, events::ActionFired, systems::reveal_block};
 use crate::ui::screen::Screen;
 use crate::view::{ConversationScrollState, DocumentCache, EditorEntities, FocusTarget, MainCell};
 use crate::view::geometry::ConversationGeometry;
+use crate::view::surface::chrome::waiting_on_asks;
 
 mod model;
 mod panel;
@@ -60,6 +62,7 @@ fn toggle_neo(
 fn sync_workspace(
     mode: Res<NeoMode>,
     documents: Res<DocumentCache>,
+    ledger: Res<LedgerMirror>,
     mut workspace: ResMut<Workspace>,
     mut seen: Local<Option<(ContextId, u64)>>,
 ) {
@@ -77,17 +80,16 @@ fn sync_workspace(
         return;
     };
     if !mirror.is_hydrated() {
-        // The mirror retains its last good snapshot during gap recovery.
-        // Keep that view until the replacement snapshot is installed.
+        // Keep the current records while the document store fetches a new snapshot.
         *seen = None;
         return;
     }
     let stamp = (mirror.context_id(), mirror.version());
-    if *seen == Some(stamp) {
+    if *seen == Some(stamp) && !ledger.is_changed() {
         return;
     }
     *seen = Some(stamp);
-    let records = Records::from_mirror(mirror);
+    let records = Records::from_mirror(mirror, &waiting_on_asks(ledger.open()));
     if !workspace.ready || workspace.records != records {
         workspace.reconcile(context, Some(records));
     }
@@ -132,6 +134,66 @@ mod tests {
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContentType, PrincipalId, Role};
 
     #[test]
+    fn ledger_changes_refresh_waiting_records_without_a_document_change() {
+        use kaijutsu_client::LedgerState;
+        use kaijutsu_types::{AskOrigin, AskStatus, AskSummary, Status};
+        use model::RecordState;
+
+        let mut app = App::new();
+        app.insert_resource(NeoMode { enabled: true })
+            .init_resource::<DocumentCache>()
+            .init_resource::<LedgerMirror>()
+            .init_resource::<Workspace>()
+            .add_systems(Update, sync_workspace);
+        let context = ContextId::from_bytes([1; 16]);
+        let principal = PrincipalId::from_bytes([2; 16]);
+        let call = BlockId::new(context, principal, 1);
+        let result = BlockId::new(context, principal, 2);
+        let mut mirror = ContextMirror::new(context);
+        mirror.apply_snapshot(vec![
+            BlockSnapshotBuilder::new(call, BlockKind::ToolCall).status(Status::Error).build(),
+            BlockSnapshotBuilder::new(result, BlockKind::ToolResult).tool_call_id(call).is_error(true).build(),
+        ], 8).unwrap();
+        let mut documents = app.world_mut().resource_mut::<DocumentCache>();
+        documents.insert(context, DocumentEntry::new(mirror, None, "test".to_string()));
+        documents.set_active(context);
+        app.update();
+        assert_eq!(app.world().resource::<Workspace>().records.history[0].state, RecordState::Failed);
+
+        let mut ask = AskSummary {
+            request_id: "01a20b2c-aaaa-bbbb-cccc-000000000001".into(),
+            status: AskStatus::Pending,
+            origin: AskOrigin::ShellGate,
+            context_id: Some(context),
+            description: String::new(),
+            statements: Vec::new(),
+            requester: None,
+            performer: None,
+            reviewer: None,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            tool_call_block_id: Some(call),
+            lineage_root: None,
+            has_exec_source: false,
+        };
+        app.world_mut().resource_mut::<LedgerMirror>().apply_state(&LedgerState::from_listing(1, vec![ask.clone()]));
+        app.update();
+        let workspace = app.world().resource::<Workspace>();
+        for row in &workspace.records.history {
+            assert_eq!(row.state, RecordState::Waiting);
+            assert!(row.summary.starts_with("waiting"));
+        }
+
+        ask.status = AskStatus::Denied;
+        app.world_mut().resource_mut::<LedgerMirror>().apply_state(&LedgerState::from_listing(2, vec![ask]));
+        app.update();
+        let workspace = app.world().resource::<Workspace>();
+        assert_eq!(workspace.records.history[0].state, RecordState::Failed);
+        assert_eq!(workspace.records.history[0].summary, "error");
+        assert_eq!(app.world().resource::<DocumentCache>().get(context).unwrap().mirror.version(), 8);
+    }
+
+    #[test]
     fn neo_actions_reveal_the_selected_source_and_leave_other_context_actions_alone() {
         let mut app = App::new();
         app.add_plugins(bevy::state::app::StatesPlugin)
@@ -139,6 +201,7 @@ mod tests {
             .init_resource::<NeoMode>()
             .init_resource::<Workspace>()
             .init_resource::<DocumentCache>()
+            .init_resource::<LedgerMirror>()
             .init_resource::<EditorEntities>()
             .init_resource::<FocusTarget>()
             .init_resource::<ConversationScrollState>()

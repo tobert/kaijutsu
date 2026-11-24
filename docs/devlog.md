@@ -245,6 +245,13 @@ and a separate command glyph; successful results keep status without another
 rule. Violet call accents regain contrast without restoring glow. Waiting
 receipts use amber even when their transport envelope carries an error flag;
 they do not replay error attention. Empty waiting receipts retain their caption.
+The desktop check exposed an older receipt stored as an error while its ask
+remained open. Waiting presentation therefore joins the live ledger by tool
+call ID before formatting, rather than relying only on the stored status.
+Closing an ask refreshes the transcript and Neo even without a block edit;
+the underlying receipt remains unchanged. Failure counts and error navigation
+use the same pending-ask association. All 1446 app tests pass, including a
+ledger-only dock refresh test. The runner rebuilt and restarted successfully.
 An isolated app confirmed user color motion while model and tool pixels stayed
 identical across frames. The integrated suite passes 1441 app tests, nine
 theme-data tests, and 94 presentation tests.

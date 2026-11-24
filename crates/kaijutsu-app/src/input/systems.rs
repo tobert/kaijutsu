@@ -265,6 +265,7 @@ pub fn handle_jump_to_latest_error(
     geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
     mut focus: ResMut<FocusTarget>,
     mut scroll_state: ResMut<ConversationScrollState>,
+    ledger: Res<crate::connection::ledger::LedgerMirror>,
 ) {
     let mut fired = false;
     for ActionFired { action, .. } in actions.read() {
@@ -286,7 +287,7 @@ pub fn handle_jump_to_latest_error(
         return;
     };
 
-    let Some(target_id) = find_latest_error_block(&editor.blocks()) else {
+    let Some(target_id) = find_latest_error_block(&editor.blocks(), &crate::view::surface::chrome::waiting_on_asks(ledger.open())) else {
         debug!("JumpToLatestError: no non-excluded error blocks in document");
         return;
     };
@@ -315,11 +316,12 @@ pub(crate) fn reveal_block(
 /// order, or `None` if there isn't one. Extracted from
 /// `handle_jump_to_latest_error` so the "which block wins" logic is
 /// unit-testable without a Bevy `App`.
-fn find_latest_error_block(blocks: &[kaijutsu_types::BlockSnapshot]) -> Option<kaijutsu_types::BlockId> {
+fn find_latest_error_block(blocks: &[kaijutsu_types::BlockSnapshot], waiting_on: &std::collections::HashMap<kaijutsu_types::BlockId, String>) -> Option<kaijutsu_types::BlockId> {
     blocks
         .iter()
         .rev()
-        .find(|b| !b.excluded && b.status == kaijutsu_types::Status::Error)
+        .find(|b| !b.excluded && b.status == kaijutsu_types::Status::Error
+            && crate::view::surface::chrome::pending_tool_ask(b, waiting_on).is_none())
         .map(|b| b.id)
 }
 
@@ -1092,7 +1094,7 @@ mod tests {
         let earlier = block(0, BlockKind::Error, Status::Error, false);
         let later = block(1, BlockKind::Error, Status::Error, false);
         let blocks = vec![earlier, later.clone()];
-        assert_eq!(find_latest_error_block(&blocks), Some(later.id));
+        assert_eq!(find_latest_error_block(&blocks, &Default::default()), Some(later.id));
     }
 
     #[test]
@@ -1100,7 +1102,7 @@ mod tests {
         let excluded_error = block(0, BlockKind::Error, Status::Error, true);
         let live_error = block(1, BlockKind::Error, Status::Error, false);
         let blocks = vec![live_error.clone(), excluded_error];
-        assert_eq!(find_latest_error_block(&blocks), Some(live_error.id));
+        assert_eq!(find_latest_error_block(&blocks, &Default::default()), Some(live_error.id));
     }
 
     #[test]
@@ -1109,13 +1111,25 @@ mod tests {
             block(0, BlockKind::Text, Status::Done, false),
             block(1, BlockKind::ToolCall, Status::Running, false),
         ];
-        assert_eq!(find_latest_error_block(&blocks), None);
+        assert_eq!(find_latest_error_block(&blocks, &Default::default()), None);
     }
 
     #[test]
     fn find_latest_error_block_none_when_only_error_is_excluded() {
         let blocks = vec![block(0, BlockKind::Error, Status::Error, true)];
-        assert_eq!(find_latest_error_block(&blocks), None);
+        assert_eq!(find_latest_error_block(&blocks, &Default::default()), None);
+    }
+
+    #[test]
+    fn latest_error_skips_pending_tool_blocks_until_the_ask_closes() {
+        let earlier = block(0, BlockKind::Error, Status::Error, false);
+        let call = block(1, BlockKind::ToolCall, Status::Error, false);
+        let mut result = block(2, BlockKind::ToolResult, Status::Error, false);
+        result.tool_call_id = Some(call.id);
+        let waiting = std::collections::HashMap::from([(call.id, "ask".to_string())]);
+        let blocks = vec![earlier.clone(), call, result.clone()];
+        assert_eq!(find_latest_error_block(&blocks, &waiting), Some(earlier.id));
+        assert_eq!(find_latest_error_block(&blocks, &Default::default()), Some(result.id));
     }
 
     #[test]
@@ -1125,6 +1139,6 @@ mod tests {
         // mid-insert) should still be findable.
         let tool_result = block(0, BlockKind::ToolResult, Status::Error, false);
         let blocks = vec![tool_result.clone()];
-        assert_eq!(find_latest_error_block(&blocks), Some(tool_result.id));
+        assert_eq!(find_latest_error_block(&blocks, &Default::default()), Some(tool_result.id));
     }
 }

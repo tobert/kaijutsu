@@ -1982,7 +1982,7 @@ mod tests {
                 .status(Status::Pending)
                 .build(),
         ];
-        assert_eq!(count_block_activity(&blocks), (2, 1));
+        assert_eq!(count_block_activity(&blocks, &Default::default()), (2, 1));
     }
 
     #[test]
@@ -2003,7 +2003,7 @@ mod tests {
                 .status(Status::Error)
                 .build(),
         ];
-        assert_eq!(count_block_activity(&blocks), (0, 1));
+        assert_eq!(count_block_activity(&blocks, &Default::default()), (0, 1));
     }
 
     #[test]
@@ -2022,7 +2022,61 @@ mod tests {
                 .status(Status::Error)
                 .build(),
         ];
-        assert_eq!(count_block_activity(&blocks), (0, 1));
+        assert_eq!(count_block_activity(&blocks, &Default::default()), (0, 1));
+    }
+
+    #[test]
+    fn pending_tool_errors_stop_counting_until_the_ask_closes() {
+        let call = test_block_id();
+        let result = test_block_id();
+        let blocks = vec![
+            BlockSnapshotBuilder::new(call, BlockKind::ToolCall).status(Status::Error).build(),
+            BlockSnapshotBuilder::new(result, BlockKind::ToolResult).tool_call_id(call).status(Status::Error).build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text).status(Status::Error).build(),
+        ];
+        let waiting = std::collections::HashMap::from([(call, "ask".to_string())]);
+        assert_eq!(count_block_activity(&blocks, &waiting), (0, 1));
+        assert_eq!(count_block_activity(&blocks, &Default::default()), (0, 3));
+    }
+
+    #[test]
+    fn ledger_only_changes_refresh_the_activity_badge() {
+        use bevy::prelude::*;
+        use kaijutsu_types::{AskOrigin, AskStatus, AskSummary};
+        let call = test_block_id();
+        let result = test_block_id();
+        let context = kaijutsu_types::ContextId::new();
+        let mut mirror = ContextMirror::new(context);
+        mirror.apply_snapshot(vec![
+            BlockSnapshotBuilder::new(result, BlockKind::ToolResult)
+                .tool_call_id(call).status(Status::Error).build(),
+        ], 1).unwrap();
+        let mut docs = crate::cell::DocumentCache::default();
+        docs.install(context, mirror, None, || "test".into());
+        docs.set_active(context);
+        let ask = AskSummary {
+            request_id: "01a04eb6-aaaa-bbbb-cccc-000000000001".into(),
+            status: AskStatus::Pending, origin: AskOrigin::ShellGate,
+            context_id: Some(context), description: String::new(), statements: vec![],
+            requester: None, performer: None, reviewer: None, created_at_ms: 0,
+            decided_at_ms: None, tool_call_block_id: Some(call), lineage_root: None,
+            has_exec_source: false,
+        };
+        let mut app = App::new();
+        app.insert_resource(docs).init_resource::<Time>().init_resource::<Theme>()
+            .init_resource::<super::DockState>()
+            .init_resource::<crate::connection::ledger::LedgerMirror>()
+            .add_systems(Update, super::update_block_activity);
+        app.update();
+        assert!(app.world().resource::<super::DockState>().block_activity.text.contains("1 failed"));
+        app.world_mut().resource_mut::<crate::connection::ledger::LedgerMirror>()
+            .apply_state(&kaijutsu_client::LedgerState::from_listing(1, vec![ask]));
+        app.update();
+        assert!(app.world().resource::<super::DockState>().block_activity.text.is_empty());
+        app.world_mut().resource_mut::<crate::connection::ledger::LedgerMirror>()
+            .apply_state(&kaijutsu_client::LedgerState::from_listing(2, vec![]));
+        app.update();
+        assert!(app.world().resource::<super::DockState>().block_activity.text.contains("1 failed"));
     }
 
     #[test]
@@ -2039,7 +2093,7 @@ mod tests {
                 .status(Status::Error)
                 .build(),
         ];
-        assert_eq!(count_block_activity(&blocks), (0, 1));
+        assert_eq!(count_block_activity(&blocks, &Default::default()), (0, 1));
     }
 
     #[test]
@@ -2059,7 +2113,7 @@ mod tests {
                 .status(Status::Error)
                 .build(),
         ];
-        assert_eq!(count_block_activity(&blocks), (0, 1));
+        assert_eq!(count_block_activity(&blocks, &Default::default()), (0, 1));
     }
 
     // ------------------------------------------------------------------
@@ -2109,7 +2163,7 @@ mod tests {
         let mut mirror = ContextMirror::new(ctx);
         mirror.apply_snapshot(blocks, 1).expect("apply_snapshot");
 
-        assert_eq!(count_block_activity(mirror.blocks()), (1, 1));
+        assert_eq!(count_block_activity(mirror.blocks(), &Default::default()), (1, 1));
     }
 
     #[test]
@@ -2131,7 +2185,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        assert_eq!(count_block_activity(mirror.blocks()), (0, 1), "sanity: starts failed");
+        assert_eq!(count_block_activity(mirror.blocks(), &Default::default()), (0, 1), "sanity: starts failed");
 
         mirror
             .receive(mirror_delivery(
@@ -2141,7 +2195,7 @@ mod tests {
             ))
             .expect("apply delivery");
 
-        assert_eq!(count_block_activity(mirror.blocks()), (0, 0));
+        assert_eq!(count_block_activity(mirror.blocks(), &Default::default()), (0, 0));
     }
 
     #[test]
@@ -2160,7 +2214,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        assert_eq!(count_block_activity(mirror.blocks()), (0, 1), "sanity: starts failed");
+        assert_eq!(count_block_activity(mirror.blocks(), &Default::default()), (0, 1), "sanity: starts failed");
 
         mirror
             .receive(mirror_delivery(
@@ -2173,7 +2227,7 @@ mod tests {
             ))
             .expect("apply delivery");
 
-        assert_eq!(count_block_activity(mirror.blocks()), (0, 0));
+        assert_eq!(count_block_activity(mirror.blocks(), &Default::default()), (0, 0));
     }
 
     #[test]
@@ -2903,15 +2957,13 @@ pub fn update_background_jobs(
 ///    doesn't regenerate them — the counters never recover.
 ///
 /// Deriving the counts fresh from `ContextMirror::blocks()` whenever the
-/// mirror's version changes makes all three impossible by construction:
+/// mirror's version or the open asks change keeps the counts current:
 /// there is no accumulator to drift out of sync with the document, because
 /// there is no accumulator.
 #[derive(Default)]
 pub(crate) struct BlockActivityState {
     /// `(active context, that document's sync version)` at the last
-    /// recompute — the cheap gate so the O(blocks) walk in
-    /// `count_block_activity` only runs when the document actually changed,
-    /// not on every frame.
+    /// recompute — the O(blocks) walk runs when the document or ledger changes.
     last_seen: Option<(kaijutsu_types::ContextId, u64)>,
     /// Cached from the last recompute; read every frame for the sparkline
     /// sample even on frames the gate above skips recomputation.
@@ -2942,7 +2994,7 @@ pub(crate) struct BlockActivityState {
 /// standalone `BlockKind::Error` with no error-status parent (parent
 /// excluded, missing, or simply not an error status) still counts too, so
 /// the failure it represents is never silently dropped.
-fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot]) -> (u32, u32) {
+fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot], waiting_on: &std::collections::HashMap<kaijutsu_types::BlockId, String>) -> (u32, u32) {
     use kaijutsu_types::{BlockKind, Status};
 
     let live_status_by_id: std::collections::HashMap<_, _> = blocks
@@ -2953,7 +3005,7 @@ fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot]) -> (u32, u32) 
     let mut running = 0u32;
     let mut failed = 0u32;
     for b in blocks {
-        if b.excluded {
+        if b.excluded || crate::view::surface::chrome::pending_tool_ask(b, waiting_on).is_some() {
             continue;
         }
         match b.status {
@@ -2993,12 +3045,13 @@ fn format_block_activity(running: u32, failed: u32, theme: &Theme) -> (String, C
 }
 
 /// Update block activity — shows running + failed block counts for the
-/// active document, re-derived from document state whenever its sync
-/// version changes (see `BlockActivityState`), never from the event stream.
+/// active document, re-derived when its sync version or the ledger changes
+/// (see `BlockActivityState`), never from the event stream.
 pub fn update_block_activity(
     mut state: Local<BlockActivityState>,
     time: Res<Time>,
     doc_cache: Res<crate::cell::DocumentCache>,
+    ledger: Res<crate::connection::ledger::LedgerMirror>,
     theme: Res<Theme>,
     mut dock: ResMut<DockState>,
 ) {
@@ -3007,10 +3060,11 @@ pub fn update_block_activity(
         .and_then(|id| doc_cache.get(id).map(|entry| (id, entry)));
     let seen = active.as_ref().map(|(id, entry)| (*id, entry.mirror.version()));
 
-    if seen != state.last_seen {
+    if seen != state.last_seen || ledger.is_changed() {
         state.last_seen = seen;
+        let waiting_on = crate::view::surface::chrome::waiting_on_asks(ledger.open());
         let (running, failed) = active
-            .map(|(_, entry)| count_block_activity(entry.mirror.blocks()))
+            .map(|(_, entry)| count_block_activity(entry.mirror.blocks(), &waiting_on))
             .unwrap_or_default();
         state.running = running;
         state.failed = failed;
@@ -3024,7 +3078,7 @@ pub fn update_block_activity(
 
     // Sample running block count for sparkline every 250ms. Reuses the
     // cached count above rather than re-deriving — the gate already
-    // guarantees it's current as of the last real document change.
+    // guarantees it reflects the latest document and ledger changes.
     let now = time.elapsed_secs_f64();
     if now - state.last_spark_sample >= 0.25 {
         state.last_spark_sample = now;

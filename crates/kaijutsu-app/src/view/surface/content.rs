@@ -28,14 +28,17 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use kaijutsu_types::{BlockId, Status};
+use kaijutsu_types::{BlockId, BlockKind, Status};
 
 use crate::cell::block_border::BorderInputs;
 use crate::cell::{CellEditor, ConversationScrollState, EditorEntities, MainCell};
+use crate::connection::ledger::LedgerMirror;
 use crate::text::rich::{RichContentKind, SpanBrush};
 use crate::ui::theme::Theme;
 use kaijutsu_present::format::{fold_line, format_single_block};
 use crate::view::geometry::{ConversationGeometry, RowKey};
+
+use super::chrome::{pending_tool_ask, waiting_on_asks};
 
 /// How many screens of slack, on each side of the viewport, keep a block's
 /// text formatted.
@@ -118,8 +121,8 @@ impl std::fmt::Debug for RichPayload {
 pub struct FormattedBlock {
     /// The source's declared content type.
     pub content_type: kaijutsu_types::ContentType,
-    /// Document version at the moment this block's *shaped form* last
-    /// actually changed.
+    /// Revision of this block's shaped form. Ledger changes can advance it
+    /// when the document version stays the same.
     ///
     /// Not simply "the version we last looked at it": re-formatting an
     /// unchanged block on somebody else's version bump must not invalidate its
@@ -369,8 +372,13 @@ pub fn sync_block_content(
     theme_epoch: Res<super::shape_cache::SurfaceThemeEpoch>,
     svg_fontdb: Res<crate::text::SvgFontDb>,
     doc_cache: Res<crate::cell::DocumentCache>,
+    ledger: Res<LedgerMirror>,
     mut cache: ResMut<BlockContentCache>,
+    mut waiting_on: Local<HashMap<BlockId, String>>,
 ) {
+    if ledger.is_changed() {
+        *waiting_on = waiting_on_asks(ledger.open());
+    }
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -413,12 +421,21 @@ pub fn sync_block_content(
     let default_bg = crate::text::color_to_rgba8(theme.bg);
 
     for id in wanted {
-        let Some(block) = editor.block_snapshot(&id) else {
+        let Some(mut block) = editor.block_snapshot(&id) else {
             // Raced a removal — the id lives in a geometry row that the next
             // reconcile will drop. Nothing to cache.
             cache.blocks.remove(&id);
             continue;
         };
+
+        // A linked open ask describes the current state of the tool. The
+        // snapshot here is an owned copy for display.
+        if pending_tool_ask(&block, &waiting_on).is_some() {
+            block.status = Status::Waiting;
+        }
+        if block.kind == BlockKind::ToolResult && block.status == Status::Waiting {
+            block.is_error = false;
+        }
 
         // A folded block with a fold line shapes that one line and nothing
         // rich: its structured output or typed content is what the fold hides.
@@ -506,7 +523,8 @@ pub fn sync_block_content(
         };
         let version = match cache.blocks.get(&id) {
             Some(prev) if !changed => prev.version,
-            _ => doc_version,
+            Some(prev) => doc_version.max(prev.version.saturating_add(1)),
+            None => doc_version,
         };
 
         cache.blocks.insert(
@@ -665,6 +683,7 @@ mod tests {
         app.init_resource::<Theme>();
         app.init_resource::<crate::text::SvgFontDb>();
         app.init_resource::<crate::cell::DocumentCache>();
+        app.init_resource::<LedgerMirror>();
         app.init_resource::<ConversationScrollState>();
         app.init_resource::<BlockContentCache>();
         app.init_resource::<crate::view::surface::shape_cache::SurfaceThemeEpoch>();
@@ -742,6 +761,81 @@ mod tests {
         app.update();
         assert_eq!(cache(&app).get(&ids[0]).unwrap().text, "hello");
         assert_eq!(cache(&app).get(&ids[1]).unwrap().text, "world");
+    }
+
+    #[test]
+    fn an_open_ask_presents_the_receipt_as_waiting_until_the_ledger_closes_it() {
+        use crate::cell::block_border::{BorderContext, compute_border_style};
+        use kaijutsu_client::LedgerState;
+        use kaijutsu_types::{AskOrigin, AskStatus, AskSummary, BlockSnapshotBuilder};
+
+        let mut app = content_app();
+        let mut editor = CellEditor::new();
+        let context = kaijutsu_types::ContextId::new();
+        let principal = editor.store.principal_id();
+        let call = BlockId::new(context, principal, 1);
+        let result = BlockId::new(context, principal, 2);
+        let blocks = [
+            BlockSnapshotBuilder::new(call, BlockKind::ToolCall)
+                .tool_name("shell_write").status(Status::Error).build(),
+            BlockSnapshotBuilder::new(result, BlockKind::ToolResult)
+                .tool_call_id(call).is_error(true).build(),
+        ];
+        editor.rebuild_from(context, principal, &blocks, |_| false, Some(result)).unwrap();
+        let document_version = editor.version();
+        let cell = app.world_mut().spawn((editor, MainCell, ConversationGeometry::default())).id();
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(cell);
+        app.update();
+        let original = cache(&app).get(&result).unwrap().clone();
+        assert_eq!(original.status, Status::Error);
+        assert_eq!(original.text, "✗");
+
+        let mut ask = AskSummary {
+            request_id: "01a20b2c-aaaa-bbbb-cccc-000000000001".into(),
+            status: AskStatus::Pending,
+            origin: AskOrigin::ShellGate,
+            context_id: Some(context),
+            description: String::new(),
+            statements: Vec::new(),
+            requester: None,
+            performer: None,
+            reviewer: None,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            tool_call_block_id: Some(call),
+            lineage_root: None,
+            has_exec_source: false,
+        };
+        app.world_mut().resource_mut::<LedgerMirror>().apply_state(&LedgerState::from_listing(1, vec![ask.clone()]));
+        app.update();
+
+        let theme = app.world().resource::<Theme>();
+        let waiting = cache(&app).get(&result).unwrap();
+        assert_eq!(cache(&app).get(&call).unwrap().status, Status::Waiting);
+        assert_eq!(waiting.status, Status::Waiting);
+        assert_eq!(waiting.border.status, Status::Waiting);
+        assert_eq!(waiting.color, theme.warning);
+        assert!(waiting.text.is_empty());
+        assert!(waiting.version > original.version);
+        let waiting_version = waiting.version;
+        let border_context = BorderContext {
+            waiting_on: super::super::chrome::waiting_on_asks(app.world().resource::<LedgerMirror>().open()),
+            ..default()
+        };
+        let style = compute_border_style(&waiting.border, theme, &border_context, false, 14.0).unwrap();
+        assert_eq!(style.bottom_label.as_deref(), Some("waiting on ask 01a20b2c"));
+
+        ask.status = AskStatus::Denied;
+        app.world_mut().resource_mut::<LedgerMirror>().apply_state(&LedgerState::from_listing(2, vec![ask]));
+        app.update();
+        let resolved = cache(&app).get(&result).unwrap();
+        assert_eq!(resolved.status, original.status);
+        assert_eq!(resolved.color, original.color);
+        assert_eq!(resolved.text, original.text);
+        assert!(resolved.version > waiting_version);
+        let editor = app.world().get::<CellEditor>(cell).unwrap();
+        assert_eq!(editor.version(), document_version);
+        assert_eq!(editor.block_snapshot(&result).unwrap().status, Status::Error);
     }
 
     /// The gate that makes `ShapeKey.content_version` worth having: a
