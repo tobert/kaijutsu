@@ -624,6 +624,27 @@ impl KernelDb {
         }
     }
 
+    /// Advance `last_post_at` when an existing post is edited (without changing `post_count`).
+    pub fn touch_topic_last_post_at(
+        &self,
+        document_id: ContextId,
+        now_ms: i64,
+    ) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE board_topics
+                SET last_post_at = MAX(last_post_at, ?1)
+             WHERE document_id = ?2",
+            params![now_ms, blob_param(document_id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!(
+                "topic {}",
+                document_id.short()
+            )));
+        }
+        Ok(())
+    }
+
     /// Increment `post_count` and advance `last_post_at` when a reply lands.
     pub fn bump_topic_post_stats(
         &self,
