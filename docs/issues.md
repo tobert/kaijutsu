@@ -83,7 +83,6 @@ A player's text registers are shared through the kernel's register store: compos
 - **A refused `registersPut` leaves the kernel's copy behind** the client's registers until the next write or a `:regpull`.
 - **A `ZZ` whose flush fails drops the batch's yank** from the reply.
 - **The app feeds `Esc` and `i` outside its register lending.**
-- **No test types `dd` in a kernel vi session and `p` in client compose.**
 - **A recovered buffer's dirty test compares normalized text.** The checkpoint and the buffer drop one trailing newline.
 - **A `:e` whose load fails after the path resolved leaves the path in the list.**
 - **A recovered cursor never rests past the last character.**
