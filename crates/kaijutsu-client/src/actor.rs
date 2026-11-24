@@ -4148,12 +4148,12 @@ async fn supervise_actor<F>(
 /// single-threaded RPC executor with foreign-context events. Multi-context
 /// clients (the app, which routes every context's events into a per-context
 /// cache) must pass `false`.
-pub fn spawn_actor(
+fn build_actor(
     config: SshConfig,
     context_id: Option<ContextId>,
     instance: String,
     scope_blocks_to_context: bool,
-) -> ActorHandle {
+) -> (ActorHandle, impl std::future::Future<Output = ()>) {
     let (tx, rx) = mpsc::channel::<ChannelCmd>(CHANNEL_CAPACITY);
     let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
     let (status_tx, _) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
@@ -4194,13 +4194,8 @@ pub fn spawn_actor(
         ledger_tx.clone(),
         clock.clone(),
     );
-    tokio::task::spawn_local(supervise_actor(
-        actor.run(),
-        status_tx.clone(),
-        status_watch_tx_supervisor,
-    ));
-
-    ActorHandle {
+    let fut = supervise_actor(actor.run(), status_tx.clone(), status_watch_tx_supervisor);
+    let handle = ActorHandle {
         tx,
         event_tx,
         status_tx,
@@ -4209,7 +4204,63 @@ pub fn spawn_actor(
         midi_exchange,
         ledger_tx,
         clock,
-    }
+    };
+    (handle, fut)
+}
+
+pub fn spawn_actor(
+    config: SshConfig,
+    context_id: Option<ContextId>,
+    instance: String,
+    scope_blocks_to_context: bool,
+) -> ActorHandle {
+    let (handle, fut) = build_actor(config, context_id, instance, scope_blocks_to_context);
+    tokio::task::spawn_local(fut);
+    handle
+}
+
+/// Spawn the RPC actor on its own dedicated OS thread with a single-threaded
+/// Tokio runtime and `LocalSet`.
+///
+/// Use this when the caller runs UI rendering or other synchronous work on its
+/// main thread (such as `kaijutsu-tui` or `kaijutsu-app`): the Cap'n Proto RPC
+/// system, SSH I/O, and liveness pinger never stall behind client drawing. The
+/// thread exits cleanly once all [`ActorHandle`] clones are dropped.
+pub fn spawn_actor_thread(
+    config: SshConfig,
+    context_id: Option<ContextId>,
+    instance: String,
+    scope_blocks_to_context: bool,
+) -> std::io::Result<ActorHandle> {
+    let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("kaijutsu-rpc-actor".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("kaijutsu-rpc-actor: failed to build runtime: {e}");
+                    return;
+                }
+            };
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(async move {
+                let (handle, fut) =
+                    build_actor(config, context_id, instance, scope_blocks_to_context);
+                if handle_tx.send(handle).is_err() {
+                    return;
+                }
+                local.run_until(fut).await;
+                // Drop LocalSet inside block_on so russh teardown still has a reactor.
+                drop(local);
+            });
+        })?;
+    handle_rx.recv().map_err(|_| {
+        std::io::Error::other("kaijutsu-rpc-actor thread exited before initializing")
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────────────

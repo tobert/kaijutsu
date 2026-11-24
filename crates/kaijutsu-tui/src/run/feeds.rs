@@ -63,9 +63,10 @@ impl Feeds {
     /// it. A second call for the same context replaces the first task.
     fn pump(&mut self, context_id: ContextId, mut rx: mpsc::Receiver<FeedEvent>) {
         let tx = self.tx.clone();
-        // `spawn_local`: the actor's Cap'n Proto types are `!Send`, so this
-        // task belongs to the caller's `LocalSet`.
-        let task = tokio::task::spawn_local(async move {
+        // `tokio::spawn`: both channels are `Send`, so feed forwarding runs on
+        // the worker pool without contending with `Terminal::draw` on the
+        // main thread's `LocalSet`.
+        let task = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 if tx.send((context_id, event)).await.is_err() {
                     break;

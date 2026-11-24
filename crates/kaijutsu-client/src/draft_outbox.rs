@@ -191,6 +191,13 @@ pub fn spawn_local(sink: impl DraftSink) -> (DraftOutbox, mpsc::UnboundedReceive
     (outbox, landed)
 }
 
+/// Start the writer on the multi-threaded Tokio runtime using an `ActorHandle`.
+pub fn spawn(actor: ActorHandle) -> (DraftOutbox, mpsc::UnboundedReceiver<Landed>) {
+    let (outbox, writer, landed) = channel(actor);
+    tokio::spawn(writer);
+    (outbox, landed)
+}
+
 impl DraftOutbox {
     /// Queue one edit behind every call already sent.
     pub fn edit(&self, context_id: ContextId, generation: u64, edit: DraftEdit) -> Result<(), OutboxError> {

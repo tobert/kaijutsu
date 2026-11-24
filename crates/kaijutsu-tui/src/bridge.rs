@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use kaijutsu_client::rpc::KjExecutionResult;
 use kaijutsu_client::start_candidate;
 use kaijutsu_client::{
-    ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
+    ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor_thread,
 };
 use kaijutsu_types::{BlockId, BlockSnapshot, ContextId};
 use tokio::sync::mpsc;
@@ -98,7 +98,8 @@ impl KernelBridge {
         // watched at once and each needs its own stream, so scoping to a
         // single joined context would starve every context but the last
         // joined.
-        let actor = spawn_actor(config, None, tui_peer_instance().to_string(), false);
+        let actor = spawn_actor_thread(config, None, tui_peer_instance().to_string(), false)
+            .context("spawn RPC actor thread")?;
 
         // A fresh actor sits in Idle until something pokes it. Kick it, then
         // wait on the level mirror — `subscribe_status()` never replays the

@@ -106,9 +106,8 @@ The footer line grows leftward over the badge cluster when a request is pending 
 
 `contrib/headless-app.sh start` runs end to end on gamescope's headless backend (about 10 fps with a debug build), at the size `--size` names (the app takes it as `--window-size`, since gamescope sends no size); `--compositor labwc` keeps the old path. `contrib/headless-smoke.sh` checks start, `act`, `state`, and a screenshot. The harness's `text` and `keys` now return only after the frames their input needs have run (two per typed character, from `get_diagnostics`' frame counter), so a following key cannot overtake the typing. A 54-character `type_text` at 12 fps arrived whole; the earlier drop after a surface switch was not reproduced and is unexplained. Key names are BRP key codes such as `KeyW`. The draft is not readable by design, so no test asserts what was typed. `kaijutsu/act` and `kaijutsu/state` (`docs/input.md`, "Agent control over BRP") now replace most key synthesis; move the harness's `keys` users onto `act`.
 
-## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
+## The tui's picker switch and compose edge cases (2026-11-10)
 
-- **The tui's local tasks sometimes do not run for hundreds of milliseconds.** The draft outbox writer, the actor and the RPC system are `spawn_local` tasks inside `local.run_until` (`main.rs`).
 - **The picker failure is unexplained.** After Enter on the picker row, `switch_seat` never reached the kernel.
 - **A sibling's submit leaves our compose text behind.**
 - **A draft that survives a shell submit is hidden from its submitter.**

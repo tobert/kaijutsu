@@ -35,7 +35,7 @@ pub mod kaijutsu_capnp {
 
 pub use actor::{
     ActorHandle, CallError, NotReadyReason, PeerAttachResult, PeerConfig, PeerInvocation,
-    UnansweredCommands, spawn_actor,
+    UnansweredCommands, spawn_actor, spawn_actor_thread,
 };
 pub use rpc::{
     AskAnswer, AskListing, AuthorBlock, Completion, CompletionKind, ContextCluster, ContextCost, ContextInfo, ContextMcpRefusal,
