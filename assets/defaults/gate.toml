@@ -115,12 +115,16 @@
 
 [global]
 allow = [
-  "kj handoff note",     # recoverable by construction; the friction that started this
+  "kj handoff note",     # recoverable by construction
+  "kj board post",       # board write policy (open/curated/locked) still governs publish vs ledger review
+  "kj board reply",
+  "kj board resolve",
+  "kj board reopen",
   "kj block create",
   "kj block append",
   "kj stage include",
   "kj stage exclude",
-  "rg",                  # non-kj entries exercising the key space: one-level key
+  "rg",                  # non-kj entries: one-level key
   "wc",
 ]
 ask = [
@@ -154,25 +158,39 @@ allow = [
 [rc.banto]
 allow = [
   "kj context create",     # banto creates its lanes, `kj context create coder --name <lane>`
-  "kj fork",             # a fork copies this context's own performer
-  "kj drive",            # runs a turn on a lane banto directs
-  "kj drift push",       # banto messages senpai and other contexts
-  "kj price set",        # appends a price row; a correction is a later row
-  "kj price set-tool",   # appends a tool price row; a correction is a later row
+  "kj fork",               # a fork copies this context's own performer
+  "kj drive",              # runs a turn on a lane banto directs
+  "kj drift push",         # banto messages senpai and other contexts
+  "kj board create",       # banto manages boards and curates topics
+  "kj board promote",
+  "kj board pin",
+  "kj board unpin",
+  "kj board set",
+  "kj price set",          # appends a price row; a correction is a later row
+  "kj price set-tool",     # appends a tool price row; a correction is a later row
 ]
 
 [rc.senpai]
 allow = [
   "kj context create",     # senpai creates its lanes, `kj context create kohai --name <lane>`
-  "kj fork",             # a fork copies this context's own performer
-  "kj drive",            # runs a turn on a lane senpai directs
-  "kj drift push",       # senpai messages banto and its kohai
+  "kj fork",               # a fork copies this context's own performer
+  "kj drive",              # runs a turn on a lane senpai directs
+  "kj drift push",         # senpai messages banto and its kohai
+  "kj board create",       # senpai manages its boards and promotes topics
+  "kj board promote",
+  "kj board pin",
+  "kj board unpin",
 ]
 
 [root]
 allow = [
-  "kj price set",        # appends a price row; a correction is a later row
-  "kj price set-tool",   # appends a tool price row; a correction is a later row
+  "kj board create",       # console / root manages boards directly
+  "kj board promote",
+  "kj board pin",
+  "kj board unpin",
+  "kj board set",
+  "kj price set",          # appends a price row; a correction is a later row
+  "kj price set-tool",     # appends a tool price row; a correction is a later row
 ]
 
 # The main seat of a companion has a writable shell while the person is
