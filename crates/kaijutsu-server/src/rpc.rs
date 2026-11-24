@@ -422,6 +422,22 @@ pub struct ServerRegistry {
 /// dedicated thread + LocalSet supports the reconcile path, which
 /// touches the `!Send` editor sessions behind the kernel mutex.
 pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
+    // Subscribe synchronously before spawning so early edits are never missed,
+    // and hand only a `Weak<ServerRegistry>` to the background thread so it
+    // never holds a strong reference cycle preventing `Kernel` drop.
+    let mut appended_sub = registry
+        .kernel
+        .kernel
+        .block_flows()
+        .subscribe("block.text_appended");
+    let mut replaced_sub = registry
+        .kernel
+        .kernel
+        .block_flows()
+        .subscribe("block.text_replaced");
+    let weak_registry = Arc::downgrade(&registry);
+    drop(registry);
+
     // Not spawned through `spawn_kaish_thread`: the reconcile path only
     // touches editor session state and never re-enters kaish, so the
     // default stack is sized correctly here.
@@ -439,9 +455,6 @@ pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
         };
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let kernel = &registry.kernel;
-            let mut appended_sub = kernel.kernel.block_flows().subscribe("block.text_appended");
-            let mut replaced_sub = kernel.kernel.block_flows().subscribe("block.text_replaced");
             log::info!("Editor reconciler online");
             loop {
                 let (context_id, block_id) = tokio::select! {
@@ -466,7 +479,11 @@ pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
                         (context_id, block_id)
                     }
                 };
-                kernel.kernel.editor_reconcile_block(context_id, block_id);
+                let Some(registry) = weak_registry.upgrade() else {
+                    log::info!("Editor reconciler: registry dropped, exiting");
+                    break;
+                };
+                registry.kernel.kernel.editor_reconcile_block(context_id, block_id);
             }
         });
     }) {

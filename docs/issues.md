@@ -377,7 +377,6 @@ Feedback retains its original source anchor when available and retries missing a
 - **4.6 Block Tools Scope:** Block and task tools edit any context a caller's `BlockId` names, breaking focus boundaries.
 - **4.7b Hydration Splitting:** Notification, Resource, Task, Error, and Drift blocks inside open model batches flush during hydration.
 - **2.2 File Caching:** Clean cached files keep serving after delete or rename; `MountBackend` never invalidates caches.
-- **5.2 Actor Lifecycles:** `spawn_editor_reconciler` holds an `Arc` cycle preventing kernel drops.
 - **5.3c Block Copying:** `cherry_pick_block` drops metadata; correct copying requires dedicated block-store minting APIs.
 - **3.1 Council Synchronization:** Council shadow's `CREATE` lock drops before `run_create_lifecycle`, priming shadows twice per call.
 - **6.3 MIDI Cues:** CAS-backed ABC cues do not play because `dispatch_midi_cue` has no prefetch path.
