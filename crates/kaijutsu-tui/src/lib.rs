@@ -40,6 +40,7 @@
 
 pub mod app;
 pub mod asks;
+pub mod boards;
 pub mod bridge;
 pub mod client_id;
 pub mod cmdline;

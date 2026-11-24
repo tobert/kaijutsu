@@ -67,11 +67,10 @@ pub enum Intent {
     /// partial verb (`crate::completion`); the caller decides that, not this module —
     /// `Keys::interpret` has no view of the compose line.
     Tab,
-    /// `Ctrl+A "` / `Ctrl+A w` — open or close the picker
-    /// (`docs/tui.md`, "The picker"). While the picker is open, keys are
-    /// routed to it directly rather than through [`Keys::interpret`] — see
-    /// `run.rs`.
+    /// `Ctrl+A "` / `Ctrl+A w` — open or close the full-screen context browser.
     TogglePicker,
+    /// `Ctrl+A b` — open or close the full-screen message board browser.
+    ToggleBoards,
     /// `Ctrl+A [` — tmux's own copy-mode chord: leave the transcript's live
     /// tail without moving the view, which is where vi motions, `v`, `y` and
     /// a search take over (`docs/tui.md`, "Scrolling is copy mode"). `Up`,
@@ -167,6 +166,7 @@ impl Keys {
                     Intent::SwitchSeat(c as usize - '0' as usize)
                 }
                 KeyCode::Char('"') | KeyCode::Char('w') => Intent::TogglePicker,
+                KeyCode::Char('b') => Intent::ToggleBoards,
                 KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
                 KeyCode::Char('[') => Intent::CopyMode,

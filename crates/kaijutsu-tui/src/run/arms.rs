@@ -22,7 +22,7 @@ use crate::render;
 use crate::editor;
 
 use super::{Frame, LoopState};
-use super::act::{Acted, act, handle_picker_key, paste_text};
+use super::act::{Acted, act, handle_boards_key, handle_picker_key, paste_text};
 use super::asks_io::{AskLanded, AskReadFor, raise_card, spawn_ask_read, spawn_ask_work};
 use super::draw::{observe_beat_sync, present, rearm_beat_wake};
 use super::feeds::{Feeds, HydrateOutcome, abandon_rehydrate, adopt, land_rehydrate, mark_activity, mark_turn_liveness, release_cold, start_hydrate};
@@ -66,10 +66,12 @@ pub(super) async fn on_input(
                     ProbePanic::Off => {}
                 }
             }
-            // The prefix is never the picker's key
-            // ([`Keys::claims`]); `act` runs the chord over it.
+            // The prefix is never the picker's or boards' key
+            // ([`Keys::claims`]); `act` runs the chord over them.
             if app.picker.is_some() && !ls.key_state.keys.claims(&key) {
                 handle_picker_key(bridge, app, key, ls.key_state.keys.armed(), feeds).await?;
+            } else if app.boards.is_some() && !ls.key_state.keys.claims(&key) {
+                handle_boards_key(bridge, app, key, ls.key_state.keys.armed()).await?;
             } else {
                 let width = terminal.size()?.width;
                 if act(bridge, app, &mut ls.key_state, key, feeds, term_lock, width)

@@ -34,7 +34,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use kaijutsu_client::{ContextInfo, ServerEvent, TrackInfo};
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Role, Status};
 use kaijutsu_viz::layout::{Band, ContextLifecycle, assign_ring_seats};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
 use crate::present::Palette;
@@ -370,6 +373,11 @@ impl PickerModel {
         }
     }
 
+    /// Whether the filter input is currently capturing keystrokes.
+    pub fn filter_editing(&self) -> bool {
+        self.filter_editing
+    }
+
     /// The context under the cursor: the row's own id in ACTIVE, RECENT and
     /// the horizon, the score context in TRACKS. `None` on an empty list.
     pub fn selected_context(&self) -> Option<ContextId> {
@@ -579,6 +587,7 @@ impl PickerModel {
                     self.index = 0;
                     Outcome::None
                 }
+                KeyCode::Char('q') => Outcome::Dismiss,
                 KeyCode::Char('/') => {
                     self.filter_editing = true;
                     self.filter.clear();
@@ -592,13 +601,29 @@ impl PickerModel {
                     self.move_index(-1);
                     Outcome::None
                 }
+                KeyCode::PageDown => {
+                    self.move_index(10);
+                    Outcome::None
+                }
+                KeyCode::PageUp => {
+                    self.move_index(-10);
+                    Outcome::None
+                }
+                KeyCode::Home => {
+                    self.index = 0;
+                    Outcome::None
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.index = self.current_len().saturating_sub(1);
+                    Outcome::None
+                }
                 KeyCode::Enter => self.activate_selection(),
                 _ => Outcome::None,
             };
         }
 
         match key.code {
-            KeyCode::Esc => Outcome::Dismiss,
+            KeyCode::Esc | KeyCode::Char('q') => Outcome::Dismiss,
             KeyCode::Char('/') => {
                 self.filter_editing = true;
                 self.filter.clear();
@@ -630,6 +655,26 @@ impl PickerModel {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.move_index(-1);
+                self.pending_confirm = None;
+                Outcome::None
+            }
+            KeyCode::PageDown => {
+                self.move_index(10);
+                self.pending_confirm = None;
+                Outcome::None
+            }
+            KeyCode::PageUp => {
+                self.move_index(-10);
+                self.pending_confirm = None;
+                Outcome::None
+            }
+            KeyCode::Home => {
+                self.index = 0;
+                self.pending_confirm = None;
+                Outcome::None
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.index = self.current_len().saturating_sub(1);
                 self.pending_confirm = None;
                 Outcome::None
             }
@@ -819,6 +864,353 @@ pub fn render(model: &PickerModel, width: u16, palette: &Palette) -> Vec<Line<'s
 
     lines.push(key_line(width, palette));
     lines
+}
+
+/// Draw the full-screen Context Browser onto `frame`:
+/// - Top header bar (`CONTEXTS` / `HORIZON`, counts, and live filter prompt)
+/// - Scrollable list of ACTIVE / RECENT / TRACKS (or HORIZON), keeping the
+///   selected row centered in the viewport
+/// - Bottom detail preview pane for the selected context (when height >= 12)
+/// - Bottom key-hints / notice / armed-prefix status bar
+pub fn draw_fullscreen(
+    frame: &mut ratatui::Frame<'_>,
+    model: &PickerModel,
+    current: Option<ContextId>,
+    detail: Option<&ContextInfo>,
+    notice: Option<&str>,
+    armed: bool,
+    palette: &Palette,
+) {
+    let area = frame.area();
+    let width = usize::from(area.width.max(1));
+    let show_detail = area.height >= 12;
+    let detail_h: u16 = if show_detail { 4 } else { 0 };
+
+    let [header_area, list_area, detail_area, footer_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(detail_h),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    // 1. Header bar
+    let (header_line, filter_cursor_col) = fullscreen_header(model, width, palette);
+    frame.render_widget(Paragraph::new(header_line), header_area);
+    if let Some(col) = filter_cursor_col {
+        let x = header_area.x + u16::try_from(col).unwrap_or(u16::MAX).min(header_area.width.saturating_sub(1));
+        frame.set_cursor_position((x, header_area.y));
+    }
+
+    // 2. Scrollable list
+    let (list_lines, selected_line) = fullscreen_list_lines(model, current, width, palette);
+    let view_h = usize::from(list_area.height);
+    let scroll = if let Some(sel) = selected_line {
+        if list_lines.len() <= view_h {
+            0
+        } else {
+            let max_scroll = list_lines.len().saturating_sub(view_h);
+            sel.saturating_sub(view_h / 2).min(max_scroll)
+        }
+    } else {
+        0
+    };
+    let visible: Vec<Line<'static>> = list_lines
+        .into_iter()
+        .skip(scroll)
+        .take(view_h)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), list_area);
+
+    // 3. Selected-context detail pane
+    if show_detail {
+        let detail_lines = fullscreen_detail_lines(model, detail, width, palette);
+        frame.render_widget(Paragraph::new(detail_lines), detail_area);
+    }
+
+    // 4. Footer bar (armed legend, notice, or key hints)
+    let footer = if armed {
+        crate::status::legend_line(area.width, palette)
+    } else if let Some(msg) = notice {
+        let clipped = truncate_chars(msg, width);
+        let pad = width.saturating_sub(display_width(&clipped));
+        Line::from(vec![
+            Span::styled(clipped, palette.status_warning()),
+            Span::styled(" ".repeat(pad), palette.status_bar()),
+        ])
+    } else {
+        let hints = if display_width(KEY_LINE_FULL) <= width {
+            KEY_LINE_FULL
+        } else {
+            KEY_LINE_SHORT
+        };
+        let clipped = truncate_chars(hints, width);
+        let pad = width.saturating_sub(display_width(&clipped));
+        Line::from(vec![
+            Span::styled(clipped, palette.status_bar()),
+            Span::styled(" ".repeat(pad), palette.status_bar()),
+        ])
+    };
+    frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
+fn fullscreen_header(model: &PickerModel, width: usize, palette: &Palette) -> (Line<'static>, Option<usize>) {
+    let title = if model.horizon_open {
+        let visible = model.visible_horizon().len();
+        format!(" HORIZON  {visible} of {}", model.horizon.len())
+    } else {
+        format!(
+            " CONTEXTS  {} active · {} recent · {} horizon · {} tracks",
+            model.visible_active().len(),
+            model.visible_recent().len(),
+            model.horizon.len(),
+            model.tracks.len(),
+        )
+    };
+    let right = if model.filter_editing {
+        format!("/ {} ", model.filter)
+    } else if !model.filter.is_empty() {
+        format!("filter: {} ", model.filter)
+    } else {
+        "/ filter · q close ".to_string()
+    };
+
+    let right_w = display_width(&right);
+    let title_room = width.saturating_sub(right_w + 1);
+    let left = truncate_chars(&title, title_room);
+    let left_w = display_width(&left);
+    let gap = width.saturating_sub(left_w + right_w);
+
+    let cursor_col = model.filter_editing.then(|| left_w + gap + right_w.saturating_sub(1));
+    let right_style = if model.filter_editing || !model.filter.is_empty() {
+        palette.status_warning()
+    } else {
+        palette.status_bar()
+    };
+    let line = Line::from(vec![
+        Span::styled(left, palette.status_active()),
+        Span::styled(" ".repeat(gap), palette.status_bar()),
+        Span::styled(truncate_chars(&right, width.saturating_sub(left_w + gap)), right_style),
+    ]);
+    (line, cursor_col)
+}
+
+fn fullscreen_row_line(
+    row: &Row,
+    selected: bool,
+    is_current: bool,
+    label_w: usize,
+    performer_w: usize,
+    width: usize,
+    palette: &Palette,
+) -> Line<'static> {
+    let marker = if selected { "› " } else { "  " };
+    let digit = row.digit.map(|d| d.to_string()).unwrap_or_else(|| " ".to_string());
+    let cur = if is_current { "*" } else { " " };
+    let flag = if row.chatter { "●" } else if row.activity { "@" } else { " " };
+    let state = if row.errored {
+        "error  "
+    } else if row.running {
+        "running"
+    } else if row.paused {
+        "paused "
+    } else {
+        "idle   "
+    };
+    let head = format!(
+        "{marker}{digit} {}{cur} {flag} {} {state} {:>3}  ",
+        pad(&row.label, label_w),
+        pad(&row.performer, performer_w),
+        format_age(row.age_ms),
+    );
+    let remaining = width.saturating_sub(display_width(&head));
+    let tail = truncate_chars(row.tail.as_deref().unwrap_or(""), remaining);
+    let full = format!("{head}{tail}");
+    let fill = width.saturating_sub(display_width(&full));
+    let style = if selected {
+        palette.copy_selection()
+    } else if row.errored {
+        palette.alarm()
+    } else if is_current {
+        palette.status().add_modifier(Modifier::BOLD)
+    } else {
+        palette.status()
+    };
+    Line::from(Span::styled(format!("{full}{}", " ".repeat(fill)), style))
+}
+
+fn fullscreen_list_lines(
+    model: &PickerModel,
+    current: Option<ContextId>,
+    width: usize,
+    palette: &Palette,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    let mut lines = Vec::new();
+    let mut selected_line = None;
+
+    if model.horizon_open {
+        let rows = model.visible_horizon();
+        let label_w = label_width(&rows);
+        let performer_w = performer_width(&rows);
+        for (i, row) in rows.iter().enumerate() {
+            let selected = i == model.index;
+            if selected {
+                selected_line = Some(lines.len());
+            }
+            lines.push(fullscreen_row_line(
+                row,
+                selected,
+                current == Some(row.context_id),
+                label_w,
+                performer_w,
+                width,
+                palette,
+            ));
+        }
+        if rows.is_empty() {
+            lines.push(Line::from(Span::styled("  (no contexts in horizon)", palette.divider())));
+        }
+        return (lines, selected_line);
+    }
+
+    let active = model.visible_active();
+    let recent = model.visible_recent();
+    let both: Vec<&Row> = active.iter().chain(recent.iter()).copied().collect();
+    let label_w = label_width(&both);
+    let performer_w = performer_width(&both);
+
+    lines.push(Line::from(Span::styled("ACTIVE", palette.divider().add_modifier(Modifier::BOLD))));
+    if active.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)", palette.divider())));
+    } else {
+        for (i, row) in active.iter().enumerate() {
+            let selected = model.section == Section::Active && i == model.index;
+            if selected {
+                selected_line = Some(lines.len());
+            }
+            lines.push(fullscreen_row_line(
+                row,
+                selected,
+                current == Some(row.context_id),
+                label_w,
+                performer_w,
+                width,
+                palette,
+            ));
+        }
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("RECENT", palette.divider().add_modifier(Modifier::BOLD))));
+    if recent.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)", palette.divider())));
+    } else {
+        for (i, row) in recent.iter().enumerate() {
+            let selected = model.section == Section::Recent && i == model.index;
+            if selected {
+                selected_line = Some(lines.len());
+            }
+            lines.push(fullscreen_row_line(
+                row,
+                selected,
+                current == Some(row.context_id),
+                label_w,
+                performer_w,
+                width,
+                palette,
+            ));
+        }
+    }
+
+    if !model.horizon.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} beyond the horizon (press h)", model.horizon.len()),
+            palette.divider(),
+        )));
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("TRACKS", palette.divider().add_modifier(Modifier::BOLD))));
+    if model.tracks.is_empty() {
+        lines.push(Line::from(Span::styled("  (no tracks)", palette.divider())));
+    } else {
+        let id_w = model.tracks.iter().map(|t| display_width(&t.id)).max().unwrap_or(0).clamp(6, 16);
+        for (i, track) in model.tracks.iter().enumerate() {
+            let selected = model.section == Section::Tracks && i == model.index;
+            if selected {
+                selected_line = Some(lines.len());
+            }
+            let mut line = track_row_line(track, selected, id_w, width, palette);
+            if selected {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let fill = width.saturating_sub(display_width(&text));
+                line = Line::from(Span::styled(format!("{text}{}", " ".repeat(fill)), palette.copy_selection()));
+            }
+            lines.push(line);
+        }
+    }
+
+    (lines, selected_line)
+}
+
+fn fullscreen_detail_lines(
+    model: &PickerModel,
+    detail: Option<&ContextInfo>,
+    width: usize,
+    palette: &Palette,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled("─".repeat(width), palette.divider()))];
+    let Some(info) = detail else {
+        lines.push(Line::from(Span::styled("  (nothing selected)", palette.divider())));
+        return lines;
+    };
+    let label = if info.label.is_empty() { info.id.short() } else { info.label.clone() };
+    let performer = info.performer.as_deref().unwrap_or(crate::app::NO_PERFORMER);
+    let model_name = if info.model.is_empty() { "-" } else { info.model.as_str() };
+    let tokens = info
+        .context_used_tokens
+        .map(|used| {
+            crate::status::TokenFigure { used, window: info.context_window }
+                .figure()
+                .text
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let cost = info
+        .cost
+        .as_ref()
+        .map(|c| crate::status::cost_figure(c).text)
+        .unwrap_or_else(|| "—".to_string());
+    let row1 = format!("  {label} ({}) · {performer} · {model_name} · {tokens} · {cost}", info.id.short());
+    lines.push(Line::from(Span::styled(truncate_chars(&row1, width), palette.compose())));
+
+    let cwd = info
+        .cwd
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let row2 = format!("  cwd: {cwd}");
+    lines.push(Line::from(Span::styled(truncate_chars(&row2, width), palette.divider())));
+
+    let preview = model
+        .selected_row_tail()
+        .or(info.top_block_preview.as_deref())
+        .unwrap_or("");
+    let row3 = format!("  {preview}");
+    lines.push(Line::from(Span::styled(truncate_chars(&row3, width), palette.status())));
+    lines
+}
+
+impl PickerModel {
+    fn selected_row_tail(&self) -> Option<&str> {
+        if self.horizon_open {
+            return self.visible_horizon().get(self.index).and_then(|r| r.tail.as_deref());
+        }
+        match self.section {
+            Section::Active => self.visible_active().get(self.index).and_then(|r| r.tail.as_deref()),
+            Section::Recent => self.visible_recent().get(self.index).and_then(|r| r.tail.as_deref()),
+            Section::Tracks => None,
+        }
+    }
 }
 
 #[cfg(test)]

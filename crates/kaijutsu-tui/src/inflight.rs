@@ -128,13 +128,42 @@ pub fn animating(entries: &[Entry]) -> bool {
     entries.iter().any(|e| e.doing == Doing::Running)
 }
 
-/// The strip row at `width`: every entry as its own region on a faint
-/// ground, joined by a space of the strip's own ground, padded to the full
-/// width so the ground reads as one row. Empty entries give an empty row of
-/// the same ground. `phase` turns the running entries' spinner and breathes
-/// their ground; a waiting entry is still.
-pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette, phase: u8) -> Line<'static> {
+/// The separator / in-flight row at `width`:
+/// - When idle (`entries` empty and not `streaming`), a clean horizontal rule
+///   (`─`) in the divider style so the transcript and compose area are clearly
+///   separated without an empty tinted slab.
+/// - When `streaming` with no unsettled tool calls, a subtle animated
+///   `─ ◐ streaming… ───` indicator on the rule.
+/// - When tool calls are in flight, each entry as a tinted chip followed by a
+///   rule filling the rest of the width. Always exactly `width` display cells.
+pub fn strip_line(
+    entries: &[Entry],
+    width: u16,
+    palette: &Palette,
+    phase: u8,
+    streaming: bool,
+) -> Line<'static> {
     let width = usize::from(width.max(1));
+    if entries.is_empty() {
+        if !streaming {
+            return Line::from(Span::styled("─".repeat(width), palette.divider()));
+        }
+        let label = format!("─ {} streaming… ", SPINNER[usize::from(phase % PHASES)]);
+        let label_w = label.chars().count();
+        if label_w >= width {
+            let clipped: String = label.chars().take(width).collect();
+            return Line::from(Span::styled(clipped, palette.status()));
+        }
+        return Line::from(vec![
+            Span::styled("─ ".to_string(), palette.divider()),
+            Span::styled(
+                format!("{} streaming… ", SPINNER[usize::from(phase % PHASES)]),
+                palette.status(),
+            ),
+            Span::styled("─".repeat(width - label_w), palette.divider()),
+        ]);
+    }
+
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for (i, entry) in entries.iter().enumerate() {
@@ -145,7 +174,7 @@ pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette, phase: u8) -
             let left = width.saturating_sub(used + sep);
             if left > 1 {
                 if sep == 1 {
-                    spans.push(Span::styled(" ".to_string(), palette.strip()));
+                    spans.push(Span::styled(" ".to_string(), palette.divider()));
                 }
                 let clipped: String = text.chars().take(left - 1).collect::<String>() + "…";
                 spans.push(Span::styled(clipped, palette.strip_region(&entry.doing, phase)));
@@ -154,13 +183,13 @@ pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette, phase: u8) -
             break;
         }
         if sep == 1 {
-            spans.push(Span::styled(" ".to_string(), palette.strip()));
+            spans.push(Span::styled(" ".to_string(), palette.divider()));
         }
         spans.push(Span::styled(text, palette.strip_region(&entry.doing, phase)));
         used += sep + cell;
     }
     if used < width {
-        spans.push(Span::styled(" ".repeat(width - used), palette.strip()));
+        spans.push(Span::styled("─".repeat(width - used), palette.divider()));
     }
     Line::from(spans)
 }
@@ -293,8 +322,8 @@ mod tests {
             }]
         );
         assert_eq!(
-            text(&strip_line(&entries, 80, &Palette::builtin(), 0)).trim_end(),
-            " ◐ shell cargo test -p kaijutsu-kernel · 4s"
+            text(&strip_line(&entries, 80, &Palette::builtin(), 0, false)).trim_end_matches('─'),
+            " ◐ shell cargo test -p kaijutsu-kernel · 4s "
         );
     }
 
@@ -310,7 +339,7 @@ mod tests {
         let entries = entries([&c, &r].into_iter(), 3_600_000, &asks);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].doing, Doing::Waiting { ask: Some("01a0686d-895e-7b31-aa17-e497ed849f67".to_string()) });
-        let line = text(&strip_line(&entries, 80, &Palette::builtin(), 2));
+        let line = text(&strip_line(&entries, 80, &Palette::builtin(), 2, false));
         assert!(line.contains("⏳ shell_write cargo test · waiting on ask 01a0686d · 1h00m"), "{line:?}");
         assert!(!animating(&entries), "a held ask has nothing to animate");
     }
@@ -409,13 +438,16 @@ mod tests {
         let entries = entries([&a, &b].into_iter(), 1000, &NoAsks::new());
         assert_eq!(entries.len(), 2);
         for width in [12u16, 30, 80] {
-            let line = strip_line(&entries, width, &Palette::builtin(), 0);
+            let line = strip_line(&entries, width, &Palette::builtin(), 0, false);
             assert_eq!(text(&line).chars().count(), usize::from(width), "width {width}");
         }
-        let wide = text(&strip_line(&entries, 80, &Palette::builtin(), 0));
+        let wide = text(&strip_line(&entries, 80, &Palette::builtin(), 0, false));
         assert!(wide.contains("◐ shell cargo build · 1s") && wide.contains("◐ grep fn main · 1s"), "{wide:?}");
-        let empty = text(&strip_line(&[], 20, &Palette::builtin(), 0));
-        assert_eq!(empty, " ".repeat(20));
+        let empty = text(&strip_line(&[], 20, &Palette::builtin(), 0, false));
+        assert_eq!(empty, "─".repeat(20));
+        let streaming = text(&strip_line(&[], 30, &Palette::builtin(), 0, true));
+        assert!(streaming.contains("◐ streaming…"), "{streaming:?}");
+        assert_eq!(streaming.chars().count(), 30);
     }
 
     /// A running entry turns its spinner and breathes its ground with the
@@ -426,7 +458,7 @@ mod tests {
         let c = call(ctx, 1, Status::Running, "shell", "{}", 0);
         let entries = entries([&c].into_iter(), 1000, &NoAsks::new());
         assert!(animating(&entries));
-        let frames: Vec<Line<'static>> = (0..PHASES).map(|p| strip_line(&entries, 40, &Palette::builtin(), p)).collect();
+        let frames: Vec<Line<'static>> = (0..PHASES).map(|p| strip_line(&entries, 40, &Palette::builtin(), p, false)).collect();
         let glyphs: Vec<char> = frames.iter().map(|l| text(l).trim_start().chars().next().unwrap()).collect();
         assert_eq!(glyphs, SPINNER.to_vec());
         let grounds: Vec<_> = frames.iter().map(|l| l.spans[0].style.bg).collect();

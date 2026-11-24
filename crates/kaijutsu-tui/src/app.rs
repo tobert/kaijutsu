@@ -281,9 +281,10 @@ pub struct App {
     /// The picker's single-line tail buffer, fed from the same kernel-wide
     /// stream, independent of which context is watched.
     pub tails: crate::picker::PickerTails,
-    /// The picker, when `Ctrl+A "` has it open — `render::overlay_lines`
-    /// draws it and the key path routes to it.
+    /// The full-screen context browser (`Ctrl+A "` / `Ctrl+A w`), when open.
     pub picker: Option<crate::picker::PickerModel>,
+    /// The full-screen message board browser (`Ctrl+A b`), when open.
+    pub boards: Option<crate::boards::BoardsModel>,
     /// A kj verb this client ran may have changed the roster: a placement
     /// from the picker or any `:kj` line. The loop takes it and starts a
     /// refresh round now.
@@ -341,6 +342,7 @@ impl App {
             beats: kaijutsu_present::beats::WellBeats::default(),
             tails: crate::picker::PickerTails::new(),
             picker: None,
+            boards: None,
             track_pulse: false,
             focused: true,
             roster_changed: false,

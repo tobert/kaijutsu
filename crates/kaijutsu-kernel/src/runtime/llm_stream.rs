@@ -502,14 +502,17 @@ fn handle_hydration_outcome(
                     snapshot
                 }
             };
-            // If eligible blocks landed after `after_block_id` before hydration
-            // ran (e.g. a queued turn or a caller that anchored earlier in the
-            // log), they are now part of the prompt this turn answers; advance
-            // the write point so the model's reply lands after them rather than
-            // burying them at the tail. Unsent drafts stay unseen and ineligible.
+            // If blocks landed after `after_block_id` before hydration ran
+            // (e.g. a queued turn, an RC trace/error projection, or a caller
+            // that anchored earlier in the log), advance the write point past
+            // them so the model's reply lands at the tail rather than above
+            // them. Unsent drafts and held drifts stay unseen and after the
+            // write point; eligible blocks must already be seen by the mailbox.
             if let Some(pos) = blocks.iter().position(|b| b.id == *after_block_id)
                 && let Some(tail) = blocks[pos + 1..].iter().rfind(|b| {
-                    mailbox.has_seen(&b.id) && crate::llm::hydrate::is_history_eligible(b)
+                    b.status != Status::Draft
+                        && !b.is_held_drift()
+                        && (mailbox.has_seen(&b.id) || !crate::llm::hydrate::is_history_eligible(b))
                 })
             {
                 *after_block_id = tail.id;
@@ -987,6 +990,30 @@ pub(crate) use crate::llm::hydrate::{InstructionForm, SYSTEM_MESSAGES_TOOL, syst
 /// best on Gemma 4 over mkviolet; see `docs/conversation-session.md`,
 /// "Kernel instructions".
 pub(crate) const INSTRUCTION_FORM: InstructionForm = InstructionForm::SystemMessagesTool;
+
+/// Advance `anchor` past any non-history-eligible, non-draft blocks (such as
+/// async RC `Trace` blocks) that landed after it mid-turn, stopping before any
+/// history-eligible block (like live user input) or held drift so `live_tail`
+/// still delivers it. Unsent drafts are skipped without becoming the anchor.
+fn advance_past_non_history_blocks(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    anchor: &mut kaijutsu_types::BlockId,
+) {
+    if let Ok(blocks) = documents.block_snapshots(context_id)
+        && let Some(pos) = blocks.iter().position(|b| b.id == *anchor)
+    {
+        for block in &blocks[pos + 1..] {
+            if block.status == Status::Draft {
+                continue;
+            }
+            if block.is_held_drift() || crate::llm::hydrate::is_history_eligible(block) {
+                break;
+            }
+            *anchor = block.id;
+        }
+    }
+}
 
 /// Record a kernel instruction and deliver it with any input pending after
 /// the turn's write point. The block follows that input in the log, so
@@ -1586,6 +1613,117 @@ mod hydration_tests {
             !wire.contains("ARCHIVED"),
             "the archived middle must not reach the wire; got: {wire}"
         );
+    }
+
+    /// RC scripts append `BlockKind::Trace` blocks at the tail of the document.
+    /// Hydration must advance `after_block_id` past those trace blocks so the
+    /// model's streamed reply lands below them rather than pinning RC messages
+    /// at the bottom of the transcript, while still stopping before an unsent
+    /// `Status::Draft`.
+    #[test]
+    fn hydration_advances_after_block_id_past_rc_trace_blocks_but_not_drafts() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+        let p = PrincipalId::new();
+        let user_block = documents
+            .insert_block_as(
+                context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+                Some(p),
+            )
+            .expect("insert user block");
+        let rc_trace = documents
+            .insert_block_as(
+                context_id,
+                None,
+                Some(&user_block),
+                Role::System,
+                BlockKind::Trace,
+                " * S10 coder/prompt/S10-env.kai  [ ok ]",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::system()),
+            )
+            .expect("insert rc trace block");
+        let _draft = documents
+            .insert_block_as(
+                context_id,
+                None,
+                Some(&rc_trace),
+                Role::User,
+                BlockKind::Text,
+                "typing next...",
+                Status::Draft,
+                ContentType::Plain,
+                Some(p),
+            )
+            .expect("insert draft block");
+
+        let mut anchor = user_block;
+        let mut mailbox = crate::ConversationMailbox::new();
+        let _ = hydrate_messages(&documents, context_id, &mut anchor, &mut mailbox, None)
+            .expect("hydration succeeds");
+        assert_eq!(
+            anchor, rc_trace,
+            "write anchor must advance past RC Trace blocks and stop before Status::Draft"
+        );
+    }
+
+    /// Mid-turn RC `Trace` blocks that append after the turn's current block
+    /// must be skipped past before inserting the next streamed block, without
+    /// skipping past unseen live user input or anchoring onto an unsent draft.
+    #[test]
+    fn advance_past_non_history_blocks_skips_mid_turn_traces_without_skipping_live_input() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+        let p = PrincipalId::new();
+        let model_block = documents
+            .insert_block_as(
+                context_id, None, None, Role::Model, BlockKind::Thinking, "hmm",
+                Status::Done, ContentType::Plain, Some(p),
+            )
+            .expect("insert model block");
+        let draft = documents
+            .insert_block_as(
+                context_id, None, Some(&model_block), Role::User, BlockKind::Text, "wip",
+                Status::Draft, ContentType::Plain, Some(p),
+            )
+            .expect("insert draft");
+
+        // Only a draft after anchor -> anchor stays on model_block.
+        let mut anchor = model_block;
+        advance_past_non_history_blocks(&documents, context_id, &mut anchor);
+        assert_eq!(anchor, model_block, "never anchor onto an unsent draft");
+
+        // RC trace appends after draft, followed by live user input -> anchor
+        // advances to rc_trace and stops before live_input.
+        let rc_trace = documents
+            .insert_block_as(
+                context_id, None, Some(&draft), Role::System, BlockKind::Trace, " * S10 [ ok ]",
+                Status::Done, ContentType::Plain, Some(PrincipalId::system()),
+            )
+            .expect("insert rc trace");
+        let _live_input = documents
+            .insert_block_as(
+                context_id, None, Some(&rc_trace), Role::User, BlockKind::Text, "wait",
+                Status::Done, ContentType::Plain, Some(p),
+            )
+            .expect("insert live input");
+
+        advance_past_non_history_blocks(&documents, context_id, &mut anchor);
+        assert_eq!(anchor, rc_trace, "advance past RC trace, stop before live user input");
     }
 }
 
@@ -3555,6 +3693,7 @@ async fn run_llm_stream(
                     // Open a fresh reasoning entry for this block (its deltas
                     // append here; ThinkingEnd stamps its signature).
                     assistant_reasoning.push((String::new(), None));
+                    advance_past_non_history_blocks(&documents, context_id, &mut last_block_id);
                     let block_id = documents.insert_block_as(
                         context_id,
                         None,
@@ -3593,6 +3732,7 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::TextStart => {
+                    advance_past_non_history_blocks(&documents, context_id, &mut last_block_id);
                     let block_id = documents.insert_block_as(
                         context_id,
                         None,
@@ -3625,6 +3765,7 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::ToolUse { id, name, input, signature } => {
+                    advance_past_non_history_blocks(&documents, context_id, &mut last_block_id);
                     let call = documents.insert_tool_call_as(context_id, None, Some(&last_block_id), &name,
                         input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal), Some(id.clone()), None)?;
                     if let Some(sig) = signature.as_deref().filter(|s| !s.is_empty()) {

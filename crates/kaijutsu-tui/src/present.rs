@@ -60,6 +60,7 @@ pub struct Palette {
     heading: Color,
     code: Color,
     selection_bg: Color,
+    bar_bg: Color,
     ansi: Option<[Color; 16]>,
 }
 
@@ -93,6 +94,7 @@ impl Palette {
             heading: Color::LightYellow,
             code: Color::LightCyan,
             selection_bg: Color::DarkGray,
+            bar_bg: Color::Indexed(236),
             ansi: None,
         }
     }
@@ -120,6 +122,7 @@ impl Palette {
             heading: Color::Rgb(224, 175, 104),       // #e0af68
             code: Color::Rgb(125, 207, 255),          // #7dcfff
             selection_bg: Color::Rgb(51, 70, 124),    // #33467c
+            bar_bg: Color::Rgb(31, 35, 53),           // #1f2335
             ansi: Some([
                 Color::Rgb(21, 22, 30),    // 0 black
                 Color::Rgb(247, 118, 142), // 1 red
@@ -186,6 +189,9 @@ impl Palette {
         }
         if let Some(c) = get_hex("selection_bg") {
             p.selection_bg = c;
+        }
+        if let Some(c) = get_hex("bar_bg").or_else(|| get_hex("bg_surface")) {
+            p.bar_bg = c;
         }
         if let Some(ansi_tbl) = doc.get("ansi").and_then(|v| v.as_table()) {
             let mut table = p.ansi.unwrap_or([Color::Reset; 16]);
@@ -268,6 +274,58 @@ impl Palette {
     /// The status line.
     pub fn status(&self) -> Style {
         Style::new().fg(self.accent)
+    }
+
+    /// Background color for the bottom status bar.
+    fn status_bar_bg(&self) -> Color {
+        if self.light_ground {
+            Color::Indexed(254)
+        } else {
+            self.bar_bg
+        }
+    }
+
+    /// Base style for the bottom status bar.
+    pub fn status_bar(&self) -> Style {
+        Style::new().fg(self.tool_result).bg(self.status_bar_bg())
+    }
+
+    /// Highlighted active seat on the bottom status bar.
+    pub fn status_active(&self) -> Style {
+        Style::new()
+            .fg(self.accent)
+            .bg(self.status_bar_bg())
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Distinct mode label on the bottom status bar (`-- INSERT --`, `-- NORMAL --`, etc.).
+    pub fn status_mode(&self, mode: &str) -> Style {
+        let fg = if mode.contains("INSERT") {
+            self.success
+        } else if mode.contains("VISUAL") {
+            self.drift_push
+        } else if mode.contains("REPLACE") {
+            self.warning
+        } else {
+            self.accent
+        };
+        Style::new()
+            .fg(fg)
+            .bg(self.status_bar_bg())
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Warning figure on the bottom status bar.
+    pub fn status_warning(&self) -> Style {
+        Style::new().fg(self.warning).bg(self.status_bar_bg())
+    }
+
+    /// Alarm figure on the bottom status bar.
+    pub fn status_alarm(&self) -> Style {
+        Style::new()
+            .fg(self.error)
+            .bg(self.status_bar_bg())
+            .add_modifier(Modifier::BOLD)
     }
 
     /// A status-line figure that needs attention (a cache past 80% of its
