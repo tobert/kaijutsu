@@ -2346,9 +2346,10 @@ impl KjDispatcher {
     /// settings, the predecessor's senpai), env, and cwd land in one
     /// transaction, unlabeled. The `create` rc lifecycle runs next and cannot
     /// share a transaction. Only a successor with a usable loadout takes over:
-    /// one more transaction archives the predecessor and moves its label, ring
-    /// seat and `handoff_ctx` and `root_ctx` pointers, after the predecessor's
-    /// `archive` rc lifecycle runs. The kernel moves no kohai. Otherwise the
+    /// one more transaction archives the predecessor, reparents its live kohai
+    /// to the successor, and moves its label, ring seat and `handoff_ctx` and
+    /// `root_ctx` pointers, after the predecessor's `archive` rc lifecycle
+    /// runs. Archived kohai keep their historical `senpai_ctx`. Otherwise the
     /// predecessor stays live and the successor stays unlabeled for
     /// inspection. The hydration window is not copied: its marker names a
     /// block in the predecessor.
@@ -6208,11 +6209,10 @@ mod tests {
         assert_eq!(db.list_watches(f.seat).unwrap()[0].changes, 1, "the archived predecessor's watch is inert");
     }
 
-    /// The successor keeps the predecessor's senpai. The kernel moves no
-    /// kohai: they keep answering to the archived predecessor, whose
-    /// character still reviews their asks, until the successor takes them
-    /// with `kj context set <ctx> --senpai <ctx>`. An archived context is not listed.
-    async fn rotate_keeps_the_senpai_and_moves_no_kohai_body() {
+    /// The successor keeps the predecessor's senpai and inherits all live
+    /// kohai. Archived kohai stay pointing at the archived predecessor and are
+    /// not listed by `list_kohai`.
+    async fn rotate_keeps_the_senpai_and_reparents_live_kohai_body() {
         let f = rotation_fixture().await;
         let lane = register_context(&f.d, Some("seat-lane"), Some(f.seat), f.amy);
         let old_lane = register_context(&f.d, Some("seat-old-lane"), Some(f.seat), f.amy);
@@ -6232,32 +6232,26 @@ mod tests {
         let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
 
         assert_eq!(senpai(successor), seat_senpai, "the successor answers to the predecessor's senpai");
-        assert_eq!(senpai(lane), Some(f.seat), "the kernel moves no kohai");
-        assert_eq!(senpai(old_lane), Some(f.seat));
+        assert_eq!(senpai(lane), Some(successor), "live kohai follow the rotated senpai");
+        assert_eq!(senpai(old_lane), Some(f.seat), "archived kohai stay on the archived predecessor");
         let db = f.d.kernel_db().lock();
-        assert!(db.list_kohai(successor).unwrap().is_empty(), "the successor has no kohai until it takes them");
         assert_eq!(
-            db.list_kohai(f.seat).unwrap().into_iter().map(|row| row.context_id).collect::<Vec<_>>(),
+            db.list_kohai(successor).unwrap().into_iter().map(|row| row.context_id).collect::<Vec<_>>(),
             vec![lane],
-            "the predecessor's kohai are the live ones"
+            "the successor inherits live kohai"
         );
+        assert!(db.list_kohai(f.seat).unwrap().is_empty(), "the archived predecessor has no live kohai left");
         assert_eq!(
             db.route_review(crate::kernel_db::ReviewQuery::ask(lane, f.coder)).unwrap().reviewer(),
             f.banto,
-            "and their asks reach the same character through the archived predecessor"
-        );
-        drop(db);
-        f.d.kernel_db().lock().set_context_senpai(lane, Some(successor)).unwrap();
-        assert_eq!(
-            f.d.kernel_db().lock().list_kohai(successor).unwrap().into_iter().map(|row| row.context_id).collect::<Vec<_>>(),
-            vec![lane],
-            "the successor takes a context with `kj context set --senpai`"
+            "and their asks reach the same character through the successor"
         );
     }
 
-    /// A rotated root console has no senpai and becomes the root character's
-    /// console at the commit; the seats under the old console stay with it.
-    async fn rotate_a_root_moves_its_console_and_no_kohai_body() {
+    /// A rotated root console has no senpai, becomes the root character's
+    /// console at the commit, and reparents live seats under the old console
+    /// to the successor.
+    async fn rotate_a_root_moves_its_console_and_reparents_live_kohai_body() {
         let f = rotation_fixture().await;
         let rotated = f.d.dispatch(&[s("context"), s("rotate"), s("amy")], &rotation_caller(f.root, f.amy)).await;
         assert!(rotated.is_ok(), "{}", rotated.message());
@@ -6266,23 +6260,24 @@ mod tests {
         assert_ne!(successor, f.root);
         assert_eq!(db.root_console(f.amy).unwrap(), Some(successor));
         assert_eq!(db.senpai_of(successor).unwrap(), None);
-        assert!(db.list_kohai(successor).unwrap().is_empty(), "the kernel moves no kohai");
+        assert_eq!(db.senpai_of(f.seat).unwrap(), Some(successor), "live seats follow the rotated root console");
         assert_eq!(
-            db.list_kohai(f.root).unwrap().into_iter().map(|row| row.context_id).collect::<Vec<_>>(),
+            db.list_kohai(successor).unwrap().into_iter().map(|row| row.context_id).collect::<Vec<_>>(),
             vec![f.seat],
-            "the seat still answers to the archived console"
+            "the rotated root console inherits its live seats"
         );
+        assert!(db.list_kohai(f.root).unwrap().is_empty(), "the archived console has no live seats left");
         assert_eq!(db.lineage_root(f.seat).unwrap(), f.amy);
     }
 
     #[test]
-    fn rotate_keeps_the_senpai_and_moves_no_kohai() {
-        crate::on_rc_thread(rotate_keeps_the_senpai_and_moves_no_kohai_body);
+    fn rotate_keeps_the_senpai_and_reparents_live_kohai() {
+        crate::on_rc_thread(rotate_keeps_the_senpai_and_reparents_live_kohai_body);
     }
 
     #[test]
-    fn rotate_a_root_moves_its_console_and_no_kohai() {
-        crate::on_rc_thread(rotate_a_root_moves_its_console_and_no_kohai_body);
+    fn rotate_a_root_moves_its_console_and_reparents_live_kohai() {
+        crate::on_rc_thread(rotate_a_root_moves_its_console_and_reparents_live_kohai_body);
     }
 
     #[test]

@@ -485,17 +485,19 @@ fn set_context_senpai_moves_a_kohai_and_refuses_cycles_and_missing_rows() {
     assert_eq!(edge(&bare), Some(a.context_id));
 }
 
-/// A rotation moves no kohai: they keep pointing at the archived
-/// predecessor. It repoints a handoff log's pointer, and only that
-/// character's.
+/// A rotation reparents live kohai to the successor while leaving archived
+/// kohai on the archived predecessor. It repoints a handoff log's pointer,
+/// and only that character's.
 #[test]
-fn commit_rotation_leaves_the_kohai_and_repoints_a_handoff_log() {
+fn commit_rotation_reparents_live_kohai_and_repoints_a_handoff_log() {
     let db = KernelDb::temporary().unwrap();
     let ws_id = setup_test_db(&db);
     let [owner, other, kohai_character] = seed_characters(&db, &["owner", "other", "kohai"])[..] else { unreachable!() };
     let top = senpai_ctx_row(&db, ws_id, "rot-top", None, Some(owner));
     let old = senpai_ctx_row(&db, ws_id, "rot-old", Some(&top), Some(other));
     let kohai = senpai_ctx_row(&db, ws_id, "rot-kohai", Some(&old), Some(kohai_character));
+    let archived_kohai = senpai_ctx_row(&db, ws_id, "rot-archived-kohai", Some(&old), Some(kohai_character));
+    db.archive_context(archived_kohai.context_id).unwrap();
     let new = senpai_ctx_row(&db, ws_id, "rot-new", None, None);
     db.write_context_character(new.context_id, other, Some(top.context_id), None).unwrap();
 
@@ -504,8 +506,14 @@ fn commit_rotation_leaves_the_kohai_and_repoints_a_handoff_log() {
     db.set_character_handoff_ctx(owner, Some(handoff.context_id)).unwrap();
 
     assert_eq!(db.commit_rotation(old.context_id, new.context_id).unwrap().handoffs_moved, 0, "no handoff log pointed at it");
-    assert_eq!(db.senpai_of(kohai.context_id).unwrap(), Some(old.context_id), "the kohai still answer to the predecessor");
-    assert!(db.list_kohai(new.context_id).unwrap().is_empty(), "the successor has none until it takes them");
+    assert_eq!(db.senpai_of(kohai.context_id).unwrap(), Some(new.context_id), "live kohai follow the rotated senpai");
+    assert_eq!(db.senpai_of(archived_kohai.context_id).unwrap(), Some(old.context_id), "archived kohai stay on the archived predecessor");
+    assert_eq!(
+        db.list_kohai(new.context_id).unwrap().into_iter().map(|r| r.context_id).collect::<Vec<_>>(),
+        vec![kohai.context_id],
+        "the successor inherits live kohai"
+    );
+    assert!(db.list_kohai(old.context_id).unwrap().is_empty(), "the archived predecessor has no remaining live kohai");
     assert!(db.get_context(old.context_id).unwrap().unwrap().is_archived());
 
     assert_eq!(db.commit_rotation(handoff.context_id, handoff_next.context_id).unwrap().handoffs_moved, 1);
