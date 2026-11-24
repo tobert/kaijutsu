@@ -108,7 +108,7 @@ fn startup_draws_the_transcript_and_the_band() {
     let rows = session.screen_text();
     assert_eq!(rows.len(), 24, "{}", session.dump("startup"));
     assert!(!rows[23].trim().is_empty(), "expected the status line on the last row:\n{}", session.dump("startup"));
-    assert!(rows[21].trim().is_empty(), "expected the blank row over the draft:\n{}", session.dump("startup"));
+    assert!(rows[21].contains('─'), "expected the separator row over the draft:\n{}", session.dump("startup"));
 
     // The draft is on screen exactly once, and the transcript above it
     // carries the lifecycle's own blocks.
@@ -259,29 +259,34 @@ fn the_picker_opens_as_an_overlay_and_leaves_the_transcript_intact() {
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
-    // A row worth watching right above the band: blank rows would make a
+    // A row worth watching in the transcript: blank rows would make a
     // lost redraw invisible.
     session.send(":!echo marker-row\r");
     let marked = session.wait_until(Duration::from_secs(20), |screen| {
         let rows: Vec<String> = screen.rows(0, 80).collect();
-        compose_row(&rows) == Some(22) && rows[19].contains("marker-row")
+        compose_row(&rows) == Some(22) && rows[..21].iter().any(|r| r.contains("marker-row"))
     });
     assert!(marked, "no transcript row landed above the band: {}", session.dump("marker"));
     let before = session.screen_text();
+    let marker_idx = before[..21]
+        .iter()
+        .position(|r| r.contains("marker-row"))
+        .expect("marker row index");
 
-    // Ctrl+A, then `"` — opens the picker (`crates/kaijutsu-tui/src/keys.rs`
-    // `ctrl_a_quote_opens_the_picker`).
+    // Ctrl+A, then `"` — opens the full-screen context browser.
     session.send("\x01\"");
-    let opened = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "ACTIVE"));
+    let opened = session.wait_until(Duration::from_secs(5), |screen| {
+        screen_contains_str(screen, "CONTEXTS") && screen_contains_str(screen, "ACTIVE")
+    });
     assert!(opened, "picker never opened: {}", session.dump("picker open"));
 
     let open_rows = session.screen_text();
-    let picker_top = picker_row(&open_rows).expect("picker's ACTIVE header is drawn");
-    let compose = compose_row(&open_rows).expect("the band keeps the draft under the overlay");
-    assert!(picker_top < compose, "the picker draws above the band: {}", session.dump("picker open"));
+    assert!(open_rows[0].contains("CONTEXTS"), "header is on row 0: {}", session.dump("picker open"));
+    assert!(picker_row(&open_rows).is_some(), "picker's ACTIVE header is drawn");
+    assert!(compose_row(&open_rows).is_none(), "full-screen picker hides the compose band: {}", session.dump("picker open"));
     assert!(
         !open_rows[23].trim().is_empty(),
-        "the status line is still the last row: {}",
+        "the key-hints footer is on the last row: {}",
         session.dump("picker open")
     );
 
@@ -294,9 +299,9 @@ fn the_picker_opens_as_an_overlay_and_leaves_the_transcript_intact() {
 
     let after = session.screen_text();
     assert_eq!(
-        after[19].trim_end(),
-        before[19].trim_end(),
-        "the transcript row above the band did not come back:\n{}",
+        after[marker_idx].trim_end(),
+        before[marker_idx].trim_end(),
+        "the transcript row did not come back:\n{}",
         session.dump("after closing picker")
     );
     assert_eq!(compose_row(&after), Some(22), "the band is where it was: {}", session.dump("after closing picker"));
@@ -307,6 +312,31 @@ fn the_picker_opens_as_an_overlay_and_leaves_the_transcript_intact() {
             session.dump("after closing picker")
         );
     }
+}
+
+/// `Ctrl+A b` opens the full-screen message board browser, and `q` closes it
+/// back to the conversation.
+#[test]
+fn ctrl_a_b_opens_and_closes_the_boards_browser() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 96);
+    wait_for_attach(&session);
+
+    session.send("\x01b");
+    let opened = session.wait_until(Duration::from_secs(10), |screen| {
+        screen_contains_str(screen, "BOARDS") && screen_contains_str(screen, "TOPICS")
+    });
+    assert!(opened, "boards browser never opened: {}", session.dump("boards open"));
+
+    let open_rows = session.screen_text();
+    assert!(open_rows[0].contains("BOARDS"), "header on row 0: {}", session.dump("boards open"));
+    assert!(compose_row(&open_rows).is_none(), "full-screen boards hides compose: {}", session.dump("boards open"));
+
+    session.send("q");
+    let closed = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen_contains_str(screen, "TOPICS") && screen_contains(screen, '\u{276f}')
+    });
+    assert!(closed, "boards browser never closed: {}", session.dump("boards close"));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -392,7 +422,7 @@ fn rows_shifted_up(before: &[String], after: &[String]) -> Option<usize> {
 }
 
 /// Rows of the transcript area — everything above the band at 24x80.
-const TRANSCRIPT_ROWS: usize = 20;
+const TRANSCRIPT_ROWS: usize = 21;
 
 /// Whether the transcript area holds `needle`. Scoped to the rows above the
 /// band, so the `:` bar and the status row cannot answer for it.

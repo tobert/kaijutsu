@@ -51,11 +51,17 @@ impl Figure {
         }
     }
 
-    fn span(&self, palette: &Palette) -> Span<'static> {
-        let style = match self.severity {
-            Severity::Ok => palette.status(),
-            Severity::Warning => palette.warning(),
-            Severity::Alarm => palette.alarm(),
+    fn span_for(&self, palette: &Palette, highlight: bool, is_mode: bool) -> Span<'static> {
+        let style = if is_mode {
+            palette.status_mode(&self.text)
+        } else if highlight && self.severity == Severity::Ok {
+            palette.status_active()
+        } else {
+            match self.severity {
+                Severity::Ok => palette.status_bar(),
+                Severity::Warning => palette.status_warning(),
+                Severity::Alarm => palette.status_alarm(),
+            }
         };
         Span::styled(self.text.clone(), style)
     }
@@ -379,7 +385,7 @@ pub fn status_line(model: &StatusModel, width: u16, palette: &Palette) -> Line<'
     if right_w + 2 > width {
         // No room for the facts; the rank alone gets the line.
         let mut spans: Vec<Span<'static>> = Vec::new();
-        push_joined(&mut spans, &left, palette);
+        push_left_joined(&mut spans, &left, model, palette);
         return Line::from(spans);
     }
     while !left.is_empty() && join_width(&left) + right_w + 2 > width {
@@ -395,24 +401,24 @@ pub fn status_line(model: &StatusModel, width: u16, palette: &Palette) -> Line<'
 
     let left_w = join_width(&left);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    push_joined(&mut spans, &left, palette);
+    push_left_joined(&mut spans, &left, model, palette);
     spans.push(Span::styled(
         " ".repeat(width - left_w - right_w),
-        palette.status(),
+        palette.status_bar(),
     ));
-    push_joined(&mut spans, &right, palette);
+    push_right_joined(&mut spans, &right, model, palette);
     Line::from(spans)
 }
 
-/// The armed-prefix legend, which replaces the status line while `Ctrl+A` is
+/// The armed-prefix legend, which replaces the compose row while `Ctrl+A` is
 /// pending. `docs/input.md`, "The prefix table" — the chords this client
 /// answers today, in that table's order.
 pub fn legend_line(width: u16, palette: &Palette) -> Line<'static> {
     // Widest first; the first tier that fits wins, and the last is the floor.
     let tiers = [
-        "Ctrl+A: 0-9 seat · n/p step · Ctrl+A last · \" picker · ' switch · A rename · r rotate · l ledger · [ copy · ] paste · Esc cancel",
-        "Ctrl+A: 0-9 · n/p · ^A last · \" pick · ' switch · A name · r rotate · l ledger · [ copy · ] paste",
-        "Ctrl+A: 0-9 seat · Ctrl+A last · \" picker",
+        "Ctrl+A: 0-9 seat · n/p step · Ctrl+A last · \" picker · b boards · ' switch · A rename · r rotate · l ledger · [ copy · ] paste · Esc cancel",
+        "Ctrl+A: 0-9 · n/p · ^A · \" pick · b board · ' sw · A name · r rotate · l ledger · [ copy · ] paste",
+        "Ctrl+A: 0-9 · ^A last · \" picker · b boards",
     ];
     let width = usize::from(width.max(1));
     let text = tiers
@@ -433,12 +439,34 @@ fn join_width(figures: &[Figure]) -> usize {
         + 2 * (figures.len() - 1)
 }
 
-fn push_joined(spans: &mut Vec<Span<'static>>, figures: &[Figure], palette: &Palette) {
+fn push_left_joined(
+    spans: &mut Vec<Span<'static>>,
+    figures: &[Figure],
+    model: &StatusModel,
+    palette: &Palette,
+) {
     for (i, figure) in figures.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ", palette.status()));
+            spans.push(Span::styled("  ", palette.status_bar()));
         }
-        spans.push(figure.span(palette));
+        let highlight = model.notice.is_none()
+            && model.seats.get(i).is_some_and(|seat| seat.current);
+        spans.push(figure.span_for(palette, highlight, false));
+    }
+}
+
+fn push_right_joined(
+    spans: &mut Vec<Span<'static>>,
+    figures: &[Figure],
+    model: &StatusModel,
+    palette: &Palette,
+) {
+    for (i, figure) in figures.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", palette.status_bar()));
+        }
+        let is_mode = !model.mode.is_empty() && figure.text == model.mode;
+        spans.push(figure.span_for(palette, false, is_mode));
     }
 }
 

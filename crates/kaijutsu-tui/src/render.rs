@@ -12,21 +12,21 @@
 use chrono::{Local, TimeZone};
 use kaijutsu_types::{BlockSnapshot, Status};
 use ratatui::backend::Backend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
-use ratatui::{Terminal};
+use ratatui::Terminal;
 
 use crate::app::App;
 use crate::status::{legend_line, status_line};
 
-/// Rows the band always takes: the in-flight strip, the blank row over the
-/// draft, one draft row and the status line. A wrapped draft takes more,
-/// up to [`compose_rows_cap`] — [`band_rows`] is the real height.
-pub const BAND_ROWS: u16 = 4;
+/// Rows the band always takes: the separator/in-flight strip, one draft row,
+/// and the status bar. A wrapped draft takes more, up to [`compose_rows_cap`]
+/// — [`band_rows`] is the real height.
+pub const BAND_ROWS: u16 = 3;
 
-/// Rows the band takes at `width` right now: the strip, the blank row, the
-/// draft's own rows (capped at a third of the screen) and the status line.
+/// Rows the band takes at `width` right now: the strip, the draft's own rows
+/// (capped at a third of the screen), and the status bar.
 pub fn band_rows(app: &App, width: u16) -> u16 {
     let draft = crate::compose::input_lines(app, width, &app.palette)
         .len()
@@ -40,8 +40,8 @@ pub fn third_of_screen(app: &App) -> u16 {
     (app.screen_rows / 3).max(1)
 }
 
-/// Whether the in-flight strip has a running entry to animate — the event
-/// loop redraws on `inflight::PHASE_MILLIS` only while it does.
+/// Whether the in-flight strip has a running entry or active turn to animate
+/// — the event loop redraws on `inflight::PHASE_MILLIS` only while it does.
 ///
 /// Never while the terminal is unfocused: a spinner nobody is looking at is
 /// a redraw per phase step over ssh for no one (`docs/tui.md`, "What owning
@@ -49,6 +49,9 @@ pub fn third_of_screen(app: &App) -> u16 {
 pub fn strip_animating(app: &App) -> bool {
     if !app.focused {
         return false;
+    }
+    if app.current.is_some_and(|id| app.turn_running(id)) {
+        return true;
     }
     let Some(view) = app.current_view() else {
         return false;
@@ -470,22 +473,20 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
     let palette = app.palette;
     let mut lines = Vec::new();
 
-    // The in-flight strip: one row, always, so the band never resizes for a
-    // tool call coming or going — only the row's text changes.
+    // The separator / in-flight strip: one row, always, so the band never
+    // resizes for a tool call coming or going — only the row's text changes.
     let strip = match app.current_view() {
         Some(view) => crate::inflight::entries(view.mirror.blocks().iter(), now_millis, &crate::inflight::ask_index(&app.open_asks)),
         None => Vec::new(),
     };
+    let streaming = app.current.is_some_and(|id| app.turn_running(id));
     lines.push(crate::inflight::strip_line(
         &strip,
         width,
         &palette,
         crate::inflight::phase(now_millis),
+        streaming,
     ));
-
-    // One blank row separates what is being read from what is being typed
-    // (`docs/tui.md`, "Conversation").
-    lines.push(Line::default());
 
     // The draft wraps and takes up to a third of the screen. Past the cap it
     // shows the rows around the cursor, the way vim scrolls a long command
@@ -495,7 +496,7 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
     let cap = compose_rows_cap(app);
     debug_assert_eq!(
         usize::from(band_rows(app, width)),
-        input.len().min(cap.max(1)).max(1) + 3,
+        input.len().min(cap.max(1)).max(1) + 2,
         "the band's counted height and its drawn rows must agree"
     );
     if input.len() > cap {
@@ -538,17 +539,51 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
 /// cursor; a disarmed ask card leaves the keys, and the cursor, to the
 /// draft.
 fn overlay_holds_keys(app: &App) -> bool {
-    app.picker.is_some() || app.ask_card_armed() || app.ledger_view.is_some()
+    app.picker.is_some() || app.boards.is_some() || app.ask_card_armed() || app.ledger_view.is_some()
 }
 
-/// The overlay's rows: the picker, or an ask card or the ledger view,
-/// whichever is open, and empty when none is. One overlay at a time, drawn
-/// between the transcript and the band (`docs/tui.md`, "The owned screen").
+/// The overlay's rows: an ask card or the ledger view, whichever is open,
+/// and empty when none is. One overlay at a time, drawn between the
+/// transcript and the band. The context browser (`app.picker`) renders
+/// full-screen via [`draw_picker`].
 pub fn overlay_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
-    if let Some(picker) = &app.picker {
-        return crate::picker::render(picker, width, &app.palette);
-    }
     crate::asks::active_view_lines(app, width).unwrap_or_default()
+}
+
+/// Draw the full-screen context browser (`Ctrl+A "` / `Ctrl+A w`).
+pub fn draw_picker<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &App,
+    armed: bool,
+) -> Result<(), B::Error> {
+    let Some(picker) = app.picker.as_ref() else {
+        return Ok(());
+    };
+    let detail = picker.selected_context().and_then(|id| app.info(id));
+    let palette = app.palette;
+    let current = app.current;
+    let notice = app.notice();
+    terminal.draw(|frame| {
+        crate::picker::draw_fullscreen(frame, picker, current, detail, notice, armed, &palette);
+    })?;
+    Ok(())
+}
+
+/// Draw the full-screen message board browser (`Ctrl+A b`).
+pub fn draw_boards<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &App,
+    armed: bool,
+) -> Result<(), B::Error> {
+    let Some(boards) = app.boards.as_ref() else {
+        return Ok(());
+    };
+    let palette = app.palette;
+    let notice = app.notice();
+    terminal.draw(|frame| {
+        crate::boards::draw_fullscreen(frame, boards, notice, armed, &palette);
+    })?;
+    Ok(())
 }
 
 /// One frame of the owned screen: the transcript on top, the band at the
@@ -577,40 +612,30 @@ pub fn draw_screen<B: Backend>(
 
     terminal.draw(|frame| {
         let area = frame.area();
-        // The transcript is bottom-aligned in its own rows: a conversation
-        // shorter than the screen sits on the band the way a shell's output
-        // sits on its prompt.
-        let drawn = u16::try_from(transcript.len()).unwrap_or(u16::MAX).min(transcript_rows);
-        if drawn > 0 {
-            let rect = Rect {
-                y: area.y + transcript_rows - drawn,
-                height: drawn,
-                ..area
-            };
-            frame.render_widget(Paragraph::new(transcript), rect);
+        let [transcript_area, overlay_area, band_area] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(overlay_rows),
+            Constraint::Length(band_rows),
+        ])
+        .areas(area);
+
+        if transcript_area.height > 0 && !transcript.is_empty() {
+            frame.render_widget(Paragraph::new(transcript), transcript_area);
         }
-        if overlay_rows > 0 {
-            let start = overlay.len() - usize::from(overlay_rows);
-            let rect = Rect {
-                y: area.y + transcript_rows,
-                height: overlay_rows,
-                ..area
-            };
-            frame.render_widget(Paragraph::new(overlay[start..].to_vec()), rect);
+        if overlay_area.height > 0 {
+            let start = overlay.len().saturating_sub(usize::from(overlay_area.height));
+            frame.render_widget(Paragraph::new(overlay[start..].to_vec()), overlay_area);
         }
-        let start = band.lines.len() - usize::from(band_rows);
-        let rect = Rect {
-            y: area.y + height - band_rows,
-            height: band_rows,
-            ..area
-        };
-        frame.render_widget(Paragraph::new(band.lines[start..].to_vec()), rect);
-        // A cursor on a row the crop dropped stays hidden with the row.
-        if let Some((row, col)) = band.cursor
-            && let Some(y) = usize::from(row).checked_sub(start)
-        {
-            let y = u16::try_from(y).unwrap_or(u16::MAX);
-            frame.set_cursor_position((rect.x + col, rect.y + y));
+        if band_area.height > 0 {
+            let start = band.lines.len().saturating_sub(usize::from(band_area.height));
+            frame.render_widget(Paragraph::new(band.lines[start..].to_vec()), band_area);
+            // A cursor on a row the crop dropped stays hidden with the row.
+            if let Some((row, col)) = band.cursor
+                && let Some(y) = usize::from(row).checked_sub(start)
+            {
+                let y = u16::try_from(y).unwrap_or(u16::MAX);
+                frame.set_cursor_position((band_area.x + col, band_area.y + y));
+            }
         }
     })?;
     Ok(())
@@ -1207,11 +1232,11 @@ mod tests {
     #[test]
     fn the_frame_carries_the_transcript_and_the_status_line() {
         let (mut app, _) = fixture();
-        // Five transcript rows, then the band's four: the strip, the blank
-        // row, the prompt, the status line.
+        // Five transcript rows, then the band's three: the separator/strip,
+        // the prompt, and the status bar.
         let mut terminal =
-            Terminal::new(TestBackend::new(96, 9)).expect("test backend builds");
-        app.screen_rows = 9;
+            Terminal::new(TestBackend::new(96, 8)).expect("test backend builds");
+        app.screen_rows = 8;
         draw_screen(&mut terminal, &mut app, 60_000, false).expect("draw");
 
         let rows = rows(&terminal);
@@ -1226,7 +1251,7 @@ mod tests {
             "the model's divider follows: {rows:?}"
         );
         assert_eq!(rows[4], "rename and getattr share the cause.");
-        assert!(rows[7].starts_with('❯'), "the draft is the band's third row: {rows:?}");
+        assert!(rows[6].starts_with('❯'), "the draft is the band's second row: {rows:?}");
 
         let status = rows.last().expect("a status line");
         assert!(status.starts_with("0 kaijutsu*"), "got {status:?}");
@@ -1310,20 +1335,16 @@ mod tests {
         );
     }
 
-    /// With nothing in flight the strip is still there — an empty row of
-    /// its own ground directly above the blank row over `❯` — so the band's
-    /// row count is the same in both states.
+    /// With nothing in flight the separator row is a clean horizontal rule
+    /// directly above `❯`, so the band's row count is the same in both states.
     #[test]
     fn the_strip_row_is_present_when_empty() {
         let (mut app, _) = fixture();
         let band = band_lines(&mut app, 40, 0, false);
         let prompt = band.iter().position(|l| l.spans.iter().any(|s| s.content.contains('❯'))).expect("prompt row");
-        let blank: String = band[prompt - 1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(blank.trim().is_empty());
-        let strip = &band[prompt - 2];
+        let strip = &band[prompt - 1];
         let text: String = strip.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, " ".repeat(40), "an empty strip is a full-width row of ground");
-        assert!(strip.spans.iter().all(|s| s.style.bg.is_some()), "the strip's ground is painted");
+        assert_eq!(text, "─".repeat(40), "an idle strip is a full-width horizontal rule");
     }
 
     /// A tool call and its result render as one unit: the pair header
@@ -1864,5 +1885,22 @@ mod tests {
         assert!(strip_animating(&app), "a running tool call animates while focused");
         app.focused = false;
         assert!(!strip_animating(&app), "nothing animates for a terminal nobody is looking at");
+    }
+
+    /// The full-screen context browser renders header, sections, detail pane,
+    /// and footer bar across the whole terminal without drawing the compose row.
+    #[test]
+    fn draw_picker_renders_fullscreen_header_list_detail_and_footer() {
+        let (mut app, _id) = fixture();
+        app.open_picker(60_000);
+        let mut terminal = Terminal::new(TestBackend::new(96, 16)).expect("test backend");
+        draw_picker(&mut terminal, &app, false).expect("draw picker");
+        let screen = rows(&terminal);
+        assert!(screen[0].contains("CONTEXTS"), "header on row 0: {screen:?}");
+        assert!(screen.iter().any(|r| r == "ACTIVE"), "ACTIVE section: {screen:?}");
+        assert!(screen.iter().any(|r| r.contains("kaijutsu*")), "current context marked: {screen:?}");
+        assert!(screen.iter().any(|r| r.contains("deepseek/deepseek-v4")), "detail pane shows model: {screen:?}");
+        assert!(screen.last().unwrap().contains("Esc dismiss"), "footer hints on last row: {screen:?}");
+        assert!(!screen.iter().any(|r| r.starts_with('❯')), "compose row hidden in full-screen browser: {screen:?}");
     }
 }

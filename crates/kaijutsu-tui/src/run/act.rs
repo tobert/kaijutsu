@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use crate::app::App;
 use crate::asks;
+use crate::boards::{self, BoardsModel, BoardsOutcome, RECENT_BOARD};
 use crate::bridge::KernelBridge;
 use crate::ctrl_z;
 use crate::interrupt;
@@ -75,6 +76,260 @@ pub(super) async fn handle_picker_key(
         },
     }
     Ok(())
+}
+
+/// Route one key to the open full-screen message board browser and run any
+/// `kj board` verb it requests against the current context.
+pub(super) async fn handle_boards_key(
+    bridge: &KernelBridge,
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    armed: bool,
+) -> Result<()> {
+    let Some(boards) = app.boards.as_mut() else {
+        return Ok(());
+    };
+    let outcome = boards.handle_key(key);
+    tracing::trace!(target: "kaijutsu_tui::keys", code = ?key.code, modifiers = ?key.modifiers,
+        kind = ?key.kind, armed, surface = "boards", ?outcome, "key");
+    apply_boards_outcome(bridge, app, outcome).await;
+    Ok(())
+}
+
+/// Open the full-screen message board browser and load the initial boards,
+/// topics, and posts.
+async fn open_boards(bridge: &KernelBridge, app: &mut App) {
+    app.picker = None;
+    app.ledger_view = None;
+    app.boards = Some(BoardsModel::new());
+    apply_boards_outcome(bridge, app, BoardsOutcome::LoadBoards).await;
+}
+
+async fn apply_boards_outcome(bridge: &KernelBridge, app: &mut App, outcome: BoardsOutcome) {
+    let Some(ctx) = app.current else {
+        if let Some(b) = app.boards.as_mut() {
+            b.status = Some("no context attached".to_string());
+        }
+        return;
+    };
+    match outcome {
+        BoardsOutcome::None => {}
+        BoardsOutcome::Dismiss => app.boards = None,
+        BoardsOutcome::LoadBoards => {
+            let argv = vec!["board".into(), "list".into()];
+            match bridge.execute_kj(ctx, argv).await {
+                Ok(res) if res.exit_code == 0 => {
+                    let parsed = boards::parse_board_list(&res.stdout);
+                    let first_board = parsed.first().map(|b| b.handle.clone());
+                    if let Some(m) = app.boards.as_mut() {
+                        m.set_boards(parsed);
+                    }
+                    if let Some(board) = first_board {
+                        load_board_topics(bridge, app, ctx, &board).await;
+                    }
+                }
+                Ok(res) => {
+                    // Fall back to the virtual `recent` view if the caller has no personal boards.
+                    let fallback = boards::parse_board_list("");
+                    if let Some(m) = app.boards.as_mut() {
+                        m.set_boards(fallback);
+                        let why = res.stderr.lines().next().unwrap_or("").trim();
+                        if !why.is_empty() {
+                            m.status = Some(why.to_string());
+                        }
+                    }
+                    load_board_topics(bridge, app, ctx, RECENT_BOARD).await;
+                }
+                Err(e) => {
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(format!("board list failed: {e}"));
+                    }
+                }
+            }
+        }
+        BoardsOutcome::LoadTopics { board } => {
+            load_board_topics(bridge, app, ctx, &board).await;
+        }
+        BoardsOutcome::LoadPosts { topic_id } => {
+            load_topic_posts(bridge, app, ctx, &topic_id).await;
+        }
+        BoardsOutcome::Reply { topic_id, body } => {
+            let argv = vec!["board".into(), "reply".into(), topic_id.clone(), body];
+            match bridge.execute_kj(ctx, argv).await {
+                Ok(res) if res.exit_code == 0 => {
+                    load_topic_posts(bridge, app, ctx, &topic_id).await;
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some("reply posted".to_string());
+                    }
+                }
+                Ok(res) => {
+                    let why = res.stderr.lines().next().unwrap_or("reply failed").trim().to_string();
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(why);
+                    }
+                }
+                Err(e) => {
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(format!("reply failed: {e}"));
+                    }
+                }
+            }
+        }
+        BoardsOutcome::NewTopic { board, title, body } => {
+            let argv = vec![
+                "board".into(),
+                "post".into(),
+                board.clone(),
+                "--title".into(),
+                title,
+                body,
+            ];
+            match bridge.execute_kj(ctx, argv).await {
+                Ok(res) if res.exit_code == 0 => {
+                    load_board_topics(bridge, app, ctx, &board).await;
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some("topic posted".to_string());
+                    }
+                }
+                Ok(res) => {
+                    let why = res.stderr.lines().next().unwrap_or("post failed").trim().to_string();
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(why);
+                    }
+                }
+                Err(e) => {
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(format!("post failed: {e}"));
+                    }
+                }
+            }
+        }
+        BoardsOutcome::ToggleResolve { topic_id, currently_resolved } => {
+            let verb = if currently_resolved { "reopen" } else { "resolve" };
+            let argv = vec!["board".into(), verb.into(), topic_id];
+            let board = app.boards.as_ref().and_then(|m| m.selected_board()).map(|b| b.handle.clone());
+            match bridge.execute_kj(ctx, argv).await {
+                Ok(res) if res.exit_code == 0 => {
+                    if let Some(board) = board {
+                        load_board_topics(bridge, app, ctx, &board).await;
+                    }
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(format!("topic {verb}d"));
+                    }
+                }
+                Ok(res) => {
+                    let why = res.stderr.lines().next().unwrap_or("failed").trim().to_string();
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(why);
+                    }
+                }
+                Err(e) => {
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(format!("{verb} failed: {e}"));
+                    }
+                }
+            }
+        }
+        BoardsOutcome::TogglePin { topic_id, currently_pinned } => {
+            let verb = if currently_pinned { "unpin" } else { "pin" };
+            let argv = vec!["board".into(), verb.into(), topic_id];
+            let board = app.boards.as_ref().and_then(|m| m.selected_board()).map(|b| b.handle.clone());
+            match bridge.execute_kj(ctx, argv).await {
+                Ok(res) if res.exit_code == 0 => {
+                    if let Some(board) = board {
+                        load_board_topics(bridge, app, ctx, &board).await;
+                    }
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(format!("topic {verb}ned"));
+                    }
+                }
+                Ok(res) => {
+                    let why = res.stderr.lines().next().unwrap_or("failed").trim().to_string();
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(why);
+                    }
+                }
+                Err(e) => {
+                    if let Some(m) = app.boards.as_mut() {
+                        m.status = Some(format!("{verb} failed: {e}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn load_board_topics(
+    bridge: &KernelBridge,
+    app: &mut App,
+    ctx: kaijutsu_types::ContextId,
+    board: &str,
+) {
+    let argv = if board == RECENT_BOARD {
+        vec!["board".into(), "recent".into(), "--limit".into(), "50".into()]
+    } else {
+        vec![
+            "board".into(),
+            "topics".into(),
+            board.to_string(),
+            "--status".into(),
+            "all".into(),
+            "--limit".into(),
+            "50".into(),
+        ]
+    };
+    match bridge.execute_kj(ctx, argv).await {
+        Ok(res) if res.exit_code == 0 => {
+            let parsed = boards::parse_topic_list(&res.stdout);
+            let first_topic = parsed.first().map(|t| t.id.clone());
+            if let Some(m) = app.boards.as_mut() {
+                m.set_topics(parsed);
+            }
+            if let Some(topic_id) = first_topic {
+                load_topic_posts(bridge, app, ctx, &topic_id).await;
+            }
+        }
+        Ok(res) => {
+            let why = res.stderr.lines().next().unwrap_or("failed to load topics").trim().to_string();
+            if let Some(m) = app.boards.as_mut() {
+                m.set_topics(Vec::new());
+                m.status = Some(why);
+            }
+        }
+        Err(e) => {
+            if let Some(m) = app.boards.as_mut() {
+                m.status = Some(format!("load topics failed: {e}"));
+            }
+        }
+    }
+}
+
+async fn load_topic_posts(
+    bridge: &KernelBridge,
+    app: &mut App,
+    ctx: kaijutsu_types::ContextId,
+    topic_id: &str,
+) {
+    let argv = vec!["board".into(), "read".into(), topic_id.to_string(), "--tail".into(), "100".into()];
+    match bridge.execute_kj(ctx, argv).await {
+        Ok(res) if res.exit_code == 0 => {
+            if let Some(m) = app.boards.as_mut() {
+                m.set_posts(res.stdout);
+            }
+        }
+        Ok(res) => {
+            let why = res.stderr.lines().next().unwrap_or("failed to read topic").trim().to_string();
+            if let Some(m) = app.boards.as_mut() {
+                m.set_posts(String::new());
+                m.status = Some(why);
+            }
+        }
+        Err(e) => {
+            if let Some(m) = app.boards.as_mut() {
+                m.status = Some(format!("read topic failed: {e}"));
+            }
+        }
+    }
 }
 
 /// Whether a key asked the loop to hand the terminal back to the host shell.
@@ -182,18 +437,20 @@ pub(super) async fn act(
     tracing::trace!(target: "kaijutsu_tui::keys", code = ?key.code, modifiers = ?key.modifiers,
         kind = ?key.kind, armed = keys.armed(), ?intent, "key");
 
-    if app.picker.is_some() || app.ledger_view.is_some() {
-        match chord_over_overlay(&intent, app.picker.is_some(), app.ledger_view.is_some()) {
+    if app.picker.is_some() || app.ledger_view.is_some() || app.boards.is_some() {
+        match chord_over_overlay(&intent, app.picker.is_some(), app.ledger_view.is_some(), app.boards.is_some()) {
             OverOverlay::Keep => {}
             OverOverlay::Hold => return Ok(Acted::Continue),
             OverOverlay::Close => {
                 app.picker = None;
                 app.ledger_view = None;
+                app.boards = None;
                 return Ok(Acted::Continue);
             }
             OverOverlay::CloseAndRun => {
                 app.picker = None;
                 app.ledger_view = None;
+                app.boards = None;
             }
         }
     }
@@ -281,6 +538,7 @@ pub(super) async fn act(
             }
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
+        Intent::ToggleBoards => open_boards(bridge, app).await,
         // A local view change: no RPC, and a scrolled view stays where the
         // reader is (`docs/tui.md`, "Folds").
         Intent::ToggleFold => match render::toggle_fold(app, width) {
@@ -479,7 +737,7 @@ fn paste_target(app: &App) -> PasteTarget {
     if editor::route_key(app, false) == editor::KeyRoute::FullScreen {
         return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
     }
-    if app.ledger_view.is_some() || app.picker.is_some() || app.ask_card_armed() {
+    if app.ledger_view.is_some() || app.picker.is_some() || app.boards.is_some() || app.ask_card_armed() {
         return PasteTarget::Refused("paste is not wired into this surface; Esc to the draft first");
     }
     if app.compose.command_line().is_some() { PasteTarget::CommandLine } else { PasteTarget::Draft }
@@ -622,13 +880,14 @@ enum OverOverlay {
 /// The prefix pops over the picker and the ledger (`docs/tui.md`, "Keys").
 /// A chord that leaves for another surface takes the overlay down on the way;
 /// one that only changes the legend or posts a notice leaves it up.
-fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool) -> OverOverlay {
+fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool, boards: bool) -> OverOverlay {
     match intent {
         Intent::Ignored | Intent::LegendChanged | Intent::NotYet(_) | Intent::Unbound(_)
         | Intent::Interrupt => OverOverlay::Keep,
         Intent::InputKey(_) | Intent::Tab | Intent::Paste => OverOverlay::Hold,
         Intent::TogglePicker if picker => OverOverlay::Close,
         Intent::OpenLedger if ledger => OverOverlay::Close,
+        Intent::ToggleBoards if boards => OverOverlay::Close,
         _ => OverOverlay::CloseAndRun,
     }
 }
@@ -765,14 +1024,16 @@ mod tests {
     /// overlay's own chord only closes it.
     #[test]
     fn a_chord_over_an_overlay_closes_it_only_when_it_leaves() {
-        assert_eq!(chord_over_overlay(&Intent::LegendChanged, true, false), OverOverlay::Keep);
-        assert_eq!(chord_over_overlay(&Intent::SwitchSeat(2), true, false), OverOverlay::CloseAndRun);
-        assert_eq!(chord_over_overlay(&Intent::LastContext, false, true), OverOverlay::CloseAndRun);
-        assert_eq!(chord_over_overlay(&Intent::TogglePicker, true, false), OverOverlay::Close);
-        assert_eq!(chord_over_overlay(&Intent::TogglePicker, false, true), OverOverlay::CloseAndRun);
-        assert_eq!(chord_over_overlay(&Intent::OpenLedger, false, true), OverOverlay::Close);
-        assert_eq!(chord_over_overlay(&Intent::Paste, true, false), OverOverlay::Hold);
-        assert_eq!(chord_over_overlay(&Intent::Unbound(crossterm::event::KeyCode::Char('x')), true, false), OverOverlay::Keep);
+        assert_eq!(chord_over_overlay(&Intent::LegendChanged, true, false, false), OverOverlay::Keep);
+        assert_eq!(chord_over_overlay(&Intent::SwitchSeat(2), true, false, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::LastContext, false, true, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::TogglePicker, true, false, false), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::TogglePicker, false, true, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::OpenLedger, false, true, false), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::ToggleBoards, false, false, true), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::ToggleBoards, true, false, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::Paste, true, false, false), OverOverlay::Hold);
+        assert_eq!(chord_over_overlay(&Intent::Unbound(crossterm::event::KeyCode::Char('x')), true, false, false), OverOverlay::Keep);
     }
 
     /// `Ctrl+O` is never one of copy mode's keys: it folds where the reader
@@ -874,7 +1135,7 @@ mod tests {
         app.screen_rows = 24;
         leave_tail(&mut app, 80, Step::Page);
         let view = app.scrolled().expect("off the tail");
-        assert_eq!(view.page(), 20, "24 rows less the band's four");
+        assert_eq!(view.page(), 21, "24 rows less the band's three");
         assert!(!app.following());
     }
 

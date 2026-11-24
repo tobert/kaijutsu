@@ -164,6 +164,12 @@ fn draw_frame(
     let size = terminal.size()?;
     let palette = app.palette;
     match &mut app.screen {
+        ScreenMode::Conversation if app.picker.is_some() => {
+            render::draw_picker(terminal, app, armed)?;
+        }
+        ScreenMode::Conversation if app.boards.is_some() => {
+            render::draw_boards(terminal, app, armed)?;
+        }
         ScreenMode::Conversation => {
             render::draw_screen(terminal, app, kaijutsu_types::now_millis(), armed)?;
         }

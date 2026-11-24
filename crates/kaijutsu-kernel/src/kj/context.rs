@@ -2874,6 +2874,8 @@ impl KjDispatcher {
         let commit = self.kernel_db().lock().commit_rotation(predecessor, successor).map_err(|e| e.to_string())?;
         self.archived_in_router(commit.shadows.iter().copied());
         self.archived_in_router(std::iter::once(predecessor));
+        self.delete_persisted_attachments(commit.shadows.iter().copied().chain(std::iter::once(predecessor)));
+        self.attach_successor_to_scheduler(successor);
         let label_error = label.and_then(|label| {
             let mut drift = self.drift_router().write();
             drift.rename(successor, Some(label)).err().map(|e| e.to_string())
@@ -3608,6 +3610,97 @@ impl KjDispatcher {
                 }
                 Err(e) => tracing::error!(context = %context.short(), track, "persisted attachment names an invalid track id: {e}"),
             }
+        }
+    }
+
+    /// Delete persisted track attachment rows for archived contexts after
+    /// their detach commands have been queued. Failures are logged because the
+    /// rotation commit has already landed.
+    fn delete_persisted_attachments(&self, contexts: impl IntoIterator<Item = ContextId>) {
+        let db = self.kernel_db().lock();
+        for context in contexts {
+            match db.list_attachments_for_context(context) {
+                Ok(rows) => {
+                    for row in rows {
+                        if let Err(e) = db.delete_attachment(&row.track_id, context) {
+                            tracing::error!(
+                                context = %context.short(),
+                                track = %row.track_id,
+                                "failed to delete archived context's persisted attachment: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => tracing::error!(
+                    context = %context.short(),
+                    "failed to list archived context's persisted attachments for cleanup: {e}"
+                ),
+            }
+        }
+    }
+
+    /// Re-attach a rotation successor to every track it inherited in SQLite.
+    /// Queued on the same beat ingress immediately after the predecessor's
+    /// detach so the scheduler hands the live seat over in FIFO order.
+    fn attach_successor_to_scheduler(&self, successor: ContextId) {
+        let entries: Vec<_> = {
+            let db = self.kernel_db().lock();
+            let rows = match db.list_attachments_for_context(successor) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(
+                        context = %successor.short(),
+                        "could not read successor's track attachments for scheduler handoff: {e}"
+                    );
+                    return;
+                }
+            };
+            rows.into_iter()
+                .map(|row| {
+                    let policy = match db.get_track(&row.track_id) {
+                        Ok(Some(t)) => crate::hyoushigi::BeatPolicy {
+                            period: std::time::Duration::from_millis(t.period_ms),
+                            beats_per_phrase: t.beats_per_phrase,
+                        },
+                        Ok(None) => crate::hyoushigi::BeatPolicy::musician_default(),
+                        Err(e) => {
+                            tracing::warn!(
+                                context = %successor.short(),
+                                track = %row.track_id,
+                                "could not read track policy for successor handoff; using default: {e}"
+                            );
+                            crate::hyoushigi::BeatPolicy::musician_default()
+                        }
+                    };
+                    (row, policy)
+                })
+                .collect()
+        };
+
+        for (row, policy) in entries {
+            let track = match kaijutsu_types::TrackId::new(row.track_id.clone()) {
+                Ok(track) => track,
+                Err(e) => {
+                    tracing::error!(
+                        context = %successor.short(),
+                        track = %row.track_id,
+                        "persisted attachment names an invalid track id: {e}"
+                    );
+                    continue;
+                }
+            };
+            let attachment = crate::hyoushigi::Attachment {
+                wakeup: crate::hyoushigi::Cadence::new(row.wakeup_every),
+                rotate: row.rotate_every_phrases.map(crate::hyoushigi::Cadence::new),
+                ooda_armed: row.ooda_armed,
+                pulse: 0,
+            };
+            self.kernel().send_beat_command(crate::hyoushigi::BeatCommand::Attach {
+                track,
+                context_id: successor,
+                attachment,
+                policy,
+            });
         }
     }
 }
@@ -5958,18 +6051,43 @@ mod tests {
         assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_some());
     }
 
-    /// `kj fork` copies a context's beat attachments to the child; rotation
-    /// copies them to the successor too, or a rotated context drops off its
-    /// clock. Both rows stay: the predecessor's detach is its own archive
-    /// lifecycle's business.
+    /// Rotation hands the predecessor's beat attachments to the successor:
+    /// the successor inherits the persisted attachment row and receives a live
+    /// `BeatCommand::Attach` on the scheduler after the predecessor detaches,
+    /// and the archived predecessor's persisted attachment row is removed.
     #[test]
     fn rotation_copies_the_beat_attachment_to_the_successor() {
         crate::on_rc_thread(rotation_copies_the_beat_attachment_to_the_successor_body);
     }
 
     async fn rotation_copies_the_beat_attachment_to_the_successor_body() {
+        use crate::hyoushigi::{BeatCommand, BeatRequest, Cadence};
         use crate::kernel_db::{PersistedAttachment, PersistedTrack};
+
         let f = rotation_fixture().await;
+        let (tx, mut ingress) = tokio::sync::mpsc::unbounded_channel::<BeatRequest>();
+        assert!(f.d.kernel().set_beat_ingress(tx), "test owns the ingress");
+        let (cmd_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BeatCommand>();
+        tokio::spawn(async move {
+            while let Some(req) = ingress.recv().await {
+                match req {
+                    BeatRequest::Command { command, reply } => {
+                        let _ = cmd_tx.send(command);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(None));
+                        }
+                    }
+                    BeatRequest::Snapshot { reply } => {
+                        let _ = reply.send(Vec::new());
+                    }
+                    BeatRequest::CommitCapture { reply, .. } => {
+                        let _ = reply.send(Err("beat stub: no tracks".into()));
+                    }
+                    BeatRequest::ClockEstimate { .. } => {}
+                }
+            }
+        });
+
         {
             let db = f.d.kernel_db().lock();
             db.upsert_track(&PersistedTrack {
@@ -5986,14 +6104,49 @@ mod tests {
         let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
         let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
 
-        let db = f.d.kernel_db().lock();
-        let copied = db.list_attachments_for_context(successor).unwrap();
-        assert_eq!(copied.len(), 1, "the successor joins the predecessor's track: {copied:?}");
-        assert_eq!(copied[0].track_id, "kaiten");
-        assert_eq!(copied[0].wakeup_every, 3600);
-        assert_eq!(copied[0].rotate_every_phrases, Some(2700));
-        assert_eq!(db.list_attachments_for_context(f.seat).unwrap().len(), 1,
-            "the predecessor keeps its row for its own detach");
+        {
+            let db = f.d.kernel_db().lock();
+            let copied = db.list_attachments_for_context(successor).unwrap();
+            assert_eq!(copied.len(), 1, "the successor joins the predecessor's track: {copied:?}");
+            assert_eq!(copied[0].track_id, "kaiten");
+            assert_eq!(copied[0].wakeup_every, 3600);
+            assert_eq!(copied[0].rotate_every_phrases, Some(2700));
+            assert!(copied[0].ooda_armed);
+            assert_eq!(
+                db.list_attachments_for_context(f.seat).unwrap().len(),
+                0,
+                "the archived predecessor drops its persisted attachment row"
+            );
+        }
+
+        // Let the stub task forward all queued BeatCommands.
+        tokio::task::yield_now().await;
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            cmds.push(cmd);
+        }
+        let detach_idx = cmds.iter().position(|c| matches!(
+            c,
+            BeatCommand::Detach { track, context_id }
+                if track.as_str() == "kaiten" && *context_id == f.seat
+        ));
+        let attach_idx = cmds.iter().position(|c| matches!(
+            c,
+            BeatCommand::Attach { track, context_id, .. }
+                if track.as_str() == "kaiten" && *context_id == successor
+        ));
+        assert!(
+            detach_idx.is_some() && attach_idx.is_some() && detach_idx.unwrap() < attach_idx.unwrap(),
+            "expected Detach(kaiten, predecessor) before Attach(kaiten, successor), got: {cmds:?}"
+        );
+        let BeatCommand::Attach { attachment, policy, .. } = &cmds[attach_idx.unwrap()] else {
+            unreachable!()
+        };
+        assert_eq!(attachment.wakeup, Cadence::new(3600));
+        assert_eq!(attachment.rotate, Some(Cadence::new(2700)));
+        assert!(attachment.ooda_armed);
+        assert_eq!(policy.period, std::time::Duration::from_millis(1000));
+        assert_eq!(policy.beats_per_phrase, 32);
     }
 
     /// Rotation carries the control list to the successor, in order, with
