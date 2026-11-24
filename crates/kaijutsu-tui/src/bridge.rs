@@ -13,7 +13,7 @@ use kaijutsu_client::start_candidate;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
-use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId};
+use kaijutsu_types::{BlockId, BlockSnapshot, ContextId};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 

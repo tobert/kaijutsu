@@ -120,7 +120,6 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Four tui tests read the `run` module's source as text.**
 - **Logic both clients carry.** Ask-to-tool join, short age/count formatting, picker head/tail lines.
 - **Two layouts of tool output** (`compute_output_layout` vs `layout_output`).
-- **The tui's `:kj` completion draws no popup.**
 - **`Ctrl+O` in the tui's draft is the fold toggle.**
 - **In the app:** `ui/tiling.rs`, `cell/mod.rs`, `bindings.toml` parsing duplication, and large files like `ui/dock.rs`.
 

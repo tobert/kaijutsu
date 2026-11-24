@@ -542,12 +542,18 @@ fn overlay_holds_keys(app: &App) -> bool {
     app.picker.is_some() || app.boards.is_some() || app.ask_card_armed() || app.ledger_view.is_some()
 }
 
-/// The overlay's rows: an ask card or the ledger view, whichever is open,
-/// and empty when none is. One overlay at a time, drawn between the
-/// transcript and the band. The context browser (`app.picker`) renders
-/// full-screen via [`draw_picker`].
+/// The overlay's rows: an ask card, the ledger view, or the `:kj ` completion
+/// popup, whichever is open, and empty when none is. One overlay at a time,
+/// drawn between the transcript and the band. The context browser
+/// (`app.picker`) and board browser (`app.boards`) render full-screen.
 pub fn overlay_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
-    crate::asks::active_view_lines(app, width).unwrap_or_default()
+    if let Some(lines) = crate::asks::active_view_lines(app, width) {
+        return lines;
+    }
+    if let Some(completion) = app.completion.as_ref() {
+        return crate::completion::popup_lines(completion, width, &app.palette);
+    }
+    Vec::new()
 }
 
 /// Draw the full-screen context browser (`Ctrl+A "` / `Ctrl+A w`).
