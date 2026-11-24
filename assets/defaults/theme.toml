@@ -1,35 +1,35 @@
-# Kaijutsu Default Theme — Synthwave
+# Kaijutsu Default Theme — Quiet Synthwave
 #
-# The app-wide identity: deep violet grounds, magenta and cyan accents.
+# The app-wide identity: plum-charcoal grounds, muted violet, rose, and cyan accents.
 # One identity, two lanes — these flat keys + [ansi]
 # are the sRGB UI lane; [scene.*] and [heroic] are the linear-HDR scene lane
 # (docs/newui.md). Colors are hex strings: "#rrggbb" or "#rrggbbaa" (with alpha).
 
 # Base UI
-bg = "#0d0221"
-panel_bg = "#12041ff2"
-fg = "#ece8f7"
-fg_dim = "#9a90bd"
-accent = "#ff2e88"
-accent2 = "#00f0ff"
-border = "#44245e"
-selection_bg = "#ff2e8833"
+bg = "#17141f"
+panel_bg = "#1d1926ff"
+fg = "#cec8d8"
+fg_dim = "#a29aad"
+accent = "#b58ba7"
+accent2 = "#8bbbc4"
+border = "#393142"
+selection_bg = "#9c8bb233"
 
 # Row type colors (conversation left borders)
-row_tool = "#d18bff"
-row_result = "#e8b45e"
+row_tool = "#9c8bb2"
+row_result = "#9c8bb2"
 
 # Semantic colors
-error = "#ff2020"
-warning = "#ffb45e"
-success = "#4ce0b3"
+error = "#e28c99"
+warning = "#c9ab7d"
+success = "#8fb5a1"
 
 # Mode colors (vim-style indicator text)
-mode_normal = "#a487ff"
-mode_insert = "#4ce0b3"
-mode_chat = "#4ce0b3"
-mode_shell = "#e8b45e"
-mode_visual = "#ff7ad9"
+mode_normal = "#9c8bb2"
+mode_insert = "#8fb5a1"
+mode_chat = "#8fb5a1"
+mode_shell = "#c9ab7d"
+mode_visual = "#b58ba7"
 
 # Mode labels (dock HUD text)
 mode_label_normal = "NORMAL"
@@ -52,12 +52,12 @@ frame_edge_thickness = 2.0
 frame_content_padding = 12.0
 
 # Frame colors
-frame_base = "#12041ff2"
-frame_focused = "#ff2e8826"
-frame_insert = "#4ce0b31f"
-frame_visual = "#ff7ad91f"
-frame_unfocused = "#0d0221cc"
-frame_edge = "#44245e99"
+frame_base = "#1d1926ff"
+frame_focused = "#8bbbc414"
+frame_insert = "#8fb5a114"
+frame_visual = "#b58ba714"
+frame_unfocused = "#17141fcc"
+frame_edge = "#39314299"
 
 # Frame shader params [intensity, _, _, _]
 frame_params_base = [0.0, 0.0, 0.0, 0.0]
@@ -69,8 +69,8 @@ frame_edge_dim_unfocused = [0.5, 0.5, 0.5, 0.6]
 frame_edge_dim_focused = [1.0, 1.0, 1.0, 1.0]
 
 # Shader effects — glow
-effect_glow_radius = 4.0
-effect_glow_intensity = 0.15
+effect_glow_radius = 0.0
+effect_glow_intensity = 0.0
 effect_glow_falloff = 2.0
 
 # Shader effects — sheen (subtle shine)
@@ -84,18 +84,18 @@ effect_breathe_amplitude = 0.05
 # Shader effects — chasing border
 effect_chase_speed = 2.0
 effect_chase_width = 0.15
-effect_chase_glow_radius = 8.0
-effect_chase_glow_intensity = 0.5
+effect_chase_glow_radius = 0.0
+effect_chase_glow_intensity = 0.0
 effect_chase_color_cycle = 0.0
 
 # Input area
 input_minimized_height = 48.0
 input_docked_height = 200.0
 input_overlay_width_pct = 0.6
-input_backdrop_color = "#0d0221d9"
+input_backdrop_color = "#17141fd9"
 
 # Font configuration
-font_rainbow = true
+font_rainbow = false
 font_mono = "Cascadia Code NF"
 font_serif = "Noto Serif"
 font_sans = "Noto Sans CJK JP"
@@ -116,23 +116,23 @@ constellation_base_radius = 500.0
 constellation_ring_spacing = 550.0
 
 # Block borders
-block_border_tool_call = "#ff2e8899"
-block_border_tool_result = "#a487ff66"
-block_border_error = "#ff2020cc"
-block_border_thinking = "#7a6aa04d"
-block_border_drift = "#c476e180"
+block_border_tool_call = "#9c8bb259"
+block_border_tool_result = "#9c8bb233"
+block_border_error = "#e28c99b3"
+block_border_thinking = "#a29aad33"
+block_border_drift = "#9c8bb259"
 block_border_thickness = 1.0
 block_border_corner_radius = 2.0
-block_border_glow_radius = 4.0
-block_border_glow_intensity = 0.10
-text_glow_radius = 2.5
-text_glow_color = "#cbb8ff2e"
+block_border_glow_radius = 0.0
+block_border_glow_intensity = 0.0
+text_glow_radius = 0.0
+text_glow_color = "#cec8d800"
 block_border_padding = 0.6
 block_spacing = 12.0
 
 # Compose block (input area)
-compose_border = "#44245e"
-compose_bg = "#0d0221"
+compose_border = "#393142"
+compose_bg = "#17141f"
 
 # Modal overlays
 modal_backdrop = "#00000099"
@@ -143,7 +143,7 @@ block_border_assistant = "#00000000"
 
 # Focus ring for the keyboard-focused conversation block (j/k) — cyan on
 # purpose, absent from the block-kind border palette above
-block_border_focus = "#00f0ffcc"
+block_border_focus = "#8bbbc499"
 
 # Layout spacing
 indent_width = 24.0

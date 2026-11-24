@@ -218,6 +218,14 @@ The conversation design pass explores quieter receipts and a separate scene
 with dialogue, an artifact workbench, and event history. Those layouts remain
 proposals; the shipped change restores the existing palette controls.
 
+Amy's all-day reading check moved the UI to quiet synthwave: plum-charcoal
+grounds, lavender-gray text, muted violet tool borders, and no text or border
+glow. Heroic retains its scene palette. Successful tool output now follows
+the loaded foreground instead of hardcoded teal; captions retain readable
+opacity independently of the stroke. The behavior tests failed before the
+fix; all 1416 app tests and nine theme-data tests passed. A 1280×720 isolated
+app confirmed the palette on prose, tool calls, results, and inline notation.
+
 ## The file cache learns what vim already knew (August 18–20)
 
 Disk is the source of truth; file buffers operate like vim swaps. Dirty buffers

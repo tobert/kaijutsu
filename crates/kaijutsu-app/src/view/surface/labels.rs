@@ -127,9 +127,8 @@ pub fn checkbox_color(border: Option<Color>, excluded: bool) -> Color {
 
 /// Read a block's label set off its computed border style.
 ///
-/// The label *color* is the border's own color for every label — that is what
-/// makes a running tool call's caption amber and a fatal error's caption red
-/// without a second palette. Because the style handed in here is the
+/// Labels retain the border's hue at readable opacity. Exclusion dims them
+/// independently of the stroke. Because the style handed in here is the
 /// **unfocused** one (`chrome::BlockChrome::style`), focusing a block recolors
 /// its stroke and leaves its labels alone; see the invalidation note in
 /// [`super::shape_cache::ShapedBlock::labels`] for why that is deliberate
@@ -139,13 +138,13 @@ pub fn block_label_spec(style: Option<&BlockBorderStyle>, excluded: bool) -> Blo
         top: style.and_then(|s| {
             s.top_label.as_deref().map(|text| LabelSpec {
                 text,
-                color: s.color,
+                color: s.color.with_alpha(if excluded { 0.45 } else { 1.0 }),
             })
         }),
         bottom: style.and_then(|s| {
             s.bottom_label.as_deref().map(|text| LabelSpec {
                 text,
-                color: s.color,
+                color: s.color.with_alpha(if excluded { 0.45 } else { 1.0 }),
             })
         }),
         checkbox: LabelSpec {
@@ -653,11 +652,9 @@ mod tests {
         assert_eq!(labels_of(&inputs(BlockKind::Text), false), (None, None));
     }
 
-    /// A label takes its border's color, which is how status reads at a
-    /// glance — and an excluded block's dim carries through to its caption,
-    /// because `compute_border_style` dims the style itself.
+    /// Captions retain their hue and stay legible above quiet strokes.
     #[test]
-    fn labels_take_the_border_color_including_the_exclusion_dim() {
+    fn labels_keep_their_hue_without_inheriting_border_opacity() {
         let mut thinking = inputs(BlockKind::Thinking);
         let (bright, _) = spec_for(&thinking, false);
         let bright = bright.expect("thinking draws a border");
@@ -668,10 +665,10 @@ mod tests {
 
         let bright_label = block_label_spec(Some(&bright), false);
         let dim_label = block_label_spec(Some(&dim), true);
-        assert_eq!(bright_label.top.unwrap().color, bright.color);
-        assert_eq!(dim_label.top.unwrap().color, dim.color);
+        assert_eq!(bright_label.top.unwrap().color, bright.color.with_alpha(1.0));
+        assert_eq!(dim_label.top.unwrap().color, dim.color.with_alpha(0.45));
         assert!(
-            dim.color.alpha() < bright.color.alpha(),
+            dim_label.top.unwrap().color.alpha() < bright_label.top.unwrap().color.alpha(),
             "exclusion must dim the caption, not only the stroke"
         );
     }
@@ -1069,7 +1066,7 @@ mod tests {
 
         // What the shape pass reads is the unfocused style, both times.
         let unfocused_spec = block_label_spec(Some(&style), false);
-        assert_eq!(unfocused_spec.top.unwrap().color, style.color);
+        assert_eq!(unfocused_spec.top.unwrap().color, style.color.with_alpha(1.0));
         assert_eq!(unfocused_spec.checkbox.color, style.color.with_alpha(0.3));
     }
 

@@ -42,14 +42,14 @@ mod tests {
 
     #[test]
     fn test_font_rainbow_param() {
-        // Default is true
+        // Sustained reading uses static text colors by default.
         let td: ThemeData = parse_theme_data(DEFAULT_THEME_TOML).unwrap();
-        assert!(td.font_rainbow);
+        assert!(!td.font_rainbow);
 
-        // Override to false
-        let modified = DEFAULT_THEME_TOML.replace("font_rainbow = true", "font_rainbow = false");
+        // Themes can still opt into rainbow text.
+        let modified = DEFAULT_THEME_TOML.replace("font_rainbow = false", "font_rainbow = true");
         let theme = Theme::from(parse_theme_data(&modified).unwrap());
-        assert!(!theme.font_rainbow);
+        assert!(theme.font_rainbow);
     }
 
     #[test]

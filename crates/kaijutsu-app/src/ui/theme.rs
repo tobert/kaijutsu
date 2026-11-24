@@ -145,9 +145,9 @@ pub struct Theme {
     pub block_assistant: Color,
     /// Thinking block text color (dim gray for de-emphasis)
     pub block_thinking: Color,
-    /// Tool call block text color (amber)
+    /// Active tool call text color.
     pub block_tool_call: Color,
-    /// Tool result block text color (green for success)
+    /// Successful tool result text color.
     pub block_tool_result: Color,
     /// Tool error block text color (red)
     pub block_tool_error: Color,
@@ -389,9 +389,9 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Block Border Configuration (shader-rendered per-block borders)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Tool call border color (amber, default from block_tool_call)
+    /// Tool call border color.
     pub block_border_tool_call: Color,
-    /// Tool result border color (green, default from block_tool_result)
+    /// Tool result border color.
     pub block_border_tool_result: Color,
     /// Error border color (red, default from block_tool_error)
     pub block_border_error: Color,
@@ -518,27 +518,27 @@ impl Default for Theme {
             // Base UI — Synthwave palette (docs/newui.md; the compiled
             // fallback mirrors the shipped theme.toml so there's no skin
             // flash between boot and the theme RPC)
-            bg: hex_to_color("#0d0221"),
-            panel_bg: hex_to_color("#12041ff2"),
-            fg: Color::srgb(0.925, 0.910, 0.968), // #ece8f7 — lifted for text contrast (2026-09-12)
-            fg_dim: Color::srgb(0.604, 0.565, 0.741), // #9a90bd — legible secondary text (2026-09-12)
-            accent: hex_to_color("#ff2e88"),
-            accent2: hex_to_color("#00f0ff"),
-            border: hex_to_color("#44245e"),
-            selection_bg: hex_to_color("#ff2e8833"),
+            bg: hex_to_color("#17141f"),
+            panel_bg: hex_to_color("#1d1926ff"),
+            fg: hex_to_color("#cec8d8"),
+            fg_dim: hex_to_color("#a29aad"),
+            accent: hex_to_color("#b58ba7"),
+            accent2: hex_to_color("#8bbbc4"),
+            border: hex_to_color("#393142"),
+            selection_bg: hex_to_color("#9c8bb233"),
 
             // Row type colors
-            row_tool: Color::srgb(0.820, 0.545, 1.000), // #d18bff violet
-            row_result: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
+            row_tool: hex_to_color("#9c8bb2"),
+            row_result: hex_to_color("#9c8bb2"),
 
             // Block text colors
-            block_assistant: Color::srgb(0.925, 0.910, 0.968), // #ece8f7 — body text, the same as fg
-            block_thinking: Color::srgb(0.435, 0.396, 0.573), // #6f6592 dim
-            block_tool_call: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
-            block_tool_result: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3 teal
-            block_tool_error: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a hot red
-            block_error_warning: Color::srgb(1.000, 0.706, 0.369), // #ffb45e amber
-            block_error_severity: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a (same as block_tool_error)
+            block_assistant: hex_to_color("#cec8d8"),
+            block_thinking: hex_to_color("#a29aad"),
+            block_tool_call: hex_to_color("#8bbbc4"),
+            block_tool_result: hex_to_color("#cec8d8"),
+            block_tool_error: hex_to_color("#e28c99"),
+            block_error_warning: hex_to_color("#c9ab7d"),
+            block_error_severity: hex_to_color("#e28c99"),
             block_error_fatal: Color::srgb(0.769, 0.118, 0.227), // #c41e3a dark red
             block_drift_push: Color::srgb(0.490, 0.878, 1.000), // #7de0ff cyan
             block_drift_pull: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
@@ -547,16 +547,16 @@ impl Default for Theme {
             block_resource: Color::srgb(0.447, 0.757, 0.667), // #72c1aa muted teal
 
             // Semantic
-            error: hex_to_color("#ff2020"),
-            warning: Color::srgb(1.000, 0.706, 0.369), // #ffb45e
-            success: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3
+            error: hex_to_color("#e28c99"),
+            warning: hex_to_color("#c9ab7d"),
+            success: hex_to_color("#8fb5a1"),
 
             // Mode colors (vim-style)
-            mode_normal: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
-            mode_insert: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3 teal
-            mode_chat: Color::srgb(0.298, 0.878, 0.702),   // #4ce0b3 teal
-            mode_shell: Color::srgb(0.910, 0.706, 0.369),  // #e8b45e gold
-            mode_visual: Color::srgb(1.000, 0.478, 0.851), // #ff7ad9 magenta
+            mode_normal: hex_to_color("#9c8bb2"),
+            mode_insert: hex_to_color("#8fb5a1"),
+            mode_chat: hex_to_color("#8fb5a1"),
+            mode_shell: hex_to_color("#c9ab7d"),
+            mode_visual: hex_to_color("#b58ba7"),
 
             // Mode labels (dock HUD, overridable via theme.toml)
             mode_label_normal: "NORMAL".into(),
@@ -599,12 +599,12 @@ impl Default for Theme {
             frame_content_padding: 12.0,
 
             // Frame colors
-            frame_base: hex_to_color("#12041ff2"),
-            frame_focused: hex_to_color("#ff2e8826"),
-            frame_insert: Color::srgba(0.298, 0.878, 0.702, 0.12), // #4ce0b3
-            frame_visual: Color::srgba(1.000, 0.478, 0.851, 0.12), // #ff7ad9
-            frame_unfocused: hex_to_color("#0d0221cc"),
-            frame_edge: hex_to_color("#44245e99"),
+            frame_base: hex_to_color("#1d1926ff"),
+            frame_focused: hex_to_color("#8bbbc414"),
+            frame_insert: hex_to_color("#8fb5a114"),
+            frame_visual: hex_to_color("#b58ba714"),
+            frame_unfocused: hex_to_color("#17141fcc"),
+            frame_edge: hex_to_color("#39314299"),
 
             // Frame shader params
             frame_params_base: Vec4::new(0.0, 0.0, 0.0, 0.0),
@@ -616,8 +616,8 @@ impl Default for Theme {
             frame_edge_dim_focused: Vec4::new(1.0, 1.0, 1.0, 1.0),
 
             // Shader effect parameters
-            effect_glow_radius: 4.0,
-            effect_glow_intensity: 0.15,
+            effect_glow_radius: 0.0,
+            effect_glow_intensity: 0.0,
             effect_glow_falloff: 2.0,
             effect_sheen_speed: 0.5,
             effect_sheen_sparkle_threshold: 0.95,
@@ -627,15 +627,15 @@ impl Default for Theme {
             // Chasing border
             effect_chase_speed: 2.0,
             effect_chase_width: 0.15,
-            effect_chase_glow_radius: 8.0,
-            effect_chase_glow_intensity: 0.5,
+            effect_chase_glow_radius: 0.0,
+            effect_chase_glow_intensity: 0.0,
             effect_chase_color_cycle: 0.0,
 
             // Input area defaults
             input_minimized_height: 48.0,
             input_docked_height: 200.0,
             input_overlay_width_pct: 0.6,
-            input_backdrop_color: hex_to_color("#0d0221d9"),
+            input_backdrop_color: hex_to_color("#17141fd9"),
 
             // OutputData rendering (structured tool results)
             output_directory: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
@@ -674,7 +674,7 @@ impl Default for Theme {
             sparkline_fill_color: Some(Color::srgba(0.490, 0.812, 1.00, 0.15)), // cyan 15% alpha
 
             // Font configuration
-            font_rainbow: true,
+            font_rainbow: false,
             font_mono: "Cascadia Code NF".into(),
             // MSDF text rendering quality
             msdf_hint_amount: 0.8,
@@ -691,28 +691,28 @@ impl Default for Theme {
             constellation_ring_spacing: 550.0,
 
             // Block borders
-            block_border_tool_call: hex_to_color("#ff2e8899"),
-            block_border_tool_result: hex_to_color("#a487ff66"),
-            block_border_error: hex_to_color("#ff2020cc"),
+            block_border_tool_call: hex_to_color("#9c8bb259"),
+            block_border_tool_result: hex_to_color("#9c8bb233"),
+            block_border_error: hex_to_color("#e28c99b3"),
             block_border_error_warning: Color::srgba(1.000, 0.706, 0.369, 0.7), // #ffb45e amber
             block_border_error_fatal: Color::srgba(0.769, 0.118, 0.227, 0.9),   // #c41e3a dark red
-            block_border_thinking: Color::srgba(0.478, 0.416, 0.627, 0.3), // #7a6aa0 muted violet
-            block_border_drift: Color::srgba(0.769, 0.463, 0.882, 0.5),  // #c476e1 violet-thread
+            block_border_thinking: hex_to_color("#a29aad33"),
+            block_border_drift: hex_to_color("#9c8bb259"),
             block_border_thickness: 1.0,
             block_border_corner_radius: 2.0,
-            block_border_glow_radius: 4.0,
-            block_border_glow_intensity: 0.10,
-            text_glow_radius: 2.5,
-            text_glow_color: Color::srgba(0.796, 0.722, 1.000, 0.18), // #cbb8ff violet-white, thinned halo (2026-09-12)
+            block_border_glow_radius: 0.0,
+            block_border_glow_intensity: 0.0,
+            text_glow_radius: 0.0,
+            text_glow_color: hex_to_color("#cec8d800"),
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose block
-            compose_border: hex_to_color("#44245e"),
-            compose_bg: hex_to_color("#0d0221"),
-            compose_palette_border: hex_to_color("#ff2e88"),
-            compose_palette_glow_radius: 10.0,
-            compose_palette_glow_intensity: 0.6,
+            compose_border: hex_to_color("#393142"),
+            compose_bg: hex_to_color("#17141f"),
+            compose_palette_border: hex_to_color("#b58ba7"),
+            compose_palette_glow_radius: 0.0,
+            compose_palette_glow_intensity: 0.0,
 
             // Modal backdrop — semi-transparent dark overlay
             modal_backdrop: Color::srgba(0.0, 0.0, 0.0, 0.6),
@@ -720,9 +720,8 @@ impl Default for Theme {
             // User/assistant text borders — transparent (opt-in)
             block_border_user: Color::srgba(0.0, 0.0, 0.0, 0.0),
             block_border_assistant: Color::srgba(0.0, 0.0, 0.0, 0.0),
-            // Focus ring — cyan #00f0ffcc, distinct from every block-kind
-            // border color
-            block_border_focus: hex_to_color("#00f0ffcc"),
+            // Focus uses cyan, distinct from every block-kind border color.
+            block_border_focus: hex_to_color("#8bbbc499"),
 
             // Layout spacing
             indent_width: 24.0,
@@ -804,6 +803,16 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
         theme.warning = hex_to_color(&td.warning);
         theme.success = hex_to_color(&td.success);
 
+        // Conversation text follows the loaded palette; success is a state,
+        // not a tint applied to every line of tool output.
+        theme.block_assistant = theme.fg;
+        theme.block_thinking = theme.fg_dim;
+        theme.block_tool_call = theme.accent2;
+        theme.block_tool_result = theme.fg;
+        theme.block_tool_error = theme.error;
+        theme.block_error_warning = theme.warning;
+        theme.block_error_severity = theme.error;
+
         // Mode colors
         theme.mode_normal = hex_to_color(&td.mode_normal);
         theme.mode_insert = hex_to_color(&td.mode_insert);
@@ -869,6 +878,8 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
         // Shader effects
         theme.effect_glow_radius = td.effect_glow_radius;
         theme.effect_glow_intensity = td.effect_glow_intensity;
+        theme.compose_palette_glow_radius = theme.effect_glow_radius;
+        theme.compose_palette_glow_intensity = theme.effect_glow_intensity;
         theme.effect_glow_falloff = td.effect_glow_falloff;
         theme.effect_sheen_speed = td.effect_sheen_speed;
         theme.effect_sheen_sparkle_threshold = td.effect_sheen_sparkle_threshold;
@@ -947,6 +958,21 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conversation_text_follows_the_loaded_palette() {
+        let mut data = kaijutsu_types::theme::ThemeData::default();
+        data.fg = "#c4bfce".into();
+        data.fg_dim = "#9f96ad".into();
+        data.accent2 = "#89b2bc".into();
+        data.error = "#dd8899".into();
+        let theme = Theme::from(data);
+        assert_eq!(theme.block_assistant, theme.fg);
+        assert_eq!(theme.block_tool_result, theme.fg);
+        assert_eq!(theme.block_thinking, theme.fg_dim);
+        assert_eq!(theme.block_tool_call, theme.accent2);
+        assert_eq!(theme.block_tool_error, theme.error);
+    }
+
     use super::*;
 
     #[test]

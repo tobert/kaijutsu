@@ -241,30 +241,30 @@ impl Default for ThemeData {
         Self {
             // Base UI — Synthwave (docs/newui.md; Tokyo Night lives on in
             // contrib/themes/tokyo-night.toml)
-            bg: "#0d0221".into(),
-            panel_bg: "#12041ff2".into(),
-            fg: "#ece8f7".into(),
-            fg_dim: "#9a90bd".into(),
-            accent: "#ff2e88".into(),
-            accent2: "#00f0ff".into(),
-            border: "#44245e".into(),
-            selection_bg: "#ff2e8833".into(),
+            bg: "#17141f".into(),
+            panel_bg: "#1d1926ff".into(),
+            fg: "#cec8d8".into(),
+            fg_dim: "#a29aad".into(),
+            accent: "#b58ba7".into(),
+            accent2: "#8bbbc4".into(),
+            border: "#393142".into(),
+            selection_bg: "#9c8bb233".into(),
 
             // Row type colors
-            row_tool: "#d18bff".into(),
-            row_result: "#e8b45e".into(),
+            row_tool: "#9c8bb2".into(),
+            row_result: "#9c8bb2".into(),
 
             // Semantic
-            error: "#ff2020".into(),
-            warning: "#ffb45e".into(),
-            success: "#4ce0b3".into(),
+            error: "#e28c99".into(),
+            warning: "#c9ab7d".into(),
+            success: "#8fb5a1".into(),
 
             // Mode colors
-            mode_normal: "#a487ff".into(),
-            mode_insert: "#4ce0b3".into(),
-            mode_chat: "#4ce0b3".into(),
-            mode_shell: "#e8b45e".into(),
-            mode_visual: "#ff7ad9".into(),
+            mode_normal: "#9c8bb2".into(),
+            mode_insert: "#8fb5a1".into(),
+            mode_chat: "#8fb5a1".into(),
+            mode_shell: "#c9ab7d".into(),
+            mode_visual: "#b58ba7".into(),
 
             // Mode labels
             mode_label_normal: "NORMAL".into(),
@@ -290,12 +290,12 @@ impl Default for ThemeData {
             frame_content_padding: 12.0,
 
             // Frame colors
-            frame_base: "#12041ff2".into(),
-            frame_focused: "#ff2e8826".into(),
-            frame_insert: "#4ce0b31f".into(),
-            frame_visual: "#ff7ad91f".into(),
-            frame_unfocused: "#0d0221cc".into(),
-            frame_edge: "#44245e99".into(),
+            frame_base: "#1d1926ff".into(),
+            frame_focused: "#8bbbc414".into(),
+            frame_insert: "#8fb5a114".into(),
+            frame_visual: "#b58ba714".into(),
+            frame_unfocused: "#17141fcc".into(),
+            frame_edge: "#39314299".into(),
 
             // Frame shader params
             frame_params_base: [0.0, 0.0, 0.0, 0.0],
@@ -307,8 +307,8 @@ impl Default for ThemeData {
             frame_edge_dim_focused: [1.0, 1.0, 1.0, 1.0],
 
             // Shader effects
-            effect_glow_radius: 4.0,
-            effect_glow_intensity: 0.15,
+            effect_glow_radius: 0.0,
+            effect_glow_intensity: 0.0,
             effect_glow_falloff: 2.0,
             effect_sheen_speed: 0.5,
             effect_sheen_sparkle_threshold: 0.95,
@@ -318,18 +318,18 @@ impl Default for ThemeData {
             // Chasing border
             effect_chase_speed: 2.0,
             effect_chase_width: 0.15,
-            effect_chase_glow_radius: 8.0,
-            effect_chase_glow_intensity: 0.5,
+            effect_chase_glow_radius: 0.0,
+            effect_chase_glow_intensity: 0.0,
             effect_chase_color_cycle: 0.0,
 
             // Input area
             input_minimized_height: 48.0,
             input_docked_height: 200.0,
             input_overlay_width_pct: 0.6,
-            input_backdrop_color: "#0d0221d9".into(),
+            input_backdrop_color: "#17141fd9".into(),
 
             // Font configuration
-            font_rainbow: true,
+            font_rainbow: false,
             font_mono: "Cascadia Code NF".into(),
             font_serif: "Noto Serif".into(),
             font_sans: "Noto Sans CJK JP".into(),
@@ -347,23 +347,23 @@ impl Default for ThemeData {
             constellation_ring_spacing: 550.0,
 
             // Block borders
-            block_border_tool_call: "#ff2e8899".into(),
-            block_border_tool_result: "#a487ff66".into(),
-            block_border_error: "#ff2020cc".into(),
-            block_border_thinking: "#7a6aa04d".into(),
-            block_border_drift: "#c476e180".into(),
+            block_border_tool_call: "#9c8bb259".into(),
+            block_border_tool_result: "#9c8bb233".into(),
+            block_border_error: "#e28c99b3".into(),
+            block_border_thinking: "#a29aad33".into(),
+            block_border_drift: "#9c8bb259".into(),
             block_border_thickness: 1.0,
             block_border_corner_radius: 2.0,
-            block_border_glow_radius: 4.0,
-            block_border_glow_intensity: 0.10,
-            text_glow_radius: 2.5,
-            text_glow_color: "#cbb8ff2e".into(),
+            block_border_glow_radius: 0.0,
+            block_border_glow_intensity: 0.0,
+            text_glow_radius: 0.0,
+            text_glow_color: "#cec8d800".into(),
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose
-            compose_border: "#44245e".into(),
-            compose_bg: "#0d0221".into(),
+            compose_border: "#393142".into(),
+            compose_bg: "#17141f".into(),
 
             // Modal
             modal_backdrop: "#00000099".into(),
@@ -371,7 +371,7 @@ impl Default for ThemeData {
             // User/assistant borders (transparent = disabled)
             block_border_user: "#00000000".into(),
             block_border_assistant: "#00000000".into(),
-            block_border_focus: default_block_border_focus(),
+            block_border_focus: "#8bbbc499".into(),
 
             // Layout spacing
             indent_width: 24.0,
