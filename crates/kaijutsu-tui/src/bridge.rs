@@ -304,17 +304,10 @@ impl KernelBridge {
         &self,
         context_id: ContextId,
     ) -> Result<(ContextMirror, mpsc::Receiver<FeedEvent>)> {
-        let rx = self
-            .actor
-            .subscribe_context(context_id)
+        self.actor
+            .hydrate_context(context_id)
             .await
-            .with_context(|| format!("subscribe to context feed for {}", context_id.short()))?;
-        let mut mirror = ContextMirror::new(context_id);
-        let (blocks, version) = self.blocks_versioned(context_id).await?;
-        mirror
-            .apply_snapshot(blocks, version)
-            .with_context(|| format!("apply initial snapshot for {}", context_id.short()))?;
-        Ok((mirror, rx))
+            .with_context(|| format!("hydrate context {}", context_id.short()))
     }
 
     /// Fetch the snapshot a rehydrate applies after `FeedEvent::Resubscribed`.
@@ -325,14 +318,10 @@ impl KernelBridge {
     /// is filtered against it rather than discarded along with a
     /// replacement mirror.
     pub async fn rehydrate_context(&self, context_id: ContextId) -> Result<(Vec<BlockSnapshot>, u64)> {
-        self.blocks_versioned(context_id).await
-    }
-
-    async fn blocks_versioned(&self, context_id: ContextId) -> Result<(Vec<BlockSnapshot>, u64)> {
         self.actor
-            .get_blocks_versioned(context_id, BlockQuery::All)
+            .fetch_context_snapshot(context_id)
             .await
-            .with_context(|| format!("get_blocks_versioned for {}", context_id.short()))
+            .with_context(|| format!("fetch context snapshot for {}", context_id.short()))
     }
 
     /// The authenticated character identity for this terminal seat.

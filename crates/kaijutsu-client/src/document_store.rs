@@ -37,7 +37,8 @@ use tokio::sync::mpsc;
 use crate::{ContextMirror, FeedEvent, MirrorError};
 
 /// A cached document for a single context: its change-feed mirror, the live
-/// feed receiver that keeps it current, and the bookkeeping the store needs
+/// feed receiver that keeps it current, a monotonic recovery epoch for
+/// rejecting obsolete async responses, and the bookkeeping the store needs
 /// to pick eviction victims.
 pub struct DocumentEntry {
     /// The context's projected block state, maintained from the change feed
@@ -47,6 +48,11 @@ pub struct DocumentEntry {
     /// and the app re-subscribing — draining is a no-op while it's `None`,
     /// never a panic.
     pub feed: Option<mpsc::Receiver<FeedEvent>>,
+    /// Monotonic epoch bumped on every install and every recovery signal
+    /// (`Resubscribed`, `Desynced`, `Terminated`). Async snapshot/re-subscribe
+    /// responses carry the epoch they were spawned for so obsolete responses
+    /// are rejected rather than clobbering newer state.
+    pub recovery_epoch: u64,
     /// Context name (e.g. the kernel_id or user-supplied name).
     pub context_name: String,
     /// When this document was last accessed (for LRU eviction).
@@ -64,9 +70,15 @@ impl DocumentEntry {
         Self {
             mirror,
             feed,
+            recovery_epoch: 1,
             context_name,
             last_accessed: Instant::now(),
         }
+    }
+
+    fn bump_epoch(&mut self) -> u64 {
+        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+        self.recovery_epoch
     }
 
     /// Drain every event currently queued on this entry's feed, applying
@@ -75,13 +87,12 @@ impl DocumentEntry {
     /// nothing more to give right now, or immediately if there is no feed to
     /// drain.
     ///
-    /// A delivery the mirror refuses (`MirrorError`) is never silently
-    /// dropped: the mirror is rebuilt fresh (same recovery as
-    /// `Resubscribed`) and the fault rides back as [`FeedSignal::Desynced`]
-    /// so the caller can log it loudly. This should not happen in normal
-    /// operation — `ContextMirror::receive` already discards a stale
-    /// straggler rather than erroring on it — so seeing one is itself
-    /// diagnostic.
+    /// On `Resubscribed`, `Desynced`, or `Terminated`, the mirror switches to
+    /// buffering mode (`ContextMirror::begin_rehydrate`, preserving the last
+    /// good blocks on screen while buffering incoming deltas) and bumps
+    /// `recovery_epoch`. Callers pass the returned `epoch` to
+    /// [`DocumentStore::apply_snapshot_for_epoch`] or
+    /// [`DocumentStore::install_for_epoch`] so obsolete responses are rejected.
     pub fn drain_feed(&mut self) -> Vec<FeedSignal> {
         let mut signals = Vec::new();
         let Some(rx) = self.feed.as_mut() else {
@@ -92,23 +103,33 @@ impl DocumentEntry {
                 Ok(FeedEvent::Changed(delivery)) => match self.mirror.receive(delivery) {
                     Ok(()) => signals.push(FeedSignal::Updated),
                     Err(e) => {
-                        self.mirror = ContextMirror::new(self.mirror.context_id());
-                        signals.push(FeedSignal::Desynced(e));
+                        self.mirror.begin_rehydrate();
+                        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+                        signals.push(FeedSignal::Desynced {
+                            error: e,
+                            epoch: self.recovery_epoch,
+                        });
                     }
                 },
                 Ok(FeedEvent::Resubscribed) => {
-                    // Same receiver, new epoch: nothing published during the
-                    // outage rode it, so the mirror held before this is
-                    // stale and is replaced wholesale, never patched.
-                    self.mirror = ContextMirror::new(self.mirror.context_id());
-                    signals.push(FeedSignal::Resubscribed);
+                    // Same receiver, new epoch: switch to buffering mode so
+                    // post-reconnect deltas wait for the snapshot while last
+                    // good blocks stay renderable.
+                    self.mirror.begin_rehydrate();
+                    self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+                    signals.push(FeedSignal::Resubscribed {
+                        epoch: self.recovery_epoch,
+                    });
                 }
                 Ok(FeedEvent::Terminated { .. }) => {
                     // Not resumable (rule 28): the receiver is spent, so
                     // there is nothing left to drain this call.
-                    self.mirror = ContextMirror::new(self.mirror.context_id());
+                    self.mirror.begin_rehydrate();
                     self.feed = None;
-                    signals.push(FeedSignal::Terminated);
+                    self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+                    signals.push(FeedSignal::Terminated {
+                        epoch: self.recovery_epoch,
+                    });
                     break;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -116,9 +137,12 @@ impl DocumentEntry {
                     // The sender side is gone without an explicit
                     // `Terminated` (e.g. the actor itself tore down) — same
                     // recovery as if it had said so.
-                    self.mirror = ContextMirror::new(self.mirror.context_id());
+                    self.mirror.begin_rehydrate();
                     self.feed = None;
-                    signals.push(FeedSignal::Terminated);
+                    self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+                    signals.push(FeedSignal::Terminated {
+                        epoch: self.recovery_epoch,
+                    });
                     break;
                 }
             }
@@ -128,38 +152,34 @@ impl DocumentEntry {
 }
 
 /// What draining one context's feed produced. `Updated` needs no reaction
-/// beyond a redraw; the other three all mean "the mirror was just reset —
-/// fetch a fresh snapshot," and the caller (which owns the actor handle,
-/// i.e. I/O the store cannot perform itself) decides how:
+/// beyond a redraw; the other three all mean "the mirror entered recovery at
+/// `epoch` — fetch a fresh snapshot," and the caller (which owns the actor
+/// handle, i.e. I/O the store cannot perform itself) decides how:
 ///
 /// - [`Self::Resubscribed`] / [`Self::Desynced`]: the existing feed receiver
-///   is still good — just re-fetch with `get_blocks_versioned` and hydrate
-///   via [`DocumentStore::apply_snapshot`].
+///   is still good — fetch with `ActorHandle::fetch_context_snapshot` and
+///   hydrate via [`DocumentStore::apply_snapshot_for_epoch`].
 /// - [`Self::Terminated`]: the receiver is spent — call
-///   `subscribe_context` again for a new one, then fetch and hydrate via
-///   [`DocumentStore::install`].
+///   `ActorHandle::hydrate_context` for a new mirror + receiver and land via
+///   [`DocumentStore::install_for_epoch`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum FeedSignal {
     /// A delivery applied cleanly (or was buffered pre-hydration).
     Updated,
     /// The actor already re-subscribed on the same receiver.
-    Resubscribed,
+    Resubscribed { epoch: u64 },
     /// The feed ended and will not resume; `DocumentEntry::feed` is now
     /// `None`.
-    Terminated,
+    Terminated { epoch: u64 },
     /// A delivery could not be applied to the mirror — never expected under
     /// normal operation (see `drain_feed`'s doc comment). Carried so the
     /// caller can surface the fault instead of masking it as an ordinary
     /// reconnect.
-    Desynced(MirrorError),
+    Desynced { error: MirrorError, epoch: u64 },
 }
 
 /// Multi-context document store — the authoritative source for all document
 /// state. The active entry is what the renderer draws.
-// TODO: Own subscription, snapshot recovery, and stale-response rejection
-// together in kaijutsu-client. App, TUI, and ACP still coordinate them separately.
-// Keep each client's retry/release presentation policy at its call site.
-// See docs/issues.md, "Shared client recovery".
 pub struct DocumentStore {
     /// Map from context_id → cached document state.
     documents: HashMap<ContextId, DocumentEntry>,
@@ -263,18 +283,48 @@ impl DocumentStore {
         if let Some(entry) = self.documents.get_mut(&context_id) {
             entry.mirror = mirror;
             entry.feed = feed;
+            entry.bump_epoch();
         } else {
             self.insert(context_id, DocumentEntry::new(mirror, feed, name()));
         }
     }
 
+    /// Epoch-checked [`Self::install`].
+    ///
+    /// When `expected_epoch` is `Some(epoch)`, installs only if `context_id`
+    /// is still present at that exact recovery epoch; otherwise rejects the
+    /// obsolete response and returns `false`. When `expected_epoch` is `None`
+    /// (initial join), installs unconditionally and returns `true`.
+    pub fn install_for_epoch(
+        &mut self,
+        context_id: ContextId,
+        expected_epoch: Option<u64>,
+        mirror: ContextMirror,
+        feed: Option<mpsc::Receiver<FeedEvent>>,
+        name: impl FnOnce() -> String,
+    ) -> bool {
+        if let Some(expected) = expected_epoch {
+            let Some(entry) = self.documents.get_mut(&context_id) else {
+                return false;
+            };
+            if entry.recovery_epoch != expected {
+                return false;
+            }
+            entry.mirror = mirror;
+            entry.feed = feed;
+            entry.bump_epoch();
+            return true;
+        }
+        self.install(context_id, mirror, feed, name);
+        true
+    }
+
     /// Re-hydrate an already-followed context's mirror from a fresh
     /// snapshot, keeping its existing feed receiver untouched — the
     /// `Resubscribed`/`Desynced` recovery path (docs/change-feed.md rules
-    /// 21-26, replayed on the ALREADY-RESET mirror `drain_feed` left
-    /// behind). A context that was left or evicted before the fetch
-    /// completed is a no-op, not an error: the fetch just lost the race
-    /// against the user leaving.
+    /// 21-26, replayed on the buffering mirror `drain_feed` left behind).
+    /// A context that was left or evicted before the fetch completed is a
+    /// no-op, not an error.
     pub fn apply_snapshot(
         &mut self,
         context_id: ContextId,
@@ -285,6 +335,33 @@ impl DocumentStore {
             return Ok(());
         };
         entry.mirror.apply_snapshot(blocks, version)
+    }
+
+    /// Epoch-checked [`Self::apply_snapshot`].
+    ///
+    /// Applies the snapshot only if `context_id` is still present at `epoch`.
+    /// Returns `Ok(true)` if applied, or `Ok(false)` if the response is
+    /// obsolete (evicted or superseded by a newer recovery/install).
+    pub fn apply_snapshot_for_epoch(
+        &mut self,
+        context_id: ContextId,
+        epoch: u64,
+        blocks: Vec<BlockSnapshot>,
+        version: u64,
+    ) -> Result<bool, MirrorError> {
+        let Some(entry) = self.documents.get_mut(&context_id) else {
+            return Ok(false);
+        };
+        if entry.recovery_epoch != epoch {
+            return Ok(false);
+        }
+        entry.mirror.apply_snapshot(blocks, version)?;
+        Ok(true)
+    }
+
+    /// Current recovery epoch for `context_id`, if cached.
+    pub fn recovery_epoch(&self, context_id: ContextId) -> Option<u64> {
+        self.documents.get(&context_id).map(|e| e.recovery_epoch)
     }
 
     /// Drain every followed context's change feed once. Returns
@@ -465,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resubscribed_signal_resets_the_mirror_and_keeps_the_receiver() {
+    fn a_resubscribed_signal_buffers_the_mirror_and_keeps_the_receiver() {
         let mut store = DocumentStore::default();
         let c = ctx();
         let mut mirror = ContextMirror::new(c);
@@ -475,15 +552,16 @@ mod tests {
 
         tx.try_send(FeedEvent::Resubscribed).unwrap();
         let signals = store.drain_feeds();
-        assert_eq!(signals, vec![(c, FeedSignal::Resubscribed)]);
+        assert_eq!(signals, vec![(c, FeedSignal::Resubscribed { epoch: 2 })]);
 
         let entry = store.get(c).unwrap();
-        assert!(!entry.mirror.is_hydrated(), "Resubscribed must throw the stale mirror away");
+        assert!(!entry.mirror.is_hydrated(), "Resubscribed must switch mirror into buffering mode");
+        assert_eq!(entry.mirror.blocks().len(), 1, "last good blocks stay visible during recovery");
         assert!(entry.feed.is_some(), "Resubscribed reuses the SAME receiver, never re-subscribes");
     }
 
     #[test]
-    fn a_terminated_signal_resets_the_mirror_and_drops_the_receiver() {
+    fn a_terminated_signal_buffers_the_mirror_and_drops_the_receiver() {
         let mut store = DocumentStore::default();
         let c = ctx();
         let mut mirror = ContextMirror::new(c);
@@ -497,10 +575,71 @@ mod tests {
         })
         .unwrap();
         let signals = store.drain_feeds();
-        assert_eq!(signals, vec![(c, FeedSignal::Terminated)]);
+        assert_eq!(signals, vec![(c, FeedSignal::Terminated { epoch: 2 })]);
 
         let entry = store.get(c).unwrap();
         assert!(!entry.mirror.is_hydrated());
         assert!(entry.feed.is_none(), "Terminated is not resumable — the dead receiver must be dropped");
+    }
+
+    #[test]
+    fn obsolete_snapshot_from_earlier_epoch_is_rejected() {
+        let mut store = DocumentStore::default();
+        let c = ctx();
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![block(c, 1, "v1")], 1).unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        store.install(c, mirror, Some(rx), || "ctx".into());
+
+        // First reconnect -> epoch 2
+        tx.try_send(FeedEvent::Resubscribed).unwrap();
+        let s1 = store.drain_feeds();
+        assert_eq!(s1, vec![(c, FeedSignal::Resubscribed { epoch: 2 })]);
+
+        // Second reconnect before first snapshot lands -> epoch 3
+        tx.try_send(FeedEvent::Resubscribed).unwrap();
+        let s2 = store.drain_feeds();
+        assert_eq!(s2, vec![(c, FeedSignal::Resubscribed { epoch: 3 })]);
+
+        // Epoch 3 snapshot lands first
+        assert!(store
+            .apply_snapshot_for_epoch(c, 3, vec![block(c, 1, "v20")], 20)
+            .unwrap());
+        assert_eq!(store.get(c).unwrap().mirror.version(), 20);
+
+        // Stale epoch 2 snapshot arrives late -> rejected, does not clobber v20
+        assert!(!store
+            .apply_snapshot_for_epoch(c, 2, vec![block(c, 1, "v12")], 12)
+            .unwrap());
+        assert_eq!(store.get(c).unwrap().mirror.version(), 20);
+        assert_eq!(store.get(c).unwrap().mirror.blocks()[0].content, "v20");
+    }
+
+    #[test]
+    fn obsolete_terminated_install_from_earlier_epoch_is_rejected() {
+        let mut store = DocumentStore::default();
+        let c = ctx();
+        let (tx, rx) = mpsc::channel(8);
+        store.install(c, ContextMirror::new(c), Some(rx), || "ctx".into());
+
+        tx.try_send(FeedEvent::Terminated {
+            reason: crate::subscriptions::SubscriptionEndReason::SlowSubscriber,
+            delivered_version: 1,
+        })
+        .unwrap();
+        let signals = store.drain_feeds();
+        assert_eq!(signals, vec![(c, FeedSignal::Terminated { epoch: 2 })]);
+
+        // A newer recovery (epoch 2) lands first and advances the epoch to 3.
+        let mut newer = ContextMirror::new(c);
+        newer.apply_snapshot(vec![block(c, 1, "fresh")], 10).unwrap();
+        assert!(store.install_for_epoch(c, Some(2), newer, None, || "ctx".into()));
+        assert_eq!(store.recovery_epoch(c), Some(3));
+
+        // A duplicate or stale recovery for epoch 2 arrives late -> rejected.
+        let mut stale = ContextMirror::new(c);
+        stale.apply_snapshot(vec![block(c, 1, "stale")], 4).unwrap();
+        assert!(!store.install_for_epoch(c, Some(2), stale, None, || "ctx".into()));
+        assert_eq!(store.get(c).unwrap().mirror.version(), 10);
     }
 }

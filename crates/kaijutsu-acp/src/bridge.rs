@@ -396,48 +396,24 @@ impl KernelBridge {
         &self,
         context_id: ContextId,
     ) -> Result<(ContextMirror, mpsc::Receiver<FeedEvent>)> {
-        let rx = self
-            .actor
-            .subscribe_context(context_id)
+        self.actor
+            .hydrate_context(context_id)
             .await
-            .with_context(|| format!("subscribe to context feed for {}", context_id.short()))?;
-        let mirror = self.hydrate_mirror(context_id).await?;
-        Ok((mirror, rx))
+            .with_context(|| format!("hydrate context {}", context_id.short()))
     }
 
-    /// Rebuild a fresh mirror after `FeedEvent::Resubscribed`. The actor has
-    /// already re-subscribed by the time that event arrives — there is no new
-    /// receiver to hand back, only a fresh mirror to fetch and hydrate; the
-    /// caller keeps reading the same `feed_rx` it already has.
-    pub async fn rehydrate_context(&self, context_id: ContextId) -> Result<ContextMirror> {
-        self.hydrate_mirror(context_id).await
-    }
-
-    /// Fetch a snapshot and hydrate a fresh mirror with it. Plain sequential
-    /// order — subscribe (by the caller, before this runs), fetch, apply —
-    /// and deliberately does NOT touch the feed receiver.
-    ///
-    /// That used to require racing `getBlocks` against the receiver in a
-    /// `select!`, to dodge a spurious `VersionWentBackwards` on a delivery
-    /// that landed mid-fetch and turned out to already be in the snapshot.
-    /// `ContextMirror::receive` no longer errors on that case — a delivery at
-    /// or below the snapshot version is now silently discarded, since the
-    /// snapshot was read AT that version and provably already contains it
-    /// (see `receive`'s doc comment in `kaijutsu-client`). So whatever piles
-    /// up on the receiver while this fetch is in flight — including a
-    /// straggler already covered by the snapshot — sorts itself out
-    /// correctly the first time the caller reads it, with no race needed.
-    async fn hydrate_mirror(&self, context_id: ContextId) -> Result<ContextMirror> {
-        let mut mirror = ContextMirror::new(context_id);
-        let (blocks, version) = self
-            .actor
-            .get_blocks_versioned(context_id, BlockQuery::All)
+    /// Fetch the snapshot for rehydration after `FeedEvent::Resubscribed`.
+    /// The actor has already re-subscribed by the time that event arrives, so
+    /// there is no new receiver; the caller keeps reading the same `feed_rx`
+    /// and applies this snapshot onto its buffering mirror.
+    pub async fn rehydrate_context(
+        &self,
+        context_id: ContextId,
+    ) -> Result<(Vec<kaijutsu_types::BlockSnapshot>, u64)> {
+        self.actor
+            .fetch_context_snapshot(context_id)
             .await
-            .with_context(|| format!("get_blocks_versioned for {}", context_id.short()))?;
-        mirror
-            .apply_snapshot(blocks, version)
-            .with_context(|| format!("apply initial snapshot for {}", context_id.short()))?;
-        Ok(mirror)
+            .with_context(|| format!("fetch context snapshot for {}", context_id.short()))
     }
 
     /// Write `text` into the context's input doc and submit it as a chat turn.

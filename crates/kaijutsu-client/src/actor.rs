@@ -1255,6 +1255,51 @@ impl ActorHandle {
         let _ = self.tx.try_send(cmd);
     }
 
+    /// Subscribe to a context's change feed and hydrate a fresh
+    /// [`crate::ContextMirror`] over it: subscribe first, fetch a versioned
+    /// snapshot (`BlockQuery::All`), then apply the snapshot.
+    ///
+    /// If fetching or applying the snapshot fails after subscribing, this
+    /// calls [`Self::unsubscribe_context`] so no orphaned feed intent stays in
+    /// the actor's reconnect table.
+    pub async fn hydrate_context(
+        &self,
+        context_id: ContextId,
+    ) -> Result<
+        (
+            crate::context_feed::ContextMirror,
+            mpsc::Receiver<crate::context_feed::FeedEvent>,
+        ),
+        crate::context_feed::HydrateError,
+    > {
+        let rx = self
+            .subscribe_context(context_id)
+            .await
+            .map_err(crate::context_feed::HydrateError::Subscribe)?;
+        let (blocks, version) = match self.fetch_context_snapshot(context_id).await {
+            Ok(snap) => snap,
+            Err(e) => {
+                self.unsubscribe_context(context_id);
+                return Err(crate::context_feed::HydrateError::Snapshot(e));
+            }
+        };
+        let mut mirror = crate::context_feed::ContextMirror::new(context_id);
+        if let Err(e) = mirror.apply_snapshot(blocks, version) {
+            self.unsubscribe_context(context_id);
+            return Err(crate::context_feed::HydrateError::Mirror(e));
+        }
+        Ok((mirror, rx))
+    }
+
+    /// Fetch a versioned full snapshot for `context_id` (used for initial
+    /// hydration and `FeedEvent::Resubscribed` / `Desynced` recovery).
+    pub async fn fetch_context_snapshot(
+        &self,
+        context_id: ContextId,
+    ) -> Result<(Vec<BlockSnapshot>, u64), CallError> {
+        self.get_blocks_versioned(context_id, BlockQuery::All).await
+    }
+
     /// Query blocks and keep the version they were read at, atomically.
     ///
     /// A caller joining a snapshot to a live subscription needs this one:
@@ -2194,6 +2239,62 @@ struct RpcActor {
     connection_epoch: Arc<AtomicU64>,
 }
 
+/// Complete one `subscribeContext` attempt and pump its observer channel into
+/// the consumer's channel.
+///
+/// If the subscribe RPC fails or times out, emits `FeedEvent::Terminated` on
+/// `sender` so the consumer recovers rather than sitting on a frozen receiver.
+/// When `announce_resubscribe` is true, sends `FeedEvent::Resubscribed` after
+/// the subscribe succeeds and strictly before any post-reconnect delivery.
+async fn pump_context_feed(
+    context_id: ContextId,
+    sender: mpsc::Sender<crate::context_feed::FeedEvent>,
+    announce_resubscribe: bool,
+    sub_result: Result<Result<(), crate::RpcError>, tokio::time::error::Elapsed>,
+    mut rx: mpsc::Receiver<crate::context_feed::FeedEvent>,
+) {
+    match sub_result {
+        Ok(Ok(())) => log::debug!("Subscribed to the change feed for {context_id}"),
+        Ok(Err(e)) => {
+            log::warn!("Context feed subscribe failed for {context_id}: {e}");
+            let _ = sender
+                .send(crate::context_feed::FeedEvent::Terminated {
+                    reason: crate::subscriptions::SubscriptionEndReason::InternalFault,
+                    delivered_version: 0,
+                })
+                .await;
+            return;
+        }
+        Err(_) => {
+            log::warn!("Context feed subscribe timed out for {context_id}");
+            let _ = sender
+                .send(crate::context_feed::FeedEvent::Terminated {
+                    reason: crate::subscriptions::SubscriptionEndReason::InternalFault,
+                    delivered_version: 0,
+                })
+                .await;
+            return;
+        }
+    }
+    if announce_resubscribe
+        && sender
+            .send(crate::context_feed::FeedEvent::Resubscribed)
+            .await
+            .is_err()
+    {
+        return;
+    }
+    // Pump the observer's channel into the consumer's. Two channels rather
+    // than one because the observer is rebuilt on every reconnect while the
+    // consumer's receiver has to survive; the pump ends when either side
+    // goes away.
+    while let Some(event) = rx.recv().await {
+        if sender.send(event).await.is_err() {
+            break;
+        }
+    }
+}
+
 impl RpcActor {
     /// Snapshot peer intent for a new handshake. Any later declaration sets
     /// `peer_attach_pending` again and is replayed on the Connected edge.
@@ -2552,15 +2653,36 @@ impl RpcActor {
     }
 
     /// Reject a command with the current state's `NotReady` reason.
+    ///
+    /// Pure-intent subscription commands (`SubscribeContext`,
+    /// `UnsubscribeContext`) are recorded/removed immediately and succeed even
+    /// while `Connecting` or in `Cooldown`, so the next `Connected` edge
+    /// replays them without forcing callers to race the handshake.
     fn reject_not_ready(&mut self, cmd: RpcCommand) {
-        if let RpcCommand::AttachPeer {
-            config,
-            invocation_tx,
-            ..
-        } = &cmd
-        {
-            self.peer_registration = Some((config.clone(), invocation_tx.clone()));
-            self.peer_attach_pending = true;
+        match cmd {
+            RpcCommand::SubscribeContext {
+                context_id,
+                sender,
+                reply,
+            } => {
+                self.context_feeds.insert(context_id, sender);
+                let _ = reply.send(Ok(()));
+                return;
+            }
+            RpcCommand::UnsubscribeContext { context_id, reply } => {
+                self.unsubscribe_context_feed(context_id);
+                let _ = reply.send(Ok(()));
+                return;
+            }
+            RpcCommand::AttachPeer {
+                ref config,
+                ref invocation_tx,
+                ..
+            } => {
+                self.peer_registration = Some((config.clone(), invocation_tx.clone()));
+                self.peer_attach_pending = true;
+            }
+            _ => {}
         }
         let reason = match &self.state {
             ActorState::Idle => NotReadyReason::Idle,
@@ -2772,10 +2894,15 @@ impl RpcActor {
 
     /// Issue one context feed's `subscribeContext` on the live connection.
     ///
-    /// Fire-and-forget on the wire, like the block re-subscribe beside it: a
-    /// failure logs and leaves the consumer waiting, which its next reconnect
-    /// repairs. No-op when not Connected — the intent stays in
-    /// `context_feeds` and is replayed on the Connected edge.
+    /// Subscribe runs before announcing `Resubscribed` (and before pumping any
+    /// deliveries into `sender`), so a consumer never receives post-reconnect
+    /// deltas ahead of `Resubscribed` and never receives a bogus `Resubscribed`
+    /// for a subscribe that failed. If the RPC fails or times out, we emit
+    /// `FeedEvent::Terminated` so the consumer recovers instead of sitting on a
+    /// frozen receiver.
+    ///
+    /// No-op when not Connected — the intent stays in `context_feeds` and is
+    /// replayed on the Connected edge.
     fn issue_context_feed(
         &self,
         context_id: ContextId,
@@ -2787,40 +2914,13 @@ impl RpcActor {
         };
         let kernel = conn.kernel.clone();
         tokio::task::spawn_local(async move {
-            // Announced inside this task, before the subscribe, so the
-            // consumer cannot receive a post-reconnect delta ahead of the
-            // notice that it must rehydrate. Two spawned tasks would race.
-            if announce_resubscribe
-                && sender
-                    .send(crate::context_feed::FeedEvent::Resubscribed)
-                    .await
-                    .is_err()
-            {
-                return;
-            }
-            let (observer, mut rx) = crate::context_feed::context_feed_channel(CONTEXT_FEED_QUEUE);
-            match tokio::time::timeout(SUBSCRIBE_TIMEOUT, kernel.subscribe_context(context_id, observer))
-                .await
-            {
-                Ok(Ok(())) => log::debug!("Subscribed to the change feed for {context_id}"),
-                Ok(Err(e)) => {
-                    log::warn!("Context feed subscribe failed for {context_id} (non-fatal): {e}");
-                    return;
-                }
-                Err(_) => {
-                    log::warn!("Context feed subscribe timed out for {context_id} (non-fatal)");
-                    return;
-                }
-            }
-            // Pump the observer's channel into the consumer's. Two channels
-            // rather than one because the observer is rebuilt on every
-            // reconnect while the consumer's receiver has to survive; the pump
-            // ends when either side goes away.
-            while let Some(event) = rx.recv().await {
-                if sender.send(event).await.is_err() {
-                    break;
-                }
-            }
+            let (observer, rx) = crate::context_feed::context_feed_channel(CONTEXT_FEED_QUEUE);
+            let sub_result = tokio::time::timeout(
+                SUBSCRIBE_TIMEOUT,
+                kernel.subscribe_context(context_id, observer),
+            )
+            .await;
+            pump_context_feed(context_id, sender, announce_resubscribe, sub_result, rx).await;
         });
     }
 
@@ -4566,6 +4666,133 @@ mod tests {
         // candidate: the loop only ever visits what's left in the map.
         actor.resubscribe_context_feeds();
         assert!(!actor.context_feeds.contains_key(&released));
+    }
+
+    /// Subscribing or unsubscribing a context feed while the actor is
+    /// `Connecting` or in `Cooldown` must record/remove the intent and reply
+    /// `Ok(())` rather than failing with `NotReady` — `enter_connected` will
+    /// replay the recorded feeds once the connection lands.
+    #[test]
+    fn subscribe_and_unsubscribe_context_succeed_while_connecting() {
+        let mut actor = test_actor();
+        actor.state = ActorState::Connecting {
+            attempt: 1,
+            started_at: Instant::now(),
+        };
+        let ctx = ContextId::new();
+        let (feed_tx, _feed_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+        let (sub_reply_tx, mut sub_reply_rx) = tokio::sync::oneshot::channel();
+        actor.reject_not_ready(RpcCommand::SubscribeContext {
+            context_id: ctx,
+            sender: feed_tx,
+            reply: sub_reply_tx,
+        });
+
+        assert!(
+            matches!(sub_reply_rx.try_recv(), Ok(Ok(()))),
+            "SubscribeContext while Connecting must succeed as recorded intent"
+        );
+        assert!(
+            actor.context_feeds.contains_key(&ctx),
+            "SubscribeContext while Connecting must be stored in context_feeds"
+        );
+
+        let (unsub_reply_tx, mut unsub_reply_rx) = tokio::sync::oneshot::channel();
+        actor.reject_not_ready(RpcCommand::UnsubscribeContext {
+            context_id: ctx,
+            reply: unsub_reply_tx,
+        });
+        assert!(
+            matches!(unsub_reply_rx.try_recv(), Ok(Ok(()))),
+            "UnsubscribeContext while Connecting must succeed"
+        );
+        assert!(
+            !actor.context_feeds.contains_key(&ctx),
+            "UnsubscribeContext while Connecting must remove the recorded intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_context_resubscribe_emits_terminated_instead_of_freezing() {
+        let ctx = ContextId::new();
+        let (sender, mut consumer_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+        let (_obs_tx, obs_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+
+        pump_context_feed(
+            ctx,
+            sender,
+            true,
+            Ok(Err(crate::RpcError::ServerError("transient failure".into()))),
+            obs_rx,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                consumer_rx.try_recv(),
+                Ok(crate::context_feed::FeedEvent::Terminated {
+                    reason: crate::subscriptions::SubscriptionEndReason::InternalFault,
+                    delivered_version: 0,
+                })
+            ),
+            "failed subscribe must emit Terminated (not Resubscribed, not silent exit)"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_context_resubscribe_emits_terminated_instead_of_freezing() {
+        let ctx = ContextId::new();
+        let (sender, mut consumer_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+        let (_obs_tx, obs_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+
+        let elapsed = tokio::time::timeout(
+            Duration::from_nanos(0),
+            std::future::pending::<Result<(), crate::RpcError>>(),
+        )
+        .await;
+        pump_context_feed(ctx, sender, true, elapsed, obs_rx).await;
+
+        assert!(
+            matches!(
+                consumer_rx.try_recv(),
+                Ok(crate::context_feed::FeedEvent::Terminated {
+                    reason: crate::subscriptions::SubscriptionEndReason::InternalFault,
+                    delivered_version: 0,
+                })
+            ),
+            "timed out subscribe must emit Terminated so the consumer recovers"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_context_resubscribe_announces_resubscribed_before_deltas() {
+        let ctx = ContextId::new();
+        let (sender, mut consumer_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+        let (obs_tx, obs_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+
+        // Pre-queue a delivery before pumping to prove Resubscribed still lands first.
+        obs_tx
+            .send(crate::context_feed::FeedEvent::Changed(
+                crate::context_feed::ContextDelivery {
+                    context_id: ctx,
+                    events: Vec::new(),
+                    version: 42,
+                },
+            ))
+            .await
+            .unwrap();
+        drop(obs_tx);
+
+        pump_context_feed(ctx, sender, true, Ok(Ok(())), obs_rx).await;
+
+        assert!(matches!(
+            consumer_rx.try_recv(),
+            Ok(crate::context_feed::FeedEvent::Resubscribed)
+        ));
+        assert!(matches!(
+            consumer_rx.try_recv(),
+            Ok(crate::context_feed::FeedEvent::Changed(d)) if d.version == 42
+        ));
     }
 
     /// Regression test for the backoff reset bug: `finish_closing` used to

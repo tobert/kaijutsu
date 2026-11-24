@@ -107,18 +107,37 @@ pub fn drain_context_hydrations(
         match item {
             ContextHydration::Joined {
                 context_id,
+                expected_epoch,
                 mirror,
                 feed,
             } => {
-                info!("Cache: hydrated {} (version {})", context_id, mirror.version());
-                doc_cache.install(context_id, mirror, Some(feed), || context_id.short());
+                let version = mirror.version();
+                if doc_cache.install_for_epoch(
+                    context_id,
+                    expected_epoch,
+                    mirror,
+                    Some(feed),
+                    || context_id.short(),
+                ) {
+                    info!("Cache: hydrated {} (version {})", context_id, version);
+                } else {
+                    debug!(
+                        "Cache: rejected obsolete hydration for {} (expected_epoch={:?})",
+                        context_id, expected_epoch
+                    );
+                }
             }
             ContextHydration::Snapshot {
                 context_id,
+                epoch,
                 blocks,
                 version,
-            } => match doc_cache.apply_snapshot(context_id, blocks, version) {
-                Ok(()) => info!("Cache: re-hydrated snapshot for {} (version {})", context_id, version),
+            } => match doc_cache.apply_snapshot_for_epoch(context_id, epoch, blocks, version) {
+                Ok(true) => info!("Cache: re-hydrated snapshot for {} (version {})", context_id, version),
+                Ok(false) => debug!(
+                    "Cache: rejected obsolete snapshot for {} (epoch {}, version {})",
+                    context_id, epoch, version
+                ),
                 Err(e) => error!("Cache: snapshot apply error for {}: {}", context_id, e),
             },
             ContextHydration::JoinFailed { context_id } => {
@@ -158,28 +177,28 @@ pub fn drain_context_feeds(
     }
     let Some(ref actor) = actor else {
         // No actor to re-hydrate with — the signals still applied locally
-        // (mirrors already reset by `drain_feeds`); recovery resumes once an
-        // actor exists again.
+        // (mirrors already switched to buffering by `drain_feeds`); recovery
+        // resumes once an actor exists again.
         return;
     };
 
     for (context_id, signal) in signals {
         match signal {
             kaijutsu_client::FeedSignal::Updated => {}
-            kaijutsu_client::FeedSignal::Desynced(e) => {
+            kaijutsu_client::FeedSignal::Desynced { error: e, epoch } => {
                 error!(
                     "context mirror desynced for {}: {} — re-hydrating from a fresh snapshot",
                     context_id, e
                 );
-                spawn_snapshot_refetch(&actor.handle, context_id, &hydration_channel);
+                spawn_snapshot_refetch(&actor.handle, context_id, epoch, &hydration_channel);
             }
-            kaijutsu_client::FeedSignal::Resubscribed => {
+            kaijutsu_client::FeedSignal::Resubscribed { epoch } => {
                 trace!("context {} resubscribed — re-hydrating from a fresh snapshot", context_id);
-                spawn_snapshot_refetch(&actor.handle, context_id, &hydration_channel);
+                spawn_snapshot_refetch(&actor.handle, context_id, epoch, &hydration_channel);
             }
-            kaijutsu_client::FeedSignal::Terminated => {
+            kaijutsu_client::FeedSignal::Terminated { epoch } => {
                 warn!("context {} feed terminated — re-subscribing and re-hydrating", context_id);
-                spawn_full_rehydrate(&actor.handle, context_id, &hydration_channel);
+                spawn_full_rehydrate(&actor.handle, context_id, epoch, &hydration_channel);
             }
         }
     }
@@ -190,19 +209,18 @@ pub fn drain_context_feeds(
 fn spawn_snapshot_refetch(
     handle: &kaijutsu_client::ActorHandle,
     context_id: ContextId,
+    epoch: u64,
     hydration_channel: &crate::connection::ContextHydrationChannel,
 ) {
     let handle = handle.clone();
     let tx = hydration_channel.sender();
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
-            match handle
-                .get_blocks_versioned(context_id, kaijutsu_types::BlockQuery::All)
-                .await
-            {
+            match handle.fetch_context_snapshot(context_id).await {
                 Ok((blocks, version)) => {
                     let _ = tx.send(crate::connection::ContextHydration::Snapshot {
                         context_id,
+                        epoch,
                         blocks,
                         version,
                     });
@@ -218,16 +236,18 @@ fn spawn_snapshot_refetch(
 fn spawn_full_rehydrate(
     handle: &kaijutsu_client::ActorHandle,
     context_id: ContextId,
+    epoch: u64,
     hydration_channel: &crate::connection::ContextHydrationChannel,
 ) {
     let handle = handle.clone();
     let tx = hydration_channel.sender();
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
-            match crate::connection::actor_plugin::hydrate_context(&handle, context_id).await {
+            match handle.hydrate_context(context_id).await {
                 Ok((mirror, feed)) => {
                     let _ = tx.send(crate::connection::ContextHydration::Joined {
                         context_id,
+                        expected_epoch: Some(epoch),
                         mirror,
                         feed,
                     });
