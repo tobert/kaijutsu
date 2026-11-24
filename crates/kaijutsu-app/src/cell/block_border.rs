@@ -242,10 +242,7 @@ pub fn compute_border_style(
                 Status::Running | Status::Pending => {
                     (BorderAnimation::Chase, theme.block_border_tool_call)
                 }
-                _ => (
-                    BorderAnimation::None,
-                    theme.block_border_tool_call.with_alpha(0.85),
-                ),
+                _ => (BorderAnimation::None, theme.block_border_tool_call),
             };
 
             // Top label: "COMMAND @username" for shell, "TOOL CALL model" for others
@@ -309,11 +306,8 @@ pub fn compute_border_style(
             let has_paired_call = block.tool_call_id.is_some();
             let color = if block.is_error {
                 theme.block_border_error
-            } else if has_paired_call {
-                // Match the ToolCall's alpha for a unified box look
-                theme.block_border_tool_call.with_alpha(0.85)
             } else {
-                theme.block_border_tool_call
+                theme.block_border_tool_result
             };
             let animation = if block.is_error {
                 BorderAnimation::Pulse
@@ -585,6 +579,39 @@ mod tests {
     fn bottom(inputs: &BorderInputs, ctx: &BorderContext, has_result: bool) -> Option<String> {
         compute_border_style(inputs, &Theme::default(), ctx, has_result, 14.0)
             .and_then(|s| s.bottom_label)
+    }
+
+    #[test]
+    fn settled_tool_call_keeps_configured_alpha() {
+        let mut theme = Theme::default();
+        theme.block_border_tool_call = Color::srgba(0.9, 0.1, 0.3, 0.12);
+        let call = call_inputs(block_id(1), Status::Done);
+        let style = compute_border_style(&call, &theme, &BorderContext::default(), true, 14.0).unwrap();
+        assert_eq!(style.color, theme.block_border_tool_call);
+        assert_eq!(style.kind, BorderKind::OpenBottom);
+        assert_eq!(style.animation, BorderAnimation::None);
+    }
+
+    #[test]
+    fn tool_results_use_configured_color_and_errors_keep_error_style() {
+        let mut theme = Theme::default();
+        theme.block_border_tool_call = Color::srgba(0.9, 0.1, 0.3, 0.12);
+        theme.block_border_tool_result = Color::srgba(0.2, 0.4, 0.8, 0.08);
+        theme.block_border_error = Color::srgba(0.8, 0.1, 0.1, 0.3);
+        let mut result = call_inputs(block_id(2), Status::Done);
+        result.kind = BlockKind::ToolResult;
+        for paired in [false, true] {
+            result.tool_call_id = paired.then(|| block_id(1));
+            let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
+            assert_eq!(style.color, theme.block_border_tool_result);
+            assert_eq!(style.kind, if paired { BorderKind::OpenTop } else { BorderKind::Full });
+            assert_eq!(style.animation, BorderAnimation::None);
+            result.is_error = true;
+            let style = compute_border_style(&result, &theme, &BorderContext::default(), false, 14.0).unwrap();
+            assert_eq!(style.color, theme.block_border_error);
+            assert_eq!(style.animation, BorderAnimation::Pulse);
+            result.is_error = false;
+        }
     }
 
     /// A call held on an ask names the ask; one with no known ask keeps the

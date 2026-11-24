@@ -208,6 +208,16 @@ All 1413 app tests and nine theme-data tests passed. An isolated app verified
 long-token wrapping at 800px, border and camera reloads through the kernel's
 theme file, and side-by-side plus nested splits through input actions.
 
+Completed tool calls had overridden configured border opacity with 85%, and
+successful results had reused the call color instead of the result color.
+Both now honor their theme values; paired geometry and error emphasis stay
+intact. Two regressions failed before the fix, and all 1415 app tests pass.
+An isolated 1280×720 app check confirmed separate call and result colors,
+paired borders, and retained error emphasis.
+The conversation design pass explores quieter receipts and a separate scene
+with dialogue, an artifact workbench, and event history. Those layouts remain
+proposals; the shipped change restores the existing palette controls.
+
 ## The file cache learns what vim already knew (August 18–20)
 
 Disk is the source of truth; file buffers operate like vim swaps. Dirty buffers
