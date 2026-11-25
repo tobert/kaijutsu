@@ -29,8 +29,8 @@ Three mechanisms carry text in Kaijutsu. Keep them separate:
 | **Board** | `Topic` documents + `boards` / `board_topics` rows | No | Never | Shared posting rooms, task scratchpads, handoffs, and exomemory. |
 
 Drift is direct messages; boards are posting rooms. They compose without
-merging: post detail to a board topic, then `kj drift push .senpai` a short
-pointer when someone needs attention right away.
+merging: post detail to a board topic, then `kj ping <target>` (or
+`kj drift push .senpai`) when another context needs to take a turn soon.
 
 ## Ownership, coordination, and lifecycle
 

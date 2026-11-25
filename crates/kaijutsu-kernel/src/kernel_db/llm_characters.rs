@@ -444,6 +444,28 @@ impl KernelDb {
         self.set_character_column("mcp_hub_ctx", principal_id, ctx.map(|c| c.as_bytes().to_vec()))
     }
 
+    /// Whether a character's contexts accept `kj ping` wake signals.
+    /// Defaults to `true` on every new character.
+    pub fn character_accepts_pings(&self, principal_id: PrincipalId) -> KernelDbResult<bool> {
+        let flag: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT accepts_pings FROM characters WHERE principal_id = ?1",
+                params![blob_param(principal_id.as_bytes())],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match flag {
+            Some(v) => Ok(v != 0),
+            None => Err(KernelDbError::NotFound(format!("character {}", principal_id.short()))),
+        }
+    }
+
+    /// Set whether a character's contexts accept `kj ping` wake signals.
+    pub fn set_character_accepts_pings(&self, principal_id: PrincipalId, accepts: bool) -> KernelDbResult<()> {
+        self.set_character_column("accepts_pings", principal_id, Some(i64::from(accepts)))
+    }
+
     /// Refuse to point `principal_id`'s `column` at `ctx` while another
     /// sheet's `column` names it, naming the sheets (`what` names the
     /// pointer in the refusal).

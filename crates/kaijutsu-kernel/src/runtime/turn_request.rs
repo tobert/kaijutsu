@@ -52,6 +52,14 @@ impl Kernel {
         self.admit_turn(request, slot, admission, idle_only)
     }
 
+    /// [`Self::request_turn`] for a wake: starts a turn only when the context
+    /// has none running, returning [`TurnAdmission::AlreadyActive`] otherwise.
+    pub(crate) fn request_turn_if_idle(self: &Arc<Self>, request: TurnRequest) -> Result<TurnAdmission, String> {
+        let slot = self.reserve_runtime_slot()?;
+        let admission = self.admit_context(request.context_id)?;
+        self.request_turn_if_idle_admitted(request, slot, admission)
+    }
+
     /// [`Self::request_turn_admitted`] for a wake: the turn starts only when
     /// the context has none running, and a busy context answers
     /// [`TurnAdmission::AlreadyActive`] with nothing queued.

@@ -36,6 +36,7 @@ pub mod diff;
 pub mod doc;
 pub mod drift;
 pub mod drive;
+pub mod ping;
 pub mod env_snapshot;
 pub mod fork;
 pub mod format;
@@ -424,6 +425,8 @@ pub struct KjDispatcher {
     semantic_index: parking_lot::RwLock<Option<Arc<kaijutsu_index::SemanticIndex>>>,
     /// Per-character sliding-window rate limiter for `open` boards.
     board_rate_limiter: Arc<board::BoardRateLimiter>,
+    /// Per-`(sender, target)` sliding-window rate limiter for `kj ping`.
+    ping_rate_limiter: Arc<ping::PingRateLimiter>,
 }
 
 impl KjDispatcher {
@@ -471,12 +474,18 @@ impl KjDispatcher {
             weak_self: parking_lot::RwLock::new(None),
             semantic_index: parking_lot::RwLock::new(None),
             board_rate_limiter: Arc::new(board::BoardRateLimiter::default()),
+            ping_rate_limiter: Arc::new(ping::PingRateLimiter::default()),
         }
     }
 
     /// Sliding-window rate limiter for `open` boards.
     pub(crate) fn board_rate_limiter(&self) -> &board::BoardRateLimiter {
         &self.board_rate_limiter
+    }
+
+    /// Sliding-window rate limiter for `kj ping`.
+    pub(crate) fn ping_rate_limiter(&self) -> &ping::PingRateLimiter {
+        &self.ping_rate_limiter
     }
 
     /// The live roster's storage half.
@@ -788,6 +797,7 @@ impl KjDispatcher {
         match cmd {
             "fork" => Box::pin(async { self.dispatch_fork(&argv[1..], caller).await }).await,
             "drive" => self.dispatch_drive(&argv[1..], caller).await,
+            "ping" => self.dispatch_ping(&argv[1..], caller).await,
             "system" => self.dispatch_system(&argv[1..], caller).await,
             "wait" => self.dispatch_wait(&argv[1..], caller).await,
             "interrupt" => self.dispatch_interrupt(&argv[1..], caller).await,

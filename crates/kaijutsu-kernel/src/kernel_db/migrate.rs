@@ -124,6 +124,7 @@ impl KernelDb {
             "ALTER TABLE character_models ADD COLUMN replay_phase TEXT CHECK (replay_phase IS NULL OR replay_phase IN ('on', 'off'))",
             "ALTER TABLE context_slots ADD COLUMN replay_phase TEXT CHECK (replay_phase IS NULL OR replay_phase IN ('on', 'off'))",
             "ALTER TABLE contexts ADD COLUMN board_id BLOB REFERENCES boards(board_id)",
+            "ALTER TABLE characters ADD COLUMN accepts_pings INTEGER NOT NULL DEFAULT 1",
         ];
         for sql in alters {
             match conn.execute(sql, []) {

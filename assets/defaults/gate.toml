@@ -125,6 +125,7 @@ allow = [
   "kj board edit",
   "kj board resolve",
   "kj board reopen",
+  "kj ping",             # opaque wake signal; consoles and opted-out characters still refuse
   "kj block create",
   "kj block append",
   "kj stage include",

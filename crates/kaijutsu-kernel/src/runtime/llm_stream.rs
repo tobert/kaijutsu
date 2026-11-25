@@ -407,6 +407,24 @@ async fn wake_undelivered_input(
         && let Err(error) = super::prompt::follow_up(kernel, context_id, block, principal, session)
     {
         failures.push((block, format!("Input sent during the turn could not start the next turn: {error}")));
+    } else if submit.is_none() {
+        let ping = undelivered.iter().rev().find_map(|input| match &input.wake {
+            Wake::Ping { principal } => Some((input.block, *principal)),
+            _ => None,
+        });
+        if let Some((block, principal)) = ping {
+            let request = super::turn_request::TurnRequest {
+                context_id,
+                after_block_id: block,
+                content: String::new(),
+                principal_id: principal,
+                continuation_epoch: None,
+                score: None,
+            };
+            if let Err(error) = kernel.request_turn_if_idle(request) {
+                tracing::debug!(%context_id, %error, "ping follow-up turn was not admitted");
+            }
+        }
     }
     for input in &undelivered {
         if let Wake::Completion { source, .. } = &input.wake

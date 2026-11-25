@@ -918,7 +918,10 @@ CREATE TABLE IF NOT EXISTS characters (
     -- A root character's console and MCP hub: contexts the kernel finds by
     -- pointer. A rotation moves a pointer at its commit, as it moves root_ctx.
     console_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
-    mcp_hub_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
+    mcp_hub_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
+    -- Whether this character's contexts accept `kj ping` wake signals.
+    -- Default 1 (accepted); 0 refuses pings with a clear error.
+    accepts_pings    INTEGER NOT NULL DEFAULT 1
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
