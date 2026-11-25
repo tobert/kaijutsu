@@ -2472,6 +2472,24 @@ fn set_context_facts(mut info: context_handle_info::Builder<'_>, facts: &kaijuts
     info.set_is_mcp_session(facts.is_mcp_session);
 }
 
+fn set_context_hud(mut info: context_handle_info::Builder<'_>, hud: &kaijutsu_types::ContextHud) {
+    info.set_is_council_backend(hud.is_council_backend);
+    info.set_held_refusal(hud.held_refusal);
+    info.set_control_count(hud.control_count);
+    info.set_decide_program(hud.decide_program.as_deref().unwrap_or(""));
+    info.set_gate_label(hud.gate_label.as_deref().unwrap_or(""));
+    info.set_bump_streak(hud.bump_streak);
+    info.set_bump_limit(hud.bump_limit);
+    info.set_last_bump_flavor(hud.last_bump_flavor.as_deref().unwrap_or(""));
+    info.set_judging_tool(hud.judging_tool.as_deref().unwrap_or(""));
+    info.set_judging_started_at(hud.judging_started_at.unwrap_or(0));
+    info.set_vibe(hud.vibe.as_deref().unwrap_or(""));
+    info.set_council_phase(hud.council_phase.as_deref().unwrap_or(""));
+    info.set_council_tps(hud.council_tps.unwrap_or(-1.0));
+    info.set_council_ttft_ms(hud.council_ttft_ms.unwrap_or(0));
+    info.set_council_entropy(hud.council_entropy.as_deref().unwrap_or(""));
+}
+
 /// Verify a context can be joined, healing the DriftRouter registration from
 /// the durable KernelDb row if the in-memory registry has lost it. Returns
 /// the context's trace id (zeroed if truly unknown) on success.
@@ -3805,6 +3823,7 @@ impl kernel::Server for KernelImpl {
                 // history at all; `resolve_background_wire_fields` treats
                 // that identically to `BackgroundSummary::default()`.
                 let bg_by_ctx = kernel_arc.shell_operations().summary_by_context().map_err(capnp::Error::failed)?;
+                let hud_by_ctx = kaijutsu_kernel::hud::build_context_huds(&kernel_arc, &listed, &bound_by_ctx).await;
 
                 let mut ctx_list = results.get().init_contexts(contexts.len() as u32);
 
@@ -3830,6 +3849,9 @@ impl kernel::Server for KernelImpl {
                     // A context with no row has no facts, and every fact stays false.
                     if let Some(facts) = facts_by_ctx.get(&ctx.id) {
                         set_context_facts(c.reborrow(), facts);
+                    }
+                    if let Some(hud) = hud_by_ctx.get(&ctx.id) {
+                        set_context_hud(c.reborrow(), hud);
                     }
 
                     // Supplement with KernelDb metadata

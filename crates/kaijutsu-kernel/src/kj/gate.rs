@@ -644,14 +644,22 @@ pub(crate) async fn run_gate_recorded(
             Err(reason) => return GateOutcome::unavailable_without_row(reason),
         }
     }
+    let tool_call_block = spec.tool_call;
     if let Some(verdict) = judge.as_mut()
-        && let Some(refused) = refuse_bump(kernel, caller, verdict).await
+        && let Some(refused) = refuse_bump(kernel, caller, verdict, tool_call_block).await
     {
         return refused;
     }
     let recorded = std::sync::OnceLock::new();
     let mut outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, judge.as_ref(), &recorded, record).await;
     let Some(mut judge) = judge else { return outcome };
+    if let Some(context_id) = caller.context_id {
+        kernel.hud().record_vibe(context_id, judge.vibe.as_deref());
+        if let Some(call_id) = tool_call_block {
+            let stamp = judge.hud_stamp(outcome.allowed(), None);
+            let _ = kernel.blocks().set_summary(context_id, &call_id, stamp);
+        }
+    }
     if outcome.allowed() && judge.allows() {
         outcome.judged = judge.judged();
     }
@@ -698,6 +706,7 @@ async fn refuse_bump(
     kernel: &Arc<crate::Kernel>,
     caller: &KjCaller,
     judge: &mut crate::council::gate::JudgeVerdict,
+    tool_call: Option<kaijutsu_types::BlockId>,
 ) -> Option<GateOutcome> {
     let bump = judge.submission_bump()?;
     let context = caller.context_id?;
@@ -763,6 +772,11 @@ async fn refuse_bump(
     };
     match written {
         Ok(decision_id) => {
+            kernel.hud().record_vibe(context, judge.vibe.as_deref());
+            if let Some(call_id) = tool_call {
+                let stamp = judge.hud_stamp(false, Some((attempt, limit, &bump.flavor)));
+                let _ = kernel.blocks().set_summary(context, &call_id, stamp);
+            }
             let message = crate::council::gate::bump_message(kernel, &bump, attempt, limit).await;
             tracing::info!(attempt, limit = ?limit, flavor = %bump.flavor, "the judge bumped the submission; nothing ran");
             judge.observe(kernel.clone(), decision_id);

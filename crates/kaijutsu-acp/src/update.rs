@@ -1000,6 +1000,7 @@ mod tests {
             is_root_console: false,
             is_console: false,
             is_mcp_session: false,
+            hud: Default::default(),
             context_used_pct: None,
             background_running_count: 0,
             background_oldest_running_started_at: None,

@@ -139,6 +139,7 @@ pub(super) async fn on_server_event(
     bridge: &KernelBridge,
     app: &mut App,
     frame: &mut Frame,
+    refresh: &mut super::Refresh,
     received: Result<ServerEvent, tokio::sync::broadcast::error::RecvError>,
 ) {
     let event = match received {
@@ -163,6 +164,10 @@ pub(super) async fn on_server_event(
     }
     if mark_turn_liveness(app, &event) {
         frame.dirty = true;
+        if matches!(event, ServerEvent::TurnCompleted { .. } | ServerEvent::TurnFailed { .. }) {
+            refresh.wanted = true;
+            refresh.interval.reset_immediately();
+        }
     }
     // Another client's yank or delete, between keys: the registers take it,
     // the clipboard does not.
@@ -242,6 +247,8 @@ pub(super) fn on_ledger_changed(bridge: &KernelBridge, app: &mut App, term_lock:
             crossterm::execute!(io::stdout(), Print(notification))
                 .context("raise a desktop notification")?;
         }
+        ls.refresh.wanted = true;
+        ls.refresh.interval.reset_immediately();
         ls.frame.dirty = true;
     }
     Ok(())

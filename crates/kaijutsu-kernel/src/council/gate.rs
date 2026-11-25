@@ -764,6 +764,8 @@ pub(crate) struct JudgeVerdict {
     pinned: Vec<super::programs::JudgedFile>,
     /// A guardian allow's key: the guardian and the risk it named.
     allow_by: Option<String>,
+    /// Operational weather glyphs from a `decisions` judge.
+    pub(crate) vibe: Option<String>,
 }
 
 /// A decision's bump: what it is called and what it tells the seat.
@@ -835,6 +837,46 @@ impl JudgeVerdict {
     /// program the submission runs was judged.
     pub(crate) fn allows(&self) -> bool {
         self.outcome == Outcome::Allow && self.programs.iter().all(ProgramVerdict::allows)
+    }
+
+    /// Single-line divider stamp for the `ToolCall` block this verdict judged.
+    pub(crate) fn hud_stamp(&self, allowed: bool, bump_attempt: Option<(u64, Option<u64>, &str)>) -> String {
+        let judge = if self.is_council() || self.record.server.model.is_empty() {
+            crate::hud::short_judge_label(&self.spec)
+        } else {
+            crate::hud::short_judge_label(&self.record.server.model)
+        };
+        let vibe = self.vibe.as_deref().map(|v| format!(" {v}")).unwrap_or_default();
+        if let Some((attempt, limit, flavor)) = bump_attempt {
+            return match limit {
+                Some(lim) => format!("{judge}{vibe} ↻ bump ({flavor}) {attempt}/{lim}"),
+                None => format!("{judge}{vibe} ↻ bump ({flavor}) #{attempt}"),
+            };
+        }
+        if allowed && self.allows() {
+            if let Some(p) = self.p_allow {
+                return format!("{judge}{vibe} ✓ {}", crate::hud::short_prob(p));
+            }
+            if let Some(a) = &self.assessment {
+                return format!("{judge}{vibe} ✓ {}", a.risk_level.as_str());
+            }
+            return format!("{judge}{vibe} ✓");
+        }
+        match &self.outcome {
+            Outcome::Report => format!("{judge}{vibe} ⛔ report"),
+            Outcome::Miss(_) => format!("{judge} · miss"),
+            _ => {
+                if !self.bump_history.is_empty() || self.escalation.is_some() {
+                    format!("{judge}{vibe} → ask (bumps)")
+                } else if let Some(p) = self.p_allow {
+                    format!("{judge}{vibe} → ask {}", crate::hud::short_prob(p))
+                } else if let Some(a) = &self.assessment {
+                    format!("{judge}{vibe} → ask ({})", a.risk_level.as_str())
+                } else {
+                    format!("{judge}{vibe} → ask")
+                }
+            }
+        }
     }
 
     /// The bump that refuses this submission, in bumper mode: the shell
@@ -1426,6 +1468,7 @@ fn build_verdict(
         assessment: None,
         allow_by: None,
         pinned: Vec::new(),
+        vibe: None,
     }
 }
 
@@ -2000,6 +2043,7 @@ pub(crate) fn model_judge_verdict(
         assessment,
         allow_by,
         pinned,
+        vibe: judged.vibe,
     }
 }
 
@@ -2071,6 +2115,31 @@ pub(crate) fn judge_summary(
                 super::guardian::JudgeKind::Decisions => "decisions model",
             };
             format!("the {kind} {}/{}", bound.backend, bound.slot.model)
+        }
+    }))
+}
+
+/// Short judge label and bump policy for `context`'s HUD (`hud::build_context_huds`).
+pub(crate) fn hud_gate_info(
+    db: &crate::kernel_db::KernelDb,
+    config: &crate::kj::gate_policy::GateConfig,
+    context: ContextId,
+    performer: Option<&crate::kj::gate_policy::GatePerformer>,
+) -> Result<Option<(String, Option<u64>, Option<crate::kj::gate_policy::JudgeEscalate>)>, String> {
+    Ok(gate_judge(db, config, context, performer)?.map(|judge| match judge {
+        GateJudge::Council(c) => {
+            let label = shell_spec(&c)
+                .map(|s| crate::hud::short_judge_label(&s.name))
+                .unwrap_or_else(|| "council".to_string());
+            (label, c.bump_limit, c.escalate)
+        }
+        GateJudge::Model(_, _, bound) => {
+            let policy = config.model_judge_policy();
+            (
+                crate::hud::short_judge_label(&bound.slot.model),
+                policy.bump_limit,
+                policy.escalate,
+            )
         }
     }))
 }
@@ -2174,6 +2243,7 @@ pub(crate) async fn consult(
             .and_then(|row| row.cwd);
         (performer, judge, cwd)
     };
+    let _judging = kernel.hud().begin_judging(context_id, &spec.tool);
     let council = match judge {
         GateJudge::Council(council) => council,
         GateJudge::Model(kind, guardian, bound) => {

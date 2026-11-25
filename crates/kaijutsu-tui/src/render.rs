@@ -50,7 +50,9 @@ pub fn strip_animating(app: &App) -> bool {
     if !app.focused {
         return false;
     }
-    if app.current.is_some_and(|id| app.turn_running(id)) {
+    if app.current.is_some_and(|id| {
+        app.turn_running(id) || app.info(id).is_some_and(|c| c.hud.judging_tool.is_some())
+    }) {
         return true;
     }
     let Some(view) = app.current_view() else {
@@ -131,11 +133,17 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
         if crate::inflight::takes_from_stream(block) {
             continue;
         }
+        let stamp = match (block.kind, block.summary.as_deref().filter(|s| !s.is_empty())) {
+            (kaijutsu_types::BlockKind::ToolCall, Some(gate)) => {
+                format!("{gate} · {}", wallclock(block.created_at))
+            }
+            _ => wallclock(block.created_at),
+        };
         out.push((
             block.clone(),
             BlockPlan {
                 speaker,
-                stamp: wallclock(block.created_at),
+                stamp,
                 show_divider,
                 gap,
                 collapsed: view.is_collapsed(block),
@@ -480,12 +488,43 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
         None => Vec::new(),
     };
     let streaming = app.current.is_some_and(|id| app.turn_running(id));
-    lines.push(crate::inflight::strip_line(
+    let open_phase = if streaming {
+        app.current_view().and_then(|view| {
+            view.mirror.blocks().iter().rev().find_map(|b| {
+                if b.status != Status::Running {
+                    return None;
+                }
+                match b.kind {
+                    kaijutsu_types::BlockKind::Thinking => Some("thinking"),
+                    kaijutsu_types::BlockKind::Text => Some("writing"),
+                    _ => None,
+                }
+            })
+        })
+    } else {
+        None
+    };
+    let current_info = app.current.and_then(|id| app.info(id));
+    let strip_hud = crate::inflight::StripHud {
+        hud: current_info.map(|c| &c.hud),
+        open_phase,
+        bg_running: current_info.map_or(0, |c| c.background_running_count),
+        bg_oldest_age: current_info
+            .and_then(|c| c.background_oldest_running_started_at)
+            .map(|started| std::time::Duration::from_millis(now_millis.saturating_sub(started))),
+        bg_failed_code: current_info
+            .filter(|c| c.background_running_count == 0)
+            .and_then(|c| c.background_last_exit_code)
+            .filter(|&code| code != 0),
+        now_millis,
+    };
+    lines.push(crate::inflight::strip_line_with_hud(
         &strip,
         width,
         &palette,
         crate::inflight::phase(now_millis),
         streaming,
+        &strip_hud,
     ));
 
     // The draft wraps and takes up to a third of the screen. Past the cap it
@@ -721,6 +760,7 @@ mod tests {
             is_root_console: false,
             is_console: false,
             is_mcp_session: false,
+            hud: Default::default(),
         }
     }
 
@@ -1908,5 +1948,23 @@ mod tests {
         assert!(screen.iter().any(|r| r.contains("deepseek/deepseek-v4")), "detail pane shows model: {screen:?}");
         assert!(screen.last().unwrap().contains("Esc dismiss"), "footer hints on last row: {screen:?}");
         assert!(!screen.iter().any(|r| r.starts_with('❯')), "compose row hidden in full-screen browser: {screen:?}");
+    }
+
+    #[test]
+    fn settled_tool_call_summary_renders_as_gate_stamp_on_divider() {
+        let (mut app, id) = fixture();
+        let mut call = block(id, 1, BlockKind::ToolCall, Role::Model, Status::Done, r#"{"command":"cargo test"}"#);
+        call.tool_name = Some("shell_write".to_string());
+        call.tool_input = Some(r#"{"command":"cargo test"}"#.to_string());
+        call.summary = Some("jev-1.13 🌊 ✓ .97".to_string());
+        let mut res = block(id, 2, BlockKind::ToolResult, Role::Model, Status::Done, "ok");
+        res.tool_call_id = Some(call.id);
+        snapshot(&mut app, id, vec![call, res]);
+
+        let drawn = text_of(&transcript_all_lines(&mut app, 96));
+        assert!(
+            drawn[0].contains("jev-1.13 🌊 ✓ .97 · "),
+            "expected settled gate stamp on tool divider: {drawn:?}"
+        );
     }
 }

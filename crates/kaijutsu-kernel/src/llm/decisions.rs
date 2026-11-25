@@ -182,6 +182,9 @@ pub struct Choice {
     pub instructions: String,
     /// Each option's label and what it means; 2 to 255 of them.
     pub options: BTreeMap<String, String>,
+    /// Auxiliary question: a missing or malformed answer is omitted from
+    /// [`DecisionResponse::answers`] instead of failing the whole reply.
+    pub optional: bool,
     /// The first label [`Choice::new`] was given twice, which
     /// [`Self::validate`] refuses.
     repeated: Option<String>,
@@ -201,7 +204,14 @@ impl Choice {
                 repeated = Some(label);
             }
         }
-        Self { instructions: instructions.into(), options: map, repeated }
+        Self { instructions: instructions.into(), options: map, optional: false, repeated }
+    }
+
+    /// Marks this question auxiliary: [`DecisionResponse::parse`] drops an
+    /// absent or invalid answer for it without failing required questions.
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
+        self
     }
 
     /// Refuses what the providers accept but answer wrongly: no instructions,
@@ -422,15 +432,29 @@ impl DecisionResponse {
         let mut answers = BTreeMap::new();
         for (id, question) in &req.questions {
             let Some(value) = raw.answers.get(id) else {
+                if question.optional {
+                    continue;
+                }
                 return Err(mismatch(id, "the reply has no answer for it".into()));
             };
             let kind = value.get("type").and_then(|t| t.as_str()).unwrap_or("(none)");
             if kind != "choice" {
+                if question.optional {
+                    continue;
+                }
                 return Err(mismatch(id, format!("asked for a choice answer, got type {kind}")));
             }
-            let answer: ChoiceAnswer = serde_json::from_value(value.clone())
-                .map_err(|e| mismatch(id, format!("the choice answer could not be read: {e}")))?;
-            answer.check(id, question)?;
+            let answer: ChoiceAnswer = match serde_json::from_value(value.clone()) {
+                Ok(a) => a,
+                Err(_) if question.optional => continue,
+                Err(e) => return Err(mismatch(id, format!("the choice answer could not be read: {e}"))),
+            };
+            if let Err(e) = answer.check(id, question) {
+                if question.optional {
+                    continue;
+                }
+                return Err(e);
+            }
             answers.insert(id.clone(), answer);
         }
         Ok(Self {
@@ -986,5 +1010,42 @@ mod tests {
         assert!(matches!(err, DecideError::Timeout(_)), "{err}");
         assert!(err.retryable());
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn optional_questions_do_not_fail_required_answers_when_omitted_or_malformed() {
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "verdict".to_string(),
+            Choice::new("ok?", [("allow", "yes"), ("ask", "human"), ("report", "stop")]),
+        );
+        questions.insert(
+            "vibe".to_string(),
+            Choice::new("weather?", [("flow", "cruising"), ("probe", "digging")]).optional(),
+        );
+        let req = DecisionRequest::new(Wire::OpenRouter, "jev", json!("state"), questions).unwrap();
+
+        let both = r#"{"model":"jev-1","answers":{
+            "verdict":{"type":"choice","choice":"allow","probabilities":{"allow":0.95,"ask":0.04,"report":0.01}},
+            "vibe":{"type":"choice","choice":"flow","probabilities":{"flow":0.7,"probe":0.3}}
+        }}"#;
+        let parsed = DecisionResponse::parse(both, &req).unwrap();
+        assert_eq!(parsed.answers["verdict"].choice, "allow");
+        assert_eq!(parsed.answers["vibe"].choice, "flow");
+
+        let missing_vibe = r#"{"model":"jev-1","answers":{
+            "verdict":{"type":"choice","choice":"allow","probabilities":{"allow":0.95,"ask":0.04,"report":0.01}}
+        }}"#;
+        let parsed = DecisionResponse::parse(missing_vibe, &req).unwrap();
+        assert_eq!(parsed.answers["verdict"].choice, "allow");
+        assert!(!parsed.answers.contains_key("vibe"));
+
+        let bad_vibe = r#"{"model":"jev-1","answers":{
+            "verdict":{"type":"choice","choice":"allow","probabilities":{"allow":0.95,"ask":0.04,"report":0.01}},
+            "vibe":{"type":"choice","choice":"bogus","probabilities":{"bogus":1.0}}
+        }}"#;
+        let parsed = DecisionResponse::parse(bad_vibe, &req).unwrap();
+        assert_eq!(parsed.answers["verdict"].choice, "allow");
+        assert!(!parsed.answers.contains_key("vibe"));
     }
 }

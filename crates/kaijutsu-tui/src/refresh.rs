@@ -163,6 +163,7 @@ mod tests {
             is_root_console: false,
             is_console: false,
             is_mcp_session: false,
+            hud: Default::default(),
         }
     }
 

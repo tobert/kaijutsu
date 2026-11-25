@@ -3492,15 +3492,39 @@ async fn run_llm_stream(
             Err(e) => (Vec::new(), Some(format!("Could not read the control list of this context: {e}"))),
         };
 
-        let build_opts = apply_tunables(
+        let is_council_provider = matches!(provider.as_ref(), Provider::Council(_));
+        let (ride_vibe, live_council, _council_hud_guard) = if is_council_provider {
+            let ride = match crate::kj::gate_policy::load_config(kernel.vfs(), &kernel_db).await {
+                Ok(cfg) => {
+                    let db = kernel_db.lock();
+                    let perf = crate::kj::gate_policy::performer_of(&db, Some(context_id)).ok().flatten();
+                    crate::kj::gate_policy::guardian_for_context(&db, &cfg, context_id, perf.as_ref())
+                        .ok()
+                        .flatten()
+                        .map_or(true, |g| g.vibe)
+                }
+                Err(_) => true,
+            };
+            let stats = Arc::new(crate::llm::stream::LiveCouncilStats::default());
+            let guard = kernel.hud().begin_council_stream(context_id, stats.clone());
+            (ride, Some(stats), Some(guard))
+        } else {
+            (false, None, None)
+        };
+
+        let mut build_opts = apply_tunables(
             BuildOpts::with_output_limit(&model_name, max_output_tokens)
                 .with_system(&system_prompt)
                 .with_tools(offered.to_vec())
                 .with_cache_breakpoints(cache_breakpoints)
                 .with_controls(controls)
-                .with_vfs(kernel.vfs().clone()),
+                .with_vfs(kernel.vfs().clone())
+                .with_ride_vibe(ride_vibe),
             &tunables,
         );
+        if let Some(stats) = live_council {
+            build_opts = build_opts.with_live_council(stats);
+        }
 
         // `retry_disposition` decides which startup failures keep the
         // bounded backoff and which are permanent refusals that stop after
@@ -3846,6 +3870,9 @@ async fn run_llm_stream(
                         &extra,
                         &stop_reason,
                     )?;
+                    if let Some(crate::llm::UsageExtra::Council(c)) = &extra {
+                        kernel.hud().record_council_done(context_id, c);
+                    }
 
                     if cancel_deadline.is_some() {
                         // Usage may arrive during cancellation, but its notice

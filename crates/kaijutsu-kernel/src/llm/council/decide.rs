@@ -515,6 +515,9 @@ impl Client {
             first_token: None,
             slot: None,
             reply_identity: None,
+            live_council: None,
+            last_tps_tenths: None,
+            entropies: Vec::new(),
         })
     }
 
@@ -620,7 +623,7 @@ impl Client {
     }
 
     /// Posts `spec` unless this client has posted it to the server.
-    async fn ensure_spec(&self, turn: &Turn, spec: &Spec) -> Result<(), (StreamErrorKind, LlmError)> {
+    pub(super) async fn ensure_spec(&self, turn: &Turn, spec: &Spec) -> Result<(), (StreamErrorKind, LlmError)> {
         let id = spec.id();
         if self.specs.lock().contains(&id) {
             return Ok(());
@@ -658,6 +661,10 @@ impl DecisionUsage {
             seed: Some(seed),
             model: served.model.clone(),
             weight_hash: served.weight_hash.clone(),
+            vibe: None,
+            tps_tenths: None,
+            mean_entropy_milli: None,
+            entropy_spark: None,
         }
     }
 

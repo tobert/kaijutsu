@@ -24,7 +24,26 @@ use serde::{Deserialize, Serialize};
 use super::ToolDefinition;
 use super::config::SlotTunables;
 
-/// Provider-agnostic streaming events from an LLM completion.
+/// Live token-rate, phase, and entropy telemetry updated in place while a
+/// `council` generation streams.
+#[derive(Debug, Default)]
+pub struct LiveCouncilStats {
+    pub phase: parking_lot::Mutex<Option<&'static str>>,
+    pub tps_tenths: std::sync::atomic::AtomicU32,
+    pub ttft_ms: std::sync::atomic::AtomicU32,
+    pub entropy_spark: parking_lot::Mutex<Option<String>>,
+}
+
+impl LiveCouncilStats {
+    pub fn snapshot(&self) -> (Option<&'static str>, u32, u32, Option<String>) {
+        (
+            *self.phase.lock(),
+            self.tps_tenths.load(std::sync::atomic::Ordering::Relaxed),
+            self.ttft_ms.load(std::sync::atomic::Ordering::Relaxed),
+            self.entropy_spark.lock().clone(),
+        )
+    }
+}
 ///
 /// Lifecycle (within a single completion):
 ///
@@ -428,6 +447,8 @@ pub struct BuildOpts {
     /// The mount table a `decide` path is read through. A turn with `decide`
     /// and no mount table is refused.
     pub vfs: Option<std::sync::Arc<crate::vfs::MountTable>>,
+    pub ride_vibe: bool,
+    pub live_council: Option<std::sync::Arc<LiveCouncilStats>>,
     pub tools: Vec<ToolDefinition>,
     /// Cache breakpoint policy for Claude and Alibaba prompt caching.
     /// Empty = no `cache_control` applied. See [`CacheTarget`].
@@ -465,6 +486,8 @@ impl BuildOpts {
             reasoning_summary: None, replay_phase: None,
             decide: None,
             vfs: None,
+            ride_vibe: true,
+            live_council: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
             controls: Vec::new(),
@@ -555,6 +578,16 @@ impl BuildOpts {
 
     pub fn with_controls(mut self, controls: Vec<gogi_proto::control::Control>) -> Self {
         self.controls = controls;
+        self
+    }
+
+    pub fn with_ride_vibe(mut self, ride: bool) -> Self {
+        self.ride_vibe = ride;
+        self
+    }
+
+    pub fn with_live_council(mut self, live: std::sync::Arc<LiveCouncilStats>) -> Self {
+        self.live_council = Some(live);
         self
     }
 }
@@ -727,6 +760,14 @@ pub struct CouncilUsageExtra {
     pub seed: Option<u64>,
     pub model: String,
     pub weight_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vibe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tps_tenths: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_entropy_milli: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entropy_spark: Option<String>,
 }
 
 /// Usage extras for Google's Gemini API (`llm/gemini/`).

@@ -619,6 +619,9 @@ pub(crate) struct GuardianConfig {
     pub(crate) house_rules_tokens: u64,
     /// The decisions judge allows when p(allow) reaches this, in (0, 1].
     pub(crate) allow_at: f64,
+    /// Attach the operational-weather `vibe` question on decisions judge calls
+    /// and `council` generations. On by default.
+    pub(crate) vibe: bool,
 }
 
 impl Default for GuardianConfig {
@@ -628,6 +631,7 @@ impl Default for GuardianConfig {
             transcript_tokens: 8_000,
             house_rules_tokens: DEFAULT_GUARDIAN_HOUSE_RULES_TOKENS,
             allow_at: 0.9,
+            vibe: true,
         }
     }
 }
@@ -792,6 +796,7 @@ struct GuardianToml {
     transcript_tokens: Option<i64>,
     house_rules_tokens: Option<i64>,
     allow_at: Option<f64>,
+    vibe: Option<bool>,
 }
 
 /// `[rc.<dir>.guardian]`, `[character.<name>.guardian]` or `[root.guardian]`.
@@ -1028,6 +1033,7 @@ impl GateConfig {
                 Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => v,
                 Some(v) => return Err(GateConfigError::Parse(format!("[guardian] allow_at: {v} must satisfy 0 < allow_at <= 1"))),
             },
+            vibe: raw.vibe.unwrap_or(defaults.vibe),
         })
     }
 
@@ -4467,6 +4473,10 @@ enabled = false
         assert!(m.contains("extra"), "{m}");
         let m = council_err("[global.guardian]\nenabled = true\n");
         assert!(m.contains("[global.guardian]"), "{m}");
+        let on = config("[rc.sol.guardian]\nenabled = true\n");
+        assert!(on.guardian_for(Some(&dir("sol"))).unwrap().vibe);
+        let off = config("[guardian]\nvibe = false\n[rc.sol.guardian]\nenabled = true\n");
+        assert!(!off.guardian_for(Some(&dir("sol"))).unwrap().vibe);
     }
 
     #[test]

@@ -1402,6 +1402,24 @@ struct ContextHandleInfo {
   isRootConsole @41 :Bool;      # Some character's `root_ctx` names this context
   isConsole @42 :Bool;          # Some character's `console_ctx` names this context
   isMcpSession @43 :Bool;       # The parent (`parentId`) is the MCP hub some character's `mcp_hub_ctx` names
+
+  # Live context HUD telemetry and posture (`kaijutsu_types::ContextHud`).
+  # 0 / -1.0 / empty = absent or off, matching the sentinels above.
+  isCouncilBackend @44 :Bool;
+  heldRefusal @45 :Bool;
+  controlCount @46 :UInt32;
+  decideProgram @47 :Text;
+  gateLabel @48 :Text;
+  bumpStreak @49 :UInt32;
+  bumpLimit @50 :UInt32;
+  lastBumpFlavor @51 :Text;
+  judgingTool @52 :Text;
+  judgingStartedAt @53 :UInt64;
+  vibe @54 :Text;
+  councilPhase @55 :Text;
+  councilTps @56 :Float32 = -1.0;
+  councilTtftMs @57 :UInt32;
+  councilEntropy @58 :Text;
 }
 
 struct PresetInfo {
