@@ -54,11 +54,15 @@ use super::KjCaller;
 pub(super) const LIST_CAP: usize = 5;
 
 /// What a section reads. Everything here is read-only; the facts that need
-/// `await` are already gathered.
+/// `await` or `BlockStore` access are gathered before locking `KernelDb` so
+/// sections never invert the `BlockStore -> KernelDb` lock order.
 pub(super) struct InfoView<'a> {
     pub db: &'a KernelDb,
     pub kernel: &'a Kernel,
-    pub blocks: &'a crate::block_store::SharedBlockStore,
+    /// Document version from `BlockStore`, absent when not resident.
+    pub version: Option<u64>,
+    /// Last note timestamp (Unix ms) on the performer's handoff log.
+    pub handoff_note_at: Result<Option<i64>, String>,
     pub row: &'a ContextRow,
     pub caller: &'a KjCaller,
     /// The long-running trace id, from the in-memory drift handle.
@@ -69,6 +73,35 @@ pub(super) struct InfoView<'a> {
     pub cost: Option<&'a crate::pricing::ContextCost>,
     /// `gate.toml`, as the kernel's config mount holds it now.
     pub gate: &'a super::gate_policy::GateConfigLoad,
+}
+
+/// Gather `BlockStore` facts without holding the `KernelDb` mutex.
+pub(super) fn read_block_facts(
+    db: &parking_lot::Mutex<KernelDb>,
+    blocks: &crate::block_store::SharedBlockStore,
+    row: &ContextRow,
+) -> (Option<u64>, Result<Option<i64>, String>) {
+    let handoff_ctx = match row.performer {
+        Some(performer) => match db.lock().get_character(performer) {
+            Ok(Some(sheet)) => Ok(sheet.handoff_ctx),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("performer sheet: {e}")),
+        },
+        None => Ok(None),
+    };
+    let version = blocks.version(row.context_id).ok();
+    let handoff_note_at = match handoff_ctx {
+        Err(e) => Err(e),
+        Ok(None) => Ok(None),
+        Ok(Some(log)) => match blocks.last_block_id(log) {
+            None => Ok(None),
+            Some(last) => blocks
+                .get_block_snapshot(log, &last)
+                .map(|snap| snap.map(|b| b.created_at as i64))
+                .map_err(|e| format!("handoff log: {e}")),
+        },
+    };
+    (version, handoff_note_at)
 }
 
 /// One section's output.
@@ -375,14 +408,7 @@ fn work(view: &InfoView<'_>) -> Result<Option<Section>, String> {
 
 /// When the performer's handoff log last got a note, in Unix milliseconds.
 fn handoff_note_at(view: &InfoView<'_>) -> Result<Option<i64>, String> {
-    let Some(performer) = view.row.performer else { return Ok(None) };
-    let Some(sheet) = view.db.get_character(performer).map_err(|e| format!("performer sheet: {e}"))? else {
-        return Ok(None);
-    };
-    let Some(log) = sheet.handoff_ctx else { return Ok(None) };
-    let Some(last) = view.blocks.last_block_id(log) else { return Ok(None) };
-    let snapshot = view.blocks.get_block_snapshot(log, &last).map_err(|e| format!("handoff log: {e}"))?;
-    Ok(snapshot.map(|b| b.created_at as i64))
+    view.handoff_note_at.clone()
 }
 
 /// `label (short-id), played by <character>`; the character is left out when
@@ -684,7 +710,7 @@ fn environment(view: &InfoView<'_>) -> Result<Option<Section>, String> {
     let workspace_label = row.workspace_id.and_then(|w| db.get_workspace(w).ok().flatten()).map(|w| w.label);
     // The document version a client hydrates against. Absent when the
     // document is not resident in this kernel.
-    let version = view.blocks.version(id).ok();
+    let version = view.version;
 
     let mut section = Section::new("Environment");
     if let Some(v) = version {
@@ -851,11 +877,13 @@ mod tests {
         let caller = caller_with_context(context);
         let review = Err("not resolved in this test".to_string());
         let gate = super::super::gate_policy::no_config();
+        let (version, handoff_note_at) = read_block_facts(d.kernel_db(), d.block_store(), &row);
         let db = d.kernel_db().lock();
         let view = InfoView {
             db: &db,
             kernel: d.kernel(),
-            blocks: d.block_store(),
+            version,
+            handoff_note_at,
             row: &row,
             caller: &caller,
             trace_id: None,

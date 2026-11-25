@@ -842,11 +842,14 @@ impl KjDispatcher {
         // not the persisted row.
         let trace_id = self.drift_router().read().trace_id_for_context(row.context_id);
 
+        let (version, handoff_note_at) =
+            super::context_info::read_block_facts(self.kernel_db(), self.block_store(), &row);
         let db = self.kernel_db().lock();
         let view = super::context_info::InfoView {
             db: &db,
             kernel: self.kernel(),
-            blocks: self.block_store(),
+            version,
+            handoff_note_at,
             row: &row,
             caller,
             trace_id,
