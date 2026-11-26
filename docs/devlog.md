@@ -585,7 +585,8 @@ and empty; no client-side fake driver generates synthetic traffic.
 The 130 BPM trio attached bass, pads, and drums to one track. Heroic now
 gives each attached musician a lane and selects the phrase details by performer.
 Conversation lays out a long score across systems at the available column
-width.
+width. The music tour shows that score with the side panels closed, then
+selects the named musicians on the road.
 
 Live testing across `zorak` (TiMidity++ on `ff4sf2.sf2`) and `moltar`
 (FluidSynth over PipeWire) turned up four practical lessons:

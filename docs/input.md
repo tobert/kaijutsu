@@ -99,7 +99,15 @@ actions: the answer is the player's.
 `kaijutsu/state` is read-only and answers while control is off. It returns the
 screen, the focus area, the active contexts, the active context id, whether
 control is on, and `control_request` (`pending`, `denied`, or `timed_out` with
-its reason; null when there is none or it was allowed).
+its reason; null when there is none or it was allowed). In Heroic, the
+`heroic` field lists performer context IDs in seat order and the selected ID.
+Use the zero-based seat index with `JumpSeat`.
+
+To tour a live score, run `python3 contrib/demo/music_tour.py <score> <musician> ...`
+with agent control enabled. The arguments take context labels or IDs.
+The tour opens the score at full width, visits each musician, then holds
+each one's lane in Heroic. Use `--neo-context <context>` to include Neo.
+When the tour ends, it restores the starting view.
 
 The latch covers only these two methods. BRP's built-in methods and
 `bevy_brp_extras` (`send_keys`, `type_text`, ECS writes) are outside it, so the
