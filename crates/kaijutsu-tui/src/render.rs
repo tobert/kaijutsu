@@ -769,14 +769,25 @@ pub fn draw_boards<B: Backend>(
 /// status line is the last row, an overlay's key-hints line is the last row
 /// it has, and the transcript shows its newest lines. Showing everything but
 /// the way to answer is the bug that cropping from the front closes.
-pub fn draw_screen<B: Backend>(
-    terminal: &mut Terminal<B>,
+/// A pre-built conversation frame ready to paint inside `BeginSynchronizedUpdate`.
+pub struct PreparedScreen {
+    transcript: Vec<Line<'static>>,
+    overlay: Vec<Line<'static>>,
+    overlay_rows: u16,
+    band: BandFrame,
+    band_rows: u16,
+}
+
+/// Build the conversation frame (wrapping, engraving, and Kitty rasterization)
+/// without touching the terminal. Callers can run this before taking `TermLock`
+/// or entering `?2026` synchronized update.
+pub fn prepare_screen(
     app: &mut App,
+    width: u16,
+    height: u16,
     now_millis: u64,
     armed: bool,
-) -> Result<(), B::Error> {
-    let size = terminal.size()?;
-    let (width, height) = (size.width, size.height);
+) -> PreparedScreen {
     let overlay = overlay_lines(app, width);
     let (transcript_rows, overlay_rows, _) = split_rows(height, band_rows(app, width), overlay.len());
     // The transcript is rendered first: it is what settles the scrolled
@@ -785,34 +796,40 @@ pub fn draw_screen<B: Backend>(
     let transcript = transcript_window(app, width, transcript_rows);
     let band = band_frame(app, width, now_millis, armed);
     let band_rows = u16::try_from(band.lines.len()).unwrap_or(u16::MAX).min(height);
-
-    draw_screen_prepared(terminal, transcript, overlay, overlay_rows, band, band_rows)
+    PreparedScreen {
+        transcript,
+        overlay,
+        overlay_rows,
+        band,
+        band_rows,
+    }
 }
 
-/// Like [`draw_screen`], but invokes `before_draw` after building the frame
-/// (and populating `app.kitty`'s pending uploads) and strictly before
-/// `terminal.draw(...)` emits placeholder cells.
-pub fn draw_screen_with<B: Backend, F>(
+/// Paint a [`PreparedScreen`] onto `terminal`.
+pub fn draw_prepared_screen<B: Backend>(
+    terminal: &mut Terminal<B>,
+    prepared: PreparedScreen,
+) -> Result<(), B::Error> {
+    draw_screen_prepared(
+        terminal,
+        prepared.transcript,
+        prepared.overlay,
+        prepared.overlay_rows,
+        prepared.band,
+        prepared.band_rows,
+    )
+}
+
+/// Draw one frame of the conversation screen (test convenience wrapper).
+pub fn draw_screen<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     now_millis: u64,
     armed: bool,
-    before_draw: F,
-) -> anyhow::Result<()>
-where
-    B::Error: Send + Sync + 'static,
-    F: FnOnce(&mut crate::kitty::KittyStore) -> anyhow::Result<()>,
-{
+) -> Result<(), B::Error> {
     let size = terminal.size()?;
-    let (width, height) = (size.width, size.height);
-    let overlay = overlay_lines(app, width);
-    let (transcript_rows, overlay_rows, _) = split_rows(height, band_rows(app, width), overlay.len());
-    let transcript = transcript_window(app, width, transcript_rows);
-    let band = band_frame(app, width, now_millis, armed);
-    let band_rows = u16::try_from(band.lines.len()).unwrap_or(u16::MAX).min(height);
-    before_draw(&mut app.kitty)?;
-    draw_screen_prepared(terminal, transcript, overlay, overlay_rows, band, band_rows)?;
-    Ok(())
+    let prepared = prepare_screen(app, size.width, size.height, now_millis, armed);
+    draw_prepared_screen(terminal, prepared)
 }
 
 fn draw_screen_prepared<B: Backend>(

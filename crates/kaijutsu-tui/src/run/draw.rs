@@ -122,6 +122,19 @@ pub(super) fn rearm_beat_wake(app: &App, beat: &mut Beat) {
     beat.wake = Some(picker::next_onset(position, beat.tempo_bps, now));
 }
 
+/// Pre-built frame payload computed outside `TermLock` and `?2026` so heavy
+/// ABC engraving, SVG rasterization, and base64 encoding never stall the key
+/// reader or hold the terminal inside a synchronized update.
+enum PreparedFrame {
+    Picker,
+    Boards,
+    Conversation(render::PreparedScreen),
+    Surface {
+        lines: Vec<ratatui::text::Line<'static>>,
+        cursor: Option<(u16, u16)>,
+    },
+}
+
 /// One frame of the owned screen, inside one synchronized update.
 ///
 /// `?2026` brackets the frame so a terminal that supports it shows the whole
@@ -140,9 +153,41 @@ fn draw(
         .playing_track()
         .is_some_and(|t| app.beats.envelope(&t.score_context_id, Instant::now()) > 0.5);
 
+    // Build the frame (and any Kitty rasterization/base64) before taking the
+    // terminal lock or opening `?2026`.
+    let size = terminal.size()?;
+    let palette = app.palette;
+    let prepared = match &mut app.screen {
+        ScreenMode::Conversation if app.picker.is_some() => PreparedFrame::Picker,
+        ScreenMode::Conversation if app.boards.is_some() => PreparedFrame::Boards,
+        ScreenMode::Conversation => PreparedFrame::Conversation(render::prepare_screen(
+            app,
+            size.width,
+            size.height,
+            kaijutsu_types::now_millis(),
+            armed,
+        )),
+        ScreenMode::Editor(screen) => {
+            let frame = editor::editor_frame(screen, size.width, size.height, &palette);
+            PreparedFrame::Surface {
+                lines: frame.lines,
+                cursor: Some(frame.cursor),
+            }
+        }
+        ScreenMode::Diff(screen) => PreparedFrame::Surface {
+            lines: screen.frame(size.height, &palette),
+            cursor: None,
+        },
+        ScreenMode::Score(screen) => PreparedFrame::Surface {
+            lines: screen.frame(size.width, size.height, &palette, &mut app.kitty),
+            cursor: None,
+        },
+    };
+    let kitty_wire = app.kitty.take_pending_wire();
+
     let _guard = term_lock.lock();
     crossterm::execute!(io::stdout(), BeginSynchronizedUpdate).context("begin a frame")?;
-    let drawn = draw_frame(terminal, app, armed, probe_panic);
+    let drawn = write_frame(terminal, app, armed, probe_panic, prepared, kitty_wire);
     // The update is ended whatever the frame did: a terminal left inside a
     // synchronized update shows nothing at all. A panic unwinds past this
     // one, which is why `restore_terminal` ends it too.
@@ -152,58 +197,29 @@ fn draw(
     ended
 }
 
-/// Flush queued Kitty graphics protocol commands (uploads, virtual placements,
-/// evictions) to stdout. Called inside `BeginSynchronizedUpdate` strictly before
-/// `terminal.draw(...)` so every `U+10EEEE` placeholder references an already
-/// uploaded image.
-fn flush_kitty_wire(kitty: &mut crate::kitty::KittyStore) -> Result<()> {
-    use std::io::Write as _;
-    let cmds = kitty.take_pending_wire();
-    if cmds.is_empty() {
-        return Ok(());
-    }
-    let mut stdout = io::stdout();
-    for cmd in cmds {
-        stdout.write_all(cmd.as_bytes()).context("write kitty graphics command")?;
-    }
-    stdout.flush().context("flush kitty graphics commands")?;
-    Ok(())
-}
-
-/// The frame itself: a full-screen surface when one has the screen, the
-/// conversation otherwise.
-fn draw_frame(
+/// Write pre-encoded Kitty graphics commands and paint the prepared frame.
+fn write_frame(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     armed: bool,
     probe_panic: bool,
+    prepared: PreparedFrame,
+    kitty_wire: Vec<String>,
 ) -> Result<()> {
     assert!(!probe_panic, "KAIJUTSU_TUI_PROBE_PANIC: panicking inside a frame");
-    let size = terminal.size()?;
-    let palette = app.palette;
-    match &mut app.screen {
-        ScreenMode::Conversation if app.picker.is_some() => {
-            render::draw_picker(terminal, app, armed)?;
+    if !kitty_wire.is_empty() {
+        use std::io::Write as _;
+        let mut stdout = io::stdout();
+        for cmd in kitty_wire {
+            stdout.write_all(cmd.as_bytes()).context("write kitty graphics command")?;
         }
-        ScreenMode::Conversation if app.boards.is_some() => {
-            render::draw_boards(terminal, app, armed)?;
-        }
-        ScreenMode::Conversation => {
-            render::draw_screen_with(terminal, app, kaijutsu_types::now_millis(), armed, flush_kitty_wire)?;
-        }
-        ScreenMode::Editor(screen) => {
-            let frame = editor::editor_frame(screen, size.width, size.height, &palette);
-            render::draw_surface(terminal, frame.lines, Some(frame.cursor))?;
-        }
-        ScreenMode::Diff(screen) => {
-            let lines = screen.frame(size.height, &palette);
-            render::draw_surface(terminal, lines, None)?;
-        }
-        ScreenMode::Score(screen) => {
-            let lines = screen.frame(size.width, size.height, &palette, &mut app.kitty);
-            flush_kitty_wire(&mut app.kitty)?;
-            render::draw_surface(terminal, lines, None)?;
-        }
+        stdout.flush().context("flush kitty graphics commands")?;
+    }
+    match prepared {
+        PreparedFrame::Picker => render::draw_picker(terminal, app, armed)?,
+        PreparedFrame::Boards => render::draw_boards(terminal, app, armed)?,
+        PreparedFrame::Conversation(screen) => render::draw_prepared_screen(terminal, screen)?,
+        PreparedFrame::Surface { lines, cursor } => render::draw_surface(terminal, lines, cursor)?,
     }
     Ok(())
 }

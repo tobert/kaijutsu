@@ -396,8 +396,19 @@ impl Scrolled {
         let needle = self.search.needle.as_deref().map(str::to_lowercase);
         for (offset, line) in lines.iter_mut().enumerate() {
             let row = start + offset;
+            let is_placeholder = line
+                .spans
+                .iter()
+                .any(|s| s.content.contains(crate::kitty::PLACEHOLDER_CHAR));
             let style = if row == reader {
-                palette.copy_cursor()
+                if is_placeholder {
+                    // Kitty Unicode placeholders encode the image ID in `fg`;
+                    // `REVERSED` would swap fg/bg and corrupt the image ID.
+                    // Use background-only highlight so fg stays intact.
+                    palette.copy_selection()
+                } else {
+                    palette.copy_cursor()
+                }
             } else if marked && (mark_start..=mark_end).contains(&row) {
                 palette.copy_selection()
             } else if needle
@@ -1302,5 +1313,22 @@ mod tests {
         assert_eq!(osc52_sequence("abc"), "\x1b]52;c;YWJj\x07", "an exact group, no padding");
         assert_eq!(osc52_sequence("abcd"), "\x1b]52;c;YWJjZA==\x07", "two pad bytes");
         assert_eq!(osc52_sequence("a"), "\x1b]52;c;YQ==\x07");
+    }
+
+    #[test]
+    fn decorate_preserves_kitty_placeholder_fg_without_reversing() {
+        use ratatui::style::{Color, Modifier};
+        let index = rows_index(&[2]);
+        let mut view = Scrolled::entering(2);
+        view.settle(&index, 2);
+        let mut lines = crate::kitty::placeholder_lines(0x010203, 4, 2);
+        view.decorate(0, &mut lines, &Palette::tokyo_midnight());
+        // Reader is on row 1 (bottom row on entry).
+        let span = &lines[1].spans[0];
+        assert_eq!(span.style.fg, Some(Color::Rgb(1, 2, 3)), "fg image id preserved");
+        assert!(
+            !span.style.add_modifier.contains(Modifier::REVERSED),
+            "must not apply REVERSED to Kitty placeholder cells"
+        );
     }
 }
