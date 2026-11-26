@@ -1,0 +1,91 @@
+set -e
+if test -z "${KJ_ENGINEER_TOPIC:-}"; then exit 0; fi
+if test -n "${KJ_OBSERVER_NOTES:-}"; then
+  note_cursor="${KJ_OBSERVER_CURSOR:-0}"
+  if test "${KJ_OBSERVER_CURSOR_TOPIC:-}" != "$KJ_OBSERVER_NOTES"; then note_cursor=0; fi
+  set +e
+  notes="$(kj board notes --topic "$KJ_OBSERVER_NOTES" --after "$note_cursor" --json 2>&1)"
+  note_status=$?
+  set -e
+  if test "$note_status" != 0; then
+    case "$notes" in
+      *"kj board notes: no topic '"*|*"kj board notes: no board '"*) notes='{"posts":[]}' ;;
+      *) echo "$notes" >&2; exit 1 ;;
+    esac
+  fi
+  for source in $(echo "$notes" | jq -r '.posts[].block_id'); do
+    note="$(echo "$notes" | jq -c --arg id "$source" '.posts[] | select(.block_id == $id)')"
+    text="$(echo "$note" | jq -r '.body | split("\n\n") | if (.[0] | startswith("Opened at tick ")) then .[1:] | join("\n\n") else "" end')"
+    case "$text" in
+      "@Toolie"|"@Toolie "*|"@Toolie:"*|"@Toolie,"*|"@Toolie
+"*|"@Toolie	"*)
+        existing="$(kj board notes --topic "$KJ_ENGINEER_TOPIC" --after 0 --json)"
+        found="$(echo "$existing" | jq -r --arg id "$source" '[.posts[] | select((.body | startswith("Engineer request: Observation from Chomosuke\n")) and (.body | endswith("\nSource note: " + $id)))] | length')"
+        if test "$found" = 0; then
+          kj board reply "$KJ_ENGINEER_TOPIC" "Engineer request: Observation from Chomosuke
+$text
+Source note: $source"
+        fi
+        ;;
+    esac
+    note_cursor="$(echo "$note" | jq -r '.number')"
+    kj context set --env "KJ_OBSERVER_CURSOR_TOPIC=$KJ_OBSERVER_NOTES"
+    kj context set --env "KJ_OBSERVER_CURSOR=$note_cursor"
+  done
+fi
+busy="$(kj context info --json | jq -r '.turn_in_flight')"
+if test "$busy" = true; then exit 0; fi
+cursor="${KJ_ENGINEER_CURSOR:-0}"
+posts="$(kj board notes --topic "$KJ_ENGINEER_TOPIC" --after "$cursor" --json)"
+# A live claimant owns the roster until it publishes its result. A successor
+# records an interrupted claim without applying it again.
+for pending in $(echo "$posts" | jq -r '[.posts[] | select(.body | startswith("Engineer claimed: ")) | .body | split("\n")[0] | ltrimstr("Engineer claimed: ")] | unique | .[]'); do
+  finished="$(echo "$posts" | jq -r --arg id "$pending" '[.posts[] | select(.body | startswith("Engineer result: " + $id + "\n"))] | length')"
+  if test "$finished" = 0; then
+    owner="$(echo "$posts" | jq -r --arg id "$pending" '[.posts[] | select(.body | startswith("Engineer claimed: " + $id + "\n"))] | .[0].body | split("\n")[1] | ltrimstr("Context: ")')"
+    state="$(kj context info "$owner" --json | jq -r '.context_state')"
+    if test "$state" = Archived; then
+      kj board reply "$KJ_ENGINEER_TOPIC" "Engineer result: $pending
+Status: interrupted
+Inspect the desk before submitting another request for this action."
+    fi
+    exit 0
+  fi
+done
+# Claims are durable. An interrupted action requires a person to inspect the
+# desk and submit a new request; replay could apply a change twice.
+for id in $(echo "$posts" | jq -r '.posts[] | select(.body | startswith("Engineer request:") or startswith("Engineer change:")) | .block_id'); do
+  claimed="$(echo "$posts" | jq -r --arg id "$id" '[.posts[] | select(.body | startswith("Engineer claimed: " + $id + "\n"))] | length')"
+  if test "$claimed" = 0; then
+    request="$(echo "$posts" | jq -c --arg id "$id" '.posts[] | select(.block_id == $id)')"
+    body="$(echo "$request" | jq -r '.body')"
+    source="$(echo "$body" | jq -Rsr 'rtrimstr("\n") | split("\n") | .[-1] | if startswith("Source note: ") then ltrimstr("Source note: ") else "" end')"
+    if test -n "$source"; then
+      all="$(kj board notes --topic "$KJ_ENGINEER_TOPIC" --after 0 --json)"
+      first="$(echo "$all" | jq -r --arg source "$source" '[.posts[] | select((.body | startswith("Engineer request: Observation from Chomosuke\n")) and (.body | endswith("\nSource note: " + $source)))] | .[0].block_id // empty')"
+      if test "$first" != "$id"; then continue; fi
+    fi
+    number="$(echo "$request" | jq -r '.number')"
+    self="$(kj context info --json | jq -r '.context_id')"
+    claim="$(kj board reply "$KJ_ENGINEER_TOPIC" --json "Engineer claimed: $id
+Context: $self
+A claim may need inspection if no result follows." | jq -r '.block_id // empty')"
+    if test -z "$claim"; then echo "toolie: claim was not published" >&2; exit 1; fi
+    claims="$(kj board notes --topic "$KJ_ENGINEER_TOPIC" --after "$cursor" --json)"
+    first="$(echo "$claims" | jq -r --arg id "$id" '[.posts[] | select(.body | startswith("Engineer claimed: " + $id + "\n"))] | .[0].block_id // empty')"
+    if test "$first" != "$claim"; then exit 0; fi
+    case "$body" in
+      "Engineer change:"*)
+        kj binding allow "external.rehearsal_desk:chair_set"
+        kj binding allow "external.rehearsal_desk:chair_restore"
+        ;;
+    esac
+    kj drive --if-idle --prompt "Engineer work
+$KJ_ENGINEER_TOPIC
+$id
+$number
+
+$body"
+    exit 0
+  fi
+done

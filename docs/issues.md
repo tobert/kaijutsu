@@ -334,6 +334,12 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
 
 ## Music refresh: live run findings (2026-11-14)
 
+- **A committed phrase can have the wrong duration.** On November 26 the
+  pads on `probe16` were asked for 64 beats. The MIDI linked to the score at
+  tick 7018 sounded through beat offset 84. At tick 7850 the chord player
+  wrote a whole-bar rest where the handoff asked for a quarter rest. A
+  stricter duration check would need the intended span from the player,
+  which can cover more than one transport grid phrase.
 - **Rehearsal kernel stopped answering SSH during playback.** On November 25,
   the 130 BPM trio and its score observer were playing on `probe16`. After
   the first three phrases committed, the viewer and MIDI bridge both lost
@@ -354,7 +360,48 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
 - **Cold restart can rewind a playing track.** The trio restarted at tick 4404 with later committed phrases already in its score. Check the first attachment's playhead seed against the score context's latest committed tick, including after a rotation. Reproduce by restarting the server while a multi-performer track is playing.
 - **Reading a track score in Bevy.** Conversation now wraps the score at bar lines as the pane resizes. The MIDI sibling shows as a bare CAS hash, and each untitled phrase is labeled `Score X:1` even though the block carries the track and tick. The empty score before the first commit gives no indication of when a phrase is due.
 
+- **An engineer can spend several inferences after a desk receipt.** In
+  Toolie’s desk result #37, a status call took 13 output tokens. Four
+  subsequent inferences each returned `max_tokens` at 256, with no further
+  desk action. The plain LFM3 turn ending in `35a7b764` separately reached
+  three ceilings with no recorded tool call before the kernel stalled.
+  With `--effort none`, plain Toolie’s next live inspection returned a
+  receipt and ended in 127 output tokens across two calls. Evaluate whether
+  an engineer should retry after the requested receipt already exists.
+- **Stagger performer computation while preserving the shared downbeat.**
+  At tick 21876 the chord and drum producers both started. Their recorded
+  compute times were 17.60 and 17.47 seconds. The chord was due at 21940 and
+  the drums at 22004. Compare prepare and start ticks with queue, compute,
+  and readiness times per served device. Spread preparation within each
+  producer’s measured lead time and keep its score commitment on the grid.
+- **Rehearsal playback and listening use different evidence.** The score
+  listener hears a short SoundFont render. The rehearsal desk measures
+  launches at the MIDI bridge. Neither measures relative attacks at the
+  speakers. The old polling bridge launched three simultaneous parts
+  sequentially, with spreads of 0.53–2.02 seconds in the rehearsal journal.
+  The clocked rehearsal bridge staged them ahead of a four-second playback
+  delay. Across 32 full three-chair launches the median spread was 0.4 ms
+  and the maximum was 3.9 ms. Later, five parts missed their deadline at
+  ticks 17652 and 17716. Toolie reported them to the listener, whose next
+  cue paired an earlier bridge tick with a later score tick. Evaluate
+  listening cues against the same phrase in both sources. Some
+  committed parts also carry different ticks. Follow those back to the
+  producer and its fallback before attributing an audible offset to the
+  mixer. Use the kernel’s stamped cues for a permanent hardware sink.
+- **A committed chord phrase can fall short of its requested length.** In
+  the November 26 trio, prompt `2d25fb02#76` in the pads context carried
+  Chomosuke’s exact bar-16 handoff. The committed ABC at tick 12091
+  (`430cba33#196` in `score-probe16`) ended after bar 14. Check generation
+  completion and phrase validation before using cue delivery as a measure
+  of what the player performed.
 - **Listening players: what is open.** `kj audio render` turns CAS notation or MIDI, or a track's last phrases, into a WAV in the CAS, and a musician with `KJ_LISTEN=<track>` gets that clip in its context before each turn (`rc/musician/tick/S10-drive.kai`). From the first live run and a kaibo review:
+  - On November 26 Nagaya refused a 47.25-second WAV on LFM3-Omni. The
+    encoder reported 4,724 input frames against a limit of 4,096. The
+    response was HTTP 500, so the kernel retried the same input, and a
+    later transport error obscured the encoder's message in the context.
+    Nagaya subsequently reported that it was starting. A four-second WAV
+    succeeded. The score observer now requests an eight-second excerpt.
+    Propagating the original refusal and its input limit remains open.
   - Prior listening blocks in the context are now excluded (`KJ_LISTEN_KEEP`), but older WAV blobs still accumulate in CAS with no blob pruning (~250 KB a phrase at 16 kHz).
   - A decision turn with clips in its context took 18 to 32 s on `lfm3-omni`, against 4 s without, and it grows as the kept history holds more clips. Each of the 16 decisions reads the audio again. The lead adapts and phrases commit, with repeats between them; one committed with no margin left.
   - The render reads the whole score context (`window_cells` scans all document blocks per cell) and loads the soundfont file on every call; mixing, `encode_wav`, and CAS store run on `spawn_blocking`.

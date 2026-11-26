@@ -1,3 +1,5 @@
-# The clock and done lifecycle run the observer. The model needs no shell.
 set -e
 kj binding allow "drive"
+if test -z "${KJ_SUMMARY_CONTEXT:-}" && test -n "${KJ_POST_NOTES:-}"; then
+  kj binding allow "builtin.notes:add_note"
+fi

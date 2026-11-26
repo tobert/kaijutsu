@@ -1,2 +1,5 @@
 set -e
-kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
+dir="$(dirname "$0")"
+mode=score
+if test -n "${KJ_SUMMARY_CONTEXT:-}"; then mode=conversation; fi
+cat "$dir/S00-stance.md" "$dir/$mode.md" | kj block create --role system --kind text --content-type text/markdown

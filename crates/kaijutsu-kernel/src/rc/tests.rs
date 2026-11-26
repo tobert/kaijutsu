@@ -406,6 +406,19 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                 let result = d.dispatch(&args, &caller).await;
                 assert!(result.is_ok(), "{}", result.message());
                 let context = lookup_context_id(&d, "observer");
+                let window = |ctx| d.kernel_db().lock().get_hydration_policy(ctx).unwrap().unwrap().1;
+                assert_eq!(window(context), 16);
+                let result = d.dispatch(&argv(&["context", "create", &performer, "--name", "score-observer"]), &caller).await;
+                assert!(result.is_ok(), "{}", result.message());
+                assert_eq!(window(lookup_context_id(&d, "score-observer")), 3,
+                    "the tail includes the listener clip, prompt, and tick trace");
+                let posted = d.dispatch(&argv(&["context", "create", &performer, "--name", "posting-observer", "--env", "KJ_POST_NOTES=band"]), &caller).await;
+                assert!(posted.is_ok(), "{}", posted.message());
+                for (label, can_post) in [("posting-observer", true), ("observer", false), ("score-observer", false)] {
+                    let binding = d.dispatch(&argv(&["binding", "show", label]), &caller).await;
+                    assert!(binding.is_ok(), "{}", binding.message());
+                    assert_eq!(binding.message().contains("builtin.notes:add_note"), can_post, "{}", binding.message());
+                }
                 let vars = d.kernel_db().lock().get_context_env(context).unwrap();
                 let value = |key: &str| vars.iter().find(|v| v.key == key).map(|v| v.value.as_str());
                 assert_eq!(value("KJ_SUMMARY_CONTEXT"), Some(source.to_hex().as_str()));
@@ -427,6 +440,22 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                     "{:?}", block_contents_in(&d, context));
             });
         }).unwrap().join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn toolie_engineer_stance_is_opt_in() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let caller = console_caller(&d);
+        let performer = rc_performer(&d, "toolie");
+        let ordinary = d.dispatch(&argv(&["context", "create", &performer, "--name", "ordinary-toolie"]), &caller).await;
+        assert!(ordinary.is_ok(), "{}", ordinary.message());
+        let engineer = d.dispatch(&argv(&["context", "create", &performer, "--name", "engineer-toolie", "--env", "KJ_ENGINEER_TOPIC=@track/band/sound"]), &caller).await;
+        assert!(engineer.is_ok(), "{}", engineer.message());
+        let normal = block_contents_in(&d, lookup_context_id(&d, "ordinary-toolie"));
+        let opted = block_contents_in(&d, lookup_context_id(&d, "engineer-toolie"));
+        assert!(!normal.iter().any(|s| s.contains("Engineer request:")), "{normal:?}");
+        assert!(opted.iter().any(|s| s.contains("Engineer request:")), "{opted:?}");
     }
 
     #[tokio::test]

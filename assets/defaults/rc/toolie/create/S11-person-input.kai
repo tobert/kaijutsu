@@ -1,1 +1,3 @@
-/config/rc/lib/create/S11-person-input.kai
+if test -z "${KJ_ENGINEER_TOPIC:-}"; then
+  /config/rc/lib/create/S11-person-input.kai
+fi

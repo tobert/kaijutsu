@@ -647,3 +647,51 @@ the score context's existing board, reachable by track name. Chomosuke keeps
 rolling conversation summaries and ensemble observations on its own character
 board. Readers can choose a topic without adding every board post to their
 conversation.
+
+In the Nagaya trio, three musicians wake every 64 beats and Chomosuke every
+128. The observer reads each playing track's latest score and handoff, then
+posts one cue to its vibe. The previous vibe already travels in its prompt,
+so a short hydration window leaves room for the new score. During rehearsal,
+a handoff naming the chord and rest in ABC reached the chord player and
+produced the requested release on beat four of bar 16. The linked MIDI gave
+us a way to check Chomosuke's reading of the turnaround.
+
+Chomosuke can hear the opening of the committed mix alongside the score and
+handoff. The first LFM3-Omni trial exceeded the audio encoder's input limit.
+An eight-second bound on synthesis kept the listening turn small. A second
+turn exposed a different limit. Its WAV was in the durable log, but the tick
+trace had displaced it from the model's two-block window. Keeping the clip,
+prompt, and trace together delivered the replacement WAV on consecutive turns.
+The listening observer now wakes every four 64-beat player phrases. Asking it
+to copy an explicit handoff in ABC brought the requested rest back into the
+chord player’s prompt.
+
+Chomosuke keeps a common observing stance and composes it with either
+conversation or score instructions at create. The score reader can send a
+separate request to Toolie on the track board. That leaves a playable cue
+for the musicians and gives the engineer a durable place to claim work and
+report tool results across rotations. The first desk trial sent and restored
+a chord pan change. Putting a user caption before the WAV gave each listen
+its own turn boundary. Previously the window pulled the preceding score and
+vibe into the new request and LFM3 kept repeating the old handoff. The
+listener now returns a player cue separately from its desk request. On a
+request to inspect the bridge, Toolie also tried to lower bass expression.
+The desk refused the change. Inspections now expose only the status tool.
+Toolie gains the mixer tools for a turn when it claims an explicit change.
+After a later reply mistook a chord pan value for a bass delay, the done rc
+began publishing the actual tool receipts. The listener reads their timings
+and misses at the start of the desk preview.
+The rehearsal bridge now stages MIDI before launching
+each due chair on the same playback grid. Moving the outgoing note releases
+into the new MIDI at time zero let three successive phrases start together.
+
+When the listener repeatedly paired attacks from different phrases, we
+reduced its score window to the newest played tick on each track. Chomosuke
+writes one observation tied to the score or clip. Its rc forwards that note
+to Toolie, who decides whether to inspect the desk.
+
+In the audio rehearsal, Omni called the native `add_note` tool. Its first
+attempt copied a long ABC phrase and exhausted the output budget before
+the call closed. Limiting the excerpt to the opening two bars let the next
+call complete. Plain LFM3 handles the desk on Spaceghost’s other GPU.
+The engineer reads notes addressed to `@Toolie` at its own cadence.

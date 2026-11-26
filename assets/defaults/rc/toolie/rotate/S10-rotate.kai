@@ -1,0 +1,2 @@
+set -e
+if test -n "${KJ_ENGINEER_TOPIC:-}"; then kj context rotate; fi

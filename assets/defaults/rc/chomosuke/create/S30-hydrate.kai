@@ -1,3 +1,7 @@
-# Keep a small working window as observation turns accumulate.
+# Keep the score clip, its prompt, and the tick trace together.
 set -e
-kj context hydrate --window 16
+if test -n "${KJ_SUMMARY_CONTEXT:-}"; then
+  kj context hydrate --window 16
+else
+  kj context hydrate --window 3
+fi

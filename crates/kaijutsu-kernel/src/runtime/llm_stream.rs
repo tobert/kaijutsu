@@ -4133,9 +4133,9 @@ async fn run_llm_stream(
                     "the provider's output limit".to_string()
                 };
                 let notice = format!(
-                    "Your last response stopped at {limit} before you \
-                     finished, and no tool call in it was complete. Continue from where you \
-                     stopped. Keep your reasoning brief and act with a tool call.",
+                    "Your last response stopped at {limit}. \
+                     Continue from where you \
+                     stopped. Finish briefly. Use a tool only if the task still requires one.",
                 );
                 tracing::warn!(
                     %context_id,
@@ -5979,6 +5979,7 @@ mod publish_tests {
                     "{}",
                     notices[0].content
                 );
+                assert!(notices[0].content.contains("Use a tool only if"), "{}", notices[0].content);
                 assert!(
                     blocks.iter().any(|b| b.content.contains("EFGA|")),
                     "the continuation's output is in the context"

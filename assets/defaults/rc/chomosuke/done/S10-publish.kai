@@ -17,7 +17,55 @@ latest="$(kj board read "$topic" --tail 1 --json | jq -r '.posts[-1].block_id')"
 if test "$latest" != "$base"; then
   exit 0
 fi
+if test -z "${KJ_SUMMARY_CONTEXT:-}" && test -n "${KJ_POST_NOTES:-}"; then
+  blocks="$(kj block list --json)"
+  interval="$(echo "$blocks" | jq -r --arg start "$KJ_INPUT_BLOCK" --arg end "$KJ_OUTPUT_BLOCK" 'index($start) as $a | index($end) as $b | if $a != null and $b != null and $b >= $a then .[$a + 1:$b + 1][] else empty end')"
+  calls="[]"
+  results="[]"
+  for block in $(split "$interval"); do
+    info="$(kj block inspect "$block" --json)"
+    kind="$(echo "$info" | jq -r '.kind')"
+    if test "$kind" = tool_call; then
+      if test "$(echo "$info" | jq -r '.role + ":" + (.tool_name // "")')" = model:add_note; then
+        calls="$(echo "$calls" | jq -c --argjson info "$info" '. + [$info]')"
+      fi
+    elif test "$kind" = tool_result; then
+      results="$(echo "$results" | jq -c --argjson info "$info" '. + [$info]')"
+    fi
+  done
+  for call in $(echo "$calls" | jq -r '.[].block_id'); do
+    receipt="$(echo "$results" | jq -r --arg call "$call" '.[] | select(.tool_call_id == $call and .status == "done" and .is_error == false) | .block_id' | head -n 1)"
+    if test -z "$receipt"; then continue; fi
+    input="$(kj block read "$call" --no-line-numbers)"
+    track="$(echo "$input" | jq -r '.track // empty')"
+    result="$(kj block read "$receipt" --no-line-numbers)"
+    result_track="$(echo "$result" | jq -Rsr 'split("/") | last | split(" ") | first | .[0:-1]')"
+    if test "$result_track" != "$KJ_POST_NOTES"; then continue; fi
+    if test -z "$track"; then
+      track="$KJ_POST_NOTES"
+    fi
+    if test "$track" != "$KJ_POST_NOTES"; then continue; fi
+    summary="$(echo "$input" | jq -r '.body // empty')"
+    if test -n "$summary"; then
+      kj board reply "$topic" "$summary
+
+Sources: $basis"
+      exit 0
+    fi
+  done
+  exit 0
+fi
 summary="$(kj block read "$KJ_OUTPUT_BLOCK" --no-line-numbers | jq -Rsr '.[0:3000]')"
+if test -z "${KJ_SUMMARY_CONTEXT:-}"; then
+  summary="$(echo "$summary" | jq -Rsr '.[0:600] | rtrimstr("\n")')"
+  if test -n "${KJ_ENGINEER_TOPIC:-}" && test -n "$summary"; then
+    request="Engineer request: Observation from Chomosuke
+$summary"
+    desk="$(kj board notes --topic "$KJ_ENGINEER_TOPIC" --limit 6 --json)"
+    seen="$(echo "$desk" | jq -r --arg request "$request" 'any(.posts[]; .body == $request)')"
+    if test "$seen" = false; then kj board reply "$KJ_ENGINEER_TOPIC" "$request"; fi
+  fi
+fi
 if test -n "$summary"; then
   kj board reply "$topic" "$summary
 

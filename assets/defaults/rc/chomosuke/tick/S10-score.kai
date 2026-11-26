@@ -5,34 +5,48 @@ if test -n "${KJ_SUMMARY_CONTEXT:-}"; then
   exit 0
 fi
 tracks="$(kj transport list --details --json)"
+if test -n "${KJ_POST_NOTES:-}"; then
+  tracks="$(echo "$tracks" | jq -c --arg track "$KJ_POST_NOTES" '[.[] | select(.track == $track)]')"
+fi
 count="$(echo "$tracks" | jq '[.[] | select(.playing)] | length')"
 if [[ "$count" -eq 0 ]]; then
   exit 0
 fi
 quota=$(( 10000 / count / 4 ))
 if [[ "$quota" -gt 1024 ]]; then quota=1024; fi
+handoff_quota=$(( 400 / count ))
 basis=""
 observations=""
+handoff_heads=""
+current_directions=""
 for track in $(echo "$tracks" | jq -r 'sort_by(.track) | .[] | select(.playing) | .track'); do
   row="$(echo "$tracks" | jq -c --arg track "$track" '.[] | select(.track == $track)')"
   context="$(echo "$row" | jq -r '.score_context')"
   playhead="$(echo "$row" | jq -r '.playhead')"
   blocks="$(kj block list -c "$context" --role model --content-type abc --tail 32 --json)"
   selected=""
+  latest_tick=""
   for block in $(echo "$blocks" | jq -r '.[]'); do
     info="$(kj block inspect -c "$context" "$block" --json)"
-    played="$(echo "$info" | jq -r --arg track "$track" --argjson now "$playhead" '.track == $track and .tick != null and .tick <= $now')"
-    if test "$played" = true; then
-      selected="$selected $block"
+    tick="$(echo "$info" | jq -r --arg track "$track" --argjson now "$playhead" 'select(.track == $track and .tick != null and .tick <= $now) | .tick')"
+    if test -z "$tick"; then continue; fi
+    if test -z "$latest_tick" || [[ "$tick" -gt "$latest_tick" ]]; then
+      latest_tick="$tick"
+      selected=""
     fi
+    if test "$tick" = "$latest_tick"; then selected="$selected $block"; fi
   done
-  # Keep a bounded history per track, in log order.
+  # Compare parts that started together on this track.
   selected="$(echo "$selected" | tr ' ' '\n' | tail -n 4)"
   for block in $(split "$selected"); do
     info="$(kj block inspect -c "$context" "$block" --json)"
     tick="$(echo "$info" | jq -r '.tick')"
     author="$(echo "$info" | jq -r '.author')"
     score="$(kj block read -c "$context" "$block" --no-line-numbers --range 0:40 | jq -Rsr --argjson n "$quota" '.[0:$n]')"
+    if test -n "${KJ_POST_NOTES:-}"; then
+      score="$(echo "$score" | jq -Rsr 'split("\n") | map(select(length > 0 and (test("^(%|[A-Za-z]:)") | not))) | join(" ") | split("|") | .[0:2] | join("|")')"
+      score="Opening ABC excerpt: $score"
+    fi
     digest="$(kj block read -c "$context" "$block" --no-line-numbers | checksum | cut -d' ' -f1)"
     basis="$basis $block:$digest"
     observations="$observations
@@ -40,6 +54,28 @@ Track $track, tick $tick, performer $author, block $block:
 $score
 "
   done
+  # A new handoff can focus the next observation.
+  topic="@track/$track/handoff"
+  set +e
+  handoff="$(kj board notes --topic "$topic" --limit 1 --json 2>&1)"
+  status=$?
+  set -e
+  if test "$status" = 0; then
+    head_id="$(echo "$handoff" | jq -r '.posts[0].block_id // empty')"
+    if test -n "$head_id"; then
+      direction="$(echo "$handoff" | jq -r --argjson n "$handoff_quota" '.posts[0].body[0:$n]')"
+      current_directions="$current_directions
+$track: $direction"
+      digest="$(echo "$handoff" | jq -r '.posts[0].body' | checksum | cut -d' ' -f1)"
+      basis="$basis $head_id:$digest"
+      handoff_heads="$handoff_heads $head_id:$digest"
+    fi
+  else
+    case "$handoff" in
+      *"kj board notes: no topic '"*) ;;
+      *) echo "$handoff" >&2; exit 1 ;;
+    esac
+  fi
 done
 if test -z "$basis"; then
   exit 0

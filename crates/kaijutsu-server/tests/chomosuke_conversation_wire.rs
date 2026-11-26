@@ -35,6 +35,9 @@ fn conversation_observer_publishes_and_reads_previous_summary_once_per_change() 
         let result = kj.execute_kj_quiet(root, &args).await.unwrap();
         let observer = kaijutsu_client::context_id_from_create_result(&result)
             .unwrap_or_else(|e| panic!("create observer: {e}; stderr: {}", result.stderr));
+        let stance = server.documents.block_snapshots(observer).unwrap().into_iter()
+            .find(|b| b.role == Role::System && b.content.starts_with("You are Chomosuke")).unwrap().content;
+        assert!(stance.contains("thread of the conversation") && !stance.contains("sound desk"));
         let performer = server.kernel_db.lock().get_context(observer).unwrap().unwrap().performer.unwrap();
         kj.join_context(observer, "conversation-observer").await.unwrap();
         let (callback, mut events) = turn_events_channel(16);

@@ -13,17 +13,82 @@ else
   fresh="$(echo "$basis" | jq -Rr --arg old "$previous_basis" '((split(" ") - [""]) - ($old | split(" "))) | length > 0')"
 fi
 if test "$fresh" = true; then
-  previous="$(kj block read "$latest" --no-line-numbers | head -n -1 | jq -Rsr '.[0:2500]')"
+  # Avoid rendering or changing the conversation while a turn is in flight.
+  busy="$(kj context info --json | jq -r '.turn_in_flight')"
+  if test "$busy" = true; then exit 0; fi
+  listen_failed=""
+  if test -z "${KJ_SUMMARY_CONTEXT:-}" && test -n "${KJ_CHOMOSUKE_LISTEN_BLOCK:-}"; then
+    owned="$(kj block list --role asset --content-type audio/wav --included --json | jq -r --arg id "$KJ_CHOMOSUKE_LISTEN_BLOCK" '.[] | select(. == $id)')"
+    if test -n "$owned"; then kj stage exclude "$owned"; fi
+    kj context set --env "KJ_CHOMOSUKE_LISTEN_BLOCK="
+  fi
+  if test -z "${KJ_SUMMARY_CONTEXT:-}" && test -n "${KJ_LISTEN:-}"; then
+    # A trio cell spans 64 beats; two 32-beat phrases cover its last commit.
+    set +e
+    heard="$(kj audio render --track "$KJ_LISTEN" --phrases 2 --max-seconds 8 --json 2>&1)"
+    status=$?
+    set -e
+    if test "$status" = 0; then
+      clip="$(echo "$heard" | jq -r '.hash // empty')"
+      if test -z "$clip"; then
+        echo "chomosuke: audio render returned no WAV hash" >&2
+        exit 1
+      fi
+      # Start this observation before its media so the hydration window
+      # keeps the clip with this score instead of pulling in the last turn.
+      kj block create --role user --kind text --content "Listen to the opening of the committed mix on $KJ_LISTEN, up to eight seconds."
+      created="$(kj block create --role asset --kind text --content-type audio/wav --content "$clip" --json)"
+      clip_block="$(echo "$created" | jq -r '.[0] // empty')"
+      if test -z "$clip_block"; then
+        echo "chomosuke: audio block creation returned no block ID" >&2
+        exit 1
+      fi
+      kj context set --env "KJ_CHOMOSUKE_LISTEN_BLOCK=$clip_block"
+    else
+      case "$heard" in
+        *"committed nothing"*|*"is dormant"*) ;;
+        *) listen_failed="$heard" ;;
+      esac
+    fi
+  fi
+  previous_note=""
+  if test -n "${KJ_SUMMARY_CONTEXT:-}"; then
+    previous="$(kj block read "$latest" --no-line-numbers | head -n -1 | jq -Rsr '.[0:2500]')"
+    previous_note="Previous summary:
+$previous"
+    instruction="Update the summary for the next reader. Keep it under 160 words."
+  else
+    instruction="One observation in plain text. Start with 'In the score' or 'In the clip'. Describe one attack, rest, or phrase length you can locate."
+    if test -n "${KJ_POST_NOTES:-}"; then
+      instruction="Call your add_note tool now. Set track to '$KJ_POST_NOTES'. In body, say what you heard or read in twelve words or fewer. After the tool returns its receipt, finish."
+    fi
+    if test -n "${handoff_heads:-}"; then
+      changed="$(echo "$handoff_heads" | jq -Rr --arg old "$previous_basis" '((split(" ") - [""]) - ($old | split(" "))) | length > 0')"
+      if test "$changed" = true; then
+        if test -n "${KJ_POST_NOTES:-}"; then
+          case "$current_directions" in
+            *"@Toolie"*) instruction="$instruction Address this note to Toolie. Start body with @Toolie." ;;
+          esac
+        fi
+        observations="$observations
+New handoff from the players. Use it as a listening question:
+$current_directions"
+      fi
+    fi
+  fi
   kj drive --if-idle --prompt "Chomosuke memory
 $KJ_MEMORY_TOPIC
 $basis
 $latest
 
-Previous summary:
-$previous
+$previous_note
 
 New observations:
 $observations
 
-Update the summary for the next reader. Keep it under 160 words."
+$instruction"
+  if test -n "$listen_failed"; then
+    echo "chomosuke: drove without listening; audio render for '$KJ_LISTEN' failed: $listen_failed" >&2
+    exit 1
+  fi
 fi

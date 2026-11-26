@@ -111,6 +111,9 @@ enum AudioCommand {
         /// Milliseconds of release tail after the last note.
         #[arg(long, default_value_t = 500)]
         tail_ms: u32,
+        /// Return at most 1 to 120 seconds from the first committed cell (or source start).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=120))]
+        max_seconds: Option<u32>,
     },
 }
 
@@ -213,7 +216,7 @@ const SYNTH_MIN_RATE: u32 = 16_000;
 /// The synthesizer behind `render`: one MIDI file in, mono samples at `rate`
 /// out, `tail_ms` of release after the last event.
 pub(crate) trait MidiSynth: Send {
-    fn render(&mut self, midi: &[u8], rate: u32, tail_ms: u32) -> Result<Vec<f32>, String>;
+    fn render(&mut self, midi: &[u8], rate: u32, tail_ms: u32, max_samples: Option<usize>) -> Result<Vec<f32>, String>;
 }
 
 /// Builds the synthesizer from a SoundFont file path.
@@ -227,6 +230,7 @@ pub(crate) struct RenderRequest {
     pub soundfont: Option<String>,
     pub rate: u32,
     pub tail_ms: u32,
+    pub max_seconds: Option<u32>,
 }
 
 /// One MIDI file to synthesize, starting `offset_samples` into the clip.
@@ -418,6 +422,7 @@ pub(crate) fn render_mix(
     parts: &[RenderPart],
     rate: u32,
     tail_ms: u32,
+    max_samples: Option<usize>,
 ) -> Result<Vec<f32>, String> {
     let cap = RENDER_MAX_SECONDS as usize * rate as usize;
     let over = |samples: usize| {
@@ -429,11 +434,14 @@ pub(crate) fn render_mix(
     };
     let mut mix: Vec<f32> = Vec::new();
     for part in parts {
+        if max_samples.is_some_and(|limit| part.offset_samples >= limit) { continue; }
         if part.offset_samples >= cap {
             return Err(over(part.offset_samples));
         }
-        let audio = synth.render(&part.midi, rate, tail_ms)?;
-        let end = part.offset_samples + audio.len();
+        let remaining = max_samples.map(|limit| limit - part.offset_samples);
+        let audio = synth.render(&part.midi, rate, tail_ms, remaining)?;
+        let count = remaining.map_or(audio.len(), |limit| audio.len().min(limit));
+        let end = part.offset_samples + count;
         if end > cap {
             return Err(over(end));
         }
@@ -491,10 +499,11 @@ struct SoundFontSynth {
 }
 
 impl MidiSynth for SoundFontSynth {
-    fn render(&mut self, midi: &[u8], rate: u32, tail_ms: u32) -> Result<Vec<f32>, String> {
+    fn render(&mut self, midi: &[u8], rate: u32, tail_ms: u32, max_samples: Option<usize>) -> Result<Vec<f32>, String> {
         let file = rustysynth::MidiFile::new(&mut std::io::Cursor::new(midi))
             .map_err(|e| format!("kj audio render: reading MIDI: {e}"))?;
-        let seconds = file.get_length() + tail_ms as f64 / 1000.0;
+        let source_seconds = file.get_length() + tail_ms as f64 / 1000.0;
+        let seconds = max_samples.map_or(source_seconds, |n| source_seconds.min(n as f64 / rate as f64));
         if seconds > RENDER_MAX_SECONDS as f64 {
             return Err(format!(
                 "kj audio render: the clip would run {seconds:.1} s, over the \
@@ -669,9 +678,10 @@ impl KjDispatcher {
 
         let cas = self.kernel().cas().clone();
         let (rate, tail_ms) = (req.rate, req.tail_ms);
+        let max_samples = req.max_seconds.map(|seconds| seconds as usize * rate as usize);
         let joined = tokio::task::spawn_blocking(move || {
             let mut synth = loader(&font)?;
-            let mut mix = render_mix(synth.as_mut(), &parts, rate, tail_ms)?;
+            let mut mix = render_mix(synth.as_mut(), &parts, rate, tail_ms, max_samples)?;
             protect_clipping(&mut mix);
             let seconds = mix.len() as f64 / rate as f64;
             let wav = encode_wav(&mix, rate);
@@ -732,8 +742,8 @@ impl KjDispatcher {
             AudioCommand::KeepRetry { id } => self.audio_keep_retry(id).await,
             AudioCommand::KeepCancel { id } => self.audio_keep_cancel(id).await,
             AudioCommand::Beats { path } => self.audio_beats(path).await,
-            AudioCommand::Render { sources, track, phrases, soundfont, rate, tail_ms } => {
-                let request = RenderRequest { sources, track, phrases, soundfont, rate, tail_ms };
+            AudioCommand::Render { sources, track, phrases, soundfont, rate, tail_ms, max_seconds } => {
+                let request = RenderRequest { sources, track, phrases, soundfont, rate, tail_ms, max_seconds };
                 self.audio_render(request, Box::new(load_soundfont_synth)).await
             }
         }
@@ -1099,7 +1109,7 @@ mod tests {
     }
 
     impl MidiSynth for FakeSynth {
-        fn render(&mut self, midi: &[u8], rate: u32, tail_ms: u32) -> Result<Vec<f32>, String> {
+        fn render(&mut self, midi: &[u8], rate: u32, tail_ms: u32, max_samples: Option<usize>) -> Result<Vec<f32>, String> {
             self.calls.lock().unwrap().push(midi.to_vec());
             let at = |tick: u32| (tick as u64 * rate as u64 / 960) as usize;
             let ons = note_on_ticks(midi);
@@ -1122,6 +1132,7 @@ mod tests {
                 t
             };
             let len = at(last_tick) + (tail_ms as u64 * rate as u64 / 1000) as usize;
+            let len = max_samples.map_or(len, |limit| len.min(limit));
             let mut out = vec![0.0f32; len];
             for tick in ons {
                 let start = at(tick);
@@ -1154,6 +1165,7 @@ mod tests {
             soundfont: Some(soundfont),
             rate: 16000,
             tail_ms: 500,
+            max_seconds: None,
         }
     }
 
@@ -1228,6 +1240,26 @@ mod tests {
         let expected = (2.0 * BURST_AMPLITUDE * i16::MAX as f32).round() as i16;
         assert_eq!(samples[0], expected, "both sources sound at sample 0");
         assert_eq!(samples[3000], 0, "the bursts end after 0.1 s");
+    }
+
+    #[tokio::test]
+    async fn render_limit_stores_a_wav_prefix() {
+        let d = crate::kj::test_helpers::test_dispatcher().await;
+        let cas = d.kernel().cas();
+        let abc = "X:1\nL:1/4\nQ:1/4=120\nK:C\nC8|\n";
+        let source = cas.store(abc.as_bytes(), ABC_MIME).unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(&[&source], dummy_soundfont(&dir));
+        req.max_seconds = Some(1);
+        let (loader, _) = fake_loader();
+        let result = d.audio_render(req, loader).await;
+        let data = data_of(&result);
+        assert_eq!(data["seconds"], 1.0);
+        let hash = data["hash"].as_str().unwrap().parse().unwrap();
+        let wav = cas.retrieve(&hash).unwrap().unwrap();
+        let (rate, channels, bits, samples) = decode_wav(&wav);
+        assert_eq!((rate, channels, bits, samples.len(), wav.len()), (16000, 1, 16, 16000, 32044));
+        assert_eq!(data["bytes"], 32044);
     }
 
     #[tokio::test]
@@ -1428,7 +1460,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut synth = FakeSynth { calls: calls.clone() };
         let part = RenderPart { offset_samples: 120 * 8000, midi: tiny_midi() };
-        let err = render_mix(&mut synth, &[part], 8000, 0).unwrap_err();
+        let err = render_mix(&mut synth, &[part], 8000, 0, None).unwrap_err();
         assert!(err.contains("120 s cap"), "{err}");
         assert!(calls.lock().unwrap().is_empty(), "nothing is synthesized for a part past the cap");
     }
@@ -1487,6 +1519,7 @@ mod tests {
             soundfont: Some(dummy_soundfont(&dir)),
             rate: 16000,
             tail_ms: 500,
+            max_seconds: None,
         };
 
         let (loader, calls) = fake_loader();
@@ -1496,6 +1529,14 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 2);
         // Second cell starts 16 beats of 0.5 s after the first; each runs 1 s.
         assert!((data_of(&result)["seconds"].as_f64().unwrap() - 9.0).abs() < 0.01, "{:?}", data_of(&result));
+
+        let (loader, calls) = fake_loader();
+        let mut limited = track_request("bass", 2);
+        limited.max_seconds = Some(2);
+        let result = d.audio_render(limited, loader).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(data_of(&result)["seconds"], 1.0);
+        assert_eq!(calls.lock().unwrap().len(), 1, "later cells are not synthesized");
 
         let (loader, _) = fake_loader();
         let unknown = d.audio_render(track_request("nope", 1), loader).await;
@@ -1561,7 +1602,7 @@ mod tests {
         let mut synth = load_soundfont_synth(Path::new(&path)).expect("load SoundFont");
         let parts: Vec<RenderPart> =
             midis.into_iter().map(|midi| RenderPart { offset_samples: 0, midi }).collect();
-        let mut mix = render_mix(synth.as_mut(), &parts, 16000, 500).expect("render");
+        let mut mix = render_mix(synth.as_mut(), &parts, 16000, 500, None).expect("render");
         protect_clipping(&mut mix);
         let seconds = mix.len() as f64 / 16000.0;
         // One bar of four beats at 120 BPM is 2 s, plus the 0.5 s tail.

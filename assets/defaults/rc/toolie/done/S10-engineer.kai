@@ -1,0 +1,61 @@
+set -e
+if test -z "${KJ_ENGINEER_TOPIC:-}" || test -z "${KJ_INPUT_BLOCK:-}"; then exit 0; fi
+header="$(kj block read "$KJ_INPUT_BLOCK" --range 0:1 --no-line-numbers | head -n 1)"
+if test "$header" != "Engineer work"; then exit 0; fi
+topic="$(kj block read "$KJ_INPUT_BLOCK" --range 1:2 --no-line-numbers | head -n 1)"
+if test "$topic" != "$KJ_ENGINEER_TOPIC"; then exit 0; fi
+id="$(kj block read "$KJ_INPUT_BLOCK" --range 2:3 --no-line-numbers | head -n 1)"
+number="$(kj block read "$KJ_INPUT_BLOCK" --range 3:4 --no-line-numbers | head -n 1)"
+kj binding revoke "external.rehearsal_desk:chair_set"
+kj binding revoke "external.rehearsal_desk:chair_restore"
+# Only report desk receipts in this turn's block interval. The final model
+# text is not evidence of a reading or action.
+result="Desk receipts could not be verified because the turn has no final output block."
+if test -n "${KJ_OUTPUT_BLOCK:-}"; then
+  result="No desk reading or change recorded."
+  blocks="$(kj block list --json)"
+  interval="$(echo "$blocks" | jq -r --arg start "$KJ_INPUT_BLOCK" --arg end "$KJ_OUTPUT_BLOCK" 'index($start) as $a | index($end) as $b | if $a != null and $b != null and $b >= $a then .[$a + 1:$b + 1][] else empty end')"
+  calls="[]"
+  results="[]"
+  for block in $(split "$interval"); do
+    info="$(kj block inspect "$block" --json)"
+    kind="$(echo "$info" | jq -r '.kind')"
+    if test "$kind" = tool_call; then
+      name="$(echo "$info" | jq -r '.tool_name // empty')"
+      role="$(echo "$info" | jq -r '.role')"
+      case "$name:$role" in
+        rehearsal_status:model|chair_set:model|chair_restore:model)
+          calls="$(echo "$calls" | jq -c --argjson info "$info" '. + [$info]')"
+          ;;
+      esac
+    elif test "$kind" = tool_result; then
+      results="$(echo "$results" | jq -c --argjson info "$info" '. + [$info]')"
+    fi
+  done
+  receipts=""
+  for call in $(echo "$calls" | jq -r '.[0:5][].block_id'); do
+    name="$(echo "$calls" | jq -r --arg call "$call" '.[] | select(.block_id == $call) | .tool_name')"
+    receipt="$(echo "$results" | jq -r --arg call "$call" '.[] | select(.tool_call_id == $call) | .block_id' | head -n 1)"
+    if test -z "$receipt"; then
+      receipts="$receipts
+$name: no result recorded (call $call)."
+    else
+      info="$(echo "$results" | jq -c --arg id "$receipt" '.[] | select(.block_id == $id)')"
+      status="$(echo "$info" | jq -r 'if .is_error then "error" else .status end')"
+      text="$(kj block read "$receipt" --no-line-numbers | jq -Rsr '.[0:600]')"
+      receipts="$receipts
+$name ($status):
+$text
+Call: $call
+Result: $receipt"
+    fi
+  done
+  count="$(echo "$calls" | jq 'length')"
+  if test "$count" -gt 5; then receipts="$receipts
+Additional desk calls omitted; inspect the turn blocks."; fi
+  if test -n "$receipts"; then result="$receipts"; fi
+fi
+kj board reply "$topic" "Engineer result: $id
+Status: $KJ_DONE_STATUS
+$result"
+kj context set --env "KJ_ENGINEER_CURSOR=$number"

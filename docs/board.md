@@ -116,6 +116,10 @@ kj board reply '@track/band/handoff' 'Keep the pickup on the next pass.'
 kj board read '@track/band/handoff'
 ```
 
+On its next score observation, Chomosuke uses a new handoff from that
+topic as a listening question. Musicians can opt into its observations through
+`KJ_VIBE_TOPIC`. See `docs/character.md`, “Chomosuke.”
+
 ## Data model
 
 Each topic is a `BlockStore` document with `DocKind::Topic` and **no**
