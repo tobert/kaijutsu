@@ -128,6 +128,7 @@ pub(super) fn rearm_beat_wake(app: &App, beat: &mut Beat) {
 enum PreparedFrame {
     Picker,
     Boards,
+    Stage(crate::stage::PreparedStage),
     Conversation(render::PreparedScreen),
     Surface {
         lines: Vec<ratatui::text::Line<'static>>,
@@ -160,6 +161,9 @@ fn draw(
     let prepared = match &mut app.screen {
         ScreenMode::Conversation if app.picker.is_some() => PreparedFrame::Picker,
         ScreenMode::Conversation if app.boards.is_some() => PreparedFrame::Boards,
+        ScreenMode::Conversation if app.stage.is_some() => {
+            PreparedFrame::Stage(crate::stage::prepare_stage(app, size.width, size.height, armed))
+        }
         ScreenMode::Conversation => PreparedFrame::Conversation(render::prepare_screen(
             app,
             size.width,
@@ -218,6 +222,7 @@ fn write_frame(
     match prepared {
         PreparedFrame::Picker => render::draw_picker(terminal, app, armed)?,
         PreparedFrame::Boards => render::draw_boards(terminal, app, armed)?,
+        PreparedFrame::Stage(stage) => crate::stage::draw_prepared_stage(terminal, stage)?,
         PreparedFrame::Conversation(screen) => render::draw_prepared_screen(terminal, screen)?,
         PreparedFrame::Surface { lines, cursor } => render::draw_surface(terminal, lines, cursor)?,
     }

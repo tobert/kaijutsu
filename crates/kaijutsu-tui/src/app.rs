@@ -275,6 +275,10 @@ pub struct App {
     /// beat"). Kept as [`crate::picker::TrackRow`] so both readers agree
     /// on `bar`/`beat`.
     pub tracks: Vec<crate::picker::TrackRow>,
+    /// Full `TrackInfo` list from the last `listTracks` poll — feeds the Stage
+    /// surface (`Ctrl+A m`) with `attached` chairs, `beats_per_phrase`, and
+    /// `clock_kind`.
+    pub track_infos: Vec<kaijutsu_client::TrackInfo>,
     /// Per-track beat phasors, fed from `ServerEvent::BeatSync` on the
     /// kernel-wide event stream (`docs/tui.md`, "Timing to music").
     pub beats: kaijutsu_present::beats::WellBeats,
@@ -285,6 +289,8 @@ pub struct App {
     pub picker: Option<crate::picker::PickerModel>,
     /// The full-screen message board browser (`Ctrl+A b`), when open.
     pub boards: Option<crate::boards::BoardsModel>,
+    /// The full-screen live music / stage surface (`Ctrl+A m`), when open.
+    pub stage: Option<crate::stage::StageModel>,
     /// A kj verb this client ran may have changed the roster: a placement
     /// from the picker or any `:kj` line. The loop takes it and starts a
     /// refresh round now.
@@ -349,10 +355,12 @@ impl App {
             kj_catalog: Vec::new(),
             completion: None,
             tracks: Vec::new(),
+            track_infos: Vec::new(),
             beats: kaijutsu_present::beats::WellBeats::default(),
             tails: crate::picker::PickerTails::new(),
             picker: None,
             boards: None,
+            stage: None,
             track_pulse: false,
             focused: true,
             rotation_primed: HashSet::new(),

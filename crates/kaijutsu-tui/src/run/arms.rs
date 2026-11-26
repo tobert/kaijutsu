@@ -22,7 +22,7 @@ use crate::render;
 use crate::editor;
 
 use super::{Frame, LoopState};
-use super::act::{Acted, act, handle_boards_key, handle_picker_key, paste_text, refresh_boards_after_editor};
+use super::act::{Acted, act, handle_boards_key, handle_picker_key, handle_stage_key, paste_text, refresh_boards_after_editor};
 use super::asks_io::{AskLanded, AskReadFor, raise_card, spawn_ask_read, spawn_ask_work};
 use super::draw::{observe_beat_sync, present, rearm_beat_wake};
 use super::feeds::{Feeds, HydrateOutcome, abandon_rehydrate, adopt, land_rehydrate, mark_activity, mark_turn_liveness, release_cold, start_hydrate};
@@ -73,6 +73,8 @@ pub(super) async fn on_input(
                 handle_picker_key(bridge, app, key, ls.key_state.keys.armed(), feeds).await?;
             } else if !app.screen.is_full_screen() && app.boards.is_some() && !ls.key_state.keys.claims(&key) {
                 handle_boards_key(bridge, app, key, ls.key_state.keys.armed()).await?;
+            } else if !app.screen.is_full_screen() && app.stage.is_some() && !ls.key_state.keys.claims(&key) {
+                handle_stage_key(bridge, app, key, feeds).await?;
             } else {
                 let width = terminal.size()?.width;
                 if act(bridge, app, &mut ls.key_state, key, feeds, term_lock, width)

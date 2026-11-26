@@ -63,3 +63,4 @@ pub mod diff;
 pub mod editor;
 pub mod kitty;
 pub mod score;
+pub mod stage;

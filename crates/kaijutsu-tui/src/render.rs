@@ -50,6 +50,9 @@ pub fn strip_animating(app: &App) -> bool {
     if !app.focused {
         return false;
     }
+    if app.stage.is_some() && app.playing_track().is_some() {
+        return true;
+    }
     if app.current.is_some_and(|id| {
         app.turn_running(id) || app.info(id).is_some_and(|c| c.hud.judging_tool.is_some())
     }) {
@@ -709,7 +712,7 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
 /// cursor; a disarmed ask card leaves the keys, and the cursor, to the
 /// draft.
 fn overlay_holds_keys(app: &App) -> bool {
-    app.picker.is_some() || app.boards.is_some() || app.ask_card_armed() || app.ledger_view.is_some()
+    app.picker.is_some() || app.boards.is_some() || app.stage.is_some() || app.ask_card_armed() || app.ledger_view.is_some()
 }
 
 /// The overlay's rows: an ask card, the ledger view, or the `:kj ` completion

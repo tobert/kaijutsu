@@ -466,20 +466,28 @@ pub(super) async fn act(
     tracing::trace!(target: "kaijutsu_tui::keys", code = ?key.code, modifiers = ?key.modifiers,
         kind = ?key.kind, armed = keys.armed(), ?intent, "key");
 
-    if app.picker.is_some() || app.ledger_view.is_some() || app.boards.is_some() {
-        match chord_over_overlay(&intent, app.picker.is_some(), app.ledger_view.is_some(), app.boards.is_some()) {
+    if app.picker.is_some() || app.ledger_view.is_some() || app.boards.is_some() || app.stage.is_some() {
+        match chord_over_overlay(
+            &intent,
+            app.picker.is_some(),
+            app.ledger_view.is_some(),
+            app.boards.is_some(),
+            app.stage.is_some(),
+        ) {
             OverOverlay::Keep => {}
             OverOverlay::Hold => return Ok(Acted::Continue),
             OverOverlay::Close => {
                 app.picker = None;
                 app.ledger_view = None;
                 app.boards = None;
+                app.stage = None;
                 return Ok(Acted::Continue);
             }
             OverOverlay::CloseAndRun => {
                 app.picker = None;
                 app.ledger_view = None;
                 app.boards = None;
+                app.stage = None;
             }
         }
     }
@@ -573,6 +581,7 @@ pub(super) async fn act(
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
         Intent::ToggleBoards => open_boards(bridge, app).await,
+        Intent::ToggleStage => open_stage(bridge, app, feeds).await,
         // A local view change: no RPC, and a scrolled view stays where the
         // reader is (`docs/tui.md`, "Folds").
         Intent::ToggleFold => match render::toggle_fold(app, width) {
@@ -771,7 +780,7 @@ fn paste_target(app: &App) -> PasteTarget {
     if editor::route_key(app, false) == editor::KeyRoute::FullScreen {
         return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
     }
-    if app.ledger_view.is_some() || app.picker.is_some() || app.boards.is_some() || app.ask_card_armed() {
+    if app.ledger_view.is_some() || app.picker.is_some() || app.boards.is_some() || app.stage.is_some() || app.ask_card_armed() {
         return PasteTarget::Refused("paste is not wired into this surface; Esc to the draft first");
     }
     if app.compose.command_line().is_some() { PasteTarget::CommandLine } else { PasteTarget::Draft }
@@ -914,7 +923,7 @@ enum OverOverlay {
 /// The prefix pops over the picker and the ledger (`docs/tui.md`, "Keys").
 /// A chord that leaves for another surface takes the overlay down on the way;
 /// one that only changes the legend or posts a notice leaves it up.
-fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool, boards: bool) -> OverOverlay {
+fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool, boards: bool, stage: bool) -> OverOverlay {
     match intent {
         Intent::Ignored | Intent::LegendChanged | Intent::NotYet(_) | Intent::Unbound(_)
         | Intent::Interrupt => OverOverlay::Keep,
@@ -922,7 +931,124 @@ fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool, boards: bool)
         Intent::TogglePicker if picker => OverOverlay::Close,
         Intent::OpenLedger if ledger => OverOverlay::Close,
         Intent::ToggleBoards if boards => OverOverlay::Close,
+        Intent::ToggleStage if stage => OverOverlay::Close,
         _ => OverOverlay::CloseAndRun,
+    }
+}
+
+/// Open the full-screen Live Music / Stage surface (`Ctrl+A m`), refresh
+/// tracks immediately, and ensure the selected track's score context is
+/// watched/hydrated so its ABC score renders right away.
+async fn open_stage(bridge: &KernelBridge, app: &mut App, feeds: &mut Feeds) {
+    if let Ok(tracks) = bridge.actor().list_tracks().await {
+        app.tracks = tracks.iter().map(crate::picker::track_row_from).collect();
+        app.track_infos = tracks;
+    }
+    let stage = crate::stage::StageModel::new();
+    let score_ctx = stage.selected_track(&app.track_infos).map(|t| t.score_context_id);
+    app.stage = Some(stage);
+    if let Some(ctx) = score_ctx {
+        ensure_stage_score_watched(bridge, app, ctx, feeds).await;
+    }
+}
+
+/// Ensure a track's score context is hydrated in `app.views` so Stage can read
+/// its latest ABC blocks without switching the active conversation seat.
+async fn ensure_stage_score_watched(
+    bridge: &KernelBridge,
+    app: &mut App,
+    score_ctx: kaijutsu_types::ContextId,
+    feeds: &mut Feeds,
+) {
+    let _ = super::feeds::watch_context(bridge, app, score_ctx, feeds).await;
+}
+
+/// Handle one keystroke on the full-screen Stage surface (`Ctrl+A m`).
+pub(super) async fn handle_stage_key(
+    bridge: &KernelBridge,
+    app: &mut App,
+    key: KeyEvent,
+    feeds: &mut Feeds,
+) -> Result<()> {
+    let tracks = app.track_infos.clone();
+    let latest_abc = app
+        .stage
+        .as_ref()
+        .and_then(|s| s.selected_track(&tracks))
+        .and_then(|t| app.views.get(&t.score_context_id))
+        .and_then(|v| crate::stage::latest_abc_in_blocks(v.mirror.blocks()));
+
+    let outcome = match app.stage.as_mut() {
+        Some(stage) => stage.handle_key(&key, &tracks, latest_abc),
+        None => return Ok(()),
+    };
+
+    // Hydrate the newly selected track's score context if needed.
+    let next_score_ctx = app
+        .stage
+        .as_ref()
+        .and_then(|s| s.selected_track(&tracks))
+        .map(|t| t.score_context_id);
+
+    match outcome {
+        crate::stage::StageOutcome::None => {
+            if let Some(ctx) = next_score_ctx {
+                ensure_stage_score_watched(bridge, app, ctx, feeds).await;
+            }
+        }
+        crate::stage::StageOutcome::Dismiss => {
+            app.stage = None;
+        }
+        crate::stage::StageOutcome::TogglePlayPause { track_id, playing } => {
+            let sub = if playing { "pause" } else { "play" };
+            run_stage_transport(bridge, app, vec!["transport".into(), sub.into(), "--track".into(), track_id]).await;
+        }
+        crate::stage::StageOutcome::Stop { track_id } => {
+            run_stage_transport(bridge, app, vec!["transport".into(), "stop".into(), "--track".into(), track_id]).await;
+        }
+        crate::stage::StageOutcome::SetTempo { track_id, bpm } => {
+            run_stage_transport(
+                bridge,
+                app,
+                vec!["transport".into(), "tempo".into(), bpm.to_string(), "--track".into(), track_id],
+            )
+            .await;
+        }
+        crate::stage::StageOutcome::SwitchContext(ctx) => {
+            app.stage = None;
+            switch_seat(bridge, app, ctx, feeds).await;
+        }
+        crate::stage::StageOutcome::OpenFullScore { title, raw_abc } => {
+            app.stage = None;
+            app.screen = ScreenMode::Score(Box::new(crate::score::ScoreScreen::open(title, raw_abc)));
+            app.clear_notice();
+        }
+    }
+    Ok(())
+}
+
+async fn run_stage_transport(bridge: &KernelBridge, app: &mut App, argv: Vec<String>) {
+    let Some(ctx) = app.current else {
+        app.note("no context attached");
+        return;
+    };
+    match bridge.execute_kj(ctx, argv).await {
+        Ok(res) if res.exit_code == 0 => {
+            if let Ok(tracks) = bridge.actor().list_tracks().await {
+                app.tracks = tracks.iter().map(crate::picker::track_row_from).collect();
+                app.track_infos = tracks;
+            }
+            app.roster_changed = true;
+        }
+        Ok(res) => {
+            let msg = res.stderr.trim();
+            app.note(if msg.is_empty() {
+                format!("kj transport exited {}", res.exit_code)
+            } else {
+                msg.to_string()
+            });
+        }
+        Err(e) => app.note(format!("kj transport failed: {e:#}")),
     }
 }
 
@@ -1074,16 +1200,18 @@ mod tests {
     /// overlay's own chord only closes it.
     #[test]
     fn a_chord_over_an_overlay_closes_it_only_when_it_leaves() {
-        assert_eq!(chord_over_overlay(&Intent::LegendChanged, true, false, false), OverOverlay::Keep);
-        assert_eq!(chord_over_overlay(&Intent::SwitchSeat(2), true, false, false), OverOverlay::CloseAndRun);
-        assert_eq!(chord_over_overlay(&Intent::LastContext, false, true, false), OverOverlay::CloseAndRun);
-        assert_eq!(chord_over_overlay(&Intent::TogglePicker, true, false, false), OverOverlay::Close);
-        assert_eq!(chord_over_overlay(&Intent::TogglePicker, false, true, false), OverOverlay::CloseAndRun);
-        assert_eq!(chord_over_overlay(&Intent::OpenLedger, false, true, false), OverOverlay::Close);
-        assert_eq!(chord_over_overlay(&Intent::ToggleBoards, false, false, true), OverOverlay::Close);
-        assert_eq!(chord_over_overlay(&Intent::ToggleBoards, true, false, false), OverOverlay::CloseAndRun);
-        assert_eq!(chord_over_overlay(&Intent::Paste, true, false, false), OverOverlay::Hold);
-        assert_eq!(chord_over_overlay(&Intent::Unbound(crossterm::event::KeyCode::Char('x')), true, false, false), OverOverlay::Keep);
+        assert_eq!(chord_over_overlay(&Intent::LegendChanged, true, false, false, false), OverOverlay::Keep);
+        assert_eq!(chord_over_overlay(&Intent::SwitchSeat(2), true, false, false, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::LastContext, false, true, false, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::TogglePicker, true, false, false, false), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::TogglePicker, false, true, false, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::OpenLedger, false, true, false, false), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::ToggleBoards, false, false, true, false), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::ToggleBoards, true, false, false, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::ToggleStage, false, false, false, true), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::ToggleStage, true, false, false, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::Paste, true, false, false, false), OverOverlay::Hold);
+        assert_eq!(chord_over_overlay(&Intent::Unbound(crossterm::event::KeyCode::Char('x')), true, false, false, false), OverOverlay::Keep);
     }
 
     /// `Ctrl+O` is never one of copy mode's keys: it folds where the reader

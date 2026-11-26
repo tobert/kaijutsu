@@ -416,7 +416,7 @@ pub fn status_line(model: &StatusModel, width: u16, palette: &Palette) -> Line<'
 pub fn legend_line(width: u16, palette: &Palette) -> Line<'static> {
     // Widest first; the first tier that fits wins, and the last is the floor.
     let tiers = [
-        "Ctrl+A: 0-9 seat · n/p step · Ctrl+A last · \" picker · b boards · ' switch · A rename · r rotate · l ledger · s score · [ copy · ] paste · Esc cancel",
+        "Ctrl+A: 0-9 seat · n/p step · Ctrl+A last · \" picker · b boards · m stage · ' switch · A rename · r rotate · l ledger · s score · [ copy · ] paste · Esc cancel",
         "Ctrl+A: 0-9 · n/p · ^A · \" pick · b board · r rotate · l ledger · s score · [ copy · ] paste",
         "Ctrl+A: 0-9 · ^A last · \" picker · b boards",
     ];

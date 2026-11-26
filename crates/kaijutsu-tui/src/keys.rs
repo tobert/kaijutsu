@@ -74,6 +74,8 @@ pub enum Intent {
     TogglePicker,
     /// `Ctrl+A b` — open or close the full-screen message board browser.
     ToggleBoards,
+    /// `Ctrl+A m` — open or close the full-screen live music / stage surface.
+    ToggleStage,
     /// `Ctrl+A [` — tmux's own copy-mode chord: leave the transcript's live
     /// tail without moving the view, which is where vi motions, `v`, `y` and
     /// a search take over (`docs/tui.md`, "Scrolling is copy mode"). `Up`,
@@ -170,6 +172,7 @@ impl Keys {
                 }
                 KeyCode::Char('"') | KeyCode::Char('w') => Intent::TogglePicker,
                 KeyCode::Char('b') => Intent::ToggleBoards,
+                KeyCode::Char('m') => Intent::ToggleStage,
                 KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
                 KeyCode::Char('s') => Intent::OpenScore,
@@ -258,6 +261,13 @@ mod tests {
         let mut keys = Keys::new();
         keys.interpret(ctrl('a'));
         assert_eq!(keys.interpret(press(KeyCode::Char('s'))), Intent::OpenScore);
+    }
+
+    #[test]
+    fn ctrl_a_m_toggles_stage() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('m'))), Intent::ToggleStage);
     }
 
     #[test]

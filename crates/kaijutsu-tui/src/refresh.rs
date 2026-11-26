@@ -71,6 +71,7 @@ pub fn apply(app: &mut App, refreshed: Refreshed) {
     }
     if let Some(tracks) = refreshed.tracks {
         app.tracks = tracks.iter().map(picker::track_row_from).collect();
+        app.track_infos = tracks;
     }
     app.refresh_picker(kaijutsu_types::now_millis());
 }
@@ -97,6 +98,7 @@ fn maybe_prime_rotation_switch(app: &mut App, cur: kaijutsu_types::ContextId, la
     let can_prime = !app.screen.is_full_screen()
         && app.picker.is_none()
         && app.boards.is_none()
+        && app.stage.is_none()
         && app.compose.command_line().is_none()
         && app.compose.text().is_empty();
     if can_prime {
