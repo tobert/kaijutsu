@@ -1676,3 +1676,152 @@ async fn board_list_all_and_empty_hint_and_compact_read_data() {
     assert_eq!(post0["number"].as_u64(), Some(1));
     assert!(post0.get("content").is_none(), "post content should not be duplicated in data: {post0}");
 }
+
+#[test]
+fn notes_commands_accept_track_and_pagination() {
+    let args = ["notes", "--track", "bass", "--performer", "alice", "--before", "7", "--limit", "4", "--json"];
+    assert!(BoardArgs::try_parse_from(args).is_ok());
+    assert!(BoardArgs::try_parse_from(["notes", "--topic", "alice/memory/vibe", "--before", "3"]).is_ok());
+    assert!(BoardArgs::try_parse_from(["notes", "--topic", "alice/memory/vibe", "--track", "bass"]).is_err());
+    assert!(BoardArgs::try_parse_from(["notes", "--topic", "alice/memory/vibe", "--performer", "alice"]).is_err());
+    assert!(BoardArgs::try_parse_from(["notes", "--after", "1", "--before", "3"]).is_err());
+    let args = ["add-note", "--track", "bass", "--at", "3", "--phrase-start", "0", "--score", "abc", "hello"];
+    assert!(BoardArgs::try_parse_from(args).is_ok());
+    for name in ["notes", "add-note"] {
+        let mut command = BoardArgs::command();
+        let help = command.find_subcommand_mut(name).unwrap().render_long_help().to_string();
+        println!("{help}");
+        assert!(help.contains("--track"));
+    }
+}
+
+#[tokio::test]
+async fn track_notes_share_posts_and_preserve_pagination_and_authors() {
+    let d = test_dispatcher().await;
+    let (_, root_ctx) = seed_root(&d);
+    let musician = create_character(&d, "note-musician", false).await;
+    let ctx = register_bound_context(&d, "notes-work", musician, Some(root_ctx), &worker_binding());
+    let c = caller_as(musician, Some(ctx));
+    d.kernel().arm_track_timeline(
+        kaijutsu_types::TrackId::new("bass_1").unwrap(),
+        kaijutsu_hyoushigi::TickClock::default(),
+        kaijutsu_types::Tick::new(10),
+    );
+    for text in ["first", "second", "third"] {
+        let result = d.dispatch(&[s("board"), s("add-note"), s("--track"), s("bass_1"), s("--at"), s("8"), s(text)], &c).await;
+        assert!(result.is_ok(), "{}", result.message());
+    }
+    d.kernel().arm_track_timeline(
+        kaijutsu_types::TrackId::new("bass-1").unwrap(),
+        kaijutsu_hyoushigi::TickClock::default(),
+        kaijutsu_types::Tick::new(10),
+    );
+    let other = d.dispatch(&[s("board"), s("add-note"), s("--track"), s("bass-1"), s("other track")], &c).await;
+    assert!(other.is_ok(), "{}", other.message());
+    let ordinary_read = d.dispatch(&[s("board"), s("read"), s("note-musician/music-notes/bass_1")], &c).await;
+    assert!(ordinary_read.is_ok(), "{}", ordinary_read.message());
+    assert!(!ordinary_read.message().contains("other track"));
+    let root = caller_as(seed_root(&d).0, Some(root_ctx));
+    let explicit = d.dispatch(&[s("board"), s("notes"), s("--track"), s("bass_1"), s("--performer"), musician.to_hex()], &root).await;
+    let KjResult::Ok { data: Some(explicit_data), .. } = explicit else { panic!("notes failed: {explicit:?}") };
+    assert_eq!(explicit_data["posts"].as_array().unwrap().len(), 3);
+    let result = d.dispatch(&[s("board"), s("notes"), s("--track"), s("bass_1"), s("--before"), s("3"), s("--limit"), s("1"), s("--json")], &c).await;
+    let KjResult::Ok { data: Some(data), .. } = result else { panic!("notes failed: {result:?}") };
+    assert_eq!(data["posts"][0]["number"], 2);
+    assert!(data["posts"][0]["body"].as_str().unwrap().contains("second"));
+    assert_eq!(data["posts"][0]["author_id"], musician.to_hex());
+    let result = d.dispatch(&[s("board"), s("notes"), s("--track"), s("bass_1"), s("--after"), s("1"), s("--limit"), s("1")], &c).await;
+    let KjResult::Ok { data: Some(data), .. } = result else { panic!("notes failed: {result:?}") };
+    assert_eq!(data["posts"].as_array().unwrap().len(), 1);
+    assert_eq!(data["posts"][0]["number"], 2);
+    let topic = d.dispatch(&[s("board"), s("notes"), s("--topic"), s("note-musician/music-notes/bass_1"), s("--after"), s("1"), s("--limit"), s("1")], &c).await;
+    let KjResult::Ok { data: Some(topic_data), .. } = topic else { panic!("topic notes failed: {topic:?}") };
+    assert_eq!(topic_data, data);
+}
+
+#[tokio::test]
+async fn concurrent_first_track_notes_share_one_topic() {
+    let d = test_dispatcher().await;
+    let (_, root_ctx) = seed_root(&d);
+    let musician = create_character(&d, "notes-race", false).await;
+    let ctx = register_bound_context(&d, "notes-race-work", musician, Some(root_ctx), &worker_binding());
+    let c = caller_as(musician, Some(ctx));
+    d.kernel().arm_track_timeline(
+        kaijutsu_types::TrackId::new("race").unwrap(),
+        kaijutsu_hyoushigi::TickClock::default(),
+        kaijutsu_types::Tick::new(3),
+    );
+    let first = [s("board"), s("add-note"), s("--track"), s("race"), s("first")];
+    let second = [s("board"), s("add-note"), s("--track"), s("race"), s("second")];
+    let (a, b) = tokio::join!(d.dispatch(&first, &c), d.dispatch(&second, &c));
+    assert!(a.is_ok(), "{}", a.message());
+    assert!(b.is_ok(), "{}", b.message());
+    let result = d.dispatch(&[s("board"), s("notes"), s("--track"), s("race")], &c).await;
+    let KjResult::Ok { data: Some(data), .. } = result else { panic!("notes failed: {result:?}") };
+    assert_eq!(data["posts"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn track_notes_vi_save_updates_one_post_and_cancel_discards() {
+    let d = Arc::new(test_dispatcher().await);
+    d.kernel().broker().set_kj_dispatcher(&d).await;
+    let (_, root_ctx) = seed_root(&d);
+    let musician = create_character(&d, "notes-editor", false).await;
+    let mut binding = worker_binding();
+    binding.grant(Capability::Editor);
+    let ctx = register_bound_context(&d, "notes-editor-work", musician, Some(root_ctx), &binding);
+    let c = caller_as(musician, Some(ctx));
+    d.kernel().arm_track_timeline(kaijutsu_types::TrackId::new("vi").unwrap(), kaijutsu_hyoushigi::TickClock::default(), kaijutsu_types::Tick::new(10));
+    let opened = d.dispatch(&[s("board"), s("add-note"), s("--track"), s("vi"), s("--vi")], &c).await;
+    let KjResult::Ok { data: Some(data), .. } = opened else { panic!("open failed: {opened:?}") };
+    let sid = data["session"].as_u64().unwrap().to_string();
+    assert!(d.dispatch(&[s("vi"), s("keys"), sid.clone(), s("ifirst<Esc>:w<CR>")], &c).await.is_ok());
+    assert!(d.dispatch(&[s("vi"), s("keys"), sid, s("A more<Esc>:wq<CR>")], &c).await.is_ok());
+    let opened = d.dispatch(&[s("board"), s("add-note"), s("--track"), s("vi"), s("--vi")], &c).await;
+    let KjResult::Ok { data: Some(data), .. } = opened else { panic!("open failed: {opened:?}") };
+    let sid = data["session"].as_u64().unwrap().to_string();
+    assert!(d.dispatch(&[s("vi"), s("keys"), sid, s("idiscard<Esc>:q!<CR>")], &c).await.is_ok());
+    let result = d.dispatch(&[s("board"), s("notes"), s("--track"), s("vi")], &c).await;
+    let KjResult::Ok { data: Some(data), .. } = result else { panic!("notes failed: {result:?}") };
+    assert_eq!(data["posts"].as_array().unwrap().len(), 1);
+    let body = data["posts"][0]["body"].as_str().unwrap();
+    assert!(body.contains("Opened at tick 10; sent at tick 10."), "{body}");
+    assert!(body.contains("first more"), "{body}");
+    assert!(!body.contains("discard"), "{body}");
+}
+
+#[tokio::test]
+async fn track_board_ref_shares_score_context_board_and_keeps_character_refs() {
+    let d = test_dispatcher().await;
+    let (root, root_ctx) = seed_root(&d);
+    let a = create_character(&d, "track-a", false).await;
+    let b = create_character(&d, "track-b", false).await;
+    let track_character = create_character(&d, "track", false).await;
+    let score_ctx = register_bound_context(&d, "track-score", root, Some(root_ctx), &worker_binding());
+    let a_ctx = register_bound_context(&d, "track-a-work", a, Some(root_ctx), &worker_binding());
+    let b_ctx = register_bound_context(&d, "track-b-work", b, Some(root_ctx), &worker_binding());
+    let track_ctx = register_bound_context(&d, "track-char-work", track_character, Some(root_ctx), &worker_binding());
+    let a = caller_as(a, Some(a_ctx));
+    let b = caller_as(b, Some(b_ctx));
+    let track_caller = caller_as(track_character, Some(track_ctx));
+    let root_caller = caller_as(root, Some(root_ctx));
+    d.kernel_db().lock().upsert_track(&crate::kernel_db::PersistedTrack {
+        track_id: "band".into(), period_ms: 500, beats_per_phrase: 4, playhead_tick: None,
+        playing: false, score_context_id: Some(score_ctx), clock_kind: "system".into(),
+    }).unwrap();
+    let missing = d.dispatch(&[s("board"), s("topics"), s("@track/missing")], &a).await;
+    assert!(!missing.is_ok(), "unknown tracks must fail");
+    let posted = d.dispatch(&[s("board"), s("post"), s("@track/band"), s("--title"), s("handoff"), s("from a")], &a).await;
+    assert!(posted.is_ok(), "{}", posted.message());
+    let reply = d.dispatch(&[s("board"), s("reply"), s("@track/band/handoff"), s("from b")], &b).await;
+    assert!(reply.is_ok(), "{}", reply.message());
+    let read = d.dispatch(&[s("board"), s("read"), s("@track/band/handoff")], &a).await;
+    assert!(read.message().contains("from a") && read.message().contains("from b"), "{}", read.message());
+    let lock = d.dispatch(&[s("board"), s("lock"), s("@track/band/handoff")], &root_caller).await;
+    assert!(lock.is_ok(), "{}", lock.message());
+    assert!(!d.dispatch(&[s("board"), s("reply"), s("@track/band/handoff"), s("blocked")], &b).await.is_ok());
+    assert!(d.dispatch(&[s("board"), s("create"), s("band")], &track_caller).await.is_ok());
+    assert!(d.dispatch(&[s("board"), s("post"), s("track/band"), s("--title"), s("separate"), s("character")], &track_caller).await.is_ok());
+    let separate = d.dispatch(&[s("board"), s("read"), s("track/band/separate")], &a).await;
+    assert!(separate.is_ok(), "{}", separate.message());
+}

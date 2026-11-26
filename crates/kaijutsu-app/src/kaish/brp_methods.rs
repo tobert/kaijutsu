@@ -17,6 +17,7 @@ use crate::input::{Action, ActionFired, FocusArea, InputContext};
 use crate::ui::screen::Screen;
 use crate::view::components::ContextSwitchRequested;
 use crate::view::document::DocumentCache;
+use crate::view::heroic::state::HeroicState;
 use kaijutsu_types::ContextId;
 
 /// Method name for switching to a context by ID.
@@ -88,6 +89,13 @@ struct StateResponse {
     /// Active binding contexts, lowest priority first.
     contexts: Vec<String>,
     active_context_id: Option<String>,
+    heroic: Option<HeroicView>,
+}
+
+#[derive(Serialize)]
+struct HeroicView {
+    performers: Vec<ContextId>,
+    selected: Option<ContextId>,
 }
 
 #[derive(Serialize)]
@@ -282,6 +290,7 @@ pub fn handle_state(
     focus: Res<FocusArea>,
     active: Res<ActiveInputContexts>,
     doc_cache: Res<DocumentCache>,
+    heroic: Option<Res<HeroicState>>,
 ) -> BrpResult {
     serde_json::to_value(StateResponse {
         control_request: control.request.as_ref().map(|r| ControlRequestView {
@@ -297,6 +306,10 @@ pub fn handle_state(
         focus: format!("{:?}", *focus),
         contexts: active.0.iter().map(|c| format!("{c:?}")).collect(),
         active_context_id: doc_cache.active_id().map(|id| id.to_string()),
+        heroic: heroic.filter(|_| *screen.get() == Screen::Heroic).map(|scene| HeroicView {
+            performers: scene.performer_ids(),
+            selected: scene.selected_performer,
+        }),
     })
     .map_err(BrpError::internal)
 }

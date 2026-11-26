@@ -978,6 +978,7 @@ impl Kernel {
         use crate::mcp::servers::{
             BlockToolsServer, BuiltinBindingsServer, BuiltinHooksServer, BuiltinResourcesServer,
             BuiltinTasksServer, BuiltinTurnServer, FileToolsServer, KernelInfoServer,
+            notes::BuiltinNotesServer,
         };
         use crate::mcp::servers::bindings_builtin::KERNEL_TOOLS_URI;
         use crate::mcp::{InstancePolicy, KernelNotification};
@@ -1029,6 +1030,10 @@ impl Kernel {
                 Arc::new(KernelInfoServer::new(self.drift.clone(), kernel_db.clone())),
                 InstancePolicy::for_kernel(self),
             )
+            .await?;
+
+        self.broker
+            .register_silently(Arc::new(BuiltinNotesServer::new(Arc::downgrade(&self.broker))), InstancePolicy::for_kernel(self))
             .await?;
 
         // builtin.turn — `done`, which ends a task. Opt-in: `*` does not
@@ -1772,6 +1777,35 @@ impl Kernel {
                         });
                         Ok((message, next))
                     }
+                    crate::kj::KjResult::Err(e) => Err(e),
+                    other => Err(other.message().to_string()),
+                }
+            }
+            BoardEditorTarget::NewNote { track, performer, opened, phrase_start, score } => {
+                match dispatcher.board_add_note(Some(track), Some(performer), Some(*opened), *phrase_start, score.as_deref(), false, text, &binding.caller).await {
+                    crate::kj::KjResult::Ok { message, data, .. } => {
+                        let next = data.as_ref().and_then(|d| {
+                            if d.get("held").and_then(|v| v.as_bool()) == Some(true) {
+                                Some(BoardEditorTarget::SubmittedForReview { ask_id: d.get("ask_id")?.as_str()?.to_string() })
+                            } else {
+                                let short = d.get("short_id")?.as_str()?;
+                                let num = d.get("post_number").and_then(|v| v.as_u64()).unwrap_or(1);
+                                Some(BoardEditorTarget::EditNote { post_ref: format!("{short}#{num}"), track: track.clone(), opened: *opened, phrase_start: *phrase_start, score: score.clone() })
+                            }
+                        });
+                        Ok((message, next))
+                    }
+                    crate::kj::KjResult::Err(e) => Err(e),
+                    other => Err(other.message().to_string()),
+                }
+            }
+            BoardEditorTarget::EditNote { post_ref, track, opened, phrase_start, score } => {
+                let track = kaijutsu_types::TrackId::new(track).map_err(|e| e.to_string())?;
+                let sent = self.track_timeline(&track).map(|t| t.lock().playhead().get())
+                    .ok_or_else(|| format!("track '{}' has no live playhead", track.as_str()))?;
+                let body = crate::editor::track_note_body(*opened, sent, *phrase_start, score.as_deref(), text);
+                match dispatcher.board_edit(post_ref, &body, &binding.caller).await {
+                    crate::kj::KjResult::Ok { message, .. } => Ok((message, None)),
                     crate::kj::KjResult::Err(e) => Err(e),
                     other => Err(other.message().to_string()),
                 }

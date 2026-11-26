@@ -34,10 +34,11 @@ pub struct HeroicInstruction {
 #[derive(Debug, Clone)]
 pub struct HeroicPerformer {
     pub context_id: ContextId,
+    pub principal_id: Option<kaijutsu_types::PrincipalId>,
     pub parent_context_id: Option<ContextId>,
     pub character: String,
     pub label: String,
-    pub rc_dir: String,
+    pub chair: Option<String>,
     pub statuses: Vec<WorkStatus>,
     pub lead_beats: f32,
     pub slack: PerformerSlack,
@@ -62,9 +63,13 @@ impl HeroicPerformer {
             &self.label
         }
     }
+
+    pub fn lane_name(&self) -> &str {
+        self.chair.as_deref().unwrap_or_else(|| self.display_name())
+    }
 }
 
-/// One track lane on the heroic road.
+/// One track and its performer lanes on the road.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct HeroicLane {
@@ -78,27 +83,10 @@ pub struct HeroicLane {
     pub performers: Vec<HeroicPerformer>,
 }
 
-impl HeroicLane {
-    /// True when every performer on this lane shares one character name;
-    /// false when multiple distinct characters share the lane (`docs/newui.md`,
-    /// "Color": shared-character lanes color their floor; mixed lanes stay neutral).
-    pub fn single_character_name(&self) -> Option<&str> {
-        let first = self.performers.first()?.character.as_str();
-        if first.is_empty() {
-            return None;
-        }
-        if self.performers.iter().all(|p| p.character == first) {
-            Some(first)
-        } else {
-            None
-        }
-    }
-}
-
 /// One pad-hit flash event produced by a note crossing the strike line.
 #[derive(Debug, Clone, Copy)]
 pub struct PadFlashEvent {
-    pub lane_idx: usize,
+    pub context_id: ContextId,
     pub color: LinearRgba,
     pub hollow: bool,
 }
@@ -205,15 +193,36 @@ impl HeroicState {
             .any(|p| p.slack.state == SlackState::Alarm)
     }
 
-    /// Total width of the road in world units (`max(lanes, 1) * lane_width`).
+    /// Number of road lanes, reserving one for a track without attachments.
+    pub fn road_lane_count(&self) -> usize {
+        self.lanes.iter().map(|track| track.performers.len().max(1)).sum()
+    }
+
+    /// Track and performer for each road lane, in road order.
+    pub fn road_lanes(&self) -> impl Iterator<Item = (&HeroicLane, Option<&HeroicPerformer>, bool)> {
+        self.lanes.iter().flat_map(|track| {
+            (0..track.performers.len().max(1))
+                .map(move |i| (track, track.performers.get(i), i == 0))
+        })
+    }
+
+    /// Total width of the road in world units.
     pub fn road_width(&self, lane_width: f32) -> f32 {
-        (self.lanes.len().max(1) as f32) * lane_width
+        (self.road_lane_count().max(1) as f32) * lane_width
     }
 
     /// Center X coordinate of `lane_idx` on the road.
     pub fn lane_center_x(&self, lane_idx: usize, lane_width: f32) -> f32 {
-        let n = self.lanes.len().max(1) as f32;
+        let n = self.road_lane_count().max(1) as f32;
         (lane_idx as f32 - (n - 1.0) * 0.5) * lane_width
+    }
+
+    pub fn performer_lane_center_x(&self, track_idx: usize, performer_idx: usize, lane_width: f32) -> f32 {
+        let preceding: usize = self.lanes[..track_idx]
+            .iter()
+            .map(|track| track.performers.len().max(1))
+            .sum();
+        self.lane_center_x(preceding + performer_idx, lane_width)
     }
 
     /// Push a new eighth-note peak row into `hill_history` and reset the accumulator.

@@ -555,6 +555,7 @@ mod tests {
                 indent_level: 0,
                 metrics_epoch: 1,
                 baked_theme_epoch: 0,
+            abc_raster_scale_bits: 0,
             },
             height: chunk_heights.iter().sum(),
             text_height: chunk_heights.iter().sum(),

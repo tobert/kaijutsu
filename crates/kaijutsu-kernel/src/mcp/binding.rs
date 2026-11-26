@@ -120,10 +120,10 @@ pub fn is_context_scoped(instance: &InstanceId) -> bool {
     instance.as_str().starts_with(CONTEXT_SCOPED_PREFIX)
 }
 
-/// Builtin instances `*` never covers: offering one changes how the
-/// context's turns behave, so an rc directory grants it by name.
+/// Builtin instances `*` never covers; an rc directory grants them by name.
 /// `builtin.turn` offers `done`, which changes how a turn ends.
-pub const OPT_IN_INSTANCES: &[&str] = &["builtin.turn"];
+/// `builtin.notes` grants access to a performer's track notes.
+pub const OPT_IN_INSTANCES: &[&str] = &["builtin.turn", "builtin.notes"];
 
 /// True if `*` covers `instance`.
 fn star_covers(instance: &InstanceId) -> bool {

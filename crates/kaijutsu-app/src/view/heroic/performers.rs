@@ -287,13 +287,7 @@ pub fn performer_world_pos(
     now_secs: f32,
 ) -> Vec3 {
     let lane = &state.lanes[lane_idx];
-    let n_perf = lane.performers.len().max(1);
-    let x_spread = if n_perf == 1 {
-        0.0
-    } else {
-        (perf_idx as f32 / (n_perf - 1) as f32 - 0.5) * (palette.lane_width * 0.42)
-    };
-    let lane_x = state.lane_center_x(lane_idx, palette.lane_width) + x_spread;
+    let lane_x = state.performer_lane_center_x(lane_idx, perf_idx, palette.lane_width);
     let road_len = (palette.road_seconds * palette.units_per_second).max(10.0);
     let target_beats = perf
         .statuses
@@ -547,7 +541,7 @@ pub fn sync_performers(
                 .any(|w| w.readiness == Readiness::Running && w.attempt > 1);
             let error_now = perf.slack.state == SlackState::Alarm || fallback;
 
-            let base_col = heroic_identity_color(&perf.character);
+            let base_col = heroic_identity_color(perf.lane_name());
             // Core crystal stays white normally and on clean fallback; turns trouble-red on alarm/trouble.
             let mut core_col = palette.now;
             if perf.slack.state == SlackState::Alarm || fallback {
@@ -650,7 +644,7 @@ pub fn sync_performers(
                 * palette.units_per_second;
             let slab_center_z = (pos.z - phrase_len_z * 0.5 + phrase_pos * 0.25).min(-0.2);
             if let Ok(mut tf) = transforms.get_mut(slot.slab_entity) {
-                tf.translation = Vec3::new(state.lane_center_x(li, palette.lane_width), 0.006, slab_center_z);
+                tf.translation = Vec3::new(pos.x, 0.006, slab_center_z);
                 tf.scale = Vec3::new(palette.lane_width * 0.86, 1.0, phrase_len_z.min(18.0));
             }
             if let Some(mut m) = mats.get_mut(&slot.slab_mat) {

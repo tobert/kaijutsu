@@ -697,7 +697,7 @@ fn wants_stdin_content(argv: &[String]) -> bool {
         ),
         (Some("rc"), Some("add"))
             | (Some("block"), Some("create"))
-            | (Some("board"), Some("post"))
+            | (Some("board"), Some("add-note" | "post"))
             | (Some("board"), Some("reply"))
             | (Some("board"), Some("edit"))
     )
@@ -1884,6 +1884,11 @@ mod tests {
             "expected .output() to be None (dropped by kaish's output limiter), got {:?}",
             res.output(),
         );
+    }
+
+    #[test]
+    fn add_note_accepts_piped_content_like_a_board_reply() {
+        assert!(super::wants_stdin_content(&["board".into(), "add-note".into()]));
     }
 
     /// Piped stdin populates `--content` for `kj rc add` when the flag is

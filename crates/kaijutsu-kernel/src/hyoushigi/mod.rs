@@ -769,8 +769,8 @@ pub fn materialize_committed(
                 // must not flood the LLM as assistant text once per materialized phrase
                 // (see the type-level blessing and the §8 doc above). Pinned by
                 // materialized_score_blocks_are_hydration_silent.
-                let mut snap = guard
-                    .materialize(cell, block_id)
+                let mut snap = cell
+                    .materialize(block_id, &src_bytes)
                     .expect("a concrete cell always materializes");
                 snap.ephemeral = true;
                 snap
@@ -1231,6 +1231,32 @@ mod tests {
             materialize_committed(&tl, &cas, &blocks, ctx, &mut cursor, &derivers).unwrap();
         assert!(again.is_empty(), "second pass is a no-op");
         assert_eq!(blocks.block_snapshots(ctx).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn durable_only_score_materializes_its_text_and_midi() {
+        use kaijutsu_cas::ContentStore;
+        let (blocks, cas, ctx, _dir) = store_and_cas();
+        let hash = cas.store(VAMP_ABC.as_bytes(), super::ABC_MIME).unwrap();
+        let mut timeline = Timeline::new(TickClock::default());
+        timeline.push_committed_for_test(Cell::concrete_on(
+            Span::instant(Tick::new(10)),
+            super::ContentRef::new(hash.clone(), super::ABC_MIME),
+            kaijutsu_types::TrackId::solo(),
+            kaijutsu_types::PrincipalId::beat(),
+        ));
+        assert!(timeline.content_bytes(&hash).is_none());
+        let tl = Arc::new(Mutex::new(timeline));
+        let mut cursor = MaterializeCursor::default();
+        materialize_committed(&tl, &cas, &blocks, ctx, &mut cursor, &DeriverRegistry::production()).unwrap();
+
+        let snaps = blocks.block_snapshots(ctx).unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].content, VAMP_ABC);
+        assert_eq!(snaps[0].content_type, kaijutsu_types::ContentType::Abc);
+        assert_eq!(snaps[1].parent_id, Some(snaps[0].id));
+        let midi_hash = kaijutsu_cas::ContentHash::from_str_checked(&snaps[1].content).unwrap();
+        assert!(cas.retrieve(&midi_hash).unwrap().unwrap().starts_with(b"MThd"));
     }
 
     /// The per-artifact resume must parent the derived sibling to the REAL source

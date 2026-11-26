@@ -123,6 +123,8 @@ pub fn collect_music_glyphs(
 /// `collect_music_glyphs` — every `Line` endpoint and every `Path` point
 /// goes through the same `offset + (p - origin) * block_scale` transform so
 /// geometry, glyphs, and text all land in one coordinate space.
+/// `raster_scale` is the target's physical pixels per logical pixel. Lines
+/// are at least one physical pixel wide so they cover a pixel center.
 ///
 /// A `Path` whose `d` fails to parse, or that specifies `fill: false` (no
 /// current engraver emitter produces a stroked Path — stroking an
@@ -136,6 +138,7 @@ pub fn collect_music_geometry(
     origin: (f64, f64),
     block_scale: f64,
     color: &Brush,
+    raster_scale: f64,
 ) -> Vec<GeometryVertex> {
     // Curve/arc flattening tolerance, in already-block-scaled PIXEL space
     // (the transform below is applied before flattening, precisely so a
@@ -169,7 +172,7 @@ pub fn collect_music_geometry(
                     p1.y,
                     p2.x,
                     p2.y,
-                    width * block_scale,
+                    (width * block_scale).max(1.0 / raster_scale),
                     rgba,
                 );
                 vertices.extend_from_slice(&quad);
@@ -474,6 +477,45 @@ mod tests {
 
     // -- collect_music_geometry -------------------------------------------
 
+    #[test]
+    fn scaled_hairlines_cover_a_pixel_at_every_subpixel_position() {
+        let brush = Brush::Solid(peniko::Color::WHITE);
+        for (horizontal, raster_scale) in [(true, 1.0), (false, 1.0), (true, 2.0), (false, 2.0)] {
+            let line = EngravingElement::Line {
+                x1: 0.0, y1: 0.0,
+                x2: if horizontal { 100.0 } else { 0.0 },
+                y2: if horizontal { 0.0 } else { 100.0 },
+                width: 0.5, source_span: (0, 0),
+            };
+            let verts = collect_music_geometry(&[line], (0.0, 0.0), (0.0, 0.0), 0.4, &brush, raster_scale);
+            let coord = |v: &GeometryVertex| (if horizontal { v.y } else { v.x }) * raster_scale as f32;
+            let lo = verts.iter().map(coord).fold(f32::INFINITY, f32::min);
+            let hi = verts.iter().map(coord).fold(f32::NEG_INFINITY, f32::max);
+            for offset in [0.0_f32, 0.2, 0.5, 0.8] {
+                let first_sample = (lo + offset - 0.5).ceil() + 0.5;
+                assert!(first_sample <= hi + offset, "hairline misses pixels at offset {offset}: {lo}..{hi}");
+            }
+        }
+    }
+
+    #[test]
+    fn eight_bar_score_keeps_all_five_staff_lines_at_930_pixels() {
+        let abc = "X:1\nK:C\nCDEF GABc|cBAG FEDC|CDEF GABc|cBAG FEDC|CDEF GABc|cBAG FEDC|CDEF GABc|cBAG FEDC|\n";
+        let tune = kaijutsu_abc::parse(abc).value.remove(0);
+        let options = kaijutsu_abc::engrave::EngravingOptions::default();
+        let elements = kaijutsu_abc::engrave::layout::engrave(&tune, &options);
+        let bounds = crate::text::abc::compute_engraving_bounds(&elements, options.margin);
+        let scale = 930.0 / bounds.width;
+        let brush = Brush::Solid(peniko::Color::WHITE);
+        let verts = collect_music_geometry(&elements[..5], (0.0, 0.0), (bounds.origin_x, bounds.origin_y), scale, &brush, 1.0);
+        assert_eq!(verts.len(), 30);
+        for line in verts.chunks_exact(6) {
+            let lo = line.iter().map(|v| v.y).fold(f32::INFINITY, f32::min);
+            let hi = line.iter().map(|v| v.y).fold(f32::NEG_INFINITY, f32::max);
+            assert!((lo - 0.5).ceil() + 0.5 <= hi, "staff line misses pixel centers: {lo}..{hi}");
+        }
+    }
+
     /// Hand-computed against the same offset/origin/block_scale as
     /// `position_and_font_size_match_hand_computed_values`: offset=(5, 3),
     /// origin=(2, 4), block_scale=2. A horizontal Line from (2,4) to
@@ -492,7 +534,7 @@ mod tests {
         }];
         let brush = Brush::Solid(peniko::Color::new([1.0, 1.0, 1.0, 1.0]));
 
-        let verts = collect_music_geometry(&elements, (5.0, 3.0), (2.0, 4.0), 2.0, &brush);
+        let verts = collect_music_geometry(&elements, (5.0, 3.0), (2.0, 4.0), 2.0, &brush, 1.0);
 
         assert_eq!(verts.len(), 6, "one stroked line = 2 triangles = 6 vertices");
         let xs: Vec<f32> = verts.iter().map(|v| v.x).collect();
@@ -519,7 +561,7 @@ mod tests {
         let brush = Brush::Solid(peniko::Color::WHITE);
 
         let block_scale = 3.0;
-        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), block_scale, &brush);
+        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), block_scale, &brush, 1.0);
 
         assert_eq!(verts.len(), 6);
         let area: f64 = {
@@ -555,7 +597,7 @@ mod tests {
         }];
         let brush = Brush::Solid(peniko::Color::WHITE);
 
-        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush);
+        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush, 1.0);
         assert!(!verts.is_empty(), "a circle must produce fillable geometry");
         assert_eq!(verts.len() % 3, 0, "output is a flat triangle list");
 
@@ -592,7 +634,7 @@ mod tests {
         }];
         let brush = Brush::Solid(peniko::Color::WHITE);
 
-        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush);
+        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush, 1.0);
         assert!(!verts.is_empty());
         assert_eq!(verts.len() % 3, 0);
 
@@ -619,7 +661,7 @@ mod tests {
         }];
         let brush = Brush::Solid(peniko::Color::WHITE);
 
-        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush);
+        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush, 1.0);
         assert!(verts.is_empty());
     }
 
@@ -633,7 +675,7 @@ mod tests {
         }];
         let brush = Brush::Solid(peniko::Color::WHITE);
 
-        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush);
+        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush, 1.0);
         assert!(verts.is_empty());
     }
 
@@ -653,7 +695,7 @@ mod tests {
         ];
         let brush = Brush::Solid(peniko::Color::WHITE);
 
-        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush);
+        let verts = collect_music_geometry(&elements, (0.0, 0.0), (0.0, 0.0), 1.0, &brush, 1.0);
         assert!(verts.is_empty());
     }
 

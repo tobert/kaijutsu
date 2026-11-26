@@ -333,6 +333,11 @@ pub enum RpcResultMessage {
         track_id: String,
         statuses: Vec<kaijutsu_hyoushigi::WorkStatus>,
     },
+    HeroicPerformerReceived {
+        context_id: ContextId,
+        principal_id: Option<kaijutsu_types::PrincipalId>,
+        chair: Option<String>,
+    },
     /// The `Ctrl+Z` context toggle resolved on the kernel: the context to
     /// switch to (a live shell child, a shell's root, or one just created),
     /// or why the toggle refused or failed. Drained by

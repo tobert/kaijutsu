@@ -79,8 +79,9 @@ The kernel runs `/config/rc/<rc_dir>/<verb>/SXX-name.kai` in lexical order
 - Scripts receive `KJ_CHARACTER` (performer name), `KJ_RC_DIR`, context
   environment variables (`kj context env`), `ROTATED_FROM` (on rotation), and
   verb-specific variables (`KJ_PARENT_BLOCK_COUNT` on `fork`, submit/tick
-  facts, `KJ_DONE_STATUS`, `KJ_DONE_FEEDBACK`, `KJ_TURN_ID`, and
-  `KJ_OUTPUT_BLOCK` on `done`).
+  facts, `KJ_DONE_STATUS`, `KJ_DONE_FEEDBACK`, `KJ_TURN_ID`, `KJ_INPUT_BLOCK`,
+  and `KJ_OUTPUT_BLOCK` on `done`). The input names the block the turn started
+  from. An autonomous drive with a prompt anchors its turn at that prompt.
 
 ### The `done` verb
 The kernel fires `done` once for each autonomous turn that ends, with

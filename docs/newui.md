@@ -32,8 +32,9 @@ When a choice comes up that this document does not cover, ask in order:
 A night road made of time runs from the viewer's feet to a striped sun on the
 horizon.
 
-Lanes of dark glass lie side by side, ruled with thin bright rails. Each lane
-is one track. Every note wears the color of the character that played it. Notes are small glowing
+Lanes of dark glass lie side by side, ruled with thin bright rails. Each attached musician has a lane. Lanes on the same track sit together and
+share its clock. A playing track with no attachments has one empty lane.
+Every note wears the color of the character that played it. Notes are small glowing
 discs that slide toward the viewer at the speed of the music. Near the bottom
 of the frame a white line crosses the road. That line is now. A note that
 reaches it flashes its landing pad and is gone.
@@ -213,13 +214,13 @@ Starting targets for the rest of the frame:
 - **Performer panel:** mid height, about 30% of the frame wide, on the side
   away from the selected lane. It may overlap fire and hills, never the
   selected lane.
-- **Flat overlay:** performer chips and history along the bottom.
+- **Flat overlay:** history and key hints along the bottom. The lane plates carry the seat keys.
 
 ### Depth bands and attention
 
 | Band | Contents | Brightness |
 |---|---|---|
-| Overlay | Chips, history trace, key hints | UI |
+| Overlay | History trace and key hints | UI |
 | Now | Strike line, pads, lane names | Brightest |
 | Road | Notes, performers, slabs, ribbons, markers, ring | Bright, fading with fog |
 | Roadside | Fire, grid, hills | Capped below the road |
@@ -246,9 +247,7 @@ its own `[heroic.hues]`.
   never decoration, and no lane may be red.
 - **A performer's color is identity.** Everything that belongs to a
   performer wears it: notes, cage, slab, ribbon, panel border, tether, ring
-  arc. A lane whose contexts share one character takes that color for its
-  floor; a lane with several characters keeps a neutral floor and lets the
-  notes carry identity.
+  arc. The floor takes the color of the musician in that lane.
 - **Magenta and cyan are the world.** Grid, rails and phrase lines. They belong
   to no performer.
 - **Rainbow is energy.** Fire and hills only. Its chroma follows the intensity
@@ -384,7 +383,7 @@ Each element shows one thing and reads from one piece of scene state.
 
 | Element | Shows | Driven by | Motion |
 |---|---|---|---|
-| Lanes and rails | One strip per track | Track list | Still. Reflow on a phrase boundary when tracks come or go. |
+| Lanes and rails | One strip per musician, grouped by track | Playing tracks and their attachments | Reflow when tracks or attachments change. |
 | Beat and phrase lines | Each track's ruler. Dim per beat, bright per phrase. Phrase lines continue across the grid in magenta. | Track period, `beatsPerPhrase` | Scroll toward the viewer |
 | Strike line and pads | Now, one ring per lane | Clock, played and fallback events | Pad swells and whitens on a hit; a second ring expands and fades over 0.3 s; red on trouble |
 | Lock line | The commit deadline | `commit_margin` (assumed one tick until the wire carries it) | Rides just ahead of the strike line |
@@ -419,7 +418,7 @@ watching. One could dip toward a lane it is about to judge.
 | Dimming | Focus | Selection | Unselected lanes drop to about 30% |
 | Performer panel | Everything about one performer | Selection and that performer's state | Opens at once on the side away from the lane |
 | Tether | Which crystal the panel belongs to | Selection | A thin lane-colored line that follows the crystal |
-| Chips | Name and state per performer | Performer state | Flat overlay |
+| Lane plates | Seat key and instrument, with the track on its first lane | Track attachments and chairs | At the strike line |
 
 ## Motion and timing
 
@@ -483,26 +482,13 @@ do.
 | Marker labels | A few words above an instruction marker, white | Legible when near; cut at about 24 characters |
 | Ribbons | A text model's streaming output | Texture first: it reads as "this one is talking" from across the room |
 
-The performer panel's layout is fixed so the eye learns where things are:
-
-```
-+--------------------------------------------------+
-| bass · musician                                  |   name, rc directory
-| slack 14  lead 3 beats   phrase 6   ready        |   slack turns red below lead
-|                                                  |
-| E1     ################                     0.41 |   decision player: candidates,
-| G1     #######                              0.17 |   bar length = probability,
-| A1     #####                                0.13 |   the pick in white
-| picked E1 G1 E1 D2 A1                            |
-|                                                  |
-| last 16 phrases: committed ▮▮▮▮▮▯▮▮ fallback ▮   |   history of dispositions
-| est 420 ms  queue 12 ms  compute 380 ms          |   from WorkStatus.timing
-+--------------------------------------------------+
-```
-
-For a text model the middle block is the last six lines of its output. The
-panel is where a player checks a performer's history, so the history rows stay
-even when space is short.
+The selected musician's panel opens with the chair, track, and tempo. It
+shows the ABC at the current beat and a MIDI summary derived from that
+phrase. For pitched instruments the summary gives the note count and
+sounding range. For the drum kit it gives the hit count and the kit
+pieces used. Work history, slack and the resolver's timing follow the music.
+The panel shows council picks and candidates when available, or the latest
+line from the performer.
 
 Rules for all text:
 

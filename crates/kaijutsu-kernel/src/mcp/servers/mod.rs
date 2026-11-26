@@ -20,6 +20,7 @@ pub mod external;
 pub mod file;
 pub mod hooks_builtin;
 pub mod kernel_info;
+pub mod notes;
 pub mod policy_admin;
 pub mod resources_builtin;
 pub mod shell;

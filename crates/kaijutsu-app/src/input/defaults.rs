@@ -551,6 +551,13 @@ pub fn default_bindings() -> Vec<Binding> {
     // Heroic (Screen::Heroic — full-window 3D road, docs/newui.md)
     // ====================================================================
 
+    b.push(Binding::key_mod(
+        KeyCode::KeyG,
+        Modifiers::CTRL,
+        InputContext::Heroic,
+        Action::HeroicBoardNote,
+        "Write a note for the selected performer",
+    ));
     b.push(Binding::key(
         KeyCode::Escape,
         InputContext::Heroic,

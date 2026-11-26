@@ -58,3 +58,74 @@ fn the_strict_parse_the_kernel_validates_with_accepts_the_drums_tune() {
     assert!(!parsed.has_errors(), "{:?}", parsed.errors().map(|f| f.message.clone()).collect::<Vec<_>>());
     assert_eq!(parsed.value.len(), 1);
 }
+
+fn engraved_heads(abc: &str) -> Vec<(u32, f64)> {
+    use kaijutsu_abc::engrave::{layout, EngravingElement, EngravingOptions};
+
+    let parsed = parse(abc);
+    assert!(!parsed.has_errors(), "parse errors: {:?}", parsed.errors().collect::<Vec<_>>());
+    layout::engrave(&parsed.value[0], &EngravingOptions::default())
+        .iter()
+        .filter_map(|element| match element {
+            EngravingElement::Glyph { codepoint: cp @ (0xE0A4 | 0xE0A9), y, .. } => Some((*cp, *y)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_drum_heads(abc: &str) {
+    let mut heads = engraved_heads(abc);
+    heads.sort_by(|a, b| a.1.total_cmp(&b.1));
+    // Default staff spacing is 10: hat above the top line, snare in the
+    // second space from the top, and kick in the bottom space.
+    assert_eq!(heads, vec![(0xE0A9, -5.0), (0xE0A4, 15.0), (0xE0A4, 35.0)]);
+}
+
+#[test]
+fn channel_ten_engraves_gm_drum_notes_and_chords_on_the_staff() {
+    for body in ["C,, D,, ^F,, |", "[C,,D,,^F,,] |"] {
+        let abc = format!("X:1\nT:Drums\n%%MIDI channel 10\nM:4/4\nL:1/4\nK:C\n{body}\n");
+        assert_drum_heads(&abc);
+    }
+}
+
+#[test]
+fn percussion_clef_engraves_gm_drum_notes_and_chords_on_the_staff() {
+    for body in ["C,, D,, ^F,, |", "[C,,D,,^F,,] |"] {
+        let abc = format!("X:1\nT:Drums\nM:4/4\nL:1/4\nK:perc\n{body}\n");
+        assert_drum_heads(&abc);
+    }
+}
+
+#[test]
+fn melodic_notes_keep_their_pitch_based_positions() {
+    let heads = engraved_heads("X:1\nT:Melody\nM:4/4\nL:1/4\nK:C\nC D F |\n");
+    assert_eq!(heads, vec![(0xE0A4, 50.0), (0xE0A4, 45.0), (0xE0A4, 35.0)]);
+}
+
+#[test]
+fn wrapped_percussion_systems_use_key_pitch_without_sharp_glyphs() {
+    use kaijutsu_abc::engrave::{layout, EngravingElement, EngravingOptions};
+
+    let abc = "X:1\nT:Drums\n%%MIDI channel 10\nM:4/4\nL:1/4\nK:G\nF,, F,, F,, F,, | F,, F,, F,, F,, | F,, F,, F,, F,, |\n";
+    let parsed = parse(abc);
+    assert!(!parsed.has_errors(), "parse errors: {:?}", parsed.errors().collect::<Vec<_>>());
+    let tune = &parsed.value[0];
+    assert!(note_ons(tune).iter().all(|&(channel, pitch)| channel == 9 && pitch == 42));
+    assert_eq!(note_ons(tune).len(), 12);
+
+    let systems = layout::engrave_systems(tune, &EngravingOptions::default(), 200.0);
+    assert!(systems.len() >= 2, "expected wrapped systems, got {}", systems.len());
+    for system in &systems {
+        assert!(system.iter().any(|e| matches!(e, EngravingElement::Glyph { codepoint: 0xE0A9, y, .. } if (*y + 5.0).abs() < 0.01)), "each system has a closed-hat head");
+        assert!(!system.iter().any(|e| matches!(e, EngravingElement::Glyph { codepoint: 0xE262, .. })), "percussion displays no sharp signs");
+    }
+}
+
+#[test]
+fn an_unassigned_percussion_note_uses_the_middle_line() {
+    for body in ["C,,,,", "c'''''"] {
+        let abc = format!("X:1\nM:4/4\nL:1/4\nK:perc\n{body}|\n");
+        assert_eq!(engraved_heads(&abc), vec![(0xE0A4, 20.0)]);
+    }
+}

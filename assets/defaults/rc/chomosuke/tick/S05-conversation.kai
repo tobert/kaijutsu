@@ -1,0 +1,41 @@
+# Observe the latest 12 included, completed user and model text blocks.
+# Older blocks outside this window are not revisited.
+set -e
+if test -z "${KJ_SUMMARY_CONTEXT:-}"; then
+  exit 0
+fi
+context="$(kj context info "$KJ_SUMMARY_CONTEXT" --json | jq -r '.context_id')"
+self="$(kj context info --json | jq -r '.context_id')"
+if test "$context" = "$self"; then
+  echo "chomosuke: source context must not be this context" >&2
+  exit 1
+fi
+if test "${KJ_MEMORY_TOPIC:-}" != "$KJ_CHARACTER/memory/context-$context"; then
+  echo "chomosuke: source changed; create a context for the new source" >&2
+  exit 1
+fi
+users="$(kj block list -c "$context" --kind text --role user --status done --included --tail 12 --json)"
+models="$(kj block list -c "$context" --kind text --role model --status done --included --tail 12 --json)"
+order="$(kj block list -c "$context" --kind text --status done --included --json)"
+blocks="$(echo "$order" | jq -c --argjson users "$users" --argjson models "$models" '[.[] | select(. as $id | ($users + $models | index($id)) != null)] | .[-12:]')"
+basis=""
+observations=""
+for block in $(echo "$blocks" | jq -r '.[]'); do
+  info="$(kj block inspect -c "$context" "$block" --json)"
+  role="$(echo "$info" | jq -r '.role')"
+  case "$role" in
+    user|model) ;;
+    *) continue ;;
+  esac
+  hash="$(kj block read -c "$context" "$block" --no-line-numbers | checksum --sha256 | cut -d' ' -f1)"
+  excerpt="$(kj block read -c "$context" "$block" --no-line-numbers --range 0:8 | cut -c 1-160)"
+  basis="$basis $block:$hash"
+  observations="$observations
+$role, block $block:
+$excerpt
+"
+done
+if test -z "$basis"; then
+  exit 0
+fi
+source /config/rc/chomosuke/lib/observe.kai

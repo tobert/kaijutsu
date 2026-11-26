@@ -1,5 +1,4 @@
-//! Rich content on the surface: geometry, rasters, and the one-chunk shaping
-//! that produces them.
+//! Geometry, rasters, and shaping for rich content on the surface.
 //!
 //! Four of the seven [`RichContentKind`]s draw something parley cannot — an
 //! engraved staff, a diff's background bands, a sparkline plot, an image
@@ -15,12 +14,9 @@
 //!
 //! # Three rules the drawn kinds live by
 //!
-//! - **One chunk, never chunked.** A diff's word washes are addressed by byte
-//!   offsets into one parley layout, and an engraved score has no lines at
-//!   all; chunking either would mean re-deriving those offsets per chunk for
-//!   no benefit. All of these are bounded by construction (the diff preview's
-//!   line budget, the engraver's own output), so the reason chunking exists —
-//!   a streamed block that grows without limit — does not apply.
+//! - **One chunk per drawing.** ABC uses one drawing per system so the
+//!   notation and staff geometry stack at the same offsets. A diff and its
+//!   word washes share one drawing and one set of byte offsets.
 //! - **Main thread only.** ABC glyph collection mutates [`MsdfAtlas`], and the
 //!   colors these bake come from [`Theme`] rather than from the block's own
 //!   color. Neither travels to `AsyncComputeTaskPool` today, and the work is
@@ -47,6 +43,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bevy::prelude::*;
+use kaijutsu_abc::engrave::{EngravingOptions, ir::engraving_bounds, layout::engrave_systems};
 use kaijutsu_types::BlockId;
 
 use crate::cell::{ConversationScrollState, EditorEntities};
@@ -88,6 +85,7 @@ pub struct RichShaper<'a> {
     pub theme: &'a Theme,
     pub atlas: &'a mut MsdfAtlas,
     pub font_data: &'a mut FontDataMap,
+    pub raster_scale: f32,
 }
 
 impl RichShaper<'_> {
@@ -166,51 +164,47 @@ impl RichShaper<'_> {
         }
     }
 
-    /// ABC: engrave the tune, scale it to the column, and emit staff geometry
-    /// + notation glyphs + text glyphs, scaled to fit (which *does* fill the
-    /// width — an engraved score has an aspect ratio, not an intrinsic pixel
-    /// size).
+    /// Shape each system at its staff size. A system that exceeds the column
+    /// without an eligible bar boundary shrinks to fit.
     fn shape_abc(&mut self, tune: &kaijutsu_abc::Tune, wrap_width: f32) -> ShapeOutput {
-        let opts = kaijutsu_abc::engrave::EngravingOptions::default();
-        let elements = kaijutsu_abc::engrave::layout::engrave(tune, &opts);
-        let bounds = crate::text::abc::compute_engraving_bounds(&elements, opts.margin);
-        if bounds.width <= 0.0 || bounds.height <= 0.0 || wrap_width <= 0.0 {
-            // `compute_engraving_bounds` guards the empty case, so this is a
-            // degenerate column (a pane mid-layout), not bad music. Reserve
-            // nothing and re-shape when a real width arrives.
-            return finish(Vec::new(), Vec::new(), Vec::new(), 0.0, 0);
+        if wrap_width <= 0.0 {
+            return ShapeOutput::default();
         }
-
-        let scale = (wrap_width as f64 / bounds.width).min(SVG_MAX_HEIGHT as f64 / bounds.height);
-        let height = (bounds.height * scale) as f32;
-        let origin = (bounds.origin_x, bounds.origin_y);
+        let opts = EngravingOptions::default();
+        let systems = engrave_systems(tune, &opts, wrap_width as f64);
         let brush = bevy_color_to_brush(self.theme.block_assistant);
-
-        let geometry = collect_music_geometry(&elements, (0.0, 0.0), origin, scale, &brush);
-        // These two queue their own glyph keys into the atlas — the deferred
-        // collector contract is a parley thing, and music glyphs never go
-        // through parley (positioned from the engraving IR directly, the
-        // locked decision in `music_bridge`).
-        let mut glyphs = collect_music_glyphs(
-            &elements,
-            (0.0, 0.0),
-            origin,
-            scale,
-            &brush,
-            self.atlas,
-        );
-        glyphs.extend(collect_music_text_glyphs(
-            &elements,
-            (0.0, 0.0),
-            origin,
-            scale,
-            &brush,
-            Some(self.font),
-            self.atlas,
-            self.font_data,
-        ));
-
-        finish(glyphs, Vec::new(), geometry, height, 0)
+        let mut out = ShapeOutput::default();
+        for elements in systems {
+            let bounds = engraving_bounds(&elements, opts.margin);
+            let scale = (wrap_width as f64 / bounds.width).min(1.0);
+            let height = (bounds.height * scale) as f32;
+            let origin = (bounds.origin_x, bounds.origin_y);
+            let geometry = collect_music_geometry(
+                &elements, (0.0, 0.0), origin, scale, &brush, self.raster_scale as f64,
+            );
+            let mut glyphs = collect_music_glyphs(
+                &elements, (0.0, 0.0), origin, scale, &brush, self.atlas,
+            );
+            glyphs.extend(collect_music_text_glyphs(
+                &elements,
+                (0.0, 0.0),
+                origin,
+                scale,
+                &brush,
+                Some(self.font),
+                self.atlas,
+                self.font_data,
+            ));
+            out.chunks.push(ShapedChunk {
+                byte_range: 0..0,
+                glyphs: Arc::new(glyphs),
+                geometry: Arc::new(geometry),
+                height,
+                frozen: false,
+            });
+            out.text_height += height;
+        }
+        out
     }
 
     /// Diff: one spanned layout, its glyphs, its per-line bands, and the
@@ -300,7 +294,7 @@ impl RichShaper<'_> {
     }
 }
 
-/// Package one rich block's drawing as the single chunk it always is.
+/// Package a rich drawing that occupies one chunk.
 fn finish(
     glyphs: Vec<crate::text::msdf::PositionedGlyph>,
     keys: Vec<crate::text::msdf::glyph::GlyphKey>,
@@ -584,6 +578,7 @@ mod tests {
             theme: &theme,
             atlas: &mut atlas,
             font_data: &mut font_data,
+            raster_scale: 1.0,
         }
         .shape(kind, text, &[], &style, wrap_width)
     }
@@ -654,41 +649,37 @@ mod tests {
         assert!(out.chunks[0].geometry.is_empty());
     }
 
-    /// The whole ABC port, end to end: engrave → staff geometry + notation
-    /// glyphs, scaled to fill the column. The height is the engraving's own
-    /// aspect ratio applied to the width, which is where the row's reserved
-    /// space comes from — the one number a wrong port would get silently
-    /// wrong.
     #[test]
     fn an_abc_tune_shapes_into_staff_geometry_and_notation_glyphs() {
-        let tunes = kaijutsu_abc::parse("X:1\nT:t\nK:C\nCDEF|GABc|\n").value;
-        let tune = Arc::new(tunes.into_iter().next().expect("test premise: one tune"));
+        let tune = kaijutsu_abc::parse("X:1\nT:t\nK:C\nCDEF|GABc|\n").value.remove(0);
+        let content = RichContentKind::Abc { tune: Arc::new(tune) };
+        let wide = shape_one(&content, "", 600.0);
+        let medium = shape_one(&content, "", 400.0);
+        let narrow = shape_one(&content, "", 300.0);
 
-        let wide = shape_one(
-            &RichContentKind::Abc {
-                tune: tune.clone(),
-            },
-            "",
-            600.0,
-        );
+        assert_eq!(wide.chunks.len(), 1);
         assert!(!wide.chunks[0].geometry.is_empty(), "staff lines are geometry");
         assert!(!wide.chunks[0].glyphs.is_empty(), "noteheads are MSDF glyphs");
         assert!(wide.text_height > 0.0);
+        assert_eq!(medium.chunks.len(), 1);
+        assert_eq!(medium.text_height, wide.text_height);
+        assert_eq!(narrow.chunks.len(), 2);
+        assert_eq!(narrow.text_height, narrow.chunks.iter().map(|chunk| chunk.height).sum::<f32>());
+    }
 
-        // Half the column, same tune: scale-to-fit means half the height.
-        let narrow = shape_one(
-            &RichContentKind::Abc {
-                tune,
-            },
-            "",
-            300.0,
-        );
-        assert!(
-            (narrow.text_height * 2.0 - wide.text_height).abs() < 0.5,
-            "an engraving fills the width and keeps its aspect: {} vs {}",
-            narrow.text_height,
-            wide.text_height,
-        );
+    #[test]
+    fn a_long_score_reflows_into_more_systems_in_a_narrow_column() {
+        let source = format!("X:1\nT:t\nM:4/4\nL:1/8\nK:C\n{}\n", "CDEF GABc|".repeat(16));
+        let tune = kaijutsu_abc::parse(&source).value.remove(0);
+        let content = RichContentKind::Abc { tune: Arc::new(tune) };
+        let wide = shape_one(&content, "", 1000.0);
+        let narrow = shape_one(&content, "", 600.0);
+
+        assert!(wide.chunks.len() > 1);
+        assert!(narrow.chunks.len() > wide.chunks.len());
+        assert!(narrow.text_height > wide.text_height);
+        assert_eq!(narrow.text_height, narrow.chunks.iter().map(|chunk| chunk.height).sum::<f32>());
+        assert!(narrow.chunks.iter().all(|chunk| !chunk.geometry.is_empty() && !chunk.glyphs.is_empty()));
     }
 
     fn svg_tree() -> Arc<usvg::Tree> {

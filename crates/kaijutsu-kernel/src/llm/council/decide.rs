@@ -1610,7 +1610,7 @@ mod tests {
         }
         let reply = program.reply_text(&[0, 1, 2, 3, 0, 1, 2, 4]);
         assert!(
-            reply.starts_with("X:1\n%%MIDI channel 1\n%%MIDI program 33\nM:4/4\nL:1/8\nK:Em\n")
+            reply.starts_with("X:1\n%%MIDI channel 1\n%%MIDI program 33\nM:4/4\nL:1/8\nK:Em clef=bass\n")
                 && reply.ends_with(" |]")
                 && reply.contains(" | "),
             "{reply}"

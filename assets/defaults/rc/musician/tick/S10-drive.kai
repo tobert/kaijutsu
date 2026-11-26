@@ -78,7 +78,37 @@ fi
 bars=$(( KJ_PHRASE_BEATS / 4 ))
 phrases=$(( KJ_LEAD_BEATS / KJ_PHRASE_BEATS + 1 ))
 target=$(( KJ_TICK + phrases * KJ_PHRASE_BEATS ))
-kj drive --track "$KJ_TRACK" --score-at "$target" --fallback last-good --prompt "Commit at tick $target. Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM, 4/4. Recently played (oldest to newest JSON): $KJ_HEARD. Play the next $KJ_PHRASE_BEATS beats ($bars bars), continuing seamlessly from what we just played. Your header and register come from your chair. Output raw ABC only."
+# Each admitted prompt carries the next three unread notes from this topic.
+# Each topic has its own cursor so alternating tracks keep their place.
+topic="$(kj board notes --performer "$KJ_CHARACTER" --track "$KJ_TRACK" --limit 0 --json | jq -r '.topic_id // empty')"
+extra=""
+cursor=""
+if test -n "$topic"; then
+  cursor_key="KJ_NOTE_CURSOR_$topic"
+  after="$(kj context info --json | jq -r --arg key "$cursor_key" '.env[$key] // 0')"
+  batch="$(kj board notes --topic "$topic" --after "$after" --limit 3 --json | jq -c '[.posts[] | {number, body: .body[0:400]}]')"
+  if test "$batch" != '[]'; then
+    cursor="$(echo "$batch" | jq -r '.[-1].number')"
+    notes="$(echo "$batch" | jq -r 'reverse | .[] | "#\(.number) \(.body)"')"
+    extra="
+Player notes (newest first):
+$notes"
+  fi
+fi
+if test -n "${KJ_VIBE_TOPIC:-}"; then
+  vibe="$(kj board notes --topic "$KJ_VIBE_TOPIC" --limit 1 --json | jq -r '
+    (.posts[0].body // "") | split("\n") |
+    if (.[-1] | startswith("Sources: ")) then .[0:-1] | join("\n") | .[0:600] else "" end')"
+  if test -n "$vibe"; then
+    extra="$extra
+Ensemble vibe:
+$vibe"
+  fi
+fi
+kj drive --track "$KJ_TRACK" --score-at "$target" --fallback last-good --prompt "Commit at tick $target. Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM, 4/4. Recently played (oldest to newest JSON): $KJ_HEARD. Play the next $KJ_PHRASE_BEATS beats ($bars bars), continuing seamlessly from what we just played. Your header and register come from your chair. Output raw ABC only.$extra"
+if test -n "$cursor"; then
+  kj context set --env "$cursor_key=$cursor"
+fi
 if [[ "$uncovered" = "repeat" ]] && [[ "$phrases" -gt 1 ]]; then
   for i in $(seq 1 $(( phrases - 1 ))); do
     kj transport repeat --track "$KJ_TRACK" --at "$(( KJ_TICK + i * KJ_PHRASE_BEATS ))"

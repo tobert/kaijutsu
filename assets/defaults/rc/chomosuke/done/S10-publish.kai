@@ -1,0 +1,25 @@
+# Publish the reply only to the revision this turn read.
+set -e
+if test "$KJ_DONE_STATUS" != ended || test -z "$KJ_OUTPUT_BLOCK"; then
+  exit 0
+fi
+header="$(kj block read "$KJ_INPUT_BLOCK" --range 0:1 --no-line-numbers | head -n 1)"
+if test "$header" != "Chomosuke memory"; then
+  exit 0
+fi
+topic="$(kj block read "$KJ_INPUT_BLOCK" --range 1:2 --no-line-numbers | head -n 1)"
+if test "$topic" != "$KJ_MEMORY_TOPIC"; then
+  exit 0
+fi
+basis="$(kj block read "$KJ_INPUT_BLOCK" --range 2:3 --no-line-numbers | head -n 1)"
+base="$(kj block read "$KJ_INPUT_BLOCK" --range 3:4 --no-line-numbers | head -n 1)"
+latest="$(kj board read "$topic" --tail 1 --json | jq -r '.posts[-1].block_id')"
+if test "$latest" != "$base"; then
+  exit 0
+fi
+summary="$(kj block read "$KJ_OUTPUT_BLOCK" --no-line-numbers | jq -Rsr '.[0:3000]')"
+if test -n "$summary"; then
+  kj board reply "$topic" "$summary
+
+Sources: $basis"
+fi

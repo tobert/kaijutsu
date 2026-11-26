@@ -61,7 +61,7 @@ fn snapshot(source: &str) -> String {
     let mut atlas = MsdfAtlas::new(&mut images, 64, 64);
 
     let glyphs = collect_music_glyphs(&elements, (0.0, 0.0), origin, 1.0, &brush, &mut atlas);
-    let geometry = collect_music_geometry(&elements, (0.0, 0.0), origin, 1.0, &brush);
+    let geometry = collect_music_geometry(&elements, (0.0, 0.0), origin, 1.0, &brush, 1.0);
 
     let mut out = String::new();
     out.push_str(&format!("bounds: {:.3} x {:.3}\n", bounds.width, bounds.height));

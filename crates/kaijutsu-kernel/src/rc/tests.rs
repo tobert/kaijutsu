@@ -392,6 +392,43 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             .context_id
     }
 
+    #[test]
+    fn chomosuke_create_sets_up_memory_for_each_source() {
+        crate::spawn_kaish_thread("chomosuke-create-test", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let d = std::sync::Arc::new(test_dispatcher_rc().await);
+                d.set_self_arc();
+                let caller = console_caller(&d);
+                let source = caller.context_id.unwrap();
+                let performer = rc_performer(&d, "chomosuke");
+                let source_arg = format!("KJ_SUMMARY_CONTEXT={}", source.to_hex());
+                let args = vec!["context".into(), "create".into(), performer.clone(), "--name".into(), "observer".into(), "--env".into(), source_arg];
+                let result = d.dispatch(&args, &caller).await;
+                assert!(result.is_ok(), "{}", result.message());
+                let context = lookup_context_id(&d, "observer");
+                let vars = d.kernel_db().lock().get_context_env(context).unwrap();
+                let value = |key: &str| vars.iter().find(|v| v.key == key).map(|v| v.value.as_str());
+                assert_eq!(value("KJ_SUMMARY_CONTEXT"), Some(source.to_hex().as_str()));
+                let topic = format!("{performer}/memory/context-{}", source.to_hex());
+                assert_eq!(value("KJ_MEMORY_TOPIC"), Some(topic.as_str()), "{:?}", block_contents_in(&d, context));
+                let read = d.dispatch(&["board".into(), "read".into(), topic], &caller).await;
+                assert!(read.is_ok(), "{}", read.message());
+                assert!(read.message().contains("Observations of context"));
+                d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+                d.block_store().insert_block_as(source, None, None, Role::User, BlockKind::Text,
+                    "a message to observe", Status::Done, ContentType::Plain, Some(caller.actor_id)).unwrap();
+                install_rc_script_file(&d, "/config/rc/chomosuke/lib/observe.kai",
+                    "kj block create --role system --kind notification --content \"seen:$basis:$observations\"").await;
+                let admission = admit(&d, context);
+                crate::rc::run(&d, test_invocation("tick", &admission), &caller).await.unwrap();
+                let run = find_run_for_context(&d, context, "tick").unwrap();
+                assert_eq!(run.outcome, Some(RcOutcome::Ok), "{:?}", block_contents_in(&d, context));
+                assert!(block_contents_in(&d, context).iter().any(|body| body.contains("seen:") && body.contains("a message to observe")),
+                    "{:?}", block_contents_in(&d, context));
+            });
+        }).unwrap().join().unwrap();
+    }
+
     #[tokio::test]
     async fn rc_create_script_authors_instruction_block() {
         let d = std::sync::Arc::new(test_dispatcher().await);

@@ -1,0 +1,24 @@
+{
+  "instructions": "Play sixteen bars of drums in 4/4. Listen to the other players. Keep a steady snare on two and four. Choose a four-bar groove at a time and save the toms for the turnaround.",
+  "input_label": "Drums played so far",
+  "question": "Which four bars fit next?",
+  "prefix": "X:1\nT:Drums\nM:4/4\nL:1/8\n%%MIDI channel 10\nK:C clef=perc\n",
+  "join": " |\n",
+  "suffix": " |]",
+  "history_messages": 1,
+  "shuffle": 2,
+  "options": {
+    "steady": {"means": "Kick on one and three, snare on two and four, quarter-note hats.", "text": "[C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2"},
+    "space": {"means": "Leave beat three to the hat in alternate bars.", "text": "[C,,^F,,]2 [D,,^F,,]2 ^F,,2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]^F,,"},
+    "pickup": {"means": "Push the kick onto the offbeat in the second and fourth bars.", "text": "[C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,[C,,^F,,] [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,[C,,^F,,] [D,,^F,,]2"},
+    "hats": {"means": "Open up the rhythm with eighth-note closed hats in bars two and four.", "text": "[C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]^F,, [D,,^F,,]^F,, [C,,^F,,]^F,, [D,,^F,,]^F,, | [C,,^F,,]2 [D,,^F,,]2 ^F,,2 [D,,^F,,]2 | [C,,^F,,]^F,, [D,,^F,,]^F,, [C,,^F,,]^F,, [D,,^F,,]^F,,"},
+    "short_fill": {"means": "Keep the backbeat and answer the last snare with two low tom hits.", "text": "[C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,[C,,^F,,] [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 ^F,,2 B,,A,,"},
+    "rolling_fill": {"means": "Move from hats to a descending three-tom fill in the last two beats.", "text": "[C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]^F,, | [C,,^F,,]2 [D,,^F,,]2 [C,,^F,,]2 [D,,^F,,]2 | [C,,^F,,]2 [D,,^F,,]2 C,B,, A,,2"}
+  },
+  "slots": [
+    {"case": "Bars 1–4. Establish the pocket.", "options": ["steady", "space"]},
+    {"case": "Bars 5–8. Decide how active the hi-hat should be.", "options": ["steady", "hats", "space"]},
+    {"case": "Bars 9–12. Set up the last four bars.", "options": ["pickup", "steady", "hats"]},
+    {"case": "Bars 13–16. Choose a tom turnaround.", "options": ["short_fill", "rolling_fill"]}
+  ]
+}

@@ -1,0 +1,7 @@
+# Open the musician's board to peer notes before the first phrase.
+set -e
+board="$KJ_CHARACTER/music-notes"
+exists="$(kj board list "$KJ_CHARACTER" --json | jq -r --arg board "$board" 'index($board) != null')"
+if test "$exists" = false; then
+  kj board create music-notes --for "$KJ_CHARACTER" --policy open --desc "Track notes"
+fi

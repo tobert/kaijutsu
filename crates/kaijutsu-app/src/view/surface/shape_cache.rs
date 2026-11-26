@@ -249,6 +249,8 @@ pub struct ShapeKey {
     /// conversation on a theme swap, which is the full-document rebake this
     /// rewrite exists to delete.
     pub baked_theme_epoch: u64,
+    /// Physical pixels per logical pixel for ABC geometry; zero for other kinds.
+    pub abc_raster_scale_bits: u32,
 }
 
 /// One chunk's shaped glyphs, in **chunk-local** coordinates: x from 0 at the
@@ -1275,6 +1277,7 @@ pub fn shape_visible_blocks(
     entities: Res<EditorEntities>,
     geometries: Query<&ConversationGeometry>,
     computed_nodes: Query<&ComputedNode>,
+    surface_targets: Query<(&super::ConversationSurface, &crate::view::ui_rtt::UiRttTexture)>,
     scroll_state: Res<ConversationScrollState>,
     text_metrics: Res<TextMetrics>,
     theme: Res<Theme>,
@@ -1313,6 +1316,10 @@ pub fn shape_visible_blocks(
         // contradicts.
         return;
     };
+    let raster_scale = surface_targets.iter()
+        .find(|(surface, _)| Some(surface.pane) == entities.conversation_container)
+        .and_then(|(_, rtt)| (rtt.width > 0 && rtt.built_width > 0.0).then_some(rtt.width as f32 / rtt.built_width))
+        .unwrap_or(text_metrics.scale_factor).max(f32::MIN_POSITIVE);
 
     let vh = if scroll_state.visible_height > 0.0 {
         scroll_state.visible_height
@@ -1414,6 +1421,7 @@ pub fn shape_visible_blocks(
                     } else {
                         0
                     },
+                    abc_raster_scale_bits: if formatted.rich == Some(RichKindInfo::Abc) { raster_scale.to_bits() } else { 0 },
                 };
                 let streaming = formatted.status == Status::Running;
                 let color = formatted.color;
@@ -1535,6 +1543,7 @@ pub fn shape_visible_blocks(
                         theme: &theme,
                         atlas: &mut atlas,
                         font_data: &mut font_data,
+                        raster_scale,
                     }
                     .shape(kind, &formatted.text, &formatted.spans, &style, wrap_width)
                 } else {
@@ -2090,6 +2099,7 @@ mod tests {
             indent_level: 0,
             metrics_epoch: 3,
             baked_theme_epoch: 0,
+            abc_raster_scale_bits: 0,
         }
     }
 
@@ -2107,6 +2117,7 @@ mod tests {
             ShapeKey { indent_level: 1, ..base },
             ShapeKey { metrics_epoch: 4, ..base },
             ShapeKey { baked_theme_epoch: 1, ..base },
+            ShapeKey { abc_raster_scale_bits: 1.0_f32.to_bits(), ..base },
         ];
         for (i, variant) in variants.iter().enumerate() {
             assert_ne!(*variant, base, "ShapeKey field {i} does not affect equality");
@@ -3148,6 +3159,7 @@ mod tests {
                 indent_level: 0,
                 metrics_epoch: 1,
                 baked_theme_epoch: 0,
+                abc_raster_scale_bits: 0,
             },
             chunks: Vec::new(),
             height,
@@ -3573,6 +3585,7 @@ mod tests {
             indent_level: 0,
             metrics_epoch: 0,
             baked_theme_epoch: 0,
+            abc_raster_scale_bits: 0,
         };
         let tasks = app.world().resource::<ShapeTasks>();
         assert!(

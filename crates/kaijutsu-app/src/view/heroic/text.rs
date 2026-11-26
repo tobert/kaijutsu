@@ -137,10 +137,10 @@ pub fn sync_heroic_text(
     };
     let now = time.elapsed_secs_f64();
     let sel_id = state.selected_performer;
-    let sel_lane = state.selected_location().map(|(li, _)| li);
+    let lane_count = state.road_lane_count();
 
     // 1. Ensure one MSDF lane nameplate per lane near strike line.
-    while text_state.lane_plates.len() < state.lanes.len() {
+    while text_state.lane_plates.len() < lane_count {
         let li = text_state.lane_plates.len();
         let (tex, panel_bundle) = create_msdf_panel(&mut images, LABEL_TEX_W, LABEL_TEX_H);
         let mat = card_mats.add(WellCardMaterial {
@@ -152,7 +152,7 @@ pub fn sync_heroic_text(
             // Keep <= 0.85 so text stays cleanly below the 1.0 bloom threshold.
             dim: Vec4::new(0.85, 0.0, 0.0, 0.0),
         });
-        let quad = meshes.add(Rectangle::new(0.78, 0.22));
+        let quad = meshes.add(Rectangle::new(0.86, 0.215));
         let entity = commands
             .spawn((
                 HeroicLaneNameplate,
@@ -171,7 +171,7 @@ pub fn sync_heroic_text(
             last_label: String::new(),
         });
     }
-    while text_state.lane_plates.len() > state.lanes.len() {
+    while text_state.lane_plates.len() > lane_count {
         if let Some(old) = text_state.lane_plates.pop() {
             commands.entity(old.entity).despawn();
         }
@@ -181,37 +181,49 @@ pub fn sync_heroic_text(
     let mut atlas_opt = atlas.as_deref_mut();
     let brush = bevy_color_to_brush(Color::srgba(0.92, 0.96, 1.0, 0.95));
 
-    for (li, lane) in state.lanes.iter().enumerate() {
+    let mut next_seat = 0;
+    for (li, (track, performer, first_in_track)) in state.road_lanes().enumerate() {
         let slot = &mut text_state.lane_plates[li];
         let lane_x = state.lane_center_x(li, palette.lane_width);
-        let dim = match sel_lane {
-            Some(s) if s != li => palette.unselected_opacity,
-            _ => 1.0,
+        let focused = sel_id.is_none() || performer.is_some_and(|p| Some(p.context_id) == sel_id);
+        let title = match performer {
+            Some(performer) => {
+                let seat = next_seat;
+                next_seat += 1;
+                let name = performer.lane_name();
+                let label = if seat < 10 { format!("[{seat}] {name}") } else { name.to_string() };
+                if first_in_track && name != track.track_id {
+                    format!("{label}\n{}", track.track_id)
+                } else {
+                    label
+                }
+            }
+            None => track.track_id.clone(),
         };
-        let char_col = lane
-            .single_character_name()
-            .map(heroic_identity_color)
+        let char_col = performer
+            .map(|p| heroic_identity_color(p.lane_name()))
             .unwrap_or(palette.rail);
         if let Some(mut m) = card_mats.get_mut(&slot.mat) {
-            m.border = Vec4::new(char_col.red, char_col.green, char_col.blue, 0.65);
-            m.dim.x = 0.85 * dim;
+            let border = if focused { 0.85 } else { 0.45 };
+            m.border = Vec4::new(char_col.red, char_col.green, char_col.blue, border);
+            m.dim.x = if focused { 0.85 } else { 0.72 };
         }
         if let Ok((Some(mut msdf), mut tf, _)) = msdf_q.get_mut(slot.entity) {
-            // Sit cleanly between the strike pads and the elevated bottom chips + dock bar.
-            tf.translation = Vec3::new(lane_x, 0.05, 0.26);
+            // Lift the plate above the pad rims while keeping it clear of the dock.
+            tf.translation = Vec3::new(lane_x, 0.09, 0.293);
             tf.rotation = Quat::from_rotation_x(-1.18);
-            let title = lane
-                .single_character_name()
-                .map(|c| format!("{}\n{}", lane.track_id, c))
-                .unwrap_or_else(|| lane.track_id.clone());
+            tf.scale.x = palette.lane_width;
             if title != slot.last_label
                 && let (Some(f), Some(at)) = (font, atlas_opt.as_deref_mut())
             {
+                let max_width = LABEL_TEX_W as f32 - 2.0 * PAD;
+                let longest = title.lines().map(|line| line.chars().count()).max().unwrap_or(1);
+                let font_size = (max_width / (longest.max(1) as f32 * 0.65)).min(30.0);
                 let glyphs = layout_msdf_line(
                     &title,
                     f,
-                    20.0,
-                    LABEL_TEX_W as f32 - 2.0 * PAD,
+                    font_size,
+                    max_width,
                     &brush,
                     VelloTextAlign::Middle,
                     at,
@@ -392,7 +404,7 @@ pub fn sync_heroic_text(
                 Some(s) if s != perf.context_id => palette.unselected_opacity,
                 _ => 1.0,
             };
-            let perf_col = heroic_identity_color(&perf.character);
+            let perf_col = heroic_identity_color(perf.lane_name());
 
             for (ci, (bar_e, bar_mat)) in slots.iter().enumerate() {
                 if let Some(cand) = perf.candidates.get(ci) {

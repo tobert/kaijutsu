@@ -305,8 +305,8 @@ struct HeardEntry {
     abc: String,
 }
 
-/// Build the `$HEARD` JSON: committed notation within the last `window` ticks of
-/// `now`, oldest→newest, across all tracks (a band view; solo bass just yields
+/// Build the `$HEARD` JSON: committed notation from `now - window` through
+/// `now` inclusive, oldest→newest, across all tracks (a band view; solo bass just yields
 /// its own lane). **Why a var at all, solo:** materialized score blocks are
 /// `ephemeral` (hydration-silent), so a player composing its next phrase cannot
 /// see its own prior notation from the conversation — `$HEARD` is the only
@@ -333,7 +333,7 @@ fn heard_json(blocks: &[BlockSnapshot], now: Tick, window: TickDelta) -> String 
         .filter(|b| b.content_type == ContentType::Abc)
         .filter_map(|b| {
             let tick = b.tick?;
-            if tick < since {
+            if tick < since || tick > now {
                 return None;
             }
             let track = b
@@ -2495,6 +2495,23 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1, "only the in-window notation block survives");
         assert_eq!(arr[0]["abc"], "KEEP");
+    }
+
+    #[test]
+    fn heard_json_excludes_stored_notation_ahead_of_restarted_playhead() {
+        let blocks = vec![
+            abc_block(1, 4371, "bass", "old"),
+            abc_block(2, 4372, "bass", "window start"),
+            abc_block(3, 4404, "bass", "playhead"),
+            abc_block(4, 4405, "bass", "next tick"),
+            abc_block(5, 5000, "bass", "later in the score"),
+        ];
+        let json = heard_json(&blocks, Tick::new(4404), TickDelta::new(32));
+        let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries, serde_json::json!([
+            { "tick": 4372, "track": "bass", "abc": "window start" },
+            { "tick": 4404, "track": "bass", "abc": "playhead" },
+        ]));
     }
 
     /// No notation yet → an empty JSON array (a fresh player, not an error).

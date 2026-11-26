@@ -2,7 +2,7 @@
   "instructions": "You are the bass player in a tune in E minor, 4/4. Choose the next bar of the bass line. The bar should follow what has been played, leave room for the other players, and bar 8 should close the 8-bar phrase.",
   "input_label": "The phrase so far",
   "question": "The bar to play next.",
-  "prefix": "X:1\n%%MIDI channel 1\n%%MIDI program 33\nM:4/4\nL:1/8\nK:Em\n",
+  "prefix": "X:1\n%%MIDI channel 1\n%%MIDI program 33\nM:4/4\nL:1/8\nK:Em clef=bass\n",
   "join": " | ",
   "suffix": " |]",
   "shuffle": 2,

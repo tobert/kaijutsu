@@ -1,0 +1,3 @@
+# Keep a small working window as observation turns accumulate.
+set -e
+kj context hydrate --window 16

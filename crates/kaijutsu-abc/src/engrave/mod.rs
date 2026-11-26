@@ -8,6 +8,7 @@
 
 pub mod font;
 pub mod ir;
+mod kit;
 pub mod layout;
 pub mod svg;
 

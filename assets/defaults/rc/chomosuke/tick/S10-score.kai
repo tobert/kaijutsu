@@ -1,0 +1,47 @@
+# Observe recent played scores on every playing track. The common observer
+# admits the turn and records the basis only after its reply is published.
+set -e
+if test -n "${KJ_SUMMARY_CONTEXT:-}"; then
+  exit 0
+fi
+tracks="$(kj transport list --details --json)"
+count="$(echo "$tracks" | jq '[.[] | select(.playing)] | length')"
+if [[ "$count" -eq 0 ]]; then
+  exit 0
+fi
+quota=$(( 10000 / count / 4 ))
+if [[ "$quota" -gt 1024 ]]; then quota=1024; fi
+basis=""
+observations=""
+for track in $(echo "$tracks" | jq -r 'sort_by(.track) | .[] | select(.playing) | .track'); do
+  row="$(echo "$tracks" | jq -c --arg track "$track" '.[] | select(.track == $track)')"
+  context="$(echo "$row" | jq -r '.score_context')"
+  playhead="$(echo "$row" | jq -r '.playhead')"
+  blocks="$(kj block list -c "$context" --role model --content-type abc --tail 32 --json)"
+  selected=""
+  for block in $(echo "$blocks" | jq -r '.[]'); do
+    info="$(kj block inspect -c "$context" "$block" --json)"
+    played="$(echo "$info" | jq -r --arg track "$track" --argjson now "$playhead" '.track == $track and .tick != null and .tick <= $now')"
+    if test "$played" = true; then
+      selected="$selected $block"
+    fi
+  done
+  # Keep a bounded history per track, in log order.
+  selected="$(echo "$selected" | tr ' ' '\n' | tail -n 4)"
+  for block in $(split "$selected"); do
+    info="$(kj block inspect -c "$context" "$block" --json)"
+    tick="$(echo "$info" | jq -r '.tick')"
+    author="$(echo "$info" | jq -r '.author')"
+    score="$(kj block read -c "$context" "$block" --no-line-numbers --range 0:40 | jq -Rsr --argjson n "$quota" '.[0:$n]')"
+    digest="$(kj block read -c "$context" "$block" --no-line-numbers | checksum | cut -d' ' -f1)"
+    basis="$basis $block:$digest"
+    observations="$observations
+Track $track, tick $tick, performer $author, block $block:
+$score
+"
+  done
+done
+if test -z "$basis"; then
+  exit 0
+fi
+source /config/rc/chomosuke/lib/observe.kai

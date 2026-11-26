@@ -11,5 +11,5 @@ X:1
 T:bass
 M:4/4
 L:1/4
-K:C
+K:C clef=bass
 ```

@@ -287,7 +287,8 @@ pub(super) fn report_failure(kernel: &Arc<Kernel>, turn_id: TurnId, request: &Tu
     kernel.turn_flows().publish(failed);
     if let Some(ending) = ending {
         let (kernel, context) = (kernel.clone(), request.context_id);
-        tokio::spawn(async move { super::rc_lifecycle::fire_done(&kernel, context, ending).await });
+        let input = request.after_block_id;
+        tokio::spawn(async move { super::rc_lifecycle::fire_done(&kernel, context, input, ending).await });
     }
 }
 

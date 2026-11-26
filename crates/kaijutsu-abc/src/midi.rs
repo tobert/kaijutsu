@@ -29,7 +29,7 @@ fn get_voice_pitch_offset(voice: &Voice, voice_defs: &[crate::ast::VoiceDef]) ->
 }
 
 /// Apply pitch offset and clamp to valid MIDI range
-fn apply_pitch_offset(base_pitch: u8, offset: i16) -> u8 {
+pub(crate) fn apply_pitch_offset(base_pitch: u8, offset: i16) -> u8 {
     ((base_pitch as i16) + offset).clamp(0, 127) as u8
 }
 
@@ -37,6 +37,12 @@ fn apply_pitch_offset(base_pitch: u8, offset: i16) -> u8 {
 /// (ABC v2.1 §4.6). Distinct from, and added to, any `V:`-level offset.
 fn key_pitch_offset(key: &Key) -> i16 {
     key.transpose as i16 + (key.octave as i16) * 12
+}
+
+pub(crate) fn pitch_offset(header: &crate::ast::Header, voice: &Voice) -> i16 {
+    get_voice_pitch_offset(voice, &header.voice_defs)
+        + key_pitch_offset(&header.key)
+        + header.midi_transpose.map(|t| t as i16).unwrap_or(0)
 }
 
 /// Play a run of gracenotes just before their principal note, stealing their
@@ -298,9 +304,7 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
     for voice in &tune.voices {
         writer.current_tick = 0;
         // Get pitch offset from voice properties (transpose, octave)
-        let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs)
-            + key_pitch_offset(&tune.header.key)
-            + tune.header.midi_transpose.map(|t| t as i16).unwrap_or(0);
+        let pitch_offset = pitch_offset(&tune.header, voice);
 
         // Strip slur grouping (MIDI-irrelevant), then expand repeats.
         let flat = flatten_slurs(&voice.elements);
@@ -565,9 +569,7 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         }
 
         // Get pitch offset from voice properties (transpose, octave)
-        let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs)
-            + key_pitch_offset(&tune.header.key)
-            + tune.header.midi_transpose.map(|t| t as i16).unwrap_or(0);
+        let pitch_offset = pitch_offset(&tune.header, voice);
 
         // A tune that names its channel keeps every voice on it. Otherwise each
         // voice gets its own channel (0-15, skipping 9, which is percussion).
@@ -817,7 +819,7 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
 /// Resolve the accidental in effect for a note: its own explicit accidental,
 /// else a bar-scoped accidental (which is seeded from the key signature), else
 /// an accidental carried across a bar line by a tie. ABC v2.1 §4.2.
-fn effective_accidental(
+pub(crate) fn effective_accidental(
     pitch: NoteName,
     note_accidental: Option<Accidental>,
     bar_accidentals: &HashMap<NoteName, Accidental>,
@@ -840,13 +842,13 @@ fn note_to_midi_pitch(
 }
 
 /// MIDI pitch for a note with its accidental already resolved.
-fn midi_pitch_with_accidental(pitch: NoteName, octave: i8, acc: Option<Accidental>) -> u8 {
+pub(crate) fn midi_pitch_with_accidental(pitch: NoteName, octave: i8, acc: Option<Accidental>) -> u8 {
     let base = pitch.to_semitone();
     // ABC octave 0 (uppercase C-B) = MIDI 60-71 (middle C octave)
     // ABC octave 1 (lowercase c-b) = MIDI 72-83
-    let octave_offset = (octave + 5) * 12;
+    let octave_offset = (i16::from(octave) + 5) * 12;
     let acc_offset = acc.map(|a| a.to_semitone_offset()).unwrap_or(0);
-    ((base as i16) + (octave_offset as i16) + (acc_offset as i16)).clamp(0, 127) as u8
+    (i16::from(base) + octave_offset + i16::from(acc_offset)).clamp(0, 127) as u8
 }
 
 /// Key-signature accidentals for an inline `[K:…]` field value (e.g. `"G"`,
@@ -874,7 +876,7 @@ fn inline_meter(value: &str) -> crate::ast::Meter {
 }
 
 /// Compute accidentals from key signature
-fn compute_key_accidentals(key: &Key) -> HashMap<NoteName, Accidental> {
+pub(crate) fn compute_key_accidentals(key: &Key) -> HashMap<NoteName, Accidental> {
     let mut accidentals = HashMap::new();
 
     // Circle of fifths

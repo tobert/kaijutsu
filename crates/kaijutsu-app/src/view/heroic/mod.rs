@@ -41,6 +41,7 @@ pub struct HeroicSavedCamera {
     projection: Option<Projection>,
     clear_color: Option<ClearColorConfig>,
     pub return_screen: Option<Screen>,
+    editor_selection: Option<kaijutsu_types::ContextId>,
 }
 
 /// Wires the heroic view screen, shaders, drivers, and systems into Bevy.
@@ -70,6 +71,7 @@ impl Plugin for HeroicPlugin {
                 Update,
                 (
                     selection::heroic_keyboard.after(InputPhase::Dispatch),
+                    selection::open_board_note,
                     live::poll_heroic_live_data,
                     live::apply_heroic_work_results,
                     live::ingest_heroic_cues,
@@ -176,6 +178,7 @@ fn enter_heroic(
     }
 
     state.clear_driver_state();
+    state.selected_performer = saved.editor_selection.take();
     if actor.is_some() {
         live::request_initial_tracks(actor.as_deref(), &result_channel);
     }
@@ -245,10 +248,10 @@ fn exit_heroic(
     mut commands: Commands,
     theme: Res<Theme>,
     next_screen: Res<NextState<Screen>>,
+    screen: Res<State<Screen>>,
     mut state: ResMut<HeroicState>,
     mut saved: ResMut<HeroicSavedCamera>,
     roots: Query<Entity, With<HeroicRoot>>,
-    chips: Query<Entity, With<selection::HeroicChipsRoot>>,
     mut cam_q: Query<(Entity, &mut Camera, &mut Transform, &mut Projection), With<HeroicCamera>>,
     mut perf_pool: ResMut<performers::HeroicPerformerPool>,
     mut text_state: ResMut<text::HeroicTextState>,
@@ -257,9 +260,7 @@ fn exit_heroic(
     for e in roots.iter() {
         commands.entity(e).despawn();
     }
-    for e in chips.iter() {
-        commands.entity(e).despawn();
-    }
+    saved.editor_selection = if *screen.get() == Screen::Editor { state.selected_performer } else { None };
     state.clear_driver_state();
     perf_pool.root = None;
     perf_pool.slots.clear();

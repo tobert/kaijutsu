@@ -183,7 +183,8 @@ pub fn sync_road(
     let road_w = state.road_width(lane_w);
     let half_w = road_w * 0.5;
     let road_len = (palette.road_seconds * palette.units_per_second).max(10.0);
-    let n_lanes = state.lanes.len().max(1);
+    let layout: Vec<_> = state.road_lanes().collect();
+    let n_lanes = layout.len().max(1);
 
     // 1. Strike and lock lines.
     if let Ok(mut tf) = strike_q.single_mut() {
@@ -199,7 +200,14 @@ pub fn sync_road(
         tf.scale.x = (road_w / 4.0).max(0.25);
     }
 
-    let sel_lane = state.selected_location().map(|(li, _)| li);
+    let lane_dim = |performer: Option<&super::state::HeroicPerformer>| {
+        match state.selected_performer {
+            Some(selected) if performer.is_none_or(|p| p.context_id != selected) => {
+                palette.unselected_opacity
+            }
+            _ => 1.0,
+        }
+    };
 
     // 2. Road glass strips (subdivided along Z for smooth vertex fog).
     if let Ok(mesh_h) = glass_q.single()
@@ -213,14 +221,22 @@ pub fn sync_road(
 
         for li in 0..n_lanes {
             let cx = state.lane_center_x(li, lane_w);
-            let dim = match sel_lane {
-                Some(sel) if sel != li => palette.unselected_opacity,
-                _ => 1.0,
-            };
+            let performer = layout.get(li).and_then(|(_, performer, _)| *performer);
+            let dim = lane_dim(performer);
             let base = pos.len() as u32;
             for s in 0..=segs {
                 let z = -(s as f32 / segs as f32) * road_len;
-                let c = fog_mix(palette.ground, Vec3::new(cx, 0.0, z), cam_pos, &palette, dim);
+                let floor = performer
+                    .map(|p| {
+                        let tint = heroic_identity_color(p.lane_name());
+                        LinearRgba::rgb(
+                            palette.ground.red + tint.red * 0.12,
+                            palette.ground.green + tint.green * 0.12,
+                            palette.ground.blue + tint.blue * 0.12,
+                        )
+                    })
+                    .unwrap_or(palette.ground);
+                let c = fog_mix(floor, Vec3::new(cx, 0.0, z), cam_pos, &palette, dim);
                 pos.push([cx - lane_w * 0.48, 0.0, z]);
                 pos.push([cx + lane_w * 0.48, 0.0, z]);
                 norm.push([0.0, 1.0, 0.0]);
@@ -252,27 +268,26 @@ pub fn sync_road(
         let rail_segs = 16usize;
         for r_i in 0..=n_lanes {
             let x = -half_w + (r_i as f32) * lane_w;
+            let track_edge = r_i == n_lanes || layout.get(r_i).is_none_or(|(_, _, first)| *first);
+            let rail_gain = if track_edge { 0.95 } else { 0.46 };
             for s in 0..rail_segs {
                 let z0 = -(s as f32 / rail_segs as f32) * road_len;
                 let z1 = -((s + 1) as f32 / rail_segs as f32) * road_len;
                 pos.push([x, 0.005, z0]);
                 pos.push([x, 0.005, z1]);
-                col.push(fog_mix(palette.rail, Vec3::new(x, 0.005, z0), cam_pos, &palette, 0.78));
-                col.push(fog_mix(palette.rail, Vec3::new(x, 0.005, z1), cam_pos, &palette, 0.78));
+                col.push(fog_mix(palette.rail, Vec3::new(x, 0.005, z0), cam_pos, &palette, rail_gain));
+                col.push(fog_mix(palette.rail, Vec3::new(x, 0.005, z1), cam_pos, &palette, rail_gain));
             }
         }
 
         // Per-lane beat and phrase lines in wall time (`TrackInfo.periodUs`).
         for li in 0..n_lanes {
             let cx = state.lane_center_x(li, lane_w);
-            let dim = match sel_lane {
-                Some(sel) if sel != li => palette.unselected_opacity,
-                _ => 1.0,
-            };
-            let (playhead, period, bpp) = state
-                .lanes
+            let performer = layout.get(li).and_then(|(_, performer, _)| *performer);
+            let dim = lane_dim(performer);
+            let (playhead, period, bpp) = layout
                 .get(li)
-                .map(|l| (l.playhead_beats, l.period_secs.max(0.05), l.beats_per_phrase.max(1)))
+                .map(|(l, _, _)| (l.playhead_beats, l.period_secs.max(0.05), l.beats_per_phrase.max(1)))
                 .unwrap_or((0.0, 0.5, 8));
 
             let max_beats = (palette.road_seconds / period).ceil() as i64;
@@ -393,37 +408,33 @@ pub fn sync_road(
         let now_secs = time.elapsed_secs_f64();
         let fall_secs = (palette.durations_ms.instruction_fall as f64 / 1000.0).max(0.05);
 
-        for (li, lane) in state.lanes.iter().enumerate() {
+        for (li, (lane, performer, _)) in layout.iter().copied().enumerate() {
+            let Some(perf) = performer else { continue };
             let cx = state.lane_center_x(li, lane_w);
-            let dim = match sel_lane {
-                Some(sel) if sel != li => palette.unselected_opacity,
-                _ => 1.0,
-            };
-            for perf in &lane.performers {
-                for instr in &perf.instructions {
-                    let dt = (instr.target_beat - lane.playhead_beats) as f32 * lane.period_secs;
-                    let z = -dt * palette.units_per_second;
-                    if z > 0.5 || z < -road_len {
-                        continue;
-                    }
-                    let fall_t = ((now_secs - instr.spawned_at_secs) / fall_secs).clamp(0.0, 1.0) as f32;
-                    let eased = 1.0 - (1.0 - fall_t).powi(3);
-                    let y = (1.0 - eased) * 4.5 + 0.06;
-                    let brightness = if instr.heard { 0.45 } else { 1.35 } * dim;
-                    let c = fog_mix(palette.now, Vec3::new(cx, y, z), cam_pos, &palette, brightness);
-                    let hw = lane_w * 0.42;
-                    let hz = 0.04;
-                    let base = pos.len() as u32;
-                    pos.push([cx - hw, y, z + hz]);
-                    pos.push([cx + hw, y, z + hz]);
-                    pos.push([cx + hw, y, z - hz]);
-                    pos.push([cx - hw, y, z - hz]);
-                    for _ in 0..4 {
-                        norm.push([0.0, 1.0, 0.0]);
-                        col.push(c);
-                    }
-                    idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            let dim = lane_dim(performer);
+            for instr in &perf.instructions {
+                let dt = (instr.target_beat - lane.playhead_beats) as f32 * lane.period_secs;
+                let z = -dt * palette.units_per_second;
+                if z > 0.5 || z < -road_len {
+                    continue;
                 }
+                let fall_t = ((now_secs - instr.spawned_at_secs) / fall_secs).clamp(0.0, 1.0) as f32;
+                let eased = 1.0 - (1.0 - fall_t).powi(3);
+                let y = (1.0 - eased) * 4.5 + 0.06;
+                let brightness = if instr.heard { 0.45 } else { 1.35 } * dim;
+                let c = fog_mix(palette.now, Vec3::new(cx, y, z), cam_pos, &palette, brightness);
+                let hw = lane_w * 0.42;
+                let hz = 0.04;
+                let base = pos.len() as u32;
+                pos.push([cx - hw, y, z + hz]);
+                pos.push([cx + hw, y, z + hz]);
+                pos.push([cx + hw, y, z - hz]);
+                pos.push([cx - hw, y, z - hz]);
+                for _ in 0..4 {
+                    norm.push([0.0, 1.0, 0.0]);
+                    col.push(c);
+                }
+                idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }
         }
 

@@ -1018,6 +1018,13 @@ fn two_musicians_share_a_band_track_with_their_own_chairs() {
         let band_before = server.kernel_db.lock().get_track("band").unwrap().expect("the band track exists");
         let drums = create_musician_with_env(&kj, &drummer, "drums", &["KJ_BAND=band", "KJ_CHAIR=drums"]).await;
 
+        for (character, context) in [(&performer, bass), (&drummer, drums)] {
+            let boards = kj.execute_kj_quiet(context, &[
+                "board".into(), "list".into(), character.clone(),
+            ]).await.unwrap();
+            assert!(boards.stdout.contains(&format!("{character}/music-notes")),
+                "the chair accepts its first note from a peer: {}", boards.stdout);
+        }
         assert!(has_chair(bass, bass_chair), "no KJ_CHAIR plays bass");
         assert!(!has_chair(bass, drums_chair), "bass carries no drum chair");
         assert!(has_chair(drums, drums_chair), "KJ_CHAIR=drums plays drums");
@@ -1139,6 +1146,88 @@ async fn wait_until_ready(timeline: &kaijutsu_kernel::hyoushigi::SharedTimeline,
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("the phrase is prepared before its deadline");
+}
+
+/// A note refers to the heard phrase even when another turn starts before save.
+#[test]
+fn a_heroic_note_saved_after_a_wakeup_reaches_the_following_musician_prompt() {
+    run_local(async {
+        use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider}};
+        use kaijutsu_server::beat::BeatScheduler;
+        use kaijutsu_types::TrackId;
+
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "notes-player").await.unwrap();
+        let performer = PrincipalId::new();
+        assign_turn_identity(&server, context, performer);
+        common::perform_with_rc_dir(&server, context, "musician");
+        kj.join_context(context, "notes-player").await.unwrap();
+        let (callback, mut events) = turn_events_channel(16);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let mock = MockClient::new("X:1\nM:4/4\nK:C\nC4|\n");
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        let track = TrackId::new("notes-band").unwrap();
+        let mut scheduler = BeatScheduler::new(server.kernel.clone(), server.documents.clone());
+        scheduler.attach(track.clone(), context, Attachment {
+            ooda_armed: false, ..Attachment::musician_default()
+        }, BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4 }).unwrap();
+        let timeline = server.kernel.track_timeline(&track).unwrap();
+        let base = tokio::time::Instant::now();
+        scheduler.play(&track, base);
+        let vibe = "The bass and kick leave the fourth beat open.";
+        let published = kj.execute_kj_quiet(context, &[
+            "board".into(), "post".into(), "@track/notes-band".into(),
+            "--title".into(), "vibe".into(), format!("{vibe}\n\nSources: rehearsal"),
+        ]).await.unwrap();
+        assert_eq!(published.exit_code, 0, "publish the vibe: {}", published.stderr);
+        let opened = kj.execute_kj(context, &[
+            "board".into(), "add-note".into(), "--track".into(), track.as_str().into(),
+            "--performer".into(), performer.to_string(), "--at".into(), "0".into(), "--vi".into(),
+        ]).await.unwrap();
+        assert_eq!(opened.exit_code, 0, "open the note: {}", opened.stderr);
+        let session = opened.data.unwrap()["session"].as_u64().unwrap();
+        let note = "Leave room for the snare on beat four.";
+        kj.editor_insert(session, note).await.unwrap();
+
+        run_shipped_tick(&server, &scheduler, context, PrincipalId::system()).await;
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+        let seeds = || server.documents.block_snapshots(context).unwrap().into_iter()
+            .filter(|b| b.content.starts_with("Commit at tick ")).map(|b| b.content).collect::<Vec<_>>();
+        assert_eq!(seeds().len(), 1);
+        assert!(!seeds()[0].contains(note), "a draft is private until saved");
+        assert!(!seeds()[0].contains(vibe), "the musician opts into the vibe topic");
+
+        let first = timeline.lock().statuses()[0].id;
+        wait_until_ready(&timeline, first).await;
+        let mut beat = 0;
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        kj.editor_keys(session, ":wq<CR>").await.unwrap();
+        common::context_verb(&kj, "set", context, &["--env", "KJ_VIBE_TOPIC=@track/notes-band/vibe"]).await;
+        run_shipped_tick(&server, &scheduler, context, PrincipalId::system()).await;
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+        let submitted = seeds();
+        assert_eq!(submitted.len(), 2);
+        assert!(submitted[1].contains(note), "the next scheduled seed carries the saved text: {}", submitted[1]);
+        assert!(submitted[1].contains(vibe), "the opted-in musician reads the published vibe: {}", submitted[1]);
+        let next = timeline.lock().statuses().into_iter().find(|work| work.id != first).unwrap().id;
+        wait_until_ready(&timeline, next).await;
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        run_shipped_tick(&server, &scheduler, context, PrincipalId::system()).await;
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+        let third = seeds();
+        assert_eq!(third.len(), 3);
+        assert!(!third[2].contains(note), "the saved note was already delivered: {} (env {:?})",
+            third[2], server.kernel_db.lock().get_context_env(context).unwrap());
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
 }
 
 /// A performer slower than one phrase is planned for by what it measured: after

@@ -2,7 +2,8 @@
 
 use crate::ast::*;
 use crate::engrave::font::font_cache;
-use crate::engrave::ir::{EngravingElement, EngravingOptions, SourceSpan};
+use crate::engrave::kit::KitPitches;
+use crate::engrave::ir::{EngravingElement, EngravingOptions, SourceSpan, engraving_bounds};
 
 /// Layout walks the AST as a flat token stream; nested `SlurGroup`s are
 /// expanded into explicit Start/End boundaries so the slur-stack logic
@@ -31,23 +32,13 @@ fn flatten_for_layout<'a>(elements: &'a [Element]) -> Vec<LayoutToken<'a>> {
 /// One stem captured while a beam group is being collected.
 #[derive(Clone, Copy)]
 struct BeamStem {
-    /// X coordinate of the stem.
-    stem_x: f64,
+    head_x: f64,
+    head_width: f64,
     /// Y of the notehead (anchor end of the stem).
     note_y: f64,
     /// Number of beams this individual note carries: 1 for 1/8,
     /// 2 for 1/16, 3 for 1/32, 4 for 1/64.
     beam_count: u8,
-}
-
-/// State accumulated for one open beam group between its first note
-/// and its last note.
-#[derive(Default)]
-struct BeamAccum {
-    stems: Vec<BeamStem>,
-    /// True = stems point up (notes below middle staff line).
-    /// Decided from the first note in the group.
-    stem_up: bool,
 }
 
 /// Identify beam groups in the token stream. A beam group is a
@@ -139,37 +130,37 @@ fn clef_middle_abs(clef: Clef) -> i32 {
         Clef::Bass => -6,       // D3 = (D, octave -1) = middle staff line
         Clef::Alto => 0,        // C4 = (C, octave 0) = middle staff line
         Clef::Tenor => -2,      // A3 = (A, octave -1) = middle staff line
-        Clef::Percussion => 6,  // not really pitched; treat like treble for fallback
+        Clef::Percussion => unreachable!("a kit note takes its position from its drum"),
     }
 }
 
 /// Standard (note, ABC-octave) placements for the seven sharps in key-sig
 /// order (F# C# G# D# A# E# B#). The octaves are conventional —
 /// chosen so the accidental sits inside (or just outside) the staff.
-fn sharp_octaves(clef: Clef) -> [(NoteName, i8); 7] {
+fn sharp_octaves(clef: Clef) -> &'static [(NoteName, i8)] {
     use NoteName::*;
     match clef {
-        Clef::Treble => [(F, 1), (C, 1), (G, 1), (D, 1), (A, 0), (E, 1), (B, 0)],
-        Clef::Bass => [(F, -1), (C, -1), (G, -1), (D, -1), (A, -2), (E, -1), (B, -2)],
-        Clef::Alto => [(F, 0), (C, 0), (G, 0), (D, 0), (A, -1), (E, 0), (B, -1)],
+        Clef::Treble => &[(F, 1), (C, 1), (G, 1), (D, 1), (A, 0), (E, 1), (B, 0)],
+        Clef::Bass => &[(F, -1), (C, -1), (G, -1), (D, -1), (A, -2), (E, -1), (B, -2)],
+        Clef::Alto => &[(F, 0), (C, 0), (G, 0), (D, 0), (A, -1), (E, 0), (B, -1)],
         // Tenor sits high enough that the conventional placement matches
         // alto's sharps, except F# and G# which drop an octave to stay on
         // the staff.
-        Clef::Tenor => [(F, -1), (C, 0), (G, -1), (D, 0), (A, -1), (E, 0), (B, -1)],
-        Clef::Percussion => [(F, 1), (C, 1), (G, 1), (D, 1), (A, 0), (E, 1), (B, 0)],
+        Clef::Tenor => &[(F, -1), (C, 0), (G, -1), (D, 0), (A, -1), (E, 0), (B, -1)],
+        Clef::Percussion => &[],
     }
 }
 
 /// Standard (note, ABC-octave) placements for the seven flats in key-sig
 /// order (Bb Eb Ab Db Gb Cb Fb).
-fn flat_octaves(clef: Clef) -> [(NoteName, i8); 7] {
+fn flat_octaves(clef: Clef) -> &'static [(NoteName, i8)] {
     use NoteName::*;
     match clef {
-        Clef::Treble => [(B, 1), (E, 2), (A, 1), (D, 2), (G, 1), (C, 2), (F, 1)],
-        Clef::Bass => [(B, -1), (E, 0), (A, -1), (D, 0), (G, -1), (C, 0), (F, -1)],
-        Clef::Alto => [(B, 0), (E, 1), (A, 0), (D, 1), (G, 0), (C, 1), (F, 0)],
-        Clef::Tenor => [(B, 0), (E, 1), (A, 0), (D, 1), (G, 0), (C, 1), (F, 0)],
-        Clef::Percussion => [(B, 1), (E, 2), (A, 1), (D, 2), (G, 1), (C, 2), (F, 1)],
+        Clef::Treble => &[(B, 1), (E, 2), (A, 1), (D, 2), (G, 1), (C, 2), (F, 1)],
+        Clef::Bass => &[(B, -1), (E, 0), (A, -1), (D, 0), (G, -1), (C, 0), (F, -1)],
+        Clef::Alto => &[(B, 0), (E, 1), (A, 0), (D, 1), (G, 0), (C, 1), (F, 0)],
+        Clef::Tenor => &[(B, 0), (E, 1), (A, 0), (D, 1), (G, 0), (C, 1), (F, 0)],
+        Clef::Percussion => &[],
     }
 }
 
@@ -182,15 +173,6 @@ fn accidental_codepoint(acc: Accidental) -> u32 {
         Accidental::DoubleSharp => 0xE263,
         Accidental::DoubleFlat => 0xE264,
     }
-}
-
-// --- Key signature ----------------------------------------------------------
-
-/// Key signature accidental count and sign — same logic as midi.rs.
-fn key_signature_info(key: &Key) -> (i8, bool) {
-    // Shared circle-of-fifths computation (also used by the MIDI generator), so
-    // the staff signature and playback can't drift. §3.1.14.
-    key.signature()
 }
 
 // --- Pitch → staff position ------------------------------------------------
@@ -244,17 +226,94 @@ impl StaffCtx {
     fn y_at(&self, pos: f64) -> f64 {
         self.y_top + pos * self.sp
     }
+}
 
-    /// Staff position for a pitched note in this clef.
-    fn pos_for(&self, pitch: &NoteName, octave: i8) -> f64 {
-        note_to_staff_position(pitch, octave, self.clef)
+/// A notehead as it appears on the staff. GM pitches select kit pieces.
+#[derive(Clone, Copy)]
+struct StaffNote {
+    pos: f64,
+    codepoint: u32,
+    accidental: Option<Accidental>,
+}
+
+impl StaffNote {
+    fn pitched(note: &Note, clef: Clef, codepoint: u32) -> Self {
+        Self {
+            pos: note_to_staff_position(&note.pitch, note.octave, clef),
+            codepoint,
+            accidental: note.accidental,
+        }
+    }
+
+    fn percussion(pitch: u8, codepoint: u32) -> Self {
+        // Staff positions count down from the top line in staff spaces.
+        let (pos, cross) = match pitch {
+            35 | 36 => (3.5, false),           // bass drums
+            38 | 40 => (1.5, false),           // snares
+            37 | 39 => (1.5, true),            // side stick, hand clap
+            41 => (3.0, false),                // toms, low to high
+            43 => (2.5, false),
+            45 => (2.0, false),
+            47 => (1.0, false),
+            48 => (0.5, false),
+            50 => (0.0, false),
+            42 | 46 => (-0.5, true),           // closed and open hi-hat
+            44 => (4.5, true),                 // pedal hi-hat
+            49 | 52 | 55 | 57 => (-1.0, true), // crash, china, splash
+            51 | 53 | 59 => (0.0, true),       // ride and bell
+            _ => (2.0, false),                 // other percussion on the middle line
+        };
+        let codepoint = if cross {
+            match codepoint {
+                0xE0A2 => 0xE0A7, // whole
+                0xE0A3 => 0xE0A8, // half
+                _ => 0xE0A9,      // filled
+            }
+        } else {
+            codepoint
+        };
+        Self { pos, codepoint, accidental: None }
+    }
+
+    fn width(self, ctx: StaffCtx) -> f64 {
+        font_cache().glyph_advance(self.codepoint).unwrap_or(500.0) * ctx.scale
+    }
+
+    fn emit(self, elements: &mut Vec<EngravingElement>, x: f64, ctx: StaffCtx, span: SourceSpan) {
+        let y = ctx.y_at(self.pos);
+        if let Some(acc) = self.accidental {
+            elements.push(EngravingElement::Glyph {
+                codepoint: accidental_codepoint(acc),
+                x: x - ctx.sp * 0.8,
+                y,
+                scale: ctx.scale,
+                source_span: span,
+            });
+        }
+        elements.push(EngravingElement::Glyph {
+            codepoint: self.codepoint,
+            x,
+            y,
+            scale: ctx.scale,
+            source_span: span,
+        });
+        emit_ledger_lines(elements, self.pos, x, self.width(ctx), ctx, span);
+    }
+}
+
+fn staff_note(note: &Note, duration: &Duration, unit: &UnitLength, clef: Clef, kit: &mut KitPitches) -> StaffNote {
+    let cp = notehead_codepoint(duration, unit);
+    if clef == Clef::Percussion {
+        StaffNote::percussion(kit.note(note), cp)
+    } else {
+        StaffNote::pitched(note, clef, cp)
     }
 }
 
 // --- Clef resolution --------------------------------------------------------
 
 /// Pick the clef for a voice. Priority: explicit V: `clef=` > header K: `clef=`
-/// > default (Treble).
+/// > percussion on GM channel 10 > treble.
 fn resolve_clef(header: &Header, voice: &Voice) -> Clef {
     let voice_def = voice
         .id
@@ -263,6 +322,7 @@ fn resolve_clef(header: &Header, voice: &Voice) -> Clef {
     voice_def
         .and_then(|vd| vd.clef)
         .or(header.key.clef)
+        .or_else(|| (header.midi_channel == Some(9)).then_some(Clef::Percussion))
         .unwrap_or(Clef::Treble)
 }
 
@@ -270,15 +330,42 @@ fn resolve_clef(header: &Header, voice: &Voice) -> Clef {
 
 /// Lay out a tune as engraving elements.
 pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement> {
+    engrave_staves(
+        &tune.header,
+        tune.voices.iter().map(|voice| StaffInput {
+            elements: &voice.elements,
+            key: &tune.header.key,
+            clef: resolve_clef(&tune.header, voice),
+            pitch_offset: crate::midi::pitch_offset(&tune.header, voice),
+        }),
+        options,
+        true,
+        true,
+    )
+}
+
+struct StaffInput<'a> {
+    elements: &'a [Element],
+    key: &'a Key,
+    pitch_offset: i16,
+    clef: Clef,
+}
+
+fn engrave_staves<'a>(
+    header: &Header,
+    staves: impl Iterator<Item = StaffInput<'a>>,
+    options: &EngravingOptions,
+    first: bool,
+    last: bool,
+) -> Vec<EngravingElement> {
     let mut elements = Vec::new();
     let font = font_cache();
     let sp = options.staff_spacing;
     let scale = sp / font.upem() * 4.0;
 
-    // Title sits above the first staff.
-    if !tune.header.title.is_empty() {
+    if first && !header.title.is_empty() {
         elements.push(EngravingElement::Text {
-            content: tune.header.title.clone(),
+            content: header.title.clone(),
             x: 0.0,
             y: -sp * 2.0,
             size: sp * 1.8,
@@ -286,37 +373,24 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
         });
     }
 
-    // Each staff occupies 4*sp vertically (4 line gaps). Add a gap of 4*sp
-    // between staves so stems/text have room. Total per voice = 8*sp.
-    let staff_gap = sp * 4.0;
-    let staff_height = sp * 4.0;
-
-    // Render each voice. Default Tune::default() always has at least one
-    // (empty) voice, so this loop is never zero-trip.
-    let mut staff_line_ranges: Vec<(usize, usize, f64)> = Vec::new();
+    // Four staff spaces for each staff and four between staves.
+    let staff_step = sp * 8.0;
+    let mut staff_line_ranges = Vec::new();
     let mut max_cursor = 0.0_f64;
-
-    for (i, voice) in tune.voices.iter().enumerate() {
-        let y_top = i as f64 * (staff_height + staff_gap);
-        let clef = resolve_clef(&tune.header, voice);
+    for (index, staff) in staves.enumerate() {
         let ctx = StaffCtx {
-            y_top,
+            y_top: index as f64 * staff_step,
             sp,
             scale,
-            clef,
+            clef: staff.clef,
         };
-        let (line_start, line_end, cursor_x) = render_staff(&mut elements, &tune.header, voice, ctx);
-        staff_line_ranges.push((line_start, line_end, cursor_x));
-        if cursor_x > max_cursor {
-            max_cursor = cursor_x;
-        }
+        let (start, end, cursor) = render_staff(&mut elements, header, staff, ctx, first, last);
+        staff_line_ranges.push(start..end);
+        max_cursor = max_cursor.max(cursor);
     }
 
-    // Normalize all staff line widths to the longest cursor — so multiple
-    // voices land on staves of the same length, even though each rendered
-    // independently.
-    for (start, end, _cursor) in staff_line_ranges {
-        for elem in &mut elements[start..end] {
+    for range in staff_line_ranges {
+        for elem in &mut elements[range] {
             if let EngravingElement::Line { x2, .. } = elem {
                 *x2 = max_cursor;
             }
@@ -326,14 +400,174 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
     elements
 }
 
+#[derive(Clone)]
+struct SystemBreak {
+    measure: usize,
+    offset: usize,
+    key: Key,
+    clef: Clef,
+}
+
+struct Breaks {
+    state: SystemBreak,
+    has_music: bool,
+    tied: bool,
+    eligible: Vec<SystemBreak>,
+    lyric_start: usize,
+}
+
+impl Breaks {
+    fn scan(&mut self, elements: &[Element], inside_slur: bool) {
+        for (index, element) in elements.iter().enumerate() {
+            match element {
+                Element::Note(note) => {
+                    self.has_music = true;
+                    self.tied = note.tie;
+                }
+                Element::Rest(rest) => {
+                    self.has_music = true;
+                    self.state.measure += usize::from(rest.multi_measure.unwrap_or(1)).saturating_sub(1);
+                }
+                Element::Chord(_) | Element::Tuplet(_) => self.has_music = true,
+                Element::SlurGroup { elements } => self.scan(elements, true),
+                Element::Bar(bar) if self.has_music => {
+                    self.has_music = false;
+                    self.state.measure += 1;
+                    // Leave ties, slurs and opening repeat/volta marks together.
+                    if !inside_slur && !self.tied && matches!(bar, Bar::Single | Bar::Double | Bar::RepeatEnd | Bar::End) {
+                        self.state.offset = index + 1;
+                        self.eligible.push(self.state.clone());
+                    }
+                }
+                Element::Lyrics { aligned: true, .. } if !inside_slur => {
+                    // Keep the syllables with the notes they label.
+                    let line_end = self.eligible.last().filter(|cut| {
+                        !self.has_music && cut.measure == self.state.measure
+                            && self.eligible.len() > self.lyric_start
+                    }).cloned();
+                    self.eligible.truncate(self.lyric_start);
+                    if let Some(mut cut) = line_end {
+                        cut.offset = index + 1;
+                        self.eligible.push(cut);
+                    }
+                    self.lyric_start = self.eligible.len();
+                }
+                Element::InlineField(field) if field.field_type == 'K' => {
+                    let (key, signature) = inline_key(field);
+                    self.state.clef = key.clef.unwrap_or(self.state.clef);
+                    if signature {
+                        self.state.key = key;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn voice_breaks(header: &Header, voice: &Voice) -> Vec<SystemBreak> {
+    let initial = SystemBreak {
+        measure: 0,
+        offset: 0,
+        key: header.key.clone(),
+        clef: resolve_clef(header, voice),
+    };
+    let mut breaks = Breaks {
+        state: initial.clone(),
+        has_music: false,
+        tied: false,
+        eligible: vec![initial],
+        lyric_start: 1,
+    };
+    breaks.scan(&voice.elements, false);
+    if !breaks.has_music && breaks.eligible.last().is_some_and(|cut| cut.measure == breaks.state.measure && cut.measure != 0) {
+        breaks.eligible.pop();
+    }
+    breaks.state.measure = usize::MAX;
+    breaks.state.offset = voice.elements.len();
+    breaks.eligible.push(breaks.state);
+    breaks.eligible
+}
+
+/// Lay out systems at bar boundaries shared by all voices. A system with no
+/// eligible break inside it may be wider than the available width.
+pub fn engrave_systems(tune: &Tune, options: &EngravingOptions, width: f64) -> Vec<Vec<EngravingElement>> {
+    let Some(first_voice) = tune.voices.first() else {
+        return vec![engrave(tune, options)];
+    };
+    let mut shared: Vec<Vec<SystemBreak>> = voice_breaks(&tune.header, first_voice)
+        .into_iter().map(|cut| vec![cut]).collect();
+    for voice in &tune.voices[1..] {
+        let cuts = voice_breaks(&tune.header, voice);
+        shared.retain_mut(|row| {
+            let Ok(index) = cuts.binary_search_by_key(&row[0].measure, |cut| cut.measure) else {
+                return false;
+            };
+            row.push(cuts[index].clone());
+            true
+        });
+    }
+
+    let last = shared.len() - 1;
+    let mut systems = Vec::new();
+    let mut from = 0;
+    while from < last {
+        let mut to = from + 1;
+        let mut system = engrave_system(tune, options, &shared, from, to);
+        while to < last && engraving_bounds(&system, options.margin).width <= width {
+            let wider = engrave_system(tune, options, &shared, from, to + 1);
+            if engraving_bounds(&wider, options.margin).width > width {
+                break;
+            }
+            to += 1;
+            system = wider;
+        }
+        systems.push(system);
+        from = to;
+    }
+    systems
+}
+
+fn engrave_system(
+    tune: &Tune,
+    options: &EngravingOptions,
+    shared: &[Vec<SystemBreak>],
+    from: usize,
+    to: usize,
+) -> Vec<EngravingElement> {
+    engrave_staves(
+        &tune.header,
+        tune.voices.iter().zip(shared[from].iter().zip(&shared[to])).map(|(voice, (start, end))| StaffInput {
+            elements: &voice.elements[start.offset..end.offset],
+            key: &start.key,
+            clef: start.clef,
+            pitch_offset: crate::midi::pitch_offset(&tune.header, voice),
+        }),
+        options,
+        from == 0,
+        to + 1 == shared.len(),
+    )
+}
+
+fn inline_key(field: &InfoField) -> (Key, bool) {
+    let value = field.value.trim();
+    let mut feedback = crate::feedback::FeedbackCollector::new();
+    (
+        crate::parser::key::parse_key_field(value, &mut feedback),
+        matches!(value.chars().next(), Some('A'..='G')),
+    )
+}
+
 /// Render one staff (one voice) at `ctx.y_top`. Returns
 /// `(staff_line_start_idx, staff_line_end_idx, final_cursor_x)`. The
 /// top-level uses the staff-line indices to normalize widths across voices.
 fn render_staff(
     elements: &mut Vec<EngravingElement>,
     header: &Header,
-    voice: &Voice,
+    staff: StaffInput<'_>,
     mut ctx: StaffCtx,
+    show_meter: bool,
+    final_system: bool,
 ) -> (usize, usize, f64) {
     let font = font_cache();
     let sp = ctx.sp;
@@ -374,30 +608,11 @@ fn render_staff(
     cursor_x += sp * 3.5;
 
     // 3. Key signature, clef-aware.
-    let (count, is_sharp) = key_signature_info(&header.key);
-    let acc_codepoint = if is_sharp { 0xE262u32 } else { 0xE260u32 };
-    let placements = if is_sharp {
-        sharp_octaves(ctx.clef)
-    } else {
-        flat_octaves(ctx.clef)
-    };
-    for &(note, oct) in placements.iter().take(count as usize) {
-        let pos = ctx.pos_for(&note, oct);
-        elements.push(EngravingElement::Glyph {
-            codepoint: acc_codepoint,
-            x: cursor_x,
-            y: ctx.y_at(pos),
-            scale: ctx.scale,
-            source_span: (0, 0),
-        });
-        cursor_x += sp;
-    }
-    if count > 0 {
-        cursor_x += sp * 0.5;
-    }
+    cursor_x = emit_key_signature(elements, staff.key, cursor_x, ctx);
 
     // 4. Time signature. Free meter (`M:none`) draws none.
-    if let Some(meter) = &header.meter
+    if show_meter
+        && let Some(meter) = &header.meter
         && !matches!(meter, Meter::None)
     {
         let (num, den) = meter.to_fraction();
@@ -411,6 +626,7 @@ fn render_staff(
     // 5. Walk voice elements.
     let unit_length = header.unit_length.unwrap_or_default();
     let unit_width = sp * 2.5;
+    let mut kit = KitPitches::new(staff.key, staff.pitch_offset);
 
     // Open volta we haven't closed yet: (x_start, label_text). Closed at
     // the next barline (any variant) by `close_volta_bracket`.
@@ -433,7 +649,7 @@ fn render_staff(
 
     // Walk a flattened token stream so nested `Element::SlurGroup`s map
     // back to the explicit Start/End boundaries the slur_stack expects.
-    let tokens = flatten_for_layout(&voice.elements);
+    let tokens = flatten_for_layout(staff.elements);
     // The last token that carries real content — trailing line breaks,
     // spaces, and beam-break hints don't count. Used to recognize a plain
     // terminal `|` so it can be promoted to a proper final barline.
@@ -449,34 +665,7 @@ fn render_staff(
             beam_group_of[i] = Some(gid);
         }
     }
-    // Stem direction per beam group, decided from the note *farthest* from
-    // the middle staff line (pos 2.0) — the conventional rule — rather than
-    // from whichever note happens to come first. Ties (the group reaches as
-    // far above as below) fall to stems-up. `pos` grows downward, so a note
-    // below the middle line has `pos > 2.0`.
-    let beam_stem_up: Vec<bool> = beam_groups
-        .iter()
-        .map(|members| {
-            let mut max_below = f64::NEG_INFINITY;
-            let mut max_above = f64::NEG_INFINITY;
-            for &ti in members {
-                if let LayoutToken::Real(Element::Note(n)) = &tokens[ti] {
-                    let pos = ctx.pos_for(&n.pitch, n.octave);
-                    max_below = max_below.max(pos - 2.0);
-                    max_above = max_above.max(2.0 - pos);
-                }
-            }
-            max_below >= max_above
-        })
-        .collect();
-    // Per-group accumulator, populated as we emit each member note.
-    let mut beam_accums: Vec<BeamAccum> = beam_stem_up
-        .iter()
-        .map(|&stem_up| BeamAccum {
-            stems: Vec::new(),
-            stem_up,
-        })
-        .collect();
+    let mut beam_stems = vec![Vec::new(); beam_groups.len()];
 
     for (token_idx, token) in tokens.iter().enumerate() {
         let element: &Element = match token {
@@ -500,11 +689,10 @@ fn render_staff(
             Element::Note(note) => {
                 let span = (0usize, 0usize);
                 let x_left = cursor_x;
-                let pos = ctx.pos_for(&note.pitch, note.octave);
+                let head = staff_note(note, &note.duration, &unit_length, ctx.clef, &mut kit);
+                let pos = head.pos;
                 let y = ctx.y_at(pos);
-                let cp = notehead_codepoint(&note.duration, &unit_length);
-                let notehead_width =
-                    font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+                let notehead_width = head.width(ctx);
                 let anchor = NoteAnchor {
                     x_left,
                     x_right: x_left + notehead_width,
@@ -529,35 +717,19 @@ fn render_staff(
                 }
 
                 let beam_gid = beam_group_of[token_idx];
-                // Direction was decided up-front from the whole group (see
-                // `beam_stem_up`); every stem in the group follows it.
-                let (suppress_flag, forced_up) = if let Some(gid) = beam_gid {
-                    (true, Some(beam_accums[gid].stem_up))
-                } else {
-                    (false, None)
-                };
                 let cursor_after = emit_note_with(
-                    elements,
-                    note,
-                    cursor_x,
-                    ctx,
-                    unit_width,
-                    &unit_length,
-                    span,
-                    suppress_flag,
-                    forced_up,
+                    elements, note, head, cursor_x, ctx, unit_width, &unit_length, span, beam_gid.is_some(),
                 );
                 if let Some(gid) = beam_gid {
-                    let stem_x =
-                        stem_center_x(x_left, notehead_width, beam_accums[gid].stem_up);
-                    beam_accums[gid].stems.push(BeamStem {
-                        stem_x,
+                    beam_stems[gid].push(BeamStem {
+                        head_x: x_left,
+                        head_width: notehead_width,
                         note_y: y,
                         beam_count: note_beam_count(&note.duration, &unit_length),
                     });
                     // If this is the last note in the group, draw the beam.
                     if beam_groups[gid].last() == Some(&token_idx) {
-                        emit_beam(elements, &beam_accums[gid], ctx);
+                        emit_beam(elements, &beam_stems[gid], ctx);
                     }
                 }
                 cursor_x = cursor_after;
@@ -587,7 +759,7 @@ fn render_staff(
                 acciaccatura,
                 notes,
             } => {
-                cursor_x = emit_grace_notes(elements, notes, *acciaccatura, cursor_x, ctx);
+                cursor_x = emit_grace_notes(elements, notes, *acciaccatura, cursor_x, ctx, &kit);
             }
             // SlurGroup is flattened to SlurStart/SlurEnd tokens before
             // this match runs, so it should never reach here.
@@ -597,71 +769,35 @@ fn render_staff(
             Element::Chord(chord) => {
                 let span = (0usize, 0usize);
                 let dur_width = duration_to_width(&chord.duration, unit_width);
-                let cp = notehead_codepoint(&chord.duration, &unit_length);
-                let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
-
-                // Sort top-to-bottom (ascending staff position) so adjacent
-                // entries that are a second apart can be offset to opposite
-                // sides of the stem, avoiding overlapping noteheads.
-                let mut placed: Vec<(f64, &Note)> = chord
-                    .notes
-                    .iter()
-                    .map(|n| (ctx.pos_for(&n.pitch, n.octave), n))
+                // Resolve accidentals in source order before sorting heads for layout.
+                let mut placed: Vec<_> = chord.notes.iter()
+                    .map(|note| staff_note(note, &chord.duration, &unit_length, ctx.clef, &mut kit))
                     .collect();
-                placed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                placed.sort_by(|a, b| a.pos.total_cmp(&b.pos));
 
                 let mut prev_pos: Option<f64> = None;
                 let mut prev_offset = false;
-                for (pos, note) in &placed {
-                    let y = ctx.y_at(*pos);
-                    // A second from the previously-placed head (and that one
-                    // wasn't itself offset) → shift this head right of the stem.
-                    let offset =
-                        matches!(prev_pos, Some(p) if (pos - p).abs() < 0.75) && !prev_offset;
-                    let head_x = if offset { cursor_x + nw } else { cursor_x };
-                    if let Some(acc) = note.accidental {
-                        elements.push(EngravingElement::Glyph {
-                            codepoint: accidental_codepoint(acc),
-                            x: cursor_x - ctx.sp * 0.8,
-                            y,
-                            scale: ctx.scale,
-                            source_span: span,
-                        });
-                    }
-                    elements.push(EngravingElement::Glyph {
-                        codepoint: cp,
-                        x: head_x,
-                        y,
-                        scale: ctx.scale,
-                        source_span: span,
-                    });
-                    emit_ledger_lines(elements, *pos, head_x, nw, ctx, span);
-                    prev_pos = Some(*pos);
+                for head in &placed {
+                    let offset = matches!(prev_pos, Some(p) if (head.pos - p).abs() < 0.75) && !prev_offset;
+                    let head_x = if offset { cursor_x + head.width(ctx) } else { cursor_x };
+                    head.emit(elements, head_x, ctx, span);
+                    prev_pos = Some(head.pos);
                     prev_offset = offset;
                 }
 
-                // Stem on the chord (highest to lowest note).
                 if absolute_ratio(&chord.duration, &unit_length) < 1.0
-                    && let (Some(first), Some(last)) = (chord.notes.first(), chord.notes.last())
+                    && let (Some(top), Some(bottom)) = (placed.first(), placed.last())
                 {
-                    let top_pos = ctx.pos_for(&first.pitch, first.octave);
-                    let bot_pos = ctx.pos_for(&last.pitch, last.octave);
-                    let (stem_top, stem_bot) = if top_pos < bot_pos {
-                        (top_pos, bot_pos)
-                    } else {
-                        (bot_pos, top_pos)
-                    };
-                    let cp = notehead_codepoint(&chord.duration, &unit_length);
-                    let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+                    let (stem_top, stem_bot) = (top.pos, bottom.pos);
                     let avg_pos = (stem_top + stem_bot) / 2.0;
                     let up = avg_pos > 2.0;
-                    let stem_x = stem_center_x(cursor_x, nw, up);
-                    let stem_dir = if up { -1.0 } else { 1.0 };
+                    let stem_x = stem_center_x(cursor_x, bottom.width(ctx), up);
+                    let (start, end) = if up { (stem_bot, stem_top - 3.5) } else { (stem_top, stem_bot + 3.5) };
                     elements.push(EngravingElement::Line {
                         x1: stem_x,
-                        y1: ctx.y_at(stem_top),
+                        y1: ctx.y_at(start),
                         x2: stem_x,
-                        y2: ctx.y_at(stem_bot) + stem_dir * sp * 3.5,
+                        y2: ctx.y_at(end),
                         width: STEM_WIDTH,
                         source_span: span,
                     });
@@ -722,12 +858,13 @@ fn render_staff(
                 }
             }
             Element::Bar(bar) => {
+                kit.bar();
                 // A plain `|` that is the last real token of the tune is the
                 // end of the final measure. Don't draw it here — fall through
                 // to the end-of-voice code, which renders a tight thin+thick
                 // final barline. (Explicit terminal bars like `|]`, `:|`, or
                 // `||` keep their own meaning and are drawn normally.)
-                if Some(token_idx) == last_structural_tok && matches!(bar, Bar::Single) {
+                if final_system && Some(token_idx) == last_structural_tok && matches!(bar, Bar::Single) {
                     close_volta_bracket(elements, &mut open_volta, cursor_x, ctx);
                     continue;
                 }
@@ -751,27 +888,9 @@ fn render_staff(
                 for elem in &tuplet.elements {
                     match elem {
                         Element::Note(note) => {
-                            let pos = ctx.pos_for(&note.pitch, note.octave);
-                            let cp = notehead_codepoint(&note.duration, &unit_length);
-                            let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
-                            if let Some(acc) = note.accidental {
-                                elements.push(EngravingElement::Glyph {
-                                    codepoint: accidental_codepoint(acc),
-                                    x: cursor_x - ctx.sp * 0.8,
-                                    y: ctx.y_at(pos),
-                                    scale: ctx.scale,
-                                    source_span: span,
-                                });
-                            }
-                            elements.push(EngravingElement::Glyph {
-                                codepoint: cp,
-                                x: cursor_x,
-                                y: ctx.y_at(pos),
-                                scale: ctx.scale,
-                                source_span: span,
-                            });
-                            emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
-                            emit_stem(elements, pos, cursor_x, ctx, &note.duration, &unit_length, span);
+                            let head = staff_note(note, &note.duration, &unit_length, ctx.clef, &mut kit);
+                            head.emit(elements, cursor_x, ctx, span);
+                            emit_stem(elements, head, cursor_x, ctx, &note.duration, &unit_length, span);
                             cursor_x += duration_to_width(&note.duration, unit_width) * scale_factor;
                         }
                         Element::Rest(rest) => {
@@ -786,26 +905,8 @@ fn render_staff(
                         }
                         Element::Chord(chord) => {
                             for note in &chord.notes {
-                                let pos = ctx.pos_for(&note.pitch, note.octave);
-                                let cp = notehead_codepoint(&chord.duration, &unit_length);
-                                let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
-                                if let Some(acc) = note.accidental {
-                                    elements.push(EngravingElement::Glyph {
-                                        codepoint: accidental_codepoint(acc),
-                                        x: cursor_x - ctx.sp * 0.8,
-                                        y: ctx.y_at(pos),
-                                        scale: ctx.scale,
-                                        source_span: span,
-                                    });
-                                }
-                                elements.push(EngravingElement::Glyph {
-                                    codepoint: cp,
-                                    x: cursor_x,
-                                    y: ctx.y_at(pos),
-                                    scale: ctx.scale,
-                                    source_span: span,
-                                });
-                                emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
+                                let head = staff_note(note, &chord.duration, &unit_length, ctx.clef, &mut kit);
+                                head.emit(elements, cursor_x, ctx, span);
                             }
                             cursor_x += duration_to_width(&chord.duration, unit_width) * scale_factor;
                         }
@@ -857,9 +958,8 @@ fn render_staff(
             // repositions the following notes and draws a new clef; a key change
             // (value starting with a root A–G) redraws the key signature here.
             Element::InlineField(field) if field.field_type == 'K' => {
-                let val = field.value.trim();
-                let mut fc = crate::feedback::FeedbackCollector::new();
-                let new_key = crate::parser::key::parse_key_field(val, &mut fc);
+                let (new_key, signature) = inline_key(field);
+                kit.key(&new_key);
                 cursor_x += sp * 0.5;
 
                 if let Some(new_clef) = new_key.clef
@@ -878,27 +978,8 @@ fn render_staff(
                     }
                 }
 
-                if matches!(val.chars().next(), Some('A'..='G')) {
-                    let (count, is_sharp) = new_key.signature();
-                    let acc_cp = if is_sharp { 0xE262u32 } else { 0xE260u32 };
-                    let placements = if is_sharp {
-                        sharp_octaves(ctx.clef)
-                    } else {
-                        flat_octaves(ctx.clef)
-                    };
-                    for &(note, oct) in placements.iter().take((count as usize).min(7)) {
-                        elements.push(EngravingElement::Glyph {
-                            codepoint: acc_cp,
-                            x: cursor_x,
-                            y: ctx.y_at(ctx.pos_for(&note, oct)),
-                            scale: ctx.scale,
-                            source_span: (0, 0),
-                        });
-                        cursor_x += sp;
-                    }
-                    if count > 0 {
-                        cursor_x += sp * 0.5;
-                    }
+                if signature {
+                    cursor_x = emit_key_signature(elements, &new_key, cursor_x, ctx);
                 }
                 cursor_x += sp * 0.5;
             }
@@ -916,17 +997,17 @@ fn render_staff(
     // suppressed in the loop and is promoted to a final barline here. The
     // last() check used to miss trailing line breaks, so a final `|` drew a
     // barline AND this auto bar — a doubled line.
-    let terminal = voice.elements.iter().rev().find(|e| {
+    let terminal = staff.elements.iter().rev().find(|e| {
         !matches!(e, Element::LineBreak | Element::Space | Element::BeamBreak)
     });
     let ends_with_bar = matches!(terminal, Some(Element::Bar(b)) if !matches!(b, Bar::Single));
-    if !ends_with_bar {
+    if final_system && !ends_with_bar {
         // Pull the barline up to a small fixed gap after the last note. The
         // per-note advance leaves a full duration-width of trailing space,
         // which reads as an oversized gap at the end of a line. Only tighten
         // when the last sounding element is a note (chords/rests don't update
         // the anchor); never push the bar further right than the cursor.
-        let ends_on_note = voice
+        let ends_on_note = staff
             .elements
             .iter()
             .rev()
@@ -1086,6 +1167,7 @@ fn emit_grace_notes(
     acciaccatura: bool,
     cursor_x: f64,
     ctx: StaffCtx,
+    kit: &KitPitches,
 ) -> f64 {
     if notes.is_empty() {
         return cursor_x;
@@ -1093,18 +1175,21 @@ fn emit_grace_notes(
     let font = font_cache();
     let grace_scale = ctx.scale * 0.6;
     let grace_step = ctx.sp * 1.0;
-    let notehead_cp = 0xE0A4u32; // filled
-    let advance = font.glyph_advance(notehead_cp).unwrap_or(500.0) * grace_scale;
 
     let mut x = cursor_x;
     let mut first_grace_anchor: Option<(f64, f64)> = None;
 
     for note in notes {
-        let pos = note_to_staff_position(&note.pitch, note.octave, ctx.clef);
-        let y = ctx.y_at(pos);
+        let head = if ctx.clef == Clef::Percussion {
+            StaffNote::percussion(kit.grace(note), 0xE0A4)
+        } else {
+            StaffNote::pitched(note, ctx.clef, 0xE0A4)
+        };
+        let advance = font.glyph_advance(head.codepoint).unwrap_or(500.0) * grace_scale;
+        let y = ctx.y_at(head.pos);
 
         // Accidental in front of the grace head, also small.
-        if let Some(acc) = note.accidental {
+        if let Some(acc) = head.accidental {
             elements.push(EngravingElement::Glyph {
                 codepoint: accidental_codepoint(acc),
                 x: x - ctx.sp * 0.5,
@@ -1115,7 +1200,7 @@ fn emit_grace_notes(
         }
 
         elements.push(EngravingElement::Glyph {
-            codepoint: notehead_cp,
+            codepoint: head.codepoint,
             x,
             y,
             scale: grace_scale,
@@ -1537,59 +1622,24 @@ fn close_volta_bracket(
 
 // --- Element emission -------------------------------------------------------
 
-/// Emit a notehead, accidental, ledger lines, stem, and (unless
-/// `suppress_flag`) a flag. When `forced_stem_up` is `Some`, the stem
-/// direction overrides the default pitch-based heuristic so all
-/// stems in a beam group point the same way.
-// Per-call state falls into three independent groups (staff geometry, the
-// note's own source span/flags, beam-group layout hints) that don't share
-// a natural owning struct — not incidental clutter a builder would trim.
+/// Beamed notes get their stems from the completed beam group.
 #[allow(clippy::too_many_arguments)]
 fn emit_note_with(
     elements: &mut Vec<EngravingElement>,
     note: &Note,
+    head: StaffNote,
     cursor_x: f64,
     ctx: StaffCtx,
     unit_width: f64,
     unit: &UnitLength,
     span: SourceSpan,
-    suppress_flag: bool,
-    forced_stem_up: Option<bool>,
+    beamed: bool,
 ) -> f64 {
-    let pos = ctx.pos_for(&note.pitch, note.octave);
-    let y = ctx.y_at(pos);
-
-    if let Some(acc) = note.accidental {
-        elements.push(EngravingElement::Glyph {
-            codepoint: accidental_codepoint(acc),
-            x: cursor_x - ctx.sp * 0.8,
-            y,
-            scale: ctx.scale,
-            source_span: span,
-        });
-    }
-
-    let cp = notehead_codepoint(&note.duration, unit);
-    let notehead_width = font_cache().glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
-    elements.push(EngravingElement::Glyph {
-        codepoint: cp,
-        x: cursor_x,
-        y,
-        scale: ctx.scale,
-        source_span: span,
-    });
-
-    emit_dots(elements, dot_count(&note.duration), cursor_x + notehead_width, y, ctx, span);
-
-    emit_ledger_lines(elements, pos, cursor_x, notehead_width, ctx, span);
-    // Beamed notes (forced_stem_up = Some) get their stems drawn by
-    // `emit_beam`, which knows the final (slope-clamped) beam line each
-    // stem must reach. Un-beamed notes draw their own fixed-length stem.
-    if forced_stem_up.is_none() {
-        emit_stem(elements, pos, cursor_x, ctx, &note.duration, unit, span);
-    }
-    if !suppress_flag {
-        emit_flag(elements, pos, cursor_x, ctx, &note.duration, unit, span);
+    head.emit(elements, cursor_x, ctx, span);
+    emit_dots(elements, dot_count(&note.duration), cursor_x + head.width(ctx), ctx.y_at(head.pos), ctx, span);
+    if !beamed {
+        emit_stem(elements, head, cursor_x, ctx, &note.duration, unit, span);
+        emit_flag(elements, head, cursor_x, ctx, &note.duration, unit, span);
     }
 
     cursor_x + duration_to_width(&note.duration, unit_width)
@@ -1603,12 +1653,11 @@ fn emit_note_with(
 /// `base_stem` long; every other stem is drawn from its notehead up/down to
 /// wherever the beam crosses that stem's x. Secondary beams (16ths, 32nds)
 /// stack toward the noteheads.
-fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: StaffCtx) {
-    if accum.stems.len() < 2 {
+fn emit_beam(elements: &mut Vec<EngravingElement>, stems: &[BeamStem], ctx: StaffCtx) {
+    if stems.len() < 2 {
         return;
     }
-    let beam_levels = accum
-        .stems
+    let beam_levels = stems
         .iter()
         .map(|s| s.beam_count)
         .max()
@@ -1624,11 +1673,16 @@ fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: Staff
     // even across big leaps; ~0.25 reads as a clear-but-calm slant.
     const MAX_SLOPE: f64 = 0.25;
 
-    let stems = &accum.stems;
-    let first = stems[0];
-    let last = stems[stems.len() - 1];
-    let x0 = first.stem_x;
-    let dx = last.stem_x - x0;
+    // Choose the direction from the head farthest from the middle line.
+    let top = stems.iter().map(|s| s.note_y).fold(f64::INFINITY, f64::min);
+    let bottom = stems.iter().map(|s| s.note_y).fold(f64::NEG_INFINITY, f64::max);
+    let middle = ctx.y_at(2.0);
+    let stem_up = bottom - middle >= middle - top;
+    let stem_x = |s: &BeamStem| stem_center_x(s.head_x, s.head_width, stem_up);
+    let first = &stems[0];
+    let last = &stems[stems.len() - 1];
+    let x0 = stem_x(first);
+    let dx = stem_x(last) - x0;
 
     let raw_slope = if dx.abs() > 1e-6 {
         (last.note_y - first.note_y) / dx
@@ -1641,16 +1695,16 @@ fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: Staff
     // that gives the closest note exactly `base_stem` of stem.
     // g_i = note_y_i - slope*(x_i - x0); stem_up beam is above (smaller y),
     // stem_down beam is below (larger y).
-    let beam_y0 = if accum.stem_up {
+    let beam_y0 = if stem_up {
         stems
             .iter()
-            .map(|s| s.note_y - slope * (s.stem_x - x0))
+            .map(|s| s.note_y - slope * (stem_x(s) - x0))
             .fold(f64::INFINITY, f64::min)
             - base_stem
     } else {
         stems
             .iter()
-            .map(|s| s.note_y - slope * (s.stem_x - x0))
+            .map(|s| s.note_y - slope * (stem_x(s) - x0))
             .fold(f64::NEG_INFINITY, f64::max)
             + base_stem
     };
@@ -1659,10 +1713,10 @@ fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: Staff
     // Stems: from each notehead to the primary beam line.
     for s in stems {
         elements.push(EngravingElement::Line {
-            x1: s.stem_x,
+            x1: stem_x(s),
             y1: s.note_y,
-            x2: s.stem_x,
-            y2: beam_y(s.stem_x),
+            x2: stem_x(s),
+            y2: beam_y(stem_x(s)),
             width: STEM_WIDTH,
             source_span: (0, 0),
         });
@@ -1675,10 +1729,10 @@ fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: Staff
     // beam ends flush with the stems rather than at their centerlines.
     // Thickness is measured vertically (the engraving convention); secondary
     // beams stack toward the noteheads.
-    let toward_heads = if accum.stem_up { 1.0 } else { -1.0 };
+    let toward_heads = if stem_up { 1.0 } else { -1.0 };
     let half_t = beam_thickness / 2.0;
-    let bx_l = first.stem_x - STEM_WIDTH / 2.0;
-    let bx_r = last.stem_x + STEM_WIDTH / 2.0;
+    let bx_l = stem_x(first) - STEM_WIDTH / 2.0;
+    let bx_r = stem_x(last) + STEM_WIDTH / 2.0;
     for level in 0..beam_levels {
         let off = level as f64 * beam_spacing * toward_heads;
         let yl = beam_y(bx_l) + off;
@@ -1896,21 +1950,20 @@ fn stem_center_x(x_left: f64, notehead_width: f64, up: bool) -> f64 {
 
 fn emit_stem(
     elements: &mut Vec<EngravingElement>,
-    pos: f64,
+    head: StaffNote,
     x: f64,
     ctx: StaffCtx,
     duration: &Duration,
     unit: &UnitLength,
     span: SourceSpan,
 ) {
+    let pos = head.pos;
     let abs = absolute_ratio(duration, unit);
     if abs >= 1.0 {
         return;
     }
 
-    let font = font_cache();
-    let cp = notehead_codepoint(duration, unit);
-    let notehead_width = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+    let notehead_width = head.width(ctx);
 
     let stem_length = ctx.sp * 3.5;
     let note_y = ctx.y_at(pos);
@@ -1935,13 +1988,14 @@ fn emit_stem(
 
 fn emit_flag(
     elements: &mut Vec<EngravingElement>,
-    pos: f64,
+    head: StaffNote,
     x: f64,
     ctx: StaffCtx,
     duration: &Duration,
     unit: &UnitLength,
     span: SourceSpan,
 ) {
+    let pos = head.pos;
     let abs = absolute_ratio(duration, unit);
 
     let flag_cp = if abs <= 0.0625 {
@@ -1961,9 +2015,7 @@ fn emit_flag(
     };
 
     if let Some(cp) = flag_cp {
-        let font = font_cache();
-        let notehead_cp = notehead_codepoint(duration, unit);
-        let notehead_width = font.glyph_advance(notehead_cp).unwrap_or(500.0) * ctx.scale;
+        let notehead_width = head.width(ctx);
 
         let stem_length = ctx.sp * 3.5;
         let note_y = ctx.y_at(pos);
@@ -1985,6 +2037,30 @@ fn emit_flag(
             source_span: span,
         });
     }
+}
+
+fn emit_key_signature(
+    elements: &mut Vec<EngravingElement>,
+    key: &Key,
+    mut x: f64,
+    ctx: StaffCtx,
+) -> f64 {
+    let (count, sharp) = key.signature();
+    let placements = if sharp { sharp_octaves(ctx.clef) } else { flat_octaves(ctx.clef) };
+    if placements.is_empty() || count == 0 {
+        return x;
+    }
+    for &(note, octave) in placements.iter().take(count as usize) {
+        elements.push(EngravingElement::Glyph {
+            codepoint: if sharp { 0xE262 } else { 0xE260 },
+            x,
+            y: ctx.y_at(note_to_staff_position(&note, octave, ctx.clef)),
+            scale: ctx.scale,
+            source_span: (0, 0),
+        });
+        x += ctx.sp;
+    }
+    x + ctx.sp * 0.5
 }
 
 fn emit_time_sig_digit(
@@ -2276,3 +2352,71 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod system_tests {
+    use super::*;
+
+    fn trio() -> Tune {
+        let mut source = String::from(
+            "X:1\nT:Trio\nM:4/4\nL:1/8\nV:lead clef=treble\nV:bass clef=bass\nV:drums clef=perc\nK:G\n",
+        );
+        for (voice, measure) in [("lead", "GABc d2e2|"), ("bass", "G,4 D,4|"), ("drums", "G2z2 G2z2|")] {
+            source.push_str(&format!("[V:{voice}] {}\n", measure.repeat(16)));
+        }
+        crate::parse(&source).value.remove(0)
+    }
+
+    #[test]
+    fn continues_key_and_clef_after_a_system_break() {
+        let source = "X:1\nL:1/8\nK:C\n[K:G clef=bass] CDEF GABc|CDEF GABc|\n";
+        let tune = crate::parse(source).value.remove(0);
+        let systems = engrave_systems(&tune, &EngravingOptions::default(), 380.0);
+        assert_eq!(systems.len(), 2);
+        for codepoint in [0xE062, 0xE262] {
+            assert!(systems[1].iter().any(|element| matches!(element,
+                EngravingElement::Glyph { codepoint: cp, .. } if *cp == codepoint
+            )));
+        }
+    }
+
+    #[test]
+    fn ties_and_slurs_stay_with_both_endpoint_notes() {
+        let source = "X:1\nL:1/8\nK:C\nCDEF GABc-|cBAG FEDC|(CDEF GABc|cBAG FEDC)|CDEF GABc|\n";
+        let tune = crate::parse(source).value.remove(0);
+        let options = EngravingOptions::default();
+        let systems = engrave_systems(&tune, &options, 300.0);
+        let paths = |elements: &[EngravingElement]| elements.iter().filter(|element| {
+            matches!(element, EngravingElement::Path { .. })
+        }).count();
+        assert_eq!(systems.len(), 3);
+        assert_eq!(systems.iter().map(|system| paths(system)).sum::<usize>(), paths(&engrave(&tune, &options)));
+    }
+
+    #[test]
+    fn wraps_all_three_staves_at_shared_bars() {
+        let tune = trio();
+        let options = EngravingOptions::default();
+        let systems = engrave_systems(&tune, &options, 660.0);
+        assert!(systems.len() > 1);
+        assert!(systems.iter().all(|system| {
+            assert!(engraving_bounds(system, options.margin).width <= 660.0);
+            let clefs = system.iter().filter(|element| matches!(element,
+                EngravingElement::Glyph { codepoint: 0xE050 | 0xE062 | 0xE069, .. }
+            )).count();
+            let staff_lines = system.iter().filter(|element| matches!(element,
+                EngravingElement::Line { x1, x2, width, .. } if *x1 == 0.0 && *width == 0.5 && *x2 <= 660.0
+            )).count();
+            clefs == 3 && staff_lines == 15
+        }));
+        assert_eq!(systems.iter().flatten().filter(|element| matches!(element,
+            EngravingElement::Text { content, .. } if content == "Trio"
+        )).count(), 1);
+
+        let notes = |system: &[EngravingElement]| system.iter().filter(|element| matches!(element,
+            EngravingElement::Glyph { codepoint: 0xE0A2..=0xE0A4, .. }
+        )).count();
+        assert_eq!(systems.iter().map(|system| notes(system)).sum::<usize>(), notes(&engrave(&tune, &options)));
+        assert!(engrave_systems(&tune, &options, 1000.0).len() < systems.len());
+    }
+}

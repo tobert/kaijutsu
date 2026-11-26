@@ -3,13 +3,14 @@
 //! Renders every visible `WorkStatus` record using shared sloped-disc, wireframe,
 //! and ring meshes, and drives strike-line pad flashes and expanding hit rings.
 
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use kaijutsu_present::work::{NoteVisualState, classify_note};
-use kaijutsu_types::Tick;
+use kaijutsu_types::{ContextId, Tick};
 
 use super::state::HeroicState;
 use crate::view::scene_palette::{HeroicPalette, heroic_identity_color};
@@ -23,14 +24,13 @@ pub struct HeroicWireNotesBatch;
 #[derive(Default)]
 pub struct PadPulseState {
     pub elapsed: f32,
-    pub active: bool,
     pub color: LinearRgba,
     pub hollow: bool,
 }
 
 #[derive(Resource, Default)]
 pub struct HeroicNotesRuntime {
-    pub pad_pulses: Vec<PadPulseState>,
+    pub pad_pulses: HashMap<ContextId, PadPulseState>,
 }
 
 /// Spawn batched note meshes and strike pads under `root`.
@@ -236,29 +236,26 @@ pub fn sync_notes_and_pads(
         .map(|tf| tf.translation)
         .unwrap_or(Vec3::new(0.0, 2.25, 3.33));
 
-    if runtime.pad_pulses.len() != state.lanes.len() {
-        runtime
-            .pad_pulses
-            .resize_with(state.lanes.len(), PadPulseState::default);
-    }
-    for p in &mut runtime.pad_pulses {
-        if p.active {
-            p.elapsed += dt;
-            if p.elapsed >= pulse_dur {
-                p.active = false;
-            }
-        }
-    }
+    runtime.pad_pulses.retain(|_, pulse| {
+        pulse.elapsed += dt;
+        pulse.elapsed < pulse_dur
+    });
     for flash in state.pending_flashes.drain(..) {
-        if let Some(slot) = runtime.pad_pulses.get_mut(flash.lane_idx) {
-            slot.active = true;
-            slot.elapsed = 0.0;
-            slot.color = flash.color;
-            slot.hollow = flash.hollow;
-        }
+        runtime.pad_pulses.insert(flash.context_id, PadPulseState {
+            elapsed: 0.0,
+            color: flash.color,
+            hollow: flash.hollow,
+        });
     }
 
-    let sel_lane = state.selected_location().map(|(li, _)| li);
+    let lane_dim = |performer: Option<&super::state::HeroicPerformer>| {
+        match state.selected_performer {
+            Some(selected) if performer.is_none_or(|p| p.context_id != selected) => {
+                palette.unselected_opacity
+            }
+            _ => 1.0,
+        }
+    };
     let trouble_dim = if state.any_alarm() { 0.67 } else { 1.0 };
 
     let lane_w = palette.lane_width;
@@ -276,17 +273,16 @@ pub fn sync_notes_and_pads(
     let mut wire_col = Vec::new();
 
     // Strike pads at z = 0 (`docs/newui.md`, "Strike line and pads").
-    for (li, _) in state.lanes.iter().enumerate() {
+    for (li, (_, performer, _)) in state.road_lanes().enumerate() {
         let cx = state.lane_center_x(li, lane_w);
-        let dim = match sel_lane {
-            Some(sel) if sel != li => palette.unselected_opacity,
-            _ => 1.0,
-        };
-        let pulse = &runtime.pad_pulses[li];
+        let dim = lane_dim(performer);
+        let color = performer
+            .map(|p| heroic_identity_color(p.lane_name()))
+            .unwrap_or(palette.rail);
         let base_pad_col = [
-            palette.rail.red * 0.6 * dim,
-            palette.rail.green * 0.6 * dim,
-            palette.rail.blue * 0.6 * dim,
+            color.red * 0.75 * dim,
+            color.green * 0.75 * dim,
+            color.blue * 0.75 * dim,
             1.0,
         ];
         append_ring_flat(
@@ -300,7 +296,7 @@ pub fn sync_notes_and_pads(
             base_pad_col,
         );
 
-        if pulse.active {
+        if let Some(pulse) = performer.and_then(|p| runtime.pad_pulses.get(&p.context_id)) {
             let t = (pulse.elapsed / pulse_dur).clamp(0.0, 1.0);
             let fade = 1.0 - t;
             let flash_scale = (1.5 + 0.8 * fade) * dim;
@@ -357,23 +353,13 @@ pub fn sync_notes_and_pads(
 
     // Notes across all lanes and performers.
     for (li, lane) in state.lanes.iter().enumerate() {
-        let base_cx = state.lane_center_x(li, lane_w);
-        let n_perf = lane.performers.len().max(1);
-        let dim = match sel_lane {
-            Some(sel) if sel != li => palette.unselected_opacity,
-            _ => 1.0,
-        };
         let playhead = Tick::new(lane.playhead_beats.floor() as i64);
         let margin = kaijutsu_types::TickDelta::new(lane.commit_margin_ticks);
 
         for (pi, perf) in lane.performers.iter().enumerate() {
-            let x_spread = if n_perf == 1 {
-                0.0
-            } else {
-                (pi as f32 / (n_perf - 1) as f32 - 0.5) * (lane_w * 0.42)
-            };
-            let cx = base_cx + x_spread;
-            let perf_col = heroic_identity_color(&perf.character);
+            let cx = state.performer_lane_center_x(li, pi, lane_w);
+            let dim = lane_dim(Some(perf));
+            let perf_col = heroic_identity_color(perf.lane_name());
             let is_perf_alarm = perf.slack.state == kaijutsu_present::work::SlackState::Alarm;
             let note_dim = dim * if is_perf_alarm { 1.0 } else { trouble_dim };
 

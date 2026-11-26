@@ -1,0 +1,3 @@
+# The clock and done lifecycle run the observer. The model needs no shell.
+set -e
+kj binding allow "drive"

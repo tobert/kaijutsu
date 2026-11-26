@@ -707,7 +707,7 @@ fn extract_msdf_blocks(
     for (msdf_glyphs, msdf_geometry, texture) in query.iter() {
         let asset_id = texture.image.id();
         let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
-        if !should_extract_msdf_block(msdf_glyphs.version, msdf_glyphs.glyphs.is_empty(), last) {
+        if !should_extract_msdf_block(msdf_glyphs.version, msdf_glyphs.glyphs.is_empty(), last, texture) {
             continue;
         }
 
@@ -754,8 +754,8 @@ fn extract_msdf_render_params(
 /// A block needs extraction when its version has advanced past what was last rendered.
 /// This includes blocks whose glyphs became empty — they still need a clear pass to
 /// remove stale texture content. Version 0 means the block was never initialized.
-fn should_extract_msdf_block(version: u64, _glyphs_empty: bool, last_rendered: u64) -> bool {
-    if version == 0 {
+fn should_extract_msdf_block(version: u64, _glyphs_empty: bool, last_rendered: u64, texture: &UiRttTexture) -> bool {
+    if version == 0 || texture.width == 0 || texture.height == 0 {
         return false;
     }
     version > last_rendered
@@ -913,22 +913,28 @@ mod tests {
     // -- should_extract_msdf_block -----------------------------------------
 
     #[test]
+    fn unallocated_texture_waits_for_resize_before_extraction() {
+        let texture = UiRttTexture::default();
+        assert!(!should_extract_msdf_block(1, false, 0, &texture));
+    }
+
+    #[test]
     fn extract_normal_glyphs_with_advanced_version() {
         // Standard case: non-empty glyphs, version ahead of last render.
-        assert!(should_extract_msdf_block(3, false, 2));
+        assert!(should_extract_msdf_block(3, false, 2, &UiRttTexture { width: 1, height: 1, ..default() }));
     }
 
     #[test]
     fn skip_when_version_zero() {
         // Initial state — never had glyphs, nothing to render or clear.
-        assert!(!should_extract_msdf_block(0, true, 0));
-        assert!(!should_extract_msdf_block(0, false, 0));
+        assert!(!should_extract_msdf_block(0, true, 0, &UiRttTexture { width: 1, height: 1, ..default() }));
+        assert!(!should_extract_msdf_block(0, false, 0, &UiRttTexture { width: 1, height: 1, ..default() }));
     }
 
     #[test]
     fn skip_when_already_rendered() {
         // Version matches last_rendered — no work needed.
-        assert!(!should_extract_msdf_block(5, false, 5));
+        assert!(!should_extract_msdf_block(5, false, 5, &UiRttTexture { width: 1, height: 1, ..default() }));
     }
 
     #[test]
@@ -936,13 +942,13 @@ mod tests {
         // THE BUG: text was "aaa", user backspaced to empty.
         // Version advanced (text changed) but glyphs are now empty.
         // Must still extract so the render pass can clear stale glyph pixels.
-        assert!(should_extract_msdf_block(6, true, 3));
+        assert!(should_extract_msdf_block(6, true, 3, &UiRttTexture { width: 1, height: 1, ..default() }));
     }
 
     #[test]
     fn skip_empty_glyphs_already_cleared() {
         // Empty glyphs at a version we already rendered (cleared).
         // No need to re-clear.
-        assert!(!should_extract_msdf_block(6, true, 6));
+        assert!(!should_extract_msdf_block(6, true, 6, &UiRttTexture { width: 1, height: 1, ..default() }));
     }
 }

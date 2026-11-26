@@ -58,6 +58,7 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 ## Heroic view follow-ups (2026-11-21)
 
 - Live kernel work updates still poll `kj transport work --track <id>` at 1 Hz via `execute_kj_quiet` (`view/heroic/live.rs`); a dedicated work-status wire event + measured performer lead field remains future work (`docs/newui.md`, "The live driver").
+- Work records identify the performer by principal. When two contexts on a track share a performer, Heroic shows both lanes and leaves their work unassigned. Context-level attribution needs the originating context on the record.
 - Audio spectrum hills currently derive 16-band energy from beat crossings and `RenderCue` onsets rather than FFT of mixed audio frames.
 - Heroic demo/test scenarios should be driven via a kernel/fixture script that creates and plays real tracks over RPC rather than a client-side fake driver (`view/heroic/fake.rs` removed).
 - Council `/decide` turns currently emit only the final chosen ABC text block without persisting per-slot pooled option probability distributions on the block or `WorkStatus`, so live 3D candidate probability bars (`HeroicPerformer.candidates`) remain unpopulated until decision weights cross the wire.
@@ -342,6 +343,9 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
   - A leader's chat message moves the answer only when each option has a description in words, and the performer's own earlier phrases outweigh it.
   - Audio in a decision works as an audio part of a context message (0.99 "sparse", 1.00 "busy" on test clips). The same clip as `case_media` is read but changes nothing; this is the nagaya's to examine. In a generation, omni called an 82 Hz tone "high-pitched".
   - The lfm engines left zorak's served list for about a minute and came back; a player must survive that.
+- **Cold restart can rewind a playing track.** The trio restarted at tick 4404 with later committed phrases already in its score. Check the first attachment's playhead seed against the score context's latest committed tick, including after a rotation. Reproduce by restarting the server while a multi-performer track is playing.
+- **Reading a track score in Bevy.** Conversation now wraps the score at bar lines as the pane resizes. The MIDI sibling shows as a bare CAS hash, and each untitled phrase is labeled `Score X:1` even though the block carries the track and tick. The empty score before the first commit gives no indication of when a phrase is due.
+
 - **Listening players: what is open.** `kj audio render` turns CAS notation or MIDI, or a track's last phrases, into a WAV in the CAS, and a musician with `KJ_LISTEN=<track>` gets that clip in its context before each turn (`rc/musician/tick/S10-drive.kai`). From the first live run and a kaibo review:
   - Prior listening blocks in the context are now excluded (`KJ_LISTEN_KEEP`), but older WAV blobs still accumulate in CAS with no blob pruning (~250 KB a phrase at 16 kHz).
   - A decision turn with clips in its context took 18 to 32 s on `lfm3-omni`, against 4 s without, and it grows as the kept history holds more clips. Each of the 16 decisions reads the audio again. The lead adapts and phrases commit, with repeats between them; one committed with no margin left.

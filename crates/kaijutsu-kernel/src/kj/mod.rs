@@ -424,6 +424,7 @@ pub struct KjDispatcher {
     semantic_index: parking_lot::RwLock<Option<Arc<kaijutsu_index::SemanticIndex>>>,
     /// Per-character sliding-window rate limiter for `open` boards.
     board_rate_limiter: Arc<board::BoardRateLimiter>,
+    notes_write: tokio::sync::Mutex<()>,
 }
 
 impl KjDispatcher {
@@ -471,6 +472,7 @@ impl KjDispatcher {
             weak_self: parking_lot::RwLock::new(None),
             semantic_index: parking_lot::RwLock::new(None),
             board_rate_limiter: Arc::new(board::BoardRateLimiter::default()),
+            notes_write: tokio::sync::Mutex::new(()),
         }
     }
 

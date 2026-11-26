@@ -107,6 +107,7 @@ pub struct EditorOpenRequested {
 /// `state` (text/cursor/mode) each frame.
 #[derive(Resource, Default, Debug)]
 pub struct ActiveEditor {
+    return_screen: Option<Screen>,
     /// The live session, or `None` when no editor is open.
     pub session: Option<EditorSessionView>,
     /// A local notice the strip shows when the kernel has nothing to say: set
@@ -136,6 +137,7 @@ fn handle_editor_open(
     mut events: MessageReader<EditorOpenRequested>,
     mut active: ResMut<ActiveEditor>,
     actor: Option<Res<RpcActor>>,
+    screen: Res<State<Screen>>,
     mut next_screen: ResMut<NextState<Screen>>,
 ) {
     for ev in events.read() {
@@ -146,6 +148,9 @@ fn handle_editor_open(
         // A new session replaces the old one; keys already queued carry their
         // session, so they cannot leak into the new one.
         active.notice = None;
+        if *screen.get() != Screen::Editor {
+            active.return_screen = Some(*screen.get());
+        }
         active.session = Some(EditorSessionView {
             session: ev.state.session,
             generation: actor.as_ref().map_or(0, |a| a.generation),
@@ -181,7 +186,7 @@ fn handle_editor_events(
             {
                 info!("editor session {session_id} closed by server");
                 active.session = None;
-                        next_screen.set(Screen::Conversation);
+                next_screen.set(active.return_screen.take().unwrap_or(Screen::Conversation));
             }
             _ => {}
         }
@@ -772,6 +777,18 @@ mod tests {
             app.world().resource::<NextState<Screen>>(),
             NextState::Pending(Screen::Conversation)
         )
+    }
+
+    #[test]
+    fn closing_editor_returns_to_heroic() {
+        let mut app = test_app();
+        app.add_message::<ServerEventMessage>().add_systems(Update, handle_editor_events);
+        open_session(&mut app, 7, 1);
+        app.world_mut().resource_mut::<ActiveEditor>().return_screen = Some(Screen::Heroic);
+        app.world_mut().write_message(ServerEventMessage(ServerEvent::EditorClosed { session_id: 7 }));
+        app.update();
+        assert!(matches!(app.world().resource::<NextState<Screen>>(), NextState::Pending(Screen::Heroic)));
+        assert!(app.world().resource::<ActiveEditor>().session.is_none());
     }
 
     #[test]

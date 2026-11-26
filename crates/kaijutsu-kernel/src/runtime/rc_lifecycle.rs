@@ -52,7 +52,7 @@ pub fn submit(
 /// The turn is already over, so nothing here may fail it: a context that
 /// cannot run the verb (no dispatcher, a full worker pool, archived) is
 /// logged and skipped.
-pub(crate) async fn fire_done(kernel: &Arc<crate::Kernel>, context: kaijutsu_types::ContextId, ending: crate::rc::DoneInfo) {
+pub(crate) async fn fire_done(kernel: &Arc<crate::Kernel>, context: kaijutsu_types::ContextId, input: kaijutsu_types::BlockId, ending: crate::rc::DoneInfo) {
     let Some(dispatcher) = kernel.broker().kj_dispatcher().await else {
         tracing::debug!(%context, "no kj dispatcher is wired; the done verb is skipped");
         return;
@@ -71,7 +71,9 @@ pub(crate) async fn fire_done(kernel: &Arc<crate::Kernel>, context: kaijutsu_typ
             return;
         }
     };
-    if let Err(error) = submit(dispatcher, admission, slot, crate::rc::VERB_DONE, ending.vars()) {
+    let mut vars = ending.vars();
+    vars.insert("KJ_INPUT_BLOCK".into(), input.to_key());
+    if let Err(error) = submit(dispatcher, admission, slot, crate::rc::VERB_DONE, vars) {
         tracing::warn!(%context, "the done verb could not start: {error}");
     }
 }

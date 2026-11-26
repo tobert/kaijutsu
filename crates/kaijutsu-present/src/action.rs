@@ -211,6 +211,8 @@ pub enum Action {
     GoToWell,
     /// `Ctrl+A k` — enter the heroic view (`Screen::Heroic`).
     GoToHeroic,
+    /// Open a board note for the selected Heroic performer.
+    HeroicBoardNote,
     /// `Ctrl+A e` — toggle the Neo workspace beside the conversation.
     ToggleNeo,
     /// Switch between the Neo workbench and event history.

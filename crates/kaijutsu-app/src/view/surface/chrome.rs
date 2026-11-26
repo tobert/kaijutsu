@@ -1350,6 +1350,7 @@ mod tests {
                 indent_level: 0,
                 metrics_epoch: 0,
                 baked_theme_epoch: 0,
+            abc_raster_scale_bits: 0,
             },
             chunks: Vec::new(),
             height: 40.0,

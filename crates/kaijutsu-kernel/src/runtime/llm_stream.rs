@@ -2975,7 +2975,7 @@ async fn process_llm_stream(
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
             if let Some(ending) = ending {
-                super::rc_lifecycle::fire_done(&kernel, context_id, ending).await;
+                super::rc_lifecycle::fire_done(&kernel, context_id, panic_anchor, ending).await;
             }
             if let Some((rotation, _settled)) = rotation {
                 settle_rotation(&kernel, rotation).await;

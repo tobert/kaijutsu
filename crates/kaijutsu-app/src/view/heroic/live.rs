@@ -14,7 +14,7 @@ use kaijutsu_audio::RENDER_FLUSH_MIME;
 use kaijutsu_client::ServerEvent;
 use kaijutsu_hyoushigi::{Disposition, FallbackReason, WorkStatus};
 use kaijutsu_present::work::compute_performer_slack;
-use kaijutsu_types::{BlockKind, ContextId, Role};
+use kaijutsu_types::{BlockKind, ContextId, PrincipalId, Role};
 
 use super::state::{
     ConstellationStar, HeroicLane, HeroicPerformer, HeroicState, PadFlashEvent,
@@ -35,6 +35,13 @@ pub struct HeroicLiveCache {
     last_track_poll: f64,
     last_work_poll: f64,
     last_beat_by_track: HashMap<String, i64>,
+    performer_info: HashMap<ContextId, PerformerInfo>,
+    in_flight_performers: HashMap<ContextId, f64>,
+}
+
+struct PerformerInfo {
+    principal_id: Option<PrincipalId>,
+    chair: Option<String>,
 }
 
 /// Fire a one-shot track listing when entering `Screen::Heroic` so live
@@ -81,6 +88,35 @@ pub fn poll_heroic_live_data(
 
     if now - cache.last_work_poll >= LIVE_POLL_INTERVAL_SECS {
         cache.last_work_poll = now;
+        cache.in_flight_performers.retain(|_, started| now - *started < 5.0);
+        let attached_contexts = tracks.tracks.iter().filter(|t| t.playing)
+            .flat_map(|t| t.attached.iter().copied());
+        for context_id in attached_contexts {
+            if cache.performer_info.contains_key(&context_id) || cache.in_flight_performers.contains_key(&context_id) {
+                continue;
+            }
+            cache.in_flight_performers.insert(context_id, now);
+            let handle = actor.handle.clone();
+            let tx = result_channel.sender();
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    let argv = vec!["context".into(), "info".into(), context_id.to_hex()];
+                    if let Ok(result) = handle.execute_kj_quiet(context_id, argv).await
+                        && result.exit_code == 0
+                        && let Some(data) = result.data
+                    {
+                        let principal_id = data["performer"].as_str().and_then(|s| PrincipalId::parse(s).ok());
+                        let rc_dir = data["rc"]["dir"].as_str().map(str::to_owned);
+                        let chair = data["env"]["KJ_CHAIR"].as_str().filter(|s| !s.is_empty())
+                            .or_else(|| (rc_dir.as_deref() == Some("musician")).then_some("bass"))
+                            .map(str::to_owned);
+                        let _ = tx.send(RpcResultMessage::HeroicPerformerReceived {
+                            context_id, principal_id, chair,
+                        });
+                    }
+                })
+                .detach();
+        }
         for track in tracks.tracks.iter().filter(|t| t.playing) {
             if cache.in_flight_tracks.contains_key(&track.id) {
                 continue;
@@ -144,6 +180,13 @@ pub fn apply_heroic_work_results(
                 cache.in_flight_tracks.remove(track_id);
                 cache.work_by_track.insert(track_id.clone(), statuses.clone());
             }
+            RpcResultMessage::HeroicPerformerReceived { context_id, principal_id, chair } => {
+                cache.in_flight_performers.remove(context_id);
+                cache.performer_info.insert(*context_id, PerformerInfo {
+                    principal_id: *principal_id,
+                    chair: chair.clone(),
+                });
+            }
             RpcResultMessage::TracksReceived { tracks: fresh } => {
                 if tracks.tracks != *fresh {
                     tracks.set_tracks(fresh.clone());
@@ -203,11 +246,13 @@ pub fn ingest_heroic_cues(
                         state.band_energies[band + 1] =
                             (state.band_energies[band + 1] + 0.45).min(1.5);
                     }
-                    state.pending_flashes.push(PadFlashEvent {
-                        lane_idx: li,
-                        color: palette.now,
-                        hollow: false,
-                    });
+                    if tracks.tracks.iter().any(|t| &t.id == track_id && t.attached.contains(context_id)) {
+                        state.pending_flashes.push(PadFlashEvent {
+                            context_id: *context_id,
+                            color: palette.now,
+                            hollow: false,
+                        });
+                    }
                 }
             }
             ServerEvent::BlockInserted { context_id, block, .. } => {
@@ -296,7 +341,7 @@ pub fn sync_heroic_state(
         drift.contexts.iter().map(|c| (c.id, c)).collect();
 
     let mut lanes = Vec::with_capacity(playing_tracks.len());
-    for (li, track) in playing_tracks.into_iter().enumerate() {
+    for track in playing_tracks {
         let period_secs = (track.period_us.max(1) as f32) / 1_000_000.0;
         let playhead_beats = if track.playing {
             beats
@@ -316,24 +361,34 @@ pub fn sync_heroic_state(
         let work = cache
             .work_by_track
             .get(&track.id)
-            .cloned()
-            .unwrap_or_default();
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
 
-        let attached_ids: Vec<ContextId> = if track.attached.is_empty() {
-            vec![track.score_context_id]
-        } else {
-            track.attached.clone()
-        };
+        let mut attached_ids = track.attached.clone();
+        attached_ids.sort_unstable();
+        let mut principal_counts = HashMap::new();
+        for context_id in &track.attached {
+            if let Some(id) = cache.performer_info.get(context_id).and_then(|p| p.principal_id) {
+                *principal_counts.entry(id).or_insert(0) += 1;
+            }
+        }
 
         let mut performers = Vec::with_capacity(attached_ids.len());
         for ctx_id in attached_ids {
             let info = ctx_map.get(&ctx_id).copied();
+            let performer = cache.performer_info.get(&ctx_id);
+            let principal_id = performer.and_then(|p| p.principal_id);
+            let work: Vec<_> = work.iter().filter(|w| {
+                principal_id == Some(w.played_by) && principal_counts.get(&w.played_by) == Some(&1)
+            }).cloned().collect();
             let character = info
                 .and_then(|c| c.performer.clone())
-                .unwrap_or_else(|| track.id.clone());
+                .unwrap_or_default();
             let label = info
                 .map(|c| c.label.clone())
-                .unwrap_or_else(|| track.id.clone());
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ctx_id.short());
+            let chair = performer.and_then(|p| p.chair.clone());
             let parent_context_id = info.and_then(|c| c.forked_from);
 
             // Lead stand-in: newest record's non-zero `estimate` until the wire event carries measured lead.
@@ -352,29 +407,32 @@ pub fn sync_heroic_state(
                 palette.alarm_beats,
             );
 
-            // Emit trouble pad flash on newly settled fallback crossing.
+            // Flash only the performer whose settled work reaches the strike line.
             if prev_beat.is_some_and(|p| beat_idx > p)
-                && let Some(rec) = work.iter().find(|r| r.start.0 == beat_idx)
-            {
-                let char_col = heroic_identity_color(&character);
-                match &rec.disposition {
-                    Some(Disposition::Fallback {
-                        reason: FallbackReason::Requested,
-                        ..
-                    }) => state.pending_flashes.push(PadFlashEvent {
-                        lane_idx: li,
-                        color: char_col,
-                        hollow: false,
-                    }),
-                    Some(Disposition::Fallback { content, .. }) => {
-                        state.pending_flashes.push(PadFlashEvent {
-                            lane_idx: li,
-                            color: palette.trouble,
-                            hollow: content.is_none(),
-                        })
+                && let Some(disposition) = work.iter().rev().find_map(|r| {
+                    if r.start.0 != beat_idx {
+                        return None;
                     }
-                    _ => {}
-                }
+                    match r.disposition.as_ref()? {
+                        d @ (Disposition::Committed { .. } | Disposition::Fallback { .. }) => Some(d),
+                        _ => None,
+                    }
+                })
+            {
+                let (color, hollow) = match disposition {
+                    Disposition::Committed { .. } => (palette.now, false),
+                    Disposition::Fallback {
+                        reason: FallbackReason::Requested,
+                        content,
+                        ..
+                    } => {
+                        let name = if character.is_empty() { &label } else { &character };
+                        (heroic_identity_color(chair.as_deref().unwrap_or(name)), content.is_none())
+                    }
+                    Disposition::Fallback { content, .. } => (palette.trouble, content.is_none()),
+                    Disposition::Cancelled | Disposition::Superseded { .. } => unreachable!(),
+                };
+                state.pending_flashes.push(PadFlashEvent { context_id: ctx_id, color, hollow });
             }
 
             let tail = tail_lines(&tails, ctx_id, 6, 48)
@@ -430,11 +488,12 @@ pub fn sync_heroic_state(
 
             performers.push(HeroicPerformer {
                 context_id: ctx_id,
+                principal_id,
                 parent_context_id,
                 character,
                 label,
-                rc_dir: "musician".into(),
-                statuses: work.clone(),
+                chair,
+                statuses: work,
                 lead_beats,
                 slack,
                 candidates: Vec::new(),
@@ -482,6 +541,9 @@ pub fn sync_heroic_state(
         .collect();
 
     state.lanes = lanes;
+    if state.selected_performer.is_some() && state.selected_location().is_none() {
+        state.selected_performer = None;
+    }
 }
 
 #[cfg(test)]
@@ -504,19 +566,67 @@ mod tests {
         }
     }
 
+    fn make_work(played_by: PrincipalId, start: i64, disposition: Option<Disposition>) -> WorkStatus {
+        use kaijutsu_hyoushigi::{Readiness, WorkId};
+        use kaijutsu_types::{Tick, TickDelta, TrackId};
+
+        WorkStatus {
+            id: WorkId(uuid::Uuid::nil()),
+            track: TrackId::new("ensemble").unwrap(),
+            played_by,
+            start: Tick::new(start),
+            admitted_at: Tick::new(start - 1),
+            estimate: TickDelta::new(1),
+            estimate_wall: Duration::from_secs(1),
+            prepare_at: Tick::new(start - 1),
+            attempt: 0,
+            started_at: None,
+            ready_at: None,
+            readiness: Readiness::Queued,
+            predicted: None,
+            actual: None,
+            valid: None,
+            error: None,
+            timing: None,
+            settled_at: disposition.as_ref().map(|_| Tick::new(start)),
+            disposition,
+        }
+    }
+
     #[test]
-    fn dormant_tracks_are_filtered_out_of_live_lanes() {
+    fn attached_performers_share_a_track_clock_and_keep_their_own_lanes() {
         let mut world = World::new();
         world.insert_resource(Time::<()>::default());
         world.insert_resource(HeroicPalette::default());
         let mut wt = WellTracks::default();
-        wt.tracks = vec![make_track("dormant-smoke", false), make_track("live-bass", true)];
+        let mut ensemble = make_track("ensemble", true);
+        let bass = ContextId::from_bytes([1; 16]);
+        let drums = ContextId::from_bytes([2; 16]);
+        ensemble.attached = vec![drums, bass];
+        wt.tracks = vec![make_track("dormant-smoke", false), ensemble];
         world.insert_resource(wt);
         world.insert_resource(WellBeatsRes::default());
         world.insert_resource(DriftState::default());
         world.insert_resource(ContextTails::default());
-        world.insert_resource(HeroicLiveCache::default());
-        world.insert_resource(HeroicState::default());
+        let bass_principal = PrincipalId::new();
+        let drums_principal = PrincipalId::new();
+        let mut cache = HeroicLiveCache::default();
+        for (ctx, principal_id, chair) in [(bass, bass_principal, "bass"), (drums, drums_principal, "drums")] {
+            cache.performer_info.insert(ctx, PerformerInfo {
+                principal_id: Some(principal_id),
+                chair: Some(chair.into()),
+            });
+        }
+        cache.work_by_track.insert("ensemble".into(), vec![
+            make_work(bass_principal, 2, None),
+            make_work(drums_principal, 1, Some(Disposition::Fallback {
+                reason: FallbackReason::DeadlineMissed,
+                policy: kaijutsu_hyoushigi::Fallback::Skip,
+                content: None,
+            })),
+        ]);
+        world.insert_resource(cache);
+        world.insert_resource(HeroicState { selected_performer: Some(drums), ..default() });
 
         let mut schedule = Schedule::default();
         schedule.add_systems(sync_heroic_state);
@@ -524,7 +634,39 @@ mod tests {
 
         let state = world.resource::<HeroicState>();
         assert_eq!(state.lanes.len(), 1);
-        assert_eq!(state.lanes[0].track_id, "live-bass");
+        assert_eq!(state.lanes[0].track_id, "ensemble");
+        assert_eq!(state.performer_ids(), vec![bass, drums]);
+        assert_eq!(state.road_width(1.0), 2.0);
+        assert_eq!(state.selected_location(), Some((0, 1)));
+        assert_eq!(state.performer_lane_center_x(0, 0, 1.0), -0.5);
+        assert_eq!(state.performer_lane_center_x(0, 1, 1.0), 0.5);
+        let mut lanes = state.road_lanes();
+        let bass_lane = lanes.next().unwrap();
+        let drums_lane = lanes.next().unwrap();
+        assert!(lanes.next().is_none());
+        assert!(std::ptr::eq(bass_lane.0, drums_lane.0));
+        assert!(bass_lane.2);
+        assert!(!drums_lane.2);
+        drop(lanes);
+        let performers = &state.lanes[0].performers;
+        assert_eq!(performers[0].lane_name(), "bass");
+        assert_eq!(performers[0].statuses.len(), 1);
+        assert_eq!(performers[0].statuses[0].played_by, bass_principal);
+        assert_eq!(performers[1].lane_name(), "drums");
+        assert_eq!(performers[1].statuses.len(), 1);
+        assert_eq!(performers[1].statuses[0].played_by, drums_principal);
+
+        let mut tracks = world.resource_mut::<WellTracks>();
+        tracks.tracks[1].attached.reverse();
+        tracks.tracks[1].playhead_tick = 1;
+        schedule.run(&mut world);
+
+        let state = world.resource::<HeroicState>();
+        assert_eq!(state.performer_ids(), vec![bass, drums]);
+        assert_eq!(state.selected_location(), Some((0, 1)));
+        assert_eq!(state.pending_flashes.len(), 1);
+        assert_eq!(state.pending_flashes[0].context_id, drums);
+        assert!(state.pending_flashes[0].hollow);
     }
 
     #[test]

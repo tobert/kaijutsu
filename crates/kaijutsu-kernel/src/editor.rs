@@ -75,10 +75,45 @@ pub enum BoardEditorTarget {
         title: String,
         tags: Vec<String>,
     },
+    /// Drafting a track note.
+    NewNote {
+        track: String,
+        performer: String,
+        opened: i64,
+        phrase_start: Option<i64>,
+        score: Option<String>,
+    },
+    /// Editing a previously saved track note.
+    EditNote {
+        post_ref: String,
+        track: String,
+        opened: i64,
+        phrase_start: Option<i64>,
+        score: Option<String>,
+    },
     /// Already submitted as a held post pending curated-board review.
     SubmittedForReview {
         ask_id: String,
     },
+}
+
+pub(crate) fn track_note_body(
+    opened: i64,
+    sent: i64,
+    phrase_start: Option<i64>,
+    score: Option<&str>,
+    text: &str,
+) -> String {
+    let mut body = format!("Opened at tick {opened}; sent at tick {sent}.");
+    if let Some(tick) = phrase_start {
+        body.push_str(&format!(" Phrase starts at tick {tick}."));
+    }
+    if let Some(hash) = score {
+        body.push_str(&format!(" Score: {hash}."));
+    }
+    body.push_str("\n\n");
+    body.push_str(text);
+    body
 }
 
 /// Kernel-side metadata for an editor session backed by a board post/draft

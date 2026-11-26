@@ -1,0 +1,29 @@
+# The opening post describes the topic. Every published revision records
+# its source blocks below the summary so a short preview shows the music or conversation.
+set -e
+latest="$(kj board read "$KJ_MEMORY_TOPIC" --tail 1 --json | jq -r '.posts[-1].block_id')"
+previous_basis="$(kj block read "$latest" --no-line-numbers | tail -n 1)"
+# A stopped track simply drops out of the score window. Only newly played
+# or edited material calls for a new vibe. A conversation also observes
+# removals from its source window.
+if test -n "${KJ_SUMMARY_CONTEXT:-}"; then
+  fresh=true
+  if test "$previous_basis" = "Sources: $basis"; then fresh=false; fi
+else
+  fresh="$(echo "$basis" | jq -Rr --arg old "$previous_basis" '((split(" ") - [""]) - ($old | split(" "))) | length > 0')"
+fi
+if test "$fresh" = true; then
+  previous="$(kj block read "$latest" --no-line-numbers | head -n -1 | jq -Rsr '.[0:2500]')"
+  kj drive --if-idle --prompt "Chomosuke memory
+$KJ_MEMORY_TOPIC
+$basis
+$latest
+
+Previous summary:
+$previous
+
+New observations:
+$observations
+
+Update the summary for the next reader. Keep it under 160 words."
+fi

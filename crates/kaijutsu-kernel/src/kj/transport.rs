@@ -190,7 +190,11 @@ enum TransportCommand {
     /// List every track with its live state (also what bare `kj transport` runs).
     /// Shows `dormant` for persisted tracks that have no live attachment in this
     /// session.
-    List,
+    List {
+        /// Include the playhead and full score context in each JSON row.
+        #[arg(long)]
+        details: bool,
+    },
     /// Show pending work and the most recent 256 dispositions: each attempt's
     /// intended tick, estimate in ticks and milliseconds, the queue and compute
     /// time its producer measured, readiness, margin, basis, and outcome. The
@@ -237,7 +241,7 @@ impl TransportCommand {
             | TransportCommand::Clock { context, .. }
             | TransportCommand::Rotate { context, .. } => context.as_deref(),
             TransportCommand::Delete { .. }
-            | TransportCommand::List
+            | TransportCommand::List { .. }
             | TransportCommand::Work { .. }
             | TransportCommand::Repeat { .. } => None,
         }
@@ -258,7 +262,7 @@ impl TransportCommand {
             | TransportCommand::Rotate { track, .. }
             | TransportCommand::Repeat { track, .. } => track.as_deref(),
             TransportCommand::Delete { track } | TransportCommand::Work { track } => Some(track.as_str()),
-            TransportCommand::List => None,
+            TransportCommand::List { .. } => None,
         }
     }
 
@@ -275,7 +279,7 @@ impl TransportCommand {
             TransportCommand::Clock { .. } => "clock",
             TransportCommand::Rotate { .. } => "rotate",
             TransportCommand::Delete { .. } => "delete",
-            TransportCommand::List => "list",
+            TransportCommand::List { .. } => "list",
             TransportCommand::Work { .. } => "work",
             TransportCommand::Repeat { .. } => "repeat",
         }
@@ -288,7 +292,7 @@ impl KjDispatcher {
         // anyone tries (per feedback.md). The roster is a read, so it needs no
         // `transport` capability; the footer points at the full verb list.
         if argv.is_empty() {
-            return self.transport_list(true).await;
+            return self.transport_list(true, false).await;
         }
         let parsed = match TransportArgs::try_parse_from(argv) {
             Ok(p) => p,
@@ -308,8 +312,8 @@ impl KjDispatcher {
         // `list` is a read-only observability surface — never gate it behind the
         // `transport` (write) capability. Short-circuit BEFORE the cap check so a
         // context that can't drive the beat can still see what's on it.
-        if matches!(command, TransportCommand::List) {
-            return self.transport_list(false).await;
+        if let TransportCommand::List { details } = command {
+            return self.transport_list(false, details).await;
         }
         if let TransportCommand::Work { track } = &command {
             let track = match TrackId::new(track) {
@@ -526,7 +530,7 @@ impl KjDispatcher {
 
                 // Dispatched (and returned) above, before this match ever runs.
                 // Kept only so the match stays exhaustive.
-                TransportCommand::List | TransportCommand::Work { .. } | TransportCommand::Repeat { .. } => {
+                TransportCommand::List { .. } | TransportCommand::Work { .. } | TransportCommand::Repeat { .. } => {
                     unreachable!("transport list, work and repeat are handled before the command match")
                 }
             };
@@ -592,7 +596,7 @@ impl KjDispatcher {
     /// `show_footer` appends the "run `kj transport --help` for all verbs"
     /// pointer — set only for the bare `kj transport` entry, kept off the
     /// explicit `kj transport list` so scripted output stays a clean table.
-    async fn transport_list(&self, show_footer: bool) -> KjResult {
+    async fn transport_list(&self, show_footer: bool, details: bool) -> KjResult {
         // Persisted set first (canonical). A corrupt row fails loud rather than
         // rendering nonsense — same posture as `list_tracks` itself. Pull every
         // attachment row in the SAME lock scope (one query, not N+1 — one per
@@ -707,7 +711,18 @@ impl KjDispatcher {
                 playhead,
                 score_short,
             });
-            handles.push(serde_json::Value::String(id.to_string()));
+            handles.push(if details {
+                serde_json::json!({
+                    "track": id,
+                    "playing": live.is_some_and(|track| track.playing),
+                    "playhead": playhead,
+                    "score_context": score.map(|context| context.to_hex()),
+                    "beats_per_phrase": beats_per_phrase,
+                    "bpm": bpm,
+                })
+            } else {
+                serde_json::Value::String(id.to_string())
+            });
         }
 
         let mut text = format_track_table(&rows);
@@ -794,7 +809,7 @@ impl KjDispatcher {
     /// zero rows → loud error (attach first); more than one → loud error
     /// (ambiguous). The stored track string that no longer
     /// parses is corruption → fail loud.
-    fn resolve_track_for_ctx(
+    pub(super) fn resolve_track_for_ctx(
         &self,
         track_override: Option<&str>,
         ctx: ContextId,
@@ -959,7 +974,7 @@ impl Classify for TransportCommand {
             // from the module's table only because `kj transport` was kept
             // out wholesale, not because it mutates — `kj/effect.rs`
             // makes it Read on its own merits).
-            TransportCommand::List | TransportCommand::Work { .. } => Effect::Read,
+            TransportCommand::List { .. } | TransportCommand::Work { .. } => Effect::Read,
             TransportCommand::Attach { .. }
             | TransportCommand::Detach { .. }
             | TransportCommand::Play { .. }
@@ -1788,7 +1803,19 @@ mod tests {
             clock_kind: "system".to_string(),
             attached: vec![ctx],
         };
+        let help = d.dispatch(&[s("transport"), s("list"), s("--help")], &c).await;
+        assert!(help.message().contains("--details"), "{}", help.message());
+        println!("{}", help.message());
+        let score = snap.score_context.to_hex();
         let _cmds = spawn_beat_stub_snap(rx, Ok(None), vec![snap]);
+        let details = d.dispatch(&[s("transport"), s("list"), s("--details")], &c).await;
+        let crate::kj::KjResult::Ok { data: Some(rows), .. } = details else {
+            panic!("expected track details, got {details:?}");
+        };
+        assert_eq!(rows[0]["track"], "lead");
+        assert_eq!(rows[0]["score_context"], score);
+        assert_eq!(rows[0]["playhead"], 384);
+        assert_eq!(rows[0]["playing"], true);
 
         let result = d.dispatch(&[s("transport"), s("list")], &c).await;
         assert!(result.is_ok(), "list failed: {}", result.message());

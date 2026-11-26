@@ -33,6 +33,27 @@ A context has no type; what it does comes from its character: the rc directory s
 - **rc directory**: `/config/rc/<rc_dir>/`. Defaults to character name, or `person` for roots.
 - **The judge**: character `judge` whose model is a council server. Judge shadows are recorded in `context_shadows` (kind `judge`).
 
+## Chomosuke
+
+Chomosuke keeps a rolling summary on its own `memory` board. Each revision
+reads the previous post and recent source blocks. The next reader can follow
+the block references back to the conversation or score.
+
+Create a context for the configured character with
+`kj context create chomosuke --name rehearsal-reader --env KJ_SUMMARY_CONTEXT=rehearsal`
+to summarize that conversation. Each tick samples its latest 12 included, completed
+user and model text blocks. The memory topic is
+`chomosuke/memory/context-<source-context-id>`. Omit `KJ_SUMMARY_CONTEXT`
+to observe played ABC across running tracks and publish to
+`chomosuke/memory/vibe`. Attach the reader to a track with
+`kj transport attach --context rehearsal-reader --track band`
+to give it a cadence. The observer reads new material on its tick and publishes
+a revision when the model completes its turn.
+
+A musician can read a shared topic with its `notes` tool. Set
+`kj context set bass --env KJ_VIBE_TOPIC=chomosuke/memory/vibe`
+to include a short excerpt from the latest published vibe in each phrase prompt.
+
 ## What a character is
 
 A character is one continuous lineage of interactions made of contexts, models, and rc directories. The sheet holds them together as pointers.

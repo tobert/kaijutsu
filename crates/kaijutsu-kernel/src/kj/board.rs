@@ -151,7 +151,7 @@ pub(crate) fn settle_board_post_answer(
 #[command(
     name = "board",
     about = "Read, post, search, and moderate shared boards and topics",
-    after_help = "Board refs: . (this context), .senpai (senpai context), '<slug>', 'self/<slug>', '<character>/<slug>'.\nTopic refs: './<slug>', '.senpai/<slug>', '<character>/<board>/<topic>', '<board>/<topic>', or '<hex-prefix>'.\nPost refs: '<topic>#<n>' (1-based post number). Quote refs with '#' or leading digits in single quotes.",
+    after_help = "Board refs: . (this context), .senpai (senpai context), '@track/<track>', '<slug>', 'self/<slug>', '<character>/<slug>'.\nTopic refs: './<slug>', '.senpai/<slug>', '@track/<track>/<topic>', '<character>/<board>/<topic>', '<board>/<topic>', or '<hex-prefix>'.\nPost refs: '<topic>#<n>' (1-based post number). Quote refs with '#' or leading digits in single quotes.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -162,6 +162,57 @@ pub(crate) struct BoardArgs {
 
 #[derive(Subcommand, Debug)]
 enum BoardCommand {
+    /// Read track notes or a board topic, newest first unless --after is set.
+    Notes {
+        /// Board topic ref. Cannot be combined with --track or --performer.
+        #[arg(long, conflicts_with_all = ["track", "performer"])]
+        topic: Option<String>,
+        /// Track name; defaults to the context's only attachment.
+        #[arg(long)]
+        track: Option<String>,
+        /// Performer name or principal ID; defaults to the caller's performer.
+        #[arg(long)]
+        performer: Option<String>,
+        /// Show posts after this number, oldest first. Cannot be combined with --before.
+        #[arg(long, conflicts_with = "before")]
+        after: Option<usize>,
+        /// Show posts before this post number.
+        #[arg(long)]
+        before: Option<usize>,
+        /// Maximum posts to show. Default 4; --after defaults to all.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Return JSON in the command output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a note to a performer's track notes.
+    AddNote {
+        /// Track name; defaults to the context's only attachment.
+        #[arg(long)]
+        track: Option<String>,
+        /// Performer name or principal ID; defaults to the caller's performer.
+        #[arg(long)]
+        performer: Option<String>,
+        /// Tick when the note was opened; defaults to the current playhead.
+        #[arg(long)]
+        at: Option<i64>,
+        /// Start tick of the referenced phrase.
+        #[arg(long)]
+        phrase_start: Option<i64>,
+        /// Content hash of the referenced score.
+        #[arg(long)]
+        score: Option<String>,
+        /// Draft the note in vi; save posts it.
+        #[arg(long)]
+        vi: bool,
+        /// Body text injected from stdin.
+        #[arg(long, hide = true)]
+        content: Option<String>,
+        /// Note text; reads stdin when omitted.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        body: Vec<String>,
+    },
     /// List boards owned by a character (defaults to the caller's character), or all boards with `--all`.
     #[command(alias = "ls")]
     List {
@@ -173,7 +224,7 @@ enum BoardCommand {
     },
     /// List topics on a board, pinned first then most recently posted.
     Topics {
-        /// Board ref: ., .senpai, '<slug>', 'self/<slug>', or '<character>/<slug>'.
+        /// Board ref: ., .senpai, '@track/<track>', '<slug>', 'self/<slug>', or '<character>/<slug>'.
         board: String,
         /// Filter by status: open, resolved, pinned, archived, or all (default excludes archived).
         #[arg(long, value_parser = ["open", "resolved", "pinned", "archived", "all"])]
@@ -190,7 +241,7 @@ enum BoardCommand {
     },
     /// Read posts in a topic, numbered #1, #2, ... in log order.
     Read {
-        /// Topic ref: './<slug>', '.senpai/<slug>', '<character>/<board>/<topic>', or '<hex-prefix>'.
+        /// Topic ref: './<slug>', '.senpai/<slug>', '@track/<track>/<topic>', '<character>/<board>/<topic>', or '<hex-prefix>'.
         topic: String,
         /// Show the last N visible posts (ignored when --after is set). Default 20.
         #[arg(long, default_value_t = 20)]
@@ -261,7 +312,7 @@ enum BoardCommand {
     },
     /// Start a new topic on a board with an opening post (max 32 KiB; reads stdin when body is omitted).
     Post {
-        /// Target board ref (lazily creates a context board for . or .senpai).
+        /// Target board ref (lazily creates a context board for ., .senpai, or @track/<track>).
         board: String,
         /// Topic title.
         #[arg(long)]
@@ -359,7 +410,7 @@ enum BoardCommand {
     Promote {
         /// Source topic ref to promote.
         topic: String,
-        /// Target board ref (lazily creates a context board for . or .senpai).
+        /// Target board ref (lazily creates a context board for ., .senpai, or @track/<track>).
         #[arg(long)]
         to: String,
         /// Title for the promoted topic (defaults to the source topic's title).
@@ -380,12 +431,14 @@ impl Classify for BoardArgs {
 impl Classify for BoardCommand {
     fn effect(&self) -> Effect {
         match self {
-            Self::List { .. }
+            Self::Notes { .. }
+            | Self::List { .. }
             | Self::Topics { .. }
             | Self::Read { .. }
             | Self::Recent { .. }
             | Self::Search { .. } => Effect::Read,
-            Self::Create { .. }
+            Self::AddNote { .. }
+            | Self::Create { .. }
             | Self::Set { .. }
             | Self::Post { .. }
             | Self::Reply { .. }
@@ -431,6 +484,13 @@ impl KjDispatcher {
         };
 
         match parsed.command {
+            BoardCommand::Notes { topic, track, performer, after, before, limit, json } => {
+                self.board_notes(topic.as_deref(), track.as_deref(), performer.as_deref(), after, before, limit, json, caller)
+            }
+            BoardCommand::AddNote { track, performer, at, phrase_start, score, vi, content, body } => {
+                let text = resolve_body_text(&body, content.as_deref());
+                self.board_add_note(track.as_deref(), performer.as_deref(), at, phrase_start, score.as_deref(), vi, &text, caller).await
+            }
             BoardCommand::List { character, all } => self.board_list(character.as_deref(), all, caller),
             BoardCommand::Topics { board, status, tag, limit, include_hidden } => {
                 self.board_topics(&board, status.as_deref(), tag.as_deref(), limit, include_hidden, caller)
@@ -494,6 +554,119 @@ impl KjDispatcher {
             BoardCommand::Promote { topic, to, title, summarize } => {
                 self.board_promote(&topic, &to, title.as_deref(), summarize, caller).await
             }
+        }
+    }
+
+    fn notes_identity(&self, track: Option<&str>, performer: Option<&str>, caller: &KjCaller) -> Result<(kaijutsu_types::TrackId, CharacterRow), String> {
+        let track = self.resolve_track_for_ctx(track, caller.require_context().map_err(|e| e.message().to_string())?)?;
+        let db = self.kernel_db().lock();
+        let owner = match performer {
+            Some(value) => {
+                let row = if let Ok(id) = PrincipalId::parse(value) {
+                    db.get_character(id)
+                } else {
+                    db.get_character_by_name(value)
+                }.map_err(|e| e.to_string())?;
+                row.ok_or_else(|| format!("no character '{value}'"))?
+            }
+            None => db.get_character(caller.actor_id).map_err(|e| e.to_string())?
+                .ok_or_else(|| "caller has no character".to_string())?,
+        };
+        Ok((track, owner))
+    }
+
+    fn board_notes(&self, topic_ref: Option<&str>, track: Option<&str>, performer: Option<&str>, after: Option<usize>, before: Option<usize>, limit: Option<usize>, json: bool, caller: &KjCaller) -> KjResult {
+        let topic = if let Some(topic_ref) = topic_ref {
+            let db = self.kernel_db().lock();
+            match self.resolve_topic_with_archived(topic_ref, true, caller, &db) {
+                Ok(topic) => Some(topic),
+                Err(e) => return KjResult::Err(format!("kj board notes: {e}")),
+            }
+        } else {
+            let (track, owner) = match self.notes_identity(track, performer, caller) {
+                Ok(v) => v,
+                Err(e) => return KjResult::Err(format!("kj board notes: {e}")),
+            };
+            let db = self.kernel_db().lock();
+            match db.get_character_board_by_slug(owner.principal_id, "music-notes") {
+                Ok(Some(board)) => match db.get_topic_by_slug_including_archived(board.board_id, track.as_str()) {
+                    Ok(topic) => topic,
+                    Err(e) => return KjResult::Err(format!("kj board notes: {e}")),
+                },
+                Ok(None) => None,
+                Err(e) => return KjResult::Err(format!("kj board notes: {e}")),
+            }
+        };
+        let mut posts = Vec::new();
+        if let Some(topic) = &topic && limit != Some(0) {
+            let blocks = match self.block_store().non_draft_snapshots(topic.document_id) {
+                Ok(blocks) => blocks,
+                Err(e) => return KjResult::Err(format!("kj board notes: {e}")),
+            };
+            let selected = blocks.iter().enumerate().filter(|(index, block)| {
+                let number = index + 1;
+                !block.excluded && !after.is_some_and(|n| number <= n) && !before.is_some_and(|n| number >= n)
+            });
+            let max = limit.unwrap_or(if after.is_some() { usize::MAX } else { 4 });
+            let selected: Vec<_> = if after.is_some() {
+                selected.take(max).collect()
+            } else {
+                selected.rev().take(max).collect()
+            };
+            for (index, block) in selected {
+                posts.push(serde_json::json!({"number": index + 1, "block_id": block.id.to_key(), "body": block.content, "author_id": block.author().to_hex(), "created_at": block.created_at}));
+            }
+        }
+        let data = serde_json::json!({"topic_id": topic.map(|t| t.document_id.to_hex()), "posts": posts});
+        let message = if json { data.to_string() } else {
+            data["posts"].as_array().unwrap().iter().map(|p| format!("#{}\n{}", p["number"], p["body"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n\n")
+        };
+        KjResult::ok_with_data(message, data)
+    }
+
+    pub(crate) async fn board_add_note(&self, track: Option<&str>, performer: Option<&str>, at: Option<i64>, phrase_start: Option<i64>, score: Option<&str>, vi: bool, text: &str, caller: &KjCaller) -> KjResult {
+        let (track, owner) = match self.notes_identity(track, performer, caller) {
+            Ok(v) => v,
+            Err(e) => return KjResult::Err(format!("kj board add-note: {e}")),
+        };
+        let current = || self.kernel().track_timeline(&track).map(|t| t.lock().playhead().get());
+        let opened = match at.or_else(current) {
+            Some(tick) => tick,
+            None => return KjResult::Err(format!("kj board add-note: track '{}' has no live playhead; pass --at", track.as_str())),
+        };
+        if vi {
+            let path = format!("board://{}/music-notes/{}#new", owner.name, track.as_str());
+            return match self.kernel().editor_open_board_signaled(&path, text, crate::editor::BoardEditorTarget::NewNote {
+                track: track.as_str().to_string(), performer: owner.principal_id.to_hex(), opened, phrase_start, score: score.map(str::to_string),
+            }, caller.clone(), Self::editor_opener_for(caller)).await {
+                Ok((id, st)) => KjResult::ok_with_data(format!("opened editor session {} on {}", id.as_u64(), st.path), st.to_json(id)),
+                Err(e) => KjResult::Err(format!("kj board add-note --vi: {e}")),
+            };
+        }
+        if text.trim().is_empty() { return KjResult::Err("kj board add-note: note body must not be empty".to_string()); }
+        let _notes_write = self.notes_write.lock().await;
+        let sent = match current() { Some(tick) => tick, None => return KjResult::Err(format!("kj board add-note: track '{}' has no live playhead", track.as_str())) };
+        let body = crate::editor::track_note_body(opened, sent, phrase_start, score, text);
+        let board_ref = format!("{}/music-notes", owner.name);
+        let (board_exists, topic) = {
+            let db = self.kernel_db().lock();
+            match db.get_character_board_by_slug(owner.principal_id, "music-notes") {
+                Ok(Some(board)) => match db.get_topic_by_slug_including_archived(board.board_id, track.as_str()) {
+                    Ok(topic) => (true, topic),
+                    Err(e) => return KjResult::Err(format!("kj board add-note: {e}")),
+                },
+                Ok(None) => (false, None),
+                Err(e) => return KjResult::Err(format!("kj board add-note: {e}")),
+            }
+        };
+        if !board_exists {
+            if let KjResult::Err(e) = self.board_create("music-notes", Some(&owner.name), "open", "Track notes", caller) { return KjResult::Err(e); }
+        }
+        match topic {
+            Some(topic) => self.board_reply(&topic.document_id.to_hex(), None, &body, caller).await,
+            None => {
+                self.create_board_topic_post(&board_ref, track.as_str(), Vec::new(), &body, None, Some(track.as_str()), "post", caller).await
+            },
         }
     }
 
@@ -1205,7 +1378,7 @@ impl KjDispatcher {
                 MAX_POST_BYTES,
             ));
         }
-        self.create_board_topic_post(board_ref, title, tags, text, None, "post", caller)
+        self.create_board_topic_post(board_ref, title, tags, text, None, None, "post", caller)
             .await
     }
 
@@ -1310,6 +1483,7 @@ impl KjDispatcher {
             source_topic.tags,
             &body,
             Some(source_topic.document_id),
+            None,
             "promote",
             caller,
         )
@@ -1324,6 +1498,7 @@ impl KjDispatcher {
         tags: Vec<String>,
         text: &str,
         promoted_from: Option<ContextId>,
+        exact_slug: Option<&str>,
         verb: &str,
         caller: &KjCaller,
     ) -> KjResult {
@@ -1353,9 +1528,17 @@ impl KjDispatcher {
                 Ok(d) => d,
                 Err(e) => return KjResult::Err(e),
             };
-            let slug = match unique_topic_slug(&db, board.board_id, title) {
-                Ok(s) => s,
-                Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
+            let slug = if let Some(slug) = exact_slug {
+                match db.get_topic_by_slug_including_archived(board.board_id, slug) {
+                    Ok(None) => slug.to_string(),
+                    Ok(Some(_)) => return KjResult::Err(format!("kj board {verb}: topic '{slug}' already exists")),
+                    Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
+                }
+            } else {
+                match unique_topic_slug(&db, board.board_id, title) {
+                    Ok(s) => s,
+                    Err(e) => return KjResult::Err(format!("kj board {verb}: {e}")),
+                }
             };
             let label = format_board_label(&db, board.board_id);
             let is_priv_or_root = caller.privileged
@@ -2310,6 +2493,15 @@ impl KjDispatcher {
         }
     }
 
+    fn track_board_context(&self, track: &str, db: &KernelDb) -> Result<crate::kernel_db::ContextRow, String> {
+        kaijutsu_types::TrackId::new(track).map_err(|e| format!("invalid track '{track}': {e}"))?;
+        let row = db.get_track(track).map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no track '{track}'"))?;
+        let id = row.score_context_id.ok_or_else(|| format!("track '{track}' has no score context"))?;
+        db.get_context(id).map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("track '{track}' score context {} not found", id.short()))
+    }
+
     fn resolve_board_read(
         &self,
         board_ref: &str,
@@ -2353,6 +2545,14 @@ impl KjDispatcher {
                         .map_err(|e| e.to_string())?
                         .map(ReadBoard::Found)
                         .ok_or_else(|| format!("senpai board {} not found", bid.short())),
+                    None => Ok(ReadBoard::UncreatedContextBoard),
+                }
+            }
+            other if other.starts_with("@track/") => {
+                let ctx = self.track_board_context(&other[7..], db)?;
+                match ctx.board_id {
+                    Some(id) => db.get_board(id).map_err(|e| e.to_string())?
+                        .map(ReadBoard::Found).ok_or_else(|| format!("context board {} not found", id.short())),
                     None => Ok(ReadBoard::UncreatedContextBoard),
                 }
             }
@@ -2403,6 +2603,17 @@ impl KjDispatcher {
                 }
                 db.ensure_context_board(senpai_id, caller.actor_id)
                     .map_err(|e| e.to_string())
+            }
+            other if other.starts_with("@track/") => {
+                let ctx = self.track_board_context(&other[7..], db)?;
+                if let Some(id) = ctx.board_id {
+                    return db.get_board(id).map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("context board {} not found", id.short()));
+                }
+                if ctx.is_archived() {
+                    return Err(format!("track score context {} is archived and has no board", ctx.context_id.short()));
+                }
+                db.ensure_context_board(ctx.context_id, caller.actor_id).map_err(|e| e.to_string())
             }
             other => self.resolve_named_board(other, caller, db),
         }
@@ -2520,6 +2731,15 @@ impl KjDispatcher {
                 lookup_slug(board.board_id, topic_slug)?
                     .ok_or_else(|| format!("no topic '{topic_slug}' on board '{board_slug}'"))
             }
+            ["@track", track, topic_slug] => {
+                let board_ref = format!("@track/{track}");
+                let board = match self.resolve_board_read(&board_ref, caller, db)? {
+                    ReadBoard::Found(board) => board,
+                    ReadBoard::UncreatedContextBoard => return Err(format!("no topic '{topic_ref}': track has no board yet")),
+                };
+                lookup_slug(board.board_id, topic_slug)?
+                    .ok_or_else(|| format!("no topic '{topic_slug}' on board '{board_ref}'"))
+            }
             [char_or_self, board_slug, topic_slug] => {
                 let board_ref = format!("{char_or_self}/{board_slug}");
                 let board = self.resolve_named_board(&board_ref, caller, db)?;
@@ -2527,7 +2747,7 @@ impl KjDispatcher {
                     .ok_or_else(|| format!("no topic '{topic_slug}' on board '{board_ref}'"))
             }
             _ => Err(format!(
-                "invalid topic ref '{topic_ref}': expected './<slug>', '.senpai/<slug>', '<character>/<board>/<topic>', '<board>/<topic>', or a hex prefix"
+                "invalid topic ref '{topic_ref}': expected './<slug>', '.senpai/<slug>', '@track/<track>/<topic>', '<character>/<board>/<topic>', '<board>/<topic>', or a hex prefix"
             )),
         }
     }

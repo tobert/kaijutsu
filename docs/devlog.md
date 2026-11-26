@@ -527,6 +527,11 @@ well, and `kaijutsu-present` owns the pure 10-rule `WorkStatus` classification
 and covered-phrase slack math. When no track is playing, the highway stays calm
 and empty; no client-side fake driver generates synthetic traffic.
 
+The 130 BPM trio attached bass, pads, and drums to one track. Heroic now
+gives each attached musician a lane and selects the phrase details by performer.
+Conversation lays out a long score across systems at the available column
+width.
+
 Live testing across `zorak` (TiMidity++ on `ff4sf2.sf2`) and `moltar`
 (FluidSynth over PipeWire) turned up four practical lessons:
 
@@ -544,6 +549,22 @@ Live testing across `zorak` (TiMidity++ on `ff4sf2.sf2`) and `moltar`
   4-bar programs leave eight seconds of silence per phrase at 120 BPM, whereas
   8-bar programs (`bass-bars.json`, `pad-bars.json`, `drum-bars.json` with
   `shuffle = 2`) play continuously across the 3-track `lfm3-omni` band.
+
+The notation rehearsal found a score could contain an empty ABC block
+alongside playable MIDI. The kernel had read the phrase from durable CAS
+to derive MIDI, then looked in the timeline's RAM cache a second time for
+the text. The score writer now uses the same resolved bytes for both.
+
+In Bevy, one of five staff lines survived fitting an eight-bar phrase to a
+930-pixel column. Giving strokes a minimum width of one physical pixel
+kept all five visible. The bass chair and its decision program declare
+bass clef.
+
+The drum chair spells a kick as `C,,` to play GM note 36. The engraver
+places that kick in the bottom space, the snare in the second space from
+the top, and the hi-hat above the staff with a cross head. A percussion
+clef selects this layout. Channel 10 supplies it when the score omits a
+clef. Other percussion without a kit position uses the middle line.
 
 ## The rotation signoff (November 23)
 
@@ -619,3 +640,10 @@ inserts/excludes before reaching the embedder, a UTF-8 `split_at` panic in
 curated-board asks; a 7-mutant audit confirmed 6/7 killed and added direct test
 coverage for `BlockStore::set_excluded`'s pending-held guard.
 
+Musicians use their own character board for track notes. Heroic opens a board
+reply at the selected performer's playhead, so a note can name the music
+heard before its author finished typing. A shared track handoff belongs to
+the score context's existing board, reachable by track name. Chomosuke keeps
+rolling conversation summaries and ensemble observations on its own character
+board. Readers can choose a topic without adding every board post to their
+conversation.

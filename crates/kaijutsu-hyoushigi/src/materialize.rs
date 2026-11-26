@@ -19,14 +19,14 @@
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, Role};
 
 use crate::cell::{Body, Cell};
-use crate::engine::Timeline;
 
-impl Timeline {
+impl Cell {
     /// Materialize a committed (concrete) cell as a [`BlockSnapshot`] tagged with
     /// its tick position. Returns `None` for a cell that isn't concrete — there is
-    /// nothing durable to persist until it crosses the write barrier.
-    pub fn materialize(&self, cell: &Cell, id: BlockId) -> Option<BlockSnapshot> {
-        let Body::Concrete(cref) = &cell.body else {
+    /// nothing durable to persist until it crosses the write barrier. `bytes` are
+    /// the content resolved from the cell's reference by the caller.
+    pub fn materialize(&self, id: BlockId, bytes: &[u8]) -> Option<BlockSnapshot> {
+        let Body::Concrete(cref) = &self.body else {
             return None;
         };
 
@@ -39,16 +39,14 @@ impl Timeline {
         // author — the author is `id.principal_id`, who PLAYED). `track.is_some()`
         // becomes the "came off the timeline" discriminator downstream.
         let mut b = BlockSnapshotBuilder::new(id, BlockKind::Text)
-            .tick(cell.span.start)
-            .track(cell.track.clone())
+            .tick(self.span.start)
+            .track(self.track.clone())
             .content_type(content_type);
 
         if is_text {
             // Text inlines in `content` (the conversation substrate's bread and butter).
             b = b.role(Role::Model);
-            if let Some(bytes) = self.content_bytes(&cref.hash) {
-                b = b.content(String::from_utf8_lossy(bytes).into_owned());
-            }
+            b = b.content(String::from_utf8_lossy(bytes).into_owned());
         } else {
             // Binary/large: the CAS hash *is* the content pointer — `img_block`'s
             // convention. The bytes stay in CAS; `content` holds the 32-hex hash.
@@ -62,6 +60,7 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Timeline;
     use crate::cell::{ContextQuery, Fallback, Recipe, ResolverId};
     use crate::content::ContextHash;
     use crate::resolver::{Resolution, Resolver, ResolverCtx};
@@ -130,8 +129,8 @@ mod tests {
 
     #[test]
     fn text_cell_inlines_content_and_projects_mime() {
-        let (tl, cell) = commit_one("text/markdown", b"# hi");
-        let block = tl.materialize(&cell, block_id()).unwrap();
+        let (_, cell) = commit_one("text/markdown", b"# hi");
+        let block = cell.materialize(block_id(), b"# hi").unwrap();
 
         assert_eq!(block.content, "# hi");
         assert_eq!(block.content_type, ContentType::Markdown); // open mime → closed hint
@@ -142,7 +141,7 @@ mod tests {
     #[test]
     fn binary_cell_references_cas_by_hash() {
         let (tl, cell) = commit_one("audio/midi", b"MThd....");
-        let block = tl.materialize(&cell, block_id()).unwrap();
+        let block = cell.materialize(block_id(), b"MThd....").unwrap();
 
         // `audio/*` projects to `ContentType::Media`; the bytes live in CAS.
         assert_eq!(block.content_type, ContentType::Media);
@@ -167,11 +166,11 @@ mod tests {
 
         // Player case: a cell on the "bass" lane played by a real principal.
         let player = PrincipalId::new();
-        let (tl, mut cell) = commit_one("audio/midi", b"MThd-player");
+        let (_, mut cell) = commit_one("audio/midi", b"MThd-player");
         cell.track = TrackId::new("bass").unwrap();
         cell.played_by = player;
         let id = BlockId::new(ContextId::new(), player, 7);
-        let snap = tl.materialize(&cell, id).unwrap();
+        let snap = cell.materialize(id, b"MThd-player").unwrap();
         assert_eq!(
             snap.track,
             Some(TrackId::new("bass").unwrap()),
@@ -182,11 +181,11 @@ mod tests {
         assert_eq!(snap.id.principal_id, player);
 
         // Fallback case: same lane, but the transport played it (beat()).
-        let (tl2, mut fb) = commit_one("audio/midi", b"MThd-vamp");
+        let (_, mut fb) = commit_one("audio/midi", b"MThd-vamp");
         fb.track = TrackId::new("bass").unwrap();
         fb.played_by = PrincipalId::beat();
         let id2 = BlockId::new(ContextId::new(), PrincipalId::beat(), 1);
-        let snap2 = tl2.materialize(&fb, id2).unwrap();
+        let snap2 = fb.materialize(id2, b"MThd-vamp").unwrap();
         assert_eq!(snap2.track, Some(TrackId::new("bass").unwrap()));
         assert_eq!(snap2.id.principal_id, PrincipalId::beat());
     }
@@ -204,7 +203,6 @@ mod tests {
             kaijutsu_types::TrackId::solo(),
             PrincipalId::beat(),
         );
-        let tl = Timeline::new(TickClock::default());
-        assert!(tl.materialize(&cell, block_id()).is_none());
+        assert!(cell.materialize(block_id(), b"").is_none());
     }
 }

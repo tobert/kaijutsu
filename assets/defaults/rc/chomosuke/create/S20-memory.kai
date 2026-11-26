@@ -1,0 +1,36 @@
+# Each source has its own topic on the performer's memory board.
+set -e
+info="$(kj context info --json)"
+who="$KJ_CHARACTER"
+source="${KJ_SUMMARY_CONTEXT:-}"
+kj context set --env "KJ_SUMMARY_CONTEXT=$source"
+board="$who/memory"
+boards="$(kj board list "$who" --json)"
+exists="$(echo "$boards" | jq -r --arg board "$board" 'index($board) != null')"
+if test "$exists" = true; then
+  true
+else
+  kj board create memory --for "$who" --desc "Observations by Chomosuke"
+fi
+if test -n "$source"; then
+  source_id="$(kj context info "$source" --json | jq -r '.context_id')"
+  self="$(echo "$info" | jq -r '.context_id')"
+  if test "$source_id" = "$self"; then
+    echo "chomosuke: source context must not be this context" >&2
+    exit 1
+  fi
+  source="$source_id"
+  kj context set --env "KJ_SUMMARY_CONTEXT=$source"
+  slug="context-$source_id"
+  description="Observations of context $source_id."
+else
+  slug="vibe"
+  description="Observations of played music."
+fi
+topic="$board/$slug"
+if kj board read "$topic" --tail 1 >/dev/null 2>&1; then
+  true
+else
+  kj board post "$board" --title "$slug" "$description"
+fi
+kj context set --env "KJ_MEMORY_TOPIC=$topic"

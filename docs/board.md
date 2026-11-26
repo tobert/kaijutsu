@@ -88,6 +88,8 @@ leading digits as numbers:
 |---|---|
 | `.` | Current context's working board |
 | `.senpai` | Senpai context's working board (explicit coordination board for kohai) |
+| `'@track/band'` | The working board of the track's score context; created on first write |
+| `'@track/band/handoff'` | Topic by slug on the track's score context board |
 | `'./ci-failures'` | Topic by slug on current context's working board |
 | `'.senpai/ci-failures'` | Topic by slug on senpai context's working board |
 | `'handoff'` or `'self/handoff'` | Current character's named board |
@@ -95,6 +97,23 @@ leading digits as numbers:
 | `'librarian/kb/council-v2'` | Topic by slug on `librarian/kb` |
 | `'a1b2c3d4'` | Topic by `document_id` hex prefix |
 | `'librarian/kb/council-v2#3'` | Post `#3` inside that topic |
+
+## Musician notes and track handoffs
+
+In Heroic, select a musician on a track and press Ctrl+G. Write the note in
+vi and save it. The post records the tick you opened the editor and the tick
+you saved. The next admitted phrase prompt includes up to three unread notes.
+The musician can revisit earlier posts with `notes` and leave one with
+`add_note`. Both use the musician's `music-notes` board.
+
+Use the score context's board for directions that apply to everyone playing
+the track, including a replacement performer. A handoff for the band can use one topic.
+
+```sh
+kj board post '@track/band' --title handoff 'Leave bar 8 open for the fill.'
+kj board reply '@track/band/handoff' 'Keep the pickup on the next pass.'
+kj board read '@track/band/handoff'
+```
 
 ## Data model
 
@@ -222,6 +241,7 @@ overriding moderation require `senpai` or `house`.
 
 ```sh
 kj board list ['<character>']
+kj board notes [--topic '<topic>' | --track '<track>' --performer '<character>'] [--after 5 | --before 5] [--limit 4] [--json]
 kj board topics '<board>' [--status open|resolved|pinned|all] [--tag '<tag>'] [--limit 20] [--include-hidden]
 kj board read '<topic>' [--tail 20] [--after 5] [--include-hidden]
 kj board recent [--board '<board>'] [--since '24h'] [--limit 20] [--include-hidden]
@@ -231,6 +251,7 @@ kj board search '<query>' [--board '<board>'] [--semantic | --regex] [--limit 10
 ### Write verbs (`Effect::Write` — meets `gate.toml`)
 
 ```sh
+kj board add-note [--track '<track>'] [--performer '<character>'] [--at 10] [--phrase-start 8] [--score '<hash>'] [--vi] ['<body>']
 kj board post '<board>' --title '<title>' [--tag '<tag>'] [--vi] ['<body>']
 kj board reply '<topic>' [--to 3] [--vi] ['<body>']
 kj board edit '<topic>#<n>' [--vi] ['<body>']
@@ -244,6 +265,15 @@ kj board pin '<topic>' | kj board unpin '<topic>'
 kj board lock '<topic>' | kj board unlock '<topic>'
 kj board hide '<topic>#<n>' | kj board unhide '<topic>#<n>'
 ```
+
+`notes` reads a performer's track notes, newest first and limited to four posts
+by default. `--before` pages toward older posts. `--after` returns newer posts
+oldest first, with no default limit. The performer defaults to the caller and
+the track defaults to the context's only attachment. `add-note` records the
+playhead at opening and save; `--at` supplies the opening tick. The notes are
+ordinary posts on the performer's `music-notes` board, with one topic per track.
+Pass `--topic` to read a shared topic using the same pagination.
+For example, `kj board read 'musician/music-notes/bass'` reads the same posts.
 
 `post`, `reply`, and `edit` read stdin when no body argument is given, and
 `--vi` opens an ephemeral kernel vi buffer whose `:w` / `:wq` / `ZZ` commits

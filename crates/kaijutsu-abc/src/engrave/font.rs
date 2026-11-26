@@ -121,6 +121,9 @@ const PRELOAD_CODEPOINTS: &[u32] = &[
     0xE0A2, // Whole notehead
     0xE0A3, // Half notehead
     0xE0A4, // Quarter/filled notehead
+    0xE0A7, // Whole cross notehead
+    0xE0A8, // Half cross notehead
+    0xE0A9, // Quarter/filled cross notehead
     0xE4E3, // Whole rest
     0xE4E4, // Half rest
     0xE4E5, // Quarter rest
@@ -283,6 +286,16 @@ mod tests {
                 "Missing glyph for codepoint U+{:04X}",
                 cp
             );
+        }
+    }
+
+    #[test]
+    fn cross_noteheads_have_outlines_and_advances() {
+        let cache = font_cache();
+        for cp in 0xE0A7..=0xE0A9 {
+            assert!(!cache.glyph_path(cp).unwrap_or("").is_empty(), "missing SVG outline for U+{cp:04X}");
+            assert!(cache.glyph_bezpath(cp).is_some_and(|path| !path.elements().is_empty()), "missing outline for U+{cp:04X}");
+            assert!(cache.glyph_advance(cp).is_some_and(|advance| advance > 0.0), "missing advance for U+{cp:04X}");
         }
     }
 
