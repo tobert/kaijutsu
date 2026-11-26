@@ -674,14 +674,8 @@ pub(crate) fn spawn_well_furniture(
         state.card_mesh = Some(meshes.add(card_block_mesh()));
     }
 
-    // Warm gold core (`ScenePalette::gold` — was `[1.0, 0.62, 0.20]`, the
-    // concept-art palette's own warm gold; leaned the rest of the way onto the
-    // room's shared gold) + indigo-violet neon rings (`ScenePalette::neon` —
-    // was `[0.35, 0.62, 1.0]`, a saturated cyan-blue). Room-palette re-skin,
-    // 2026-07-11: HDR-on-activity behavior (`energy`/ripples in
-    // `well_rings.wesl`) is untouched — only these RESTING identity hues moved.
     let deck_material = ring_materials.add(crate::shaders::WellRingsMaterial::new(
-        Vec4::new(palette.gold.red, palette.gold.green, palette.gold.blue, 1.0),
+        ScenePalette::vec3(palette.gold).extend(1.0),
         ScenePalette::vec3(palette.neon).extend(1.0),
     ));
     // Tilt + place the deck on the same funnel axis as the cards: its center
@@ -779,9 +773,7 @@ pub(crate) fn spawn_well_furniture(
         params: Vec4::ZERO,
         shape: card_shape(),
         border: Vec4::ZERO,
-        // dim.x = 1: never dimmed (not a rim Card). y/z are the live
-        // chatter/beat lanes — MUST stay 0 (Vec4::ONE here lit both full-on:
-        // the accidental cyan+gold "cream ring" fixed 2026-07-06).
+        // The reading panel stays at full brightness.
         dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
     });
     // Spawned as its own scene rather than inline under the root: the MSDF
@@ -816,7 +808,7 @@ pub(crate) fn spawn_well_furniture(
         params: Vec4::ZERO,
         shape: label_shape(),
         border: Vec4::ZERO,
-        // dim.x only — y/z are live chatter/beat lanes, not brightness.
+        // Only the label brightness is active.
         dim: Vec4::new(LABEL_DIM, 0.0, 0.0, 0.0),
     });
     let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
@@ -1184,6 +1176,102 @@ pub fn well_keyboard(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn reloading_the_scene_palette_recolors_existing_well_materials() {
+        use crate::shaders::{TerraceRingMaterial, WellRingsMaterial};
+        let mut app = App::new();
+        app.init_resource::<ScenePalette>()
+            .init_resource::<Assets<WellRingsMaterial>>()
+            .init_resource::<Assets<TerraceRingMaterial>>()
+            .add_systems(Update, sync_well_palette);
+        let deck = app.world_mut().resource_mut::<Assets<WellRingsMaterial>>()
+            .add(WellRingsMaterial::new(Vec4::ZERO, Vec4::ZERO));
+        let terrace = app.world_mut().resource_mut::<Assets<TerraceRingMaterial>>()
+            .add(TerraceRingMaterial::new(0.7, 0.9, 1.0, -1.0, Vec3::ZERO, 0.37, 1, 2, Vec3::ZERO));
+        app.update();
+
+        {
+            let mut palette = app.world_mut().resource_mut::<ScenePalette>();
+            palette.gold = LinearRgba::rgb(0.7, 0.9, 0.3);
+            palette.neon = LinearRgba::rgb(0.2, 0.4, 0.8);
+            palette.terrace = LinearRgba::rgb(0.4, 0.1, 0.2);
+        }
+        app.update();
+        let deck_material = app.world().resource::<Assets<WellRingsMaterial>>().get(&deck).unwrap();
+        let terrace_material = app.world().resource::<Assets<TerraceRingMaterial>>().get(&terrace).unwrap();
+        assert_eq!(deck_material.core_color, Vec4::new(0.7, 0.9, 0.3, 1.0));
+        assert_eq!(deck_material.ring_color, Vec4::new(0.2, 0.4, 0.8, 1.0));
+        assert_eq!(terrace_material.color, Vec4::new(0.4, 0.1, 0.2, 0.37));
+        assert_eq!(terrace_material.accent, Vec4::new(0.7, 0.9, 0.3, 0.0));
+    }
+
+    #[test]
+    fn deck_ripple_starts_at_the_plinth_then_fades_toward_the_rim() {
+        use crate::shaders::WellRingsMaterial;
+        use super::super::activity::{RingActivity, MAX_RIPPLES, RIPPLE_LIFETIME};
+        use super::super::live::WellBeatsRes;
+
+        let mut app = App::new();
+        app.init_resource::<RingActivity>()
+            .init_resource::<WellBeatsRes>()
+            .init_resource::<Assets<WellRingsMaterial>>()
+            .add_systems(Update, sync_deck_material);
+        let material = app.world_mut().resource_mut::<Assets<WellRingsMaterial>>()
+            .add(WellRingsMaterial::new(Vec4::ONE, Vec4::ONE));
+        app.world_mut().spawn((EventHorizonDeck, MeshMaterial3d(material.clone())));
+        app.world_mut().resource_mut::<RingActivity>().ripple(std::f32::consts::FRAC_PI_2, 0.8);
+
+        let packed = |app: &App| {
+            app.world().resource::<Assets<WellRingsMaterial>>().get(&material).unwrap().ripples
+        };
+        let start = crate::view::room::TABLE_PLINTH_RADIUS / (RING_DECK_SIZE * STATION_CENTER_SCALE * 0.5);
+        app.update();
+        let first = packed(&app)[0];
+        assert!(first.abs_diff_eq(Vec4::new(0.0, 1.0, start, 0.8), 1e-5), "{first:?}");
+
+        app.world_mut().resource_mut::<RingActivity>().tick(RIPPLE_LIFETIME * 0.5);
+        app.update();
+        let middle = packed(&app)[0];
+        assert!(middle.abs_diff_eq(Vec4::new(0.0, 1.0, (start + 1.0) * 0.5, 0.4), 1e-5), "{middle:?}");
+
+        app.world_mut().resource_mut::<RingActivity>().tick(RIPPLE_LIFETIME);
+        app.update();
+        assert_eq!(packed(&app), [Vec4::ZERO; MAX_RIPPLES]);
+    }
+
+    #[test]
+    fn a_finished_seated_turn_sends_one_ripple_toward_its_card() {
+        use crate::connection::actor_plugin::ServerEventMessage;
+        use kaijutsu_client::{ServerEvent, TurnCompletedStopReason, TurnOrigin};
+        use super::super::activity::RingActivity;
+        let seated = ContextId::new();
+        let other = ContextId::new();
+        let mut app = App::new();
+        app.init_resource::<TimeWellState>().init_resource::<RingActivity>()
+            .add_message::<ServerEventMessage>().add_systems(Update, ripple_on_finished_turn);
+        let source = super::super::card::well_tilt_quat() * Vec3::new(0.0, 2.0, -3.0);
+        let entity = app.world_mut().spawn((
+            RingSeat { band: Band::Active, within_index: 1, ring_len: 4 },
+            Transform::from_translation(source),
+        )).id();
+        app.world_mut().resource_mut::<TimeWellState>().entities.insert(seated, entity);
+        for (context_id, stop_reason) in [
+            (other, TurnCompletedStopReason::EndTurn),
+            (seated, TurnCompletedStopReason::CancelledSoft),
+            (seated, TurnCompletedStopReason::MaxTokens),
+            (seated, TurnCompletedStopReason::EndTurn),
+        ] {
+            app.world_mut().write_message(ServerEventMessage(ServerEvent::TurnCompleted {
+                turn_id: kaijutsu_types::TurnId::new(), context_id, principal_id: kaijutsu_types::PrincipalId::new(),
+                output_block_id: None, stop_reason, origin: TurnOrigin::Autonomous,
+            }));
+        }
+        app.update();
+        let activity = app.world().resource::<RingActivity>();
+        assert_eq!(activity.ripples.len(), 1);
+        assert!((activity.ripples[0].angle - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
 
     /// Helper: the card mesh's positions, before worrying about which face.
     fn card_mesh_positions() -> Vec<[f32; 3]> {
@@ -2055,31 +2143,55 @@ pub fn apply_horizon_label_lod(
     }
 }
 
-/// The `RingActivity` decay tick alone — split out of the old
-/// `tick_and_sync_rings` (Slice C, `lovely-swimming-prism.md`) so it can run
-/// **fully ungated**, mirroring `live::ingest_live_events`'s own ungated
-/// system. This must NOT freeze outside the room: a design-review correction
-/// caught that putting this in the room-gated ambient tier alongside
-/// [`accumulate_ring_activity`] would reintroduce the exact
-/// frozen-then-flashes-bright-on-reentry bug the old `exit_time_well`'s
-/// `RingActivity::default()` reset used to guard against — energy now decays
-/// toward zero in real time while you're away (Conversation, or any other
-/// screen), so by the time you return it's already calmed down instead of
-/// snapping back to a stale, high value. [`sync_deck_material`] (ambient —
-/// room-gated) is the half that actually WRITES the decayed value into the
-/// deck's material; nothing to draw, nothing gated here.
-pub fn tick_ring_activity(time: Res<Time>, mut activity: ResMut<super::activity::RingActivity>) {
-    activity.tick(time.delta_secs());
+/// A natural turn ending sends a single wave toward the card's current bearing.
+pub fn ripple_on_finished_turn(
+    mut events: MessageReader<crate::connection::actor_plugin::ServerEventMessage>,
+    state: Res<TimeWellState>,
+    seats: Query<&Transform, With<RingSeat>>,
+    mut activity: ResMut<super::activity::RingActivity>,
+) {
+    use kaijutsu_client::{ServerEvent, TurnCompletedStopReason};
+    for event in events.read() {
+        match &event.0 {
+            ServerEvent::TurnCompleted { context_id, stop_reason: TurnCompletedStopReason::EndTurn, .. } => {
+                if let Some(entity) = state.entities.get(context_id)
+                    && let Ok(seat) = seats.get(*entity)
+                {
+                    let pos = super::card::well_tilt_quat().inverse() * seat.translation;
+                    activity.ripple(pos.y.atan2(pos.x), 1.0);
+                }
+            }
+            ServerEvent::Reconnected => activity.ripples.clear(),
+            _ => {}
+        }
+    }
 }
 
-/// Push the well's pulse into the deck material uniforms: the global
-/// `energy` (ring brightness / flow / core spin), the beat envelope
-/// (`energy.y` — the throat heartbeat from whatever track is rolling, see
-/// [`super::live::WellBeats`]), and the packed ripple array
-/// (`[cos, sin, age_norm, intensity]`, unused slots `intensity = 0`). The
-/// visual-write half of the old `tick_and_sync_rings` — ambient (room-gated),
-/// since there's nothing to draw outside the room; the decay tick itself
-/// moved to [`tick_ring_activity`] (ungated).
+pub fn sync_well_palette(
+    palette: Res<ScenePalette>,
+    mut decks: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
+    mut terraces: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
+) {
+    if !palette.is_changed() { return; }
+    let gold = ScenePalette::vec3(palette.gold);
+    for (_, deck) in decks.iter_mut() {
+        deck.core_color = gold.extend(1.0);
+        deck.ring_color = ScenePalette::vec3(palette.neon).extend(1.0);
+    }
+    for (_, terrace) in terraces.iter_mut() {
+        terrace.color = ScenePalette::vec3(palette.terrace).extend(terrace.color.w);
+        terrace.accent = gold.extend(0.0);
+    }
+}
+
+/// Age ripples even when the room is closed so old turns fade before re-entry.
+pub fn tick_ring_activity(time: Res<Time>, mut activity: ResMut<super::activity::RingActivity>) {
+    if !activity.ripples.is_empty() {
+        activity.tick(time.delta_secs());
+    }
+}
+
+/// Update the deck's beat envelope and ripples while it is visible.
 pub fn sync_deck_material(
     activity: Res<super::activity::RingActivity>,
     beats: Res<super::live::WellBeatsRes>,
@@ -2089,24 +2201,26 @@ pub fn sync_deck_material(
     let Ok(handle) = deck.single() else {
         return;
     };
-    let Some(mut mat) = ring_materials.get_mut(&handle.0) else {
+    let Some(mat) = ring_materials.get(&handle.0) else {
         return;
     };
-
-    mat.energy.x = activity.energy;
-    mat.energy.y = beats.global_envelope(std::time::Instant::now());
-
-    let mut packed = [Vec4::ZERO; super::activity::MAX_RIPPLES];
-    for (i, r) in activity
-        .ripples
-        .iter()
-        .take(super::activity::MAX_RIPPLES)
-        .enumerate()
-    {
-        let age_norm = (r.age / super::activity::RIPPLE_LIFETIME).clamp(0.0, 1.0);
-        packed[i] = Vec4::new(r.angle.cos(), r.angle.sin(), age_norm, r.intensity);
+    let beat = beats.global_envelope(std::time::Instant::now());
+    let mut ripples = [Vec4::ZERO; super::activity::MAX_RIPPLES];
+    let deck_radius = RING_DECK_SIZE * STATION_CENTER_SCALE * 0.5;
+    let plinth_edge = crate::view::room::TABLE_PLINTH_RADIUS / deck_radius;
+    for (slot, ripple) in ripples.iter_mut().zip(&activity.ripples) {
+        let progress = (ripple.age / super::activity::RIPPLE_LIFETIME).clamp(0.0, 1.0);
+        let front = plinth_edge + (1.0 - plinth_edge) * progress;
+        let amplitude = ripple.intensity * (1.0 - progress);
+        *slot = Vec4::new(ripple.angle.cos(), ripple.angle.sin(), front, amplitude);
     }
-    mat.ripples = packed;
+
+    if (mat.beat != beat || mat.ripples != ripples)
+        && let Some(mut mat) = ring_materials.get_mut(&handle.0)
+    {
+        mat.beat = beat;
+        mat.ripples = ripples;
+    }
 }
 
 /// Billboard every card (and the in-world "+N" label — [`HorizonLabel`] rides

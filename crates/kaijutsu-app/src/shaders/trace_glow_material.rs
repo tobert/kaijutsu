@@ -18,12 +18,9 @@
 //!
 //! `color` may carry brightness above 1.0 at the crest/breath's peak — the
 //! app camera's threshold-1.0 bloom pass (`main::setup_camera`) haloes it
-//! softly. Every spawn site renormalizes its identity hue so the peak lands
-//! at exactly [`crate::view::scene_palette::ScenePalette::crest`]
-//! (`room::crest_color`), and picks a `trough` low enough that
-//! `trough * crest < 1.0` — the element's resting state (and its
-//! time-average) stays LDR even though the crest blooms (`view::scene_geometry`'s
-//! amended material discipline).
+//! softly. Floor traces and terminal pads keep the theme's authored
+//! brightness up to the scene crest limit. Wall trim and the inscribed ring
+//! use the full crest. Each material supplies its own trough fraction.
 
 use bevy::prelude::*;
 use bevy::material::AlphaMode;
@@ -34,10 +31,7 @@ use bevy::shader::ShaderRef;
 /// terminal pad disc, an inscribed-ring annulus, or a wall-trim strip.
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct TraceGlowMaterial {
-    /// Crest hue: linear rgb in `.xyz`, renormalized so its brightest channel
-    /// is exactly [`crate::view::scene_palette::ScenePalette::crest`] (may
-    /// exceed 1.0 — HDR, blooms); `.w` unused (every element this material
-    /// draws is opaque).
+    /// Linear RGB at the crest. Values above one can bloom.
     #[uniform(0)]
     pub color: Vec4,
 

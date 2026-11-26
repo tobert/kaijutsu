@@ -162,8 +162,7 @@ pub fn toggle_legend(
         // Neutral readout white, selection-independent (unlike the retired
         // panels' selection-accent echo — the legend has no selection to echo).
         border,
-        // dim.x = 1: never dimmed (not a rim Card). y/z are live
-        // chatter/beat lanes — 0, or the frame washes cyan+gold.
+        // The legend stays at full brightness.
         dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
     });
 

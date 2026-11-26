@@ -628,6 +628,12 @@ the top, and the hi-hat above the staff with a cross head. A percussion
 clef selects this layout. Channel 10 supplies it when the score omits a
 clef. Other percussion without a kit position uses the middle line.
 
+The Time Well uses two gestures for the rehearsal. A track’s own clock
+moves a packet along its ray. A context finishing a turn sends one ripple
+toward its seat. The room floor used to lift every trace to the same peak,
+which erased the differences in brightness the theme gave them. Keeping
+those differences lets the live signals stand out against the wiring.
+
 ## The rotation signoff (November 23)
 
 A rotation asked for from inside a context's own turn used to archive the

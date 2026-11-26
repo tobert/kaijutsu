@@ -7,9 +7,8 @@
 //! churn, the ray persists. While the track's clock rolls, a bright pulse
 //! rides the beam from the mouth down into the throat on every beat (energy
 //! falling into the well), phase-driven by the app-local beat phasor
-//! ([`crate::view::time_well::live::WellBeats`]) — *distribute tempo, not
-//! pulses*. A stopped track is a dim, steady filament (LDR — passive
-//! structure; the bright/blooming vocabulary stays reserved for live action).
+//! ([`kaijutsu_present::beats::WellBeats`]). A steady filament is dim when
+//! stopped and brighter when the roster reports playing without a phasor.
 
 use bevy::prelude::*;
 use bevy::material::AlphaMode;
@@ -24,19 +23,17 @@ pub struct TrackRayMaterial {
     #[uniform(0)]
     pub color: Vec4,
 
-    /// `[beat_env, playing, beat_frac, activity]`:
+    /// `[beat_env, clock, beat_frac, _]`:
     /// - `beat_env` — the beat envelope (1.0 on the beat, decaying through it);
-    /// - `playing` — 0/1 transport gate for the pulse;
+    /// - `clock` — 0.0 stopped, 0.5 playing without a phasor, 1.0 live phasor;
     /// - `beat_frac` — fractional position within the current beat (0..1),
-    ///   which the shader maps to the pulse's position along the beam;
-    /// - `activity` — decaying event energy of the track's attached contexts
-    ///   (0..1), lifting the whole filament while its players talk.
+    ///   which the shader maps to the pulse's position along the beam.
     #[uniform(1)]
     pub params: Vec4,
 }
 
 impl TrackRayMaterial {
-    /// A quiet ray in `color`: stopped, no pulse, no activity.
+    /// A stopped ray in `color`.
     pub fn new(color: Vec4) -> Self {
         Self { color, params: Vec4::ZERO }
     }

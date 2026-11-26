@@ -7,7 +7,7 @@
 //! "Appendix: substrate notes" → data flow).
 //! `Join::reconcile` here is the **layout tick**. Card `live_status` rides the
 //! same poll (kernel-derived, `ContextInfo.live_status`); the sub-poll live
-//! layer — chatter/beat uniforms + tail buffers off the event stream — lives
+//! layer — beat envelopes and tail buffers off the event stream — lives
 //! in [`super::live`] and never relayouts.
 
 use std::collections::{HashMap, HashSet};
@@ -211,8 +211,7 @@ pub fn sync_time_well(
             params: Vec4::ZERO,
             shape: super::scene::card_shape(),
             border: Vec4::ZERO,
-            // dim.x = full brightness until dim_nonfocused_rings sets it; y/z
-            // are the live chatter/beat lanes and start quiet.
+            // Start at full brightness until dim_nonfocused_rings runs.
             dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
         });
 

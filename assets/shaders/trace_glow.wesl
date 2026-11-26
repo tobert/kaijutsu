@@ -3,9 +3,7 @@
 // layout doc). Zero per-frame CPU writes: every element's phase/rate/trough
 // is baked in at spawn time, and all motion here comes from `globals.time`.
 //
-// color  = [r, g, b, _]      — crest hue, renormalized so its brightest
-//                              channel is exactly GLOW_CREST (may exceed 1.0
-//                              — HDR, blooms through the app's bloom pass)
+// color  = [r, g, b, _]      — linear RGB at the crest
 // params = [phase, rate, trough, mode]
 //   mode 0 — traveling wave: one crest glides along uv.x at `rate`
 //     cycles/second, offset by `phase` (a `[0,1)` cycle-fraction). uv.x is

@@ -42,12 +42,6 @@ const PAD: f32 = 14.0;
 const LABEL_FONT_SIZE: f32 = 24.0;
 /// Inner padding (logical px in the label-texture space).
 const LABEL_PAD: f32 = 10.0;
-/// Dim, desaturated LDR brush for label text — passive structural state, not
-/// live action (the HDR-tiering rule reserves bloom for the latter).
-fn label_brush() -> Brush {
-    bevy_color_to_brush(Color::srgba(0.75, 0.85, 0.97, 0.75))
-}
-
 /// Font size for the card-face gist line, ~0.75× the smallest badge (fork
 /// badge, 12.0 — see `card_text_glyphs`) so it reads smaller than every badge
 /// above it, not just the biggest.
@@ -65,11 +59,22 @@ pub(super) const GIST_LINE_CHARS: usize = 40;
 /// Hard cap on wrapped gist lines; content beyond this is ellipsized.
 const GIST_MAX_LINES: usize = 2;
 
-/// Dim brush for the gist line — dimmer than every badge brush above it
-/// (title ~1.0 alpha, model badge 0.85, fork badge 0.65): this is the least
-/// important line on the card face, a hint rather than a spec.
-fn gist_brush() -> Brush {
-    bevy_color_to_brush(Color::srgba(0.80, 0.86, 0.97, 0.55))
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct CardTextColors {
+    title: Color,
+    body: Color,
+    paused: Color,
+    identity: Color,
+}
+
+impl From<&crate::ui::theme::Theme> for CardTextColors {
+    fn from(theme: &crate::ui::theme::Theme) -> Self {
+        Self { title: theme.fg, body: theme.fg_dim, paused: theme.warning, identity: theme.accent }
+    }
+}
+
+fn panel_needs_redraw(previous: Option<Entity>, current: Entity, content_changed: bool) -> bool {
+    previous != Some(current) || content_changed
 }
 
 /// Tail lines shown on the reading card's absorbed tail cut (HUD-melt slice
@@ -95,13 +100,6 @@ const READING_BLOCK_HEADER_SIZE: f32 = 8.0;
 /// line above it (this is reference material, denser and further down the
 /// hierarchy than the card's own summary).
 const READING_BLOCK_BODY_SIZE: f32 = 7.0;
-
-/// Dim, slightly-brighter-than-body brush for a reading-card block's section
-/// label — one step up from [`gist_brush`]'s dimness, the same alpha-taper
-/// idiom every other field on the card already uses for hierarchy.
-fn reading_block_header_brush() -> Brush {
-    bevy_color_to_brush(Color::srgba(0.86, 0.93, 1.0, 0.75))
-}
 
 /// Greedy word-wrap: split `text` into lines of at most `line_chars`
 /// characters each, never breaking a word mid-way. A single word longer than
@@ -265,13 +263,6 @@ pub fn ancestry_text(
     out
 }
 
-// HDR gain for the focus card's bevel frame (the `border` ring band: the
-// selection's accent lifted so the frame reads as a deliberate beveled edge,
-// replacing the accidental cream ring the pre-mask-fix chatter/beat lanes
-// used to paint; a touch under the legend panel's `gain_hud_border` so the
-// in-world card doesn't outshine the legend) moved onto
-// `ScenePalette::gain_reading_border`.
-
 /// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, drifting]`.
 /// `status` is a float code the shader switches on for the rim FX: pending/none →
 /// 0, running → 1 (breathing pulse), done → 2 (no rim), error → 3 (steady red).
@@ -323,6 +314,7 @@ fn collect_field(
 /// seam between them, extracted so neither copy can drift from the other.
 fn card_header_glyphs(
     card: &Card,
+    colors: &CardTextColors,
     font: &VelloFont,
     max_advance: Option<f32>,
     s: f32,
@@ -335,7 +327,7 @@ fn card_header_glyphs(
     let mut y = pad + 6.0 * s;
 
     // ── Title. ──
-    let title_brush = bevy_color_to_brush(Color::srgb(0.98, 0.99, 1.0));
+    let title_brush = bevy_color_to_brush(colors.title);
     let title = font.layout(
         &data.title,
         &VelloTextStyle { font_size: 22.0 * s, line_height: 1.1, ..default() },
@@ -351,7 +343,7 @@ fn card_header_glyphs(
     // the MSDF font pipeline's glyph coverage for it is unverified, and the
     // literal reads correctly everywhere the rest of the card's text does.
     if data.paused {
-        let brush = bevy_color_to_brush(Color::srgb(1.0, 0.78, 0.35));
+        let brush = bevy_color_to_brush(colors.paused);
         let marker = font.layout(
             "PAUSED",
             &VelloTextStyle { font_size: 13.0 * s, ..default() },
@@ -365,7 +357,7 @@ fn card_header_glyphs(
 
     // ── Model badge. ──
     if !data.model_badge.is_empty() {
-        let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.85));
+        let brush = bevy_color_to_brush(colors.identity);
         let badge = font.layout(
             &data.model_badge,
             &VelloTextStyle { font_size: 14.0 * s, ..default() },
@@ -379,7 +371,7 @@ fn card_header_glyphs(
 
     // ── Fork badge. ──
     if let Some(fork) = &data.fork_badge {
-        let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.65));
+        let brush = bevy_color_to_brush(colors.body);
         // Plain word, not U+2442 ⑂ — the shaping font has no glyph for it
         // and renders tofu (live-verified 2026-07-12).
         let label = format!("fork {fork}");
@@ -406,6 +398,7 @@ fn card_header_glyphs(
 /// gist/keywords/cluster), so it's a sibling, not a caller, of this one.
 fn card_text_glyphs(
     card: &Card,
+    colors: &CardTextColors,
     font: &VelloFont,
     w: f32,
     h: f32,
@@ -417,7 +410,7 @@ fn card_text_glyphs(
     let data = &card.data;
     let max_advance = Some(w - 2.0 * pad);
     let mut out = Vec::new();
-    let mut y = card_header_glyphs(card, font, max_advance, s, pad, atlas, font_data_map, &mut out);
+    let mut y = card_header_glyphs(card, colors, font, max_advance, s, pad, atlas, font_data_map, &mut out);
 
     // ── Gist line(s). ── Sentence-level extractive summary (Tier 2,
     // `kaijutsu-kernel::runtime::synthesis::compute_gist`), riding the same
@@ -430,7 +423,7 @@ fn card_text_glyphs(
         && let Some(wrapped) = wrap_gist(preview, GIST_LINE_CHARS, GIST_MAX_LINES)
         && y < h - pad
     {
-        let brush = gist_brush();
+        let brush = bevy_color_to_brush(colors.body);
         let l = font.layout(
             &wrapped,
             &VelloTextStyle { font_size: GIST_FONT_SIZE * s, line_height: 1.15, ..default() },
@@ -450,7 +443,7 @@ fn card_text_glyphs(
     if let Some(tail_text) = card.tail.as_deref()
         && y < h - pad
     {
-        let brush = gist_brush();
+        let brush = bevy_color_to_brush(colors.body);
         let l = font.layout(
             tail_text,
             &VelloTextStyle { font_size: GIST_FONT_SIZE * s, line_height: 1.15, ..default() },
@@ -465,7 +458,7 @@ fn card_text_glyphs(
     // ── Keywords. ──
     let tail = data.keywords.join(" · ");
     if !tail.is_empty() && y < h - pad {
-        let brush = bevy_color_to_brush(Color::srgba(0.92, 0.95, 1.0, 0.72));
+        let brush = bevy_color_to_brush(colors.body);
         let l = font.layout(
             &tail,
             &VelloTextStyle { font_size: 12.0 * s, line_height: 1.15, ..default() },
@@ -477,7 +470,7 @@ fn card_text_glyphs(
 
     // ── Cluster label (haystack only), bottom-anchored. ──
     if let Some(cluster) = &data.cluster_label {
-        let brush = bevy_color_to_brush(Color::srgba(0.86, 0.93, 1.0, 0.95));
+        let brush = bevy_color_to_brush(colors.identity);
         let text = format!("◇ {cluster}");
         let l = font.layout(
             &text,
@@ -506,6 +499,7 @@ fn card_text_glyphs(
 /// margin. Returns the y-cursor after the block.
 fn layout_reading_block(
     text: &str,
+    colors: &CardTextColors,
     font: &VelloFont,
     max_advance: Option<f32>,
     s: f32,
@@ -537,7 +531,7 @@ fn layout_reading_block(
             max_advance,
         );
         let lh = l.height();
-        collect_field(&l, (pad as f64, y as f64), &reading_block_header_brush(), atlas, font_data_map, out);
+        collect_field(&l, (pad as f64, y as f64), &bevy_color_to_brush(colors.title), atlas, font_data_map, out);
         y += lh + 3.0 * s;
     }
     if !body.is_empty() {
@@ -548,7 +542,7 @@ fn layout_reading_block(
             max_advance,
         );
         let lh = l.height();
-        collect_field(&l, (pad as f64, y as f64), &gist_brush(), atlas, font_data_map, out);
+        collect_field(&l, (pad as f64, y as f64), &bevy_color_to_brush(colors.body), atlas, font_data_map, out);
         y += lh + 10.0 * s;
     }
     y
@@ -573,6 +567,7 @@ fn layout_reading_block(
 /// get when you dolly in and look, not a live ticker.
 fn reading_card_glyphs(
     card: &Card,
+    colors: &CardTextColors,
     join: &Join<ContextId, ContextInfo>,
     track: Option<&kaijutsu_client::TrackInfo>,
     tail: Option<&str>,
@@ -587,23 +582,23 @@ fn reading_card_glyphs(
     let max_advance = Some(w - 2.0 * pad);
     let y_limit = h - pad;
     let mut out = Vec::new();
-    let mut y = card_header_glyphs(card, font, max_advance, s, pad, atlas, font_data_map, &mut out);
+    let mut y = card_header_glyphs(card, colors, font, max_advance, s, pad, atlas, font_data_map, &mut out);
 
     let specs = reading_specs_text(&card.data, track);
     y = layout_reading_block(
-        &specs, font, max_advance, s, pad, y, y_limit, true, atlas, font_data_map, &mut out,
+        &specs, colors, font, max_advance, s, pad, y, y_limit, true, atlas, font_data_map, &mut out,
     );
 
     let ancestry = ancestry_text(card.context_id, |id| {
         join.get(&id).map(|c| (c.id.display_or(Some(c.label.as_str())), c.forked_from))
     });
     y = layout_reading_block(
-        &ancestry, font, max_advance, s, pad, y, y_limit, true, atlas, font_data_map, &mut out,
+        &ancestry, colors, font, max_advance, s, pad, y, y_limit, true, atlas, font_data_map, &mut out,
     );
 
     if let Some(tail_text) = tail {
         layout_reading_block(
-            tail_text, font, max_advance, s, pad, y, y_limit, false, atlas, font_data_map, &mut out,
+            tail_text, colors, font, max_advance, s, pad, y, y_limit, false, atlas, font_data_map, &mut out,
         );
     }
 
@@ -629,6 +624,7 @@ fn reading_card_glyphs(
 /// bay's `text_dirty` idiom rather than leaning on a subtler assumption about
 /// how long a gap in this system's own execution can safely be.
 pub fn build_card_scenes(
+    theme: Res<crate::ui::theme::Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     mut atlas: Option<ResMut<MsdfAtlas>>,
@@ -642,6 +638,7 @@ pub fn build_card_scenes(
         &MeshMaterial3d<WellCardMaterial>,
     )>,
     changed: Query<Entity, Changed<Card>>,
+    mut last_colors: Local<Option<CardTextColors>>,
 ) {
     let Some(font) = fonts.get(&font_handles.mono) else {
         return; // font still loading; retry next change, `card_text_dirty` untouched
@@ -652,7 +649,8 @@ pub fn build_card_scenes(
     // Only clear the arm once glyphs are actually about to be committed for
     // every card (below) — same "don't eat the flag on a scheduling surprise"
     // discipline as `room::room_plate_text`'s `any` guard.
-    let rebuild_all = state.card_text_dirty;
+    let colors = CardTextColors::from(&*theme);
+    let rebuild_all = state.card_text_dirty || *last_colors != Some(colors);
     let changed_set: std::collections::HashSet<Entity> = changed.iter().collect();
     for (entity, card, mut msdf, mat_node) in query.iter_mut() {
         if !rebuild_all && !changed_set.contains(&entity) {
@@ -661,7 +659,7 @@ pub fn build_card_scenes(
         // Pure MSDF surface: the build size lives on the card's `UiRttTexture`
         // (set once at spawn); the MSDF pass clears and owns the texture. No
         // vello scene — the shader draws the body.
-        let glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
+        let glyphs = card_text_glyphs(card, &colors, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
         commit_panel_glyphs(&mut msdf, glyphs);
 
         if let Some(mut mat) = materials.get_mut(&mat_node.0) {
@@ -669,6 +667,7 @@ pub fn build_card_scenes(
         }
     }
     if rebuild_all {
+        *last_colors = Some(colors);
         state.card_text_dirty = false;
     }
 }
@@ -711,6 +710,7 @@ pub fn sync_card_material_params(
 /// per frame — the tail is a snapshot, not a live-updating window (see
 /// [`reading_card_glyphs`]'s own doc).
 pub fn update_reading_card(
+    theme: Res<crate::ui::theme::Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     mut atlas: Option<ResMut<MsdfAtlas>>,
@@ -722,21 +722,30 @@ pub fn update_reading_card(
     palette: Res<crate::view::scene_palette::ScenePalette>,
     cards: Query<&Card>,
     mut reading: Query<
-        (&mut MsdfBlockGlyphs, &MeshMaterial3d<WellCardMaterial>),
+        (Entity, &mut MsdfBlockGlyphs, &MeshMaterial3d<WellCardMaterial>),
         With<ReadingCard>,
     >,
     mut last: Local<Option<ContextId>>,
+    mut last_entity: Local<Option<Entity>>,
+    mut last_colors: Local<Option<CardTextColors>>,
 ) {
-    if state.selected == *last {
+    let Ok((entity, mut msdf, mat_node)) = reading.single_mut() else {
+        return;
+    };
+    let colors = CardTextColors::from(&*theme);
+    if !panel_needs_redraw(*last_entity, entity,
+        state.selected != *last || *last_colors != Some(colors) || palette.is_changed()) {
         return;
     }
     let Some(font) = fonts.get(&font_handles.mono) else {
         return;
     };
-    let Ok((mut msdf, mat_node)) = reading.single_mut() else {
-        return; // focus card not spawned yet
-    };
+    if state.selected.is_some() && atlas.is_none() {
+        return;
+    }
     *last = state.selected;
+    *last_entity = Some(entity);
+    *last_colors = Some(colors);
 
     // Build size lives on the focus card's `UiRttTexture` (set at spawn).
     let glyphs = match state
@@ -763,6 +772,7 @@ pub fn update_reading_card(
                     );
                     reading_card_glyphs(
                         card,
+                        &colors,
                         &state.join,
                         track,
                         tail.as_deref(),
@@ -795,6 +805,7 @@ pub fn update_reading_card(
 /// valid, cleared-to-transparent commit — see the callers).
 fn layout_label_text(
     text: &str,
+    color: Color,
     font: &VelloFont,
     atlas: &mut MsdfAtlas,
     font_data_map: &mut FontDataMap,
@@ -802,7 +813,7 @@ fn layout_label_text(
     if text.is_empty() {
         return Vec::new();
     }
-    let brush = label_brush();
+    let brush = bevy_color_to_brush(color);
     let layout = font.layout(
         text,
         &VelloTextStyle { font_size: LABEL_FONT_SIZE, line_height: 1.1, ..default() },
@@ -824,40 +835,81 @@ fn layout_label_text(
 /// panel, not "+0" — nothing has spilled past the horizon). Same font-asset
 /// gate as the other label/card builders.
 pub fn build_horizon_label(
+    theme: Res<crate::ui::theme::Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     mut atlas: Option<ResMut<MsdfAtlas>>,
     mut font_data_map: ResMut<FontDataMap>,
     state: Res<TimeWellState>,
-    mut query: Query<&mut MsdfBlockGlyphs, With<HorizonLabel>>,
-    mut last: Local<Option<usize>>,
+    mut query: Query<(Entity, &mut MsdfBlockGlyphs), With<HorizonLabel>>,
+    mut last: Local<Option<(usize, Color)>>,
+    mut last_entity: Local<Option<Entity>>,
 ) {
-    if *last == Some(state.horizon_count) {
+    let Ok((entity, mut msdf)) = query.single_mut() else {
+        return;
+    };
+    if !panel_needs_redraw(*last_entity, entity, *last != Some((state.horizon_count, theme.fg_dim))) {
         return;
     }
     let Some(font) = fonts.get(&font_handles.mono) else {
         return; // font still loading; retry next tick (leaves `last` unset)
     };
-    let Ok(mut msdf) = query.single_mut() else {
-        return; // label not spawned yet
+    let Some(atlas) = atlas.as_deref_mut() else {
+        return;
     };
-    *last = Some(state.horizon_count);
+    *last = Some((state.horizon_count, theme.fg_dim));
+    *last_entity = Some(entity);
 
     let text = if state.horizon_count > 0 {
         format!("+{}", state.horizon_count)
     } else {
         String::new()
     };
-    let glyphs = match atlas.as_deref_mut() {
-        Some(atlas) => layout_label_text(&text, font, atlas, &mut font_data_map),
-        None => Vec::new(),
-    };
+    let glyphs = layout_label_text(&text, theme.fg_dim, font, atlas, &mut font_data_map);
     commit_panel_glyphs(&mut msdf, glyphs);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn respawned_panel_needs_redraw_with_unchanged_content() {
+        let old = Entity::from_raw_u32(1).unwrap();
+        let replacement = Entity::from_raw_u32(2).unwrap();
+        assert!(!panel_needs_redraw(Some(old), old, false));
+        assert!(panel_needs_redraw(Some(old), replacement, false));
+        assert!(panel_needs_redraw(Some(old), old, true));
+    }
+
+    #[test]
+    fn card_text_colors_follow_theme_roles() {
+        let mut theme = crate::ui::theme::Theme::default();
+        theme.fg = Color::srgb(0.1, 0.2, 0.3);
+        theme.fg_dim = Color::srgb(0.4, 0.5, 0.6);
+        theme.warning = Color::srgb(0.7, 0.8, 0.9);
+        let colors = CardTextColors::from(&theme);
+        assert_eq!(colors.title, theme.fg);
+        assert_eq!(colors.body, theme.fg_dim);
+        assert_eq!(colors.paused, theme.warning);
+        assert_eq!(colors.identity, theme.accent);
+        let previous = Some(colors);
+        theme.fg = Color::srgb(0.9, 0.8, 0.7);
+        assert!(previous != Some(CardTextColors::from(&theme)));
+        assert!(previous == Some(colors));
+    }
+
+    #[test]
+    fn horizon_glyphs_use_custom_muted_color() {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/NotoMono-Regular.ttf")).unwrap();
+        let font = crate::text::shaping::load_into_font_context(bytes);
+        let mut images = Assets::<Image>::default();
+        let mut atlas = MsdfAtlas::new(&mut images, 64, 64);
+        let mut fonts = FontDataMap::default();
+        let glyphs = layout_label_text("+3", Color::srgb(0.2, 0.4, 0.6), &font, &mut atlas, &mut fonts);
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.iter().all(|glyph| glyph.color == [51, 102, 153, 255]));
+    }
 
     #[test]
     fn wrap_gist_none_for_blank_input() {

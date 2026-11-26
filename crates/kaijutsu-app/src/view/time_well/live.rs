@@ -2,29 +2,17 @@
 //! view of what each context just did) and per-track **beat phasors** (the
 //! beat made visible).
 //!
-//! Both ingest the same kernel-wide `ServerEvent` stream the activity deck
-//! rides (see [`super::activity`]), but the ingest system runs **ungated**
-//! (every screen) so the well opens warm: tails accumulate and phasors stay
-//! locked while you're in the conversation view.
+//! Ingest runs on every screen so the well opens with current tail lines
+//! and a synchronized clock for each track.
 //!
 //! Beat stance: *distribute tempo, not pulses* (`docs/time.md`). The kernel
 //! ships low-rate [`ServerEvent::BeatSync`] references keyed by the track's
-//! **score context**; each becomes a local [`LocalBeat`] phasor here. The pulse
+//! **score context**; each anchors a local phasor. The pulse
 //! animation is derived locally from the phasor every frame; nothing streams
 //! per-beat over the wire.
 //!
-//! Render targets (no card-texture rebuilds — see `WellCardMaterial`):
-//! - `dim.y` = **chatter**: the context's decaying event energy
-//!   ([`super::activity::RingActivity::context_energy`]) — a cyan rim lift
-//!   the instant a card's context is talking.
-//! - `dim.z` = **beat**: the envelope of the phasor keyed by this context —
-//!   today that lights the score-context card; the track roster (Stage 3
-//!   wire) extends it to every attached context's card.
-//! - `WellRingsMaterial.energy.y` = the **global** beat envelope — the throat
-//!   glow breathes on the beat of whatever is playing.
-//! - `Card::tail` = the selected card's own live-tail band, rendered directly
-//!   on its face (the retired HUD South panel's old job, absorbed HUD-melt
-//!   slice 2).
+//! Card rims use their track's beat envelope. The deck uses the loudest
+//! track envelope, and the selected card draws its own tail lines.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
@@ -337,17 +325,10 @@ fn quantize(v: f32) -> f32 {
 /// LDR — passive structure, not action (the beat thump is the bright part).
 const TRACK_BORDER_STRENGTH: f32 = 0.55;
 
-/// Push each card's live lanes into its material: `dim.y` = chatter (the
-/// context's decaying event energy), `dim.z` = beat envelope, and `border` =
-/// its track's hue when attached. The beat is keyed through
-/// [`super::rays::WellTracks::beat_key_of`] — every card on a lane (players
-/// and score alike) thumps with its track's phasor; a context not on the
-/// roster falls back to its own id (which still lights a score context up
-/// before the first track poll lands). Values are quantized and
-/// change-guarded so a quiet card never touches `Assets<WellCardMaterial>`
-/// (same discipline as `scene::dim_nonfocused_rings`).
+/// Update each card with its track's beat envelope and border hue. A score
+/// context can use its own clock before the roster arrives. Only write the
+/// material when the quantized beat or hue changes.
 pub fn sync_card_live_uniforms(
-    activity: Res<super::activity::RingActivity>,
     beats: Res<WellBeatsRes>,
     tracks: Res<super::rays::WellTracks>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
@@ -358,10 +339,6 @@ pub fn sync_card_live_uniforms(
 ) {
     let now = Instant::now();
     for (card, handle) in cards.iter() {
-        let chatter = quantize(
-            (activity.context_energy(&card.context_id) / super::activity::CONTEXT_MAX)
-                .clamp(0.0, 1.0),
-        );
         let beat_key = tracks
             .beat_key_of
             .get(&card.context_id)
@@ -381,14 +358,13 @@ pub fn sync_card_live_uniforms(
         // Read via the non-dirtying `get`; only reach for `get_mut` on change.
         let Some(cur) = materials
             .get(&handle.0)
-            .map(|m| (m.dim.y, m.dim.z, m.border))
+            .map(|m| (m.dim.z, m.border))
         else {
             continue;
         };
-        if cur != (chatter, beat, border)
+        if cur != (beat, border)
             && let Some(mut mat) = materials.get_mut(&handle.0)
         {
-            mat.dim.y = chatter;
             mat.dim.z = beat;
             mat.border = border;
         }

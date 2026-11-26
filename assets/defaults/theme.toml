@@ -177,9 +177,9 @@ bright_white = "#ece7fa"
 
 # ─── The 3D scene lane (docs/newui.md, "Color") ──────────────────────────────
 # Identity hues as sRGB hex — the app linearizes them for the HDR pipeline.
-# Brightness lives in [scene.tiers]; hues keep their brightest channel near
-# full. [scene.post] applies LIVE on theme change; hues/tiers apply at the
-# next room entry.
+# Floor traces preserve their authored brightness up to [scene.tiers].crest.
+# The well deck, terraces, and [scene.post] update on theme reload.
+# Other room furniture picks up these colors on the next room entry.
 
 [scene.hues]
 bg = "#05070b"             # the octagon's void (room clear color)

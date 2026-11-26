@@ -1,37 +1,7 @@
-//! Time-well context browser — the first concrete consumer of `kaijutsu-viz`.
-//!
-//! A radial 3D "well" of context cards, seated by **explicit ring placement**
-//! (`docs/timewell.md`, "Ring membership becomes explicit") — **two rings and
-//! a floor**, hanging over the room's table: `Active` on top (the ten
-//! `p`romoted/visited contexts) and `Recent` just above the tabletop (the ten
-//! most-recently-active). Each ring seats exactly 10
-//! (`kaijutsu_viz::layout::RING_SLOTS`); everything else — demoted,
-//! concluded, and the overflow past those twenty seats — is **past the event
-//! horizon**: no card entity, a "+N" count lying on the accretion disc that
-//! rings the table plinth at floor level. Each ring has its own
-//! radius/height terrace; within a ring, angle encodes seat order.
-//! `docs/time-well-concepts.md` holds the earlier UX record; the retired
-//! substrate design survives as the "Appendix: substrate notes" in
-//! `docs/timewell.md` (full viz-substrate.md in git history).
-//!
-//! Module map:
-//! - [`card`] — pure `ContextInfo` → card-model mapping, band assignment, layout,
-//!   and the `LayoutPos → Vec3` well-lift (no Bevy, unit-tested).
-//! - [`scene`] — the 3D scene: camera, root, screen toggle, billboarding, card
-//!   motion, components, and live state resource.
-//! - [`drape`] — on-selection lineage drapes: curved ribbons down the bowl
-//!   wall from the selected card to each fork-ancestor's card (pure curve
-//!   math, unit-tested; reuses `TraceGlowMaterial`).
-//! - [`sync`] — the layout tick: keyed-join reconcile → spawn/despawn → layout.
-//! - [`activity`] — the well's pulse: kernel-event stream → ring energy + ripples
-//!   driving the base ring deck (unit-tested math).
-//! - [`live`] — live state beyond the poll: per-context tail buffers (the
-//!   card face's tail band) and per-track beat phasors (chatter + beat card
-//!   lanes, the deck heartbeat).
-//! - [`rays`] — tracks as beams down the funnel wall: the `listTracks` poll,
-//!   the ray entities at name-stable bearings, and the per-frame beat pulse.
-//! - [`legend`] — the transient `?` keyboard legend, the retired edge HUD's
-//!   last survivor.
+//! A radial context browser on the room table. Active and Recent seat up to
+//! ten contexts each. The count on the deck includes contexts beyond the rings.
+//! Track rays carry the score clocks. A completed turn sends a ripple toward
+//! the current bearing of the context that played it.
 
 pub mod activity;
 pub mod card;
@@ -50,29 +20,9 @@ use crate::ui::screen::Screen;
 
 /// Wires the time-well browser into the app.
 ///
-/// Slice C (`lovely-swimming-prism.md`, time-well/room integration) split the
-/// old single `run_if(in_state(Screen::TimeWell))` tuple into three tiers:
-/// - **fully ungated** — runs on every screen, `live::ingest_live_events`'s
-///   existing pattern ("the well opens warm"). [`scene::tick_ring_activity`]
-///   joins it this slice: the `RingActivity` decay tick must not freeze
-///   outside the room (see its own doc for the bug that guards against).
-/// - **ambient** (`run_if(in_state(Screen::Room))`) — the well IS room
-///   furniture now; everything that keeps its cards/rings/rays live and
-///   correct at room scale runs here, cards included (the "opens warm"
-///   property extends to the well's own contents, not just tails/beats).
-///   The dim/selection/lineage/drift overlays and the focus-card/horizon-
-///   label LOD gates joined this tier in the freeze-fix slice (2026-07-11):
-///   each must react to BOTH zoom directions — clearing/hiding on zoom-OUT,
-///   not just applying on zoom-in — the same reasoning
-///   `legend::despawn_legend_unzoomed` needs to justify running here rather
-///   than dived-only. Left dived-only, they froze whatever dim/pop/lineage
-///   state was live on the last dived frame, visible at room scale until the
-///   next dive re-ran them.
-/// - **dived-only** (`run_if(well_zoomed)`) — keyboard, the legend toggle, and
-///   the card/reading/horizon TEXT builders: room-scale card text is
-///   unreadable pixels, so text rasterization stays gated to the dive
-///   (`text::build_card_scenes`'s own doc has the reasoning + the
-///   `card_text_dirty` catch-up arm).
+/// Tails and beat clocks update on every screen. The room shows the same
+/// cards, track rays and deck at either camera distance. Diving into the
+/// well enables browsing and builds the text at reading size.
 pub struct TimeWellPlugin;
 
 impl Plugin for TimeWellPlugin {
@@ -99,20 +49,14 @@ impl Plugin for TimeWellPlugin {
                     live::ingest_live_events,
                     rays::apply_tracks,
                     scene::tick_ring_activity,
+                    scene::ripple_on_finished_turn.after(scene::tick_ring_activity).before(scene::sync_deck_material),
                 ),
             )
             // Ambient: room-scale truth. The well breathes here whether
             // you're dived into it or just walking past its bearing.
             .add_systems(
                 Update,
-                // Two nested `.chain()`ed groups, not one flat tuple: Bevy's
-                // `IntoSystemConfigs` tuple impl tops out below the ~21
-                // systems this tier now runs (the drape overlay tipped it
-                // over) — nesting preserves full mouth-to-throat ordering
-                // (every system in group A still runs before every system in
-                // group B) while staying under that ceiling. Split at the
-                // same "pulse/placement plumbing" vs "selection-driven
-                // overlays" seam the comments below already draw.
+                // Split the ordered room systems to fit Bevy’s tuple limit.
                 (
                     (
                         sync::poll_clusters,
@@ -124,19 +68,9 @@ impl Plugin for TimeWellPlugin {
                         scene::spin_rings,
                         scene::move_cards_toward_target,
                         scene::billboard_cards,
-                        // `scene::accumulate_ring_activity` was here. The
-                        // glow's event ingest is DISABLED pending a redesign
-                        // (Amy, 2026-08-15) — see `activity::RingActivity`.
+                        scene::sync_well_palette,
                         scene::sync_deck_material,
                         live::sync_card_live_uniforms,
-                        // Moved here from dived-only (freeze-fix slice,
-                        // 2026-07-11): each must react to BOTH zoom directions —
-                        // see this file's own doc comment above for the full
-                        // reasoning, and each system's own doc for its specific
-                        // zoom branch. `highlight_drift` is the one exception: no
-                        // zoom branch at all (see its doc) — `DriftState` polls
-                        // ungated on every screen, so its shimmer is truthful
-                        // live info even at room scale.
                         scene::dim_nonfocused_rings,
                         scene::sync_focus_card_visibility,
                         scene::apply_horizon_label_lod,

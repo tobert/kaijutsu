@@ -60,10 +60,7 @@ pub struct WellCardMaterial {
     /// card rather than fade it. Written per-frame by `scene::dim_nonfocused_rings`
     /// (rim cards only; the focus card + the transient legend stay 1.0).
     ///
-    /// `.y` = live **chatter** (0..1) and `.z` = live **beat** envelope (0..1)
-    /// — the event-driven card lanes written by
-    /// `view::time_well::live::sync_card_live_uniforms` (cyan rim lift / gold
-    /// beat thump in the shader, no texture rebuild). `.w` unused.
+    /// `.z` is the track's beat envelope (0..1). `.y` and `.w` are unused.
     #[uniform(6)]
     pub dim: Vec4,
 }

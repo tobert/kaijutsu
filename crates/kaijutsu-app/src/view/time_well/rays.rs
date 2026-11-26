@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use bevy::prelude::*;
 use kaijutsu_client::TrackInfo;
+use kaijutsu_present::beats::beat_envelope_at;
 use kaijutsu_types::ContextId;
 
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
@@ -222,12 +223,10 @@ pub fn ray_transform(angle: f32) -> Transform {
     Transform::from_rotation(super::card::well_tilt_quat() * Quat::from_rotation_z(angle))
 }
 
-/// One track's beam in the scene. Carries the track's id + its beat key (the
-/// score context — what [`super::live::WellBeats`] phasors are keyed by).
+/// One track's beam in the scene, keyed by its track ID.
 #[derive(Component)]
 pub struct TrackRay {
     pub track_id: String,
-    pub score_context: ContextId,
 }
 
 /// The polled track roster + the derived maps the rest of the well reads.
@@ -411,10 +410,7 @@ pub fn sync_track_rays(
         )));
         let entity = commands
             .spawn((
-                TrackRay {
-                    track_id: t.id.clone(),
-                    score_context: t.score_context_id,
-                },
+                TrackRay { track_id: t.id.clone() },
                 Mesh3d(mesh.clone()),
                 MeshMaterial3d(material),
                 ray_transform(angle),
@@ -453,44 +449,28 @@ fn quantize(v: f32) -> f32 {
     (v / RAY_LANE_STEP).round() * RAY_LANE_STEP
 }
 
-/// Push each ray's live state into its material: beat envelope + fractional
-/// beat position from the track's phasor, transport gate from the roster,
-/// and the attached contexts' chatter. A playing ray animates every frame
-/// (the pulse rides `beat_frac`); a stopped, quiet ray settles and stops
-/// writing.
+/// Animate a playing track's ray while its score context has a phasor.
 pub fn animate_track_rays(
     state: Res<WellTracks>,
     beats: Res<super::live::WellBeatsRes>,
-    activity: Res<super::activity::RingActivity>,
     mut materials: ResMut<Assets<TrackRayMaterial>>,
     rays: Query<(&TrackRay, &MeshMaterial3d<TrackRayMaterial>)>,
 ) {
     let now = Instant::now();
     for (ray, handle) in rays.iter() {
-        let info = state.tracks.iter().find(|t| t.id == ray.track_id);
-        let playing = info.is_some_and(|t| t.playing);
-        let (env, frac) = beats.envelope_and_frac(&ray.score_context, now);
-        // The lane's chatter: the loudest attached context (score included).
-        let chatter = info
-            .map(|t| {
-                t.attached
-                    .iter()
-                    .chain(std::iter::once(&t.score_context_id))
-                    .map(|c| activity.context_energy(c) / super::activity::CONTEXT_MAX)
-                    .fold(0.0f32, f32::max)
-                    .clamp(0.0, 1.0)
-            })
-            .unwrap_or(0.0);
-
-        let next = Vec4::new(
-            quantize(env),
-            if playing { 1.0 } else { 0.0 },
-            // beat_frac is the pulse's position — quantizing it would stutter
-            // the packet, so it stays continuous; it only varies while a
-            // phasor exists (0.0 otherwise, which settles).
-            frac,
-            quantize(chatter),
-        );
+        let Some(info) = state.tracks.iter().find(|t| t.id == ray.track_id) else {
+            continue;
+        };
+        let (env, clock, frac) = match (info.playing, beats.beat_position(&info.score_context_id, now)) {
+            (true, Some(pos)) => {
+                let frac = pos - pos.floor();
+                (quantize(beat_envelope_at(frac)), 1.0, frac as f32)
+            }
+            (true, None) => (0.0, 0.5, 0.0),
+            (false, _) => (0.0, 0.0, 0.0),
+        };
+        // Keep the fractional position continuous so the pulse moves smoothly.
+        let next = Vec4::new(env, clock, frac, 0.0);
         let Some(cur) = materials.get(&handle.0).map(|m| m.params) else {
             continue;
         };
@@ -666,6 +646,63 @@ mod tests {
                 .map(|n| ContextId::from_bytes([*n; 16]))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn ray_pulse_requires_playing_transport_and_its_own_score_clock() {
+        use super::super::live::WellBeatsRes;
+        use bevy::ecs::system::RunSystemOnce;
+        use kaijutsu_audio::BeatRef;
+        use kaijutsu_present::beats::PHASOR_STALE;
+
+        let mut app = App::new();
+        app.init_resource::<WellTracks>()
+            .init_resource::<WellBeatsRes>()
+            .init_resource::<Assets<TrackRayMaterial>>();
+        let world = app.world_mut();
+        let mut bass = track("bass", 9, &[1]);
+        let mut drums = track("drums", 8, &[2]);
+        drums.playing = true;
+        world.resource_mut::<WellTracks>().set_tracks(vec![bass.clone(), drums.clone()]);
+        let mut spawn_ray = |info: &TrackInfo| {
+            let mat = world.resource_mut::<Assets<TrackRayMaterial>>()
+                .add(TrackRayMaterial::new(Vec4::ONE));
+            world.spawn((
+                TrackRay { track_id: info.id.clone() },
+                MeshMaterial3d(mat.clone()),
+            ));
+            mat
+        };
+        let bass_ray = spawn_ray(&bass);
+        let drums_ray = spawn_ray(&drums);
+        let step = |world: &mut World| {
+            world.run_system_once(animate_track_rays).unwrap();
+            let mats = world.resource::<Assets<TrackRayMaterial>>();
+            (mats.get(&bass_ray).unwrap().params, mats.get(&drums_ray).unwrap().params)
+        };
+
+        let unsynced = Vec4::new(0.0, 0.5, 0.0, 0.0);
+        assert_eq!(step(world), (Vec4::ZERO, unsynced));
+
+        let now = Instant::now();
+        world.resource_mut::<WellBeatsRes>()
+            .observe(bass.score_context_id, BeatRef::new(4.25, 1.0), now, now);
+        assert_eq!(step(world), (Vec4::ZERO, unsynced), "a stopped track stays still");
+
+        bass.playing = true;
+        world.resource_mut::<WellTracks>().set_tracks(vec![bass.clone(), drums.clone()]);
+        let (bass_params, drums_params) = step(world);
+        assert_eq!(bass_params.y, 1.0);
+        assert_eq!(drums_params, unsynced, "another track's phasor cannot drive the ray");
+
+        world.resource_mut::<WellBeatsRes>()
+            .observe(drums.score_context_id, BeatRef::new(8.5, 1.0), now, now);
+        assert_eq!(step(world).1.y, 1.0);
+        world.resource_mut::<WellBeatsRes>().reset(&drums.score_context_id);
+        assert_eq!(step(world).1, unsynced, "flush clears the pulse before the next poll");
+
+        world.resource_mut::<WellBeatsRes>().prune_stale(now + PHASOR_STALE);
+        assert_eq!(step(world).0, unsynced, "a stale phasor stops driving the ray");
     }
 
     /// Regression (DeepSeek review, 2026-07-04): exit despawns the rays but

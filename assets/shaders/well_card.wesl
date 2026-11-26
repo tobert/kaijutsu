@@ -20,7 +20,7 @@ import bevy_pbr::render::mesh_view_bindings::globals;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, drifting]
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var<uniform> border: vec4<f32>; // [r, g, b, strength] — steady outline (HUD); cards leave strength 0
-@group(constants::MATERIAL_BIND_GROUP) @binding(6) var<uniform> dim: vec4<f32>;    // [brightness, chatter, beat, _] — focus dim ×, live chatter glow, beat envelope
+@group(constants::MATERIAL_BIND_GROUP) @binding(6) var<uniform> dim: vec4<f32>;    // [brightness, _, beat, _]
 
 // Signed distance to a rounded box centered at origin, half-size `b`, radius `r`.
 fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
@@ -97,27 +97,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let status = params.z;
 
-    // Live-action signals accumulate here and are added AFTER the focus dim:
-    // "bright = live action" must read from every ring, not just the focused
-    // one — a running/beating/chattering card on a dimmed ring is exactly the
-    // at-a-glance signal the well exists for (Gemini review, 2026-07-04).
-    // Navigation state (selection/lineage) and passive structure stay under
-    // the dim so the focused ring still pops.
+    // Apply live effects after focus dimming so the status rim and beat
+    // remain visible on every ring.
     var live = vec3<f32>(0.0, 0.0, 0.0);
 
-    // --- Live chatter (dim.y): the context's decaying event energy, pushed by
-    // the kernel-wide block stream the moment this card's context is talking —
-    // a cyan HDR lift on the rim that fades in ~2s of quiet. Sits UNDER the
-    // status/selection rims (it's ambience, not state). ---
-    let chatter = dim.y;
-    if (chatter > 0.005) {
-        live += vec3<f32>(0.45, 0.85, 1.0) * (2.2 * chatter) * band;
-        alpha = max(alpha, band * min(chatter * 2.0, 1.0));
-    }
-
-    // --- Beat (dim.z): the live beat envelope of this card's track phasor
-    // (score-context cards today; every attached card once the track roster is
-    // on the wire). A warm gold thump, HDR so it blooms on the beat. ---
+    // Beat envelope of the card's track.
     let beat = dim.z;
     if (beat > 0.005) {
         live += vec3<f32>(1.0, 0.72, 0.22) * (2.8 * beat) * band;

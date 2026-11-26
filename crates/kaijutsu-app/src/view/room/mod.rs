@@ -48,11 +48,8 @@
 //! furnished bearing uses. Unzoomed, the well's rings/cards sit ambient and
 //! dim; Enter/Down on the TimeWell carousel entry zooms the shared camera
 //! into the well's mouth via [`shot::RoomShot::WellOverview`] — no scene cut
-//! — and the well's own keyboard/HUD/nav take over while zoomed. Ctrl+W is a
-//! **symmetric room toggle** (`time_well::scene::toggle_time_well`):
-//! Conversation → dive straight into the well; Room (any station, zoomed or
-//! not) → straight back to Conversation — reading only the current screen,
-//! never how it was reached.
+//! — and the well's controls take over. Gamepad Start or Ctrl+A w dives
+//! into the well from any screen.
 //!
 //! Materials are mostly built-in [`StandardMaterial`] with `unlit: true`,
 //! carrying brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR
@@ -318,21 +315,7 @@ const ROUTE_ARC_SEGMENTS: usize = 14;
 const ROUTE_PAD_RADIUS_RANGE: (f32, f32) = (6.0, 14.0);
 
 // ── Faint moving glow (`TraceGlowMaterial`; Amy, 2026-07-10) ────────────────
-// "make the circuit patterns and border glow faintly like the concepts... a
-// lil bloom or some other shader; something faintly moving might be
-// interesting." Every crest renormalizes to `ScenePalette::crest`
-// (`crest_color`); these constants are each element's RESTING trough and
-// its wave/breath rate — the knobs that make one glowing thing read subtler
-// or livelier than another. SLOW and FAINT is the target across the board —
-// the room must not read as an arcade.
-
-// Floor-trace glow trough (mode 0, `spawn_floor`: `ScenePalette::trough_wiring`
-// — the resting brightness fraction of a route's crest colour between the
-// traveling crest's passes, a clear step down so the crest's transit reads
-// as motion, not a flicker) and terminal-pad glow trough (mode 1,
-// `ScenePalette::trough_pads` — a hair brighter than the wiring trough, since
-// every crest shares the same `ScenePalette::crest` ceiling regardless of
-// gain) moved onto the palette resource.
+// The trace and pad troughs are fractions of the authored route brightness.
 /// `(min, max)` seconds for one crest to cross a whole route (mode 0 period,
 /// `rate = 1 / period`) — jittered per-route from `bearing::BoardRoute`'s
 /// `glow_phase01` so the board doesn't pulse in lockstep.
@@ -1062,12 +1045,7 @@ fn spawn_floor(
                 route.points.iter().all(|p| (p[0] * p[0] + p[2] * p[2]).sqrt() > KEEPOUT_RADIUS),
                 "every generated route must clear the console keep-out ({KEEPOUT_RADIUS})"
             );
-            let identity = [
-                route.hue[0] * route.brightness_scale,
-                route.hue[1] * route.brightness_scale,
-                route.hue[2] * route.brightness_scale,
-            ];
-            let crest = crest_color(identity, palette.crest);
+            let crest = floor_trace_crest(route.hue, route.brightness_scale, palette.crest);
             debug_assert!(
                 crest.x.max(crest.y).max(crest.z) <= palette.crest + 1e-4,
                 "floor trace crest must stay capped at ScenePalette::crest: {crest:?}"
@@ -1777,6 +1755,17 @@ pub(crate) fn crest_color(identity: [f32; 3], crest: f32) -> Vec4 {
     Vec4::new(identity[0] * scale, identity[1] * scale, identity[2] * scale, 0.0)
 }
 
+/// Apply the route's gain to the theme color within the room's crest limit.
+fn floor_trace_crest(hue: [f32; 3], gain: f32, ceiling: f32) -> Vec4 {
+    let color = Vec3::from_array(hue) * gain;
+    let peak = color.max_element();
+    if peak > ceiling && peak > 0.0 {
+        (color * (ceiling / peak)).extend(0.0)
+    } else {
+        color.extend(0.0)
+    }
+}
+
 /// Snap a glow value to the [`GLOW_STEP`] grid so a settled marker stops
 /// touching `Assets<StandardMaterial>`.
 fn quantize(v: f32) -> f32 {
@@ -2126,6 +2115,13 @@ mod tests {
         assert!(MARKER_HEIGHT_RESERVED < MARKER_HEIGHT, "still shorter than a station pylon");
     }
 
+    #[test]
+    fn floor_trace_preserves_theme_brightness_below_the_crest_limit() {
+        assert_eq!(floor_trace_crest([0.25, 0.125, 0.0], 0.5, 1.0), Vec4::new(0.125, 0.0625, 0.0, 0.0));
+        assert_eq!(floor_trace_crest([1.0, 0.5, 0.0], 2.0, 1.0), Vec4::new(1.0, 0.5, 0.0, 0.0));
+        assert_eq!(floor_trace_crest([0.0; 3], 1.0, 1.0), Vec4::ZERO);
+    }
+
     // ── circuit-board routes (real production config) ──
 
     #[test]
@@ -2197,13 +2193,6 @@ mod tests {
 
     #[test]
     fn every_generated_board_route_crest_is_capped_and_trough_stays_ldr() {
-        // The new invariant (2026-07-10, the faint-moving-glow slice) in
-        // place of the old flat "< 1.0" check: every route's crest
-        // renormalizes to AT MOST `ScenePalette::crest` regardless of its
-        // raw identity hue, and both the trace's and the pad's RESTING
-        // trough level stay LDR even measured against the crest cap itself
-        // (`trough * crest < 1.0`) — the element only ever reads loud
-        // at the crest's instantaneous peak, never sustained.
         let palette = ScenePalette::default();
         for (bi, bundle) in route_bundles(&palette).iter().enumerate() {
             let seed_base = bi as u32 * 10_007;
@@ -2216,12 +2205,7 @@ mod tests {
                 ROUTE_PAD_RADIUS_RANGE,
                 seed_base,
             ) {
-                let identity = [
-                    route.hue[0] * route.brightness_scale,
-                    route.hue[1] * route.brightness_scale,
-                    route.hue[2] * route.brightness_scale,
-                ];
-                let crest = crest_color(identity, palette.crest);
+                let crest = floor_trace_crest(route.hue, route.brightness_scale, palette.crest);
                 let max_channel = crest.x.max(crest.y).max(crest.z);
                 assert!(
                     max_channel <= palette.crest + 1e-4,
