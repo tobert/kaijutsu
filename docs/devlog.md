@@ -313,6 +313,11 @@ feed and updates the same block on later writes. The parent command gives
 the reader a source before its result arrives. A trace block keeps that
 preview out of the model's conversation history.
 
+Formatting an error can add `error ←` ahead of its text. Applying the original
+ANSI color ranges to that heading reproduced a viewer panic inside the arrow.
+Conversation now keeps those ranges only when the displayed text preserves
+the corresponding source bytes, including when a trailing newline is trimmed.
+
 ## The file cache learns what vim already knew (August 18–20)
 
 Disk is the source of truth; file buffers operate like vim swaps. Dirty buffers

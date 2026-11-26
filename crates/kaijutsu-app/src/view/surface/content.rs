@@ -495,20 +495,20 @@ pub fn sync_block_content(
             content: rich_content,
         } = detected;
 
-        // Deliberately **outside** the detection reuse gate above. ANSI spans
-        // are not something detection derives — they arrive on the snapshot,
-        // already parsed by the kernel — so `rich_input_fingerprint` (which
-        // documents itself as exactly `detect_rich_content_typed`'s input set)
-        // stays honest about its own inputs, and staleness is prevented by
-        // simply re-resolving these every sweep. Cheap: the list is empty for
-        // every block that did not come through an ingest transform, and a
-        // resolved span is a handful of integer moves.
-        let style_spans = crate::text::ansi::resolve_style_spans(
-            &block.style_spans,
-            crate::text::color_to_rgba8(color),
-            default_bg,
-            &palette,
-        );
+        // ANSI spans address the source bytes. A trailing trim preserves
+        // those offsets, and shaping clips spans at the end of the text.
+        // Resolve them every sweep because a snapshot can change its spans
+        // without changing the rich detection inputs.
+        let style_spans = if !block.style_spans.is_empty() && block.content.starts_with(&text) {
+            crate::text::ansi::resolve_style_spans(
+                &block.style_spans,
+                crate::text::color_to_rgba8(color),
+                default_bg,
+                &palette,
+            )
+        } else {
+            Vec::new()
+        };
         let spans_fp = spans_fingerprint(&spans, &style_spans);
 
         // Only shaping-relevant movement restamps the version — colors are the
@@ -1169,6 +1169,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_error_header_does_not_receive_ansi_offsets_from_the_summary() {
+        use crate::text::shaping::{
+            VelloTextAlign, VelloTextStyle, load_into_font_context,
+        };
+
+        let mut app = content_app();
+        let id = seed_one(
+            &mut app, Role::Tool, BlockKind::Error, ContentType::Plain, "failure",
+        );
+        set_style_spans(&mut app, id, vec![kaijutsu_types::StyleSpan {
+            fg: Some(kaijutsu_types::StyleColor::Indexed(1)),
+            ..ansi_span(0, 7)
+        }]);
+        app.update();
+
+        let formatted = cache(&app).get(&id).unwrap();
+        assert!(formatted.text.starts_with("error ← "));
+        let font = load_into_font_context(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/NotoMono-Regular.ttf"
+        )).to_vec());
+        font.layout_styled(
+            &formatted.text,
+            &VelloTextStyle::default(),
+            VelloTextAlign::Left,
+            None,
+            &formatted.style_spans,
+        );
+        assert!(formatted.style_spans.is_empty());
+    }
+
     /// A block with no ingest transform behind it carries no styled spans, and
     /// that emptiness is what keeps it on the plain shaping path (and out of
     /// the theme-epoch `ShapeKey`).
@@ -1186,7 +1217,7 @@ mod tests {
     #[test]
     fn spans_arriving_on_unchanged_text_restamp_the_version() {
         let mut app = content_app();
-        let ids = seed(&mut app, &["hello"]);
+        let ids = seed(&mut app, &["hello\n"]);
         app.update();
         let before = cache(&app).get(&ids[0]).unwrap().version;
 
