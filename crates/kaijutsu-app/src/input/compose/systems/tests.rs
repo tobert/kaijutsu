@@ -13,6 +13,13 @@ use kaijutsu_types::{BlockId, InputEdge, PrincipalId};
 
 use super::*;
 
+#[test]
+fn context_switch_preserves_scroll_but_other_shell_submissions_follow() {
+    assert!(!shell_submission_follows(&shell_kj_argv("kj context switch alpha")));
+    assert!(shell_submission_follows(&shell_kj_argv("kj context rename alpha")));
+    assert!(shell_submission_follows(&shell_kj_argv("echo hello")));
+}
+
 /// A kernel stand-in: applies each edit to its own copy of the draft, char
 /// indexed as the kernel is, and logs every call in the order it arrived.
 #[derive(Clone, Default)]

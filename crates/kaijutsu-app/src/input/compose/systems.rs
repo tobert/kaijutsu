@@ -25,6 +25,10 @@ use crate::input::{Action, ClipboardWriter, InputContext, SystemClipboard};
 use crate::view::components::GlobalErrorQueue;
 use crate::view::shell_dock::ShellDockMarker;
 
+fn shell_submission_follows(argv: &Option<Vec<String>>) -> bool {
+    !matches!(argv.as_deref(), Some([context, switch, ..]) if context == "context" && switch == "switch")
+}
+
 /// Everything a compose keystroke may touch.
 #[derive(SystemParam)]
 pub struct ComposeIo<'w, 's> {
@@ -259,7 +263,9 @@ impl ComposeIo<'_, '_> {
                 RpcResultMessage::RpcError { operation: "shell submit".into(), error: reason }
             }
         };
-        let task = match shell_kj_argv(&code) {
+        let argv = shell_kj_argv(&code);
+        let follow = shell_submission_follows(&argv);
+        let task = match argv {
             Some(argv) => IoTaskPool::get().spawn(tracing::Instrument::instrument(
                 async move {
                     let message = match handle.execute_kj(context, argv).await {
@@ -284,7 +290,9 @@ impl ComposeIo<'_, '_> {
         };
         task.detach();
         self.compose.shell = ComposeBuffer::default();
-        self.scroll.start_following();
+        if follow {
+            self.scroll.start_following();
+        }
         *self.focus = FocusArea::Conversation;
     }
 
