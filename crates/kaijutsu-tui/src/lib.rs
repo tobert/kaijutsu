@@ -61,3 +61,5 @@ pub mod run;
 pub mod status;
 pub mod diff;
 pub mod editor;
+pub mod kitty;
+pub mod score;

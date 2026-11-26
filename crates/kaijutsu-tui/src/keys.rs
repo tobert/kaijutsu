@@ -61,6 +61,9 @@ pub enum Intent {
     /// about a block the context already holds (`docs/tui.md`, "Editor and
     /// diff").
     OpenDiff,
+    /// `Ctrl+A s` — open the ABC sheet music score viewer on the score at or
+    /// above the reader's line, the newest on the live tail.
+    OpenScore,
     /// `Ctrl+A l` — open the ledger view (`docs/tui.md`, "The ledger").
     OpenLedger,
     /// Bare `Tab`. Completes the verb when the `:` bar holds `kj ` and a
@@ -169,6 +172,7 @@ impl Keys {
                 KeyCode::Char('b') => Intent::ToggleBoards,
                 KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
+                KeyCode::Char('s') => Intent::OpenScore,
                 KeyCode::Char('[') => Intent::CopyMode,
                 KeyCode::Char(']') => Intent::Paste,
                 KeyCode::Char('n') => Intent::StepSeat(1),
@@ -247,6 +251,13 @@ mod tests {
         let mut keys = Keys::new();
         keys.interpret(ctrl('a'));
         assert_eq!(keys.interpret(press(KeyCode::Char(']'))), Intent::Paste);
+    }
+
+    #[test]
+    fn ctrl_a_s_opens_score_viewer() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('s'))), Intent::OpenScore);
     }
 
     #[test]

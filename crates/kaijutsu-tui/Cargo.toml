@@ -28,6 +28,16 @@ kaijutsu-viz.workspace = true
 # read; `BeatRef`/`RefDisposition` decode the `ServerEvent::BeatSync` wire
 # shape the same way the app's `time_well::live::ingest_live_events` does.
 kaijutsu-audio.workspace = true
+# ABC notation parsing and engraving for inline scores and the full-screen
+# score viewer (`score.rs`).
+kaijutsu-abc.workspace = true
+
+# CPU SVG rasterization for engraved ABC scores → Kitty graphics (`kitty.rs`).
+# Exact same versions as `kaijutsu-app`.
+resvg = "0.47"
+usvg = "0.47"
+tiny-skia = "0.12"
+base64 = "0.22"
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }

@@ -152,6 +152,24 @@ fn draw(
     ended
 }
 
+/// Flush queued Kitty graphics protocol commands (uploads, virtual placements,
+/// evictions) to stdout. Called inside `BeginSynchronizedUpdate` strictly before
+/// `terminal.draw(...)` so every `U+10EEEE` placeholder references an already
+/// uploaded image.
+fn flush_kitty_wire(kitty: &mut crate::kitty::KittyStore) -> Result<()> {
+    use std::io::Write as _;
+    let cmds = kitty.take_pending_wire();
+    if cmds.is_empty() {
+        return Ok(());
+    }
+    let mut stdout = io::stdout();
+    for cmd in cmds {
+        stdout.write_all(cmd.as_bytes()).context("write kitty graphics command")?;
+    }
+    stdout.flush().context("flush kitty graphics commands")?;
+    Ok(())
+}
+
 /// The frame itself: a full-screen surface when one has the screen, the
 /// conversation otherwise.
 fn draw_frame(
@@ -171,7 +189,7 @@ fn draw_frame(
             render::draw_boards(terminal, app, armed)?;
         }
         ScreenMode::Conversation => {
-            render::draw_screen(terminal, app, kaijutsu_types::now_millis(), armed)?;
+            render::draw_screen_with(terminal, app, kaijutsu_types::now_millis(), armed, flush_kitty_wire)?;
         }
         ScreenMode::Editor(screen) => {
             let frame = editor::editor_frame(screen, size.width, size.height, &palette);
@@ -179,6 +197,11 @@ fn draw_frame(
         }
         ScreenMode::Diff(screen) => {
             let lines = screen.frame(size.height, &palette);
+            render::draw_surface(terminal, lines, None)?;
+        }
+        ScreenMode::Score(screen) => {
+            let lines = screen.frame(size.width, size.height, &palette, &mut app.kitty);
+            flush_kitty_wire(&mut app.kitty)?;
             render::draw_surface(terminal, lines, None)?;
         }
     }

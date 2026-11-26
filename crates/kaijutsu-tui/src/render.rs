@@ -266,6 +266,39 @@ fn waiting_line(app: &App) -> Option<Line<'static>> {
     ))
 }
 
+/// Render one block's lines for the transcript: inline Kitty ABC score when
+/// graphics are enabled and the block holds an uncollapsed parseable ABC tune,
+/// otherwise the wrap cache's normal styled text lines.
+fn block_rendered_lines(
+    app: &mut App,
+    block: &BlockSnapshot,
+    item: &BlockPlan,
+    performer: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let palette = app.palette;
+    let view = block_view(item, performer, block);
+    let lineage = app.lineage_for(block);
+    let view = crate::present::BlockView { lineage, ..view };
+    if !item.collapsed
+        && app.kitty.enabled
+        && let Some(mut score_lines) = crate::score::inline_abc_lines(
+            block.content_type,
+            &block.content,
+            width,
+            &palette,
+            &mut app.kitty,
+        )
+    {
+        if item.show_divider {
+            let (header, _) = crate::present::divider_text(&view, width);
+            score_lines.insert(0, Line::from(ratatui::text::Span::styled(header, palette.divider())));
+        }
+        return score_lines;
+    }
+    app.wrap.lines(block, &view, width, &palette).to_vec()
+}
+
 /// The transcript's visible rows: `height` rows of the current context's
 /// blocks, wrapped at `width`, ending at the newest row while the view
 /// follows the tail ([`crate::app::ContextView::transcript`]).
@@ -306,10 +339,7 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
             row += block_rows;
             continue;
         }
-        let view = block_view(item, &performer, block);
-        let lineage = app.lineage_for(block);
-        let view = crate::present::BlockView { lineage, ..view };
-        let mut block_lines = app.wrap.lines(block, &view, width, &palette).to_vec();
+        let mut block_lines = block_rendered_lines(app, block, item, &performer, width);
         if item.gap {
             block_lines.insert(0, Line::default());
         }
@@ -363,14 +393,10 @@ fn plan_rows(app: &mut App, width: u16) -> Option<PlannedRows> {
     if plan.is_empty() {
         return None;
     }
-    let palette = app.palette;
     let performer = performer_of(app);
     let mut rows: Vec<crate::copy::RowBlock> = Vec::with_capacity(plan.len());
     for (block, item) in &plan {
-        let view = block_view(item, &performer, block);
-        let lineage = app.lineage_for(block);
-        let view = crate::present::BlockView { lineage, ..view };
-        let counted = app.wrap.lines(block, &view, width, &palette).len();
+        let counted = block_rendered_lines(app, block, item, &performer, width).len();
         // `render_block` puts the divider first when there is one, and the
         // gap row goes above that.
         let leading = usize::from(item.gap) + usize::from(item.show_divider);
@@ -402,13 +428,9 @@ pub fn transcript_all_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
     let Some(PlannedRows { plan, rows, performer }) = plan_rows(app, width) else {
         return Vec::new();
     };
-    let palette = app.palette;
     let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.iter().map(|r| r.rows).sum());
     for (block, item) in &plan {
-        let view = block_view(item, &performer, block);
-        let lineage = app.lineage_for(block);
-        let view = crate::present::BlockView { lineage, ..view };
-        let mut block_lines = app.wrap.lines(block, &view, width, &palette).to_vec();
+        let mut block_lines = block_rendered_lines(app, block, item, &performer, width);
         if item.gap {
             block_lines.insert(0, Line::default());
         }
@@ -692,6 +714,43 @@ pub fn draw_screen<B: Backend>(
     let band = band_frame(app, width, now_millis, armed);
     let band_rows = u16::try_from(band.lines.len()).unwrap_or(u16::MAX).min(height);
 
+    draw_screen_prepared(terminal, transcript, overlay, overlay_rows, band, band_rows)
+}
+
+/// Like [`draw_screen`], but invokes `before_draw` after building the frame
+/// (and populating `app.kitty`'s pending uploads) and strictly before
+/// `terminal.draw(...)` emits placeholder cells.
+pub fn draw_screen_with<B: Backend, F>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    now_millis: u64,
+    armed: bool,
+    before_draw: F,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+    F: FnOnce(&mut crate::kitty::KittyStore) -> anyhow::Result<()>,
+{
+    let size = terminal.size()?;
+    let (width, height) = (size.width, size.height);
+    let overlay = overlay_lines(app, width);
+    let (transcript_rows, overlay_rows, _) = split_rows(height, band_rows(app, width), overlay.len());
+    let transcript = transcript_window(app, width, transcript_rows);
+    let band = band_frame(app, width, now_millis, armed);
+    let band_rows = u16::try_from(band.lines.len()).unwrap_or(u16::MAX).min(height);
+    before_draw(&mut app.kitty)?;
+    draw_screen_prepared(terminal, transcript, overlay, overlay_rows, band, band_rows)?;
+    Ok(())
+}
+
+fn draw_screen_prepared<B: Backend>(
+    terminal: &mut Terminal<B>,
+    transcript: Vec<Line<'static>>,
+    overlay: Vec<Line<'static>>,
+    overlay_rows: u16,
+    band: BandFrame,
+    band_rows: u16,
+) -> Result<(), B::Error> {
     terminal.draw(|frame| {
         let area = frame.area();
         let [transcript_area, overlay_area, band_area] = Layout::vertical([

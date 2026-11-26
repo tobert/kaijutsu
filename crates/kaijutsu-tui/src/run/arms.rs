@@ -108,7 +108,16 @@ pub(super) async fn on_input(
         }
         // The frame is rebuilt at the new size on the next tick:
         // the transcript re-wraps and the band follows.
-        Event::Resize(..) => ls.frame.dirty = true,
+        Event::Resize(..) => {
+            if app.kitty.enabled {
+                let px = crate::kitty::query_cell_pixels();
+                if px != app.kitty.cell_px {
+                    app.kitty.cell_px = px;
+                    app.kitty.clear();
+                }
+            }
+            ls.frame.dirty = true;
+        }
         // Focus reporting (DECSET 1004). Coming back draws a
         // frame, so what is on screen is current rather than
         // whatever was there when focus left; leaving disarms

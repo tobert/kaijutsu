@@ -414,6 +414,21 @@ impl Palette {
         self.copy_selection()
     }
 
+    /// Header and ABC field lines in the score viewer and inline score stubs.
+    pub fn score_heading(&self) -> Style {
+        Style::new().fg(self.heading)
+    }
+
+    /// Raw ABC body text in the score viewer's text/raw fallback.
+    pub fn score_code(&self) -> Style {
+        Style::new().fg(self.code)
+    }
+
+    /// Muted chrome / comments / truncation hints in the score viewer.
+    pub fn score_dim(&self) -> Style {
+        self.dim()
+    }
+
     /// The editor's transient message line (vim `E492`).
     pub fn editor_message(&self) -> Style {
         Style::new().fg(Color::Yellow)

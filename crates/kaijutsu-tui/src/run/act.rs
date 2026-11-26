@@ -533,6 +533,7 @@ pub(super) async fn act(
             None => app.note("no previous context"),
         },
         Intent::OpenDiff => act_open_diff(app, width),
+        Intent::OpenScore => super::surfaces::act_open_score(app, width),
         Intent::CopyMode => match app.current {
             // Already off the tail: the chord is where the reader is, not a
             // second entry that would re-anchor them at the live tail.
@@ -957,6 +958,22 @@ fn act_full_screen(app: &mut App, key: KeyEvent, term_lock: &TermLock) {
             }
             DiffKey::Yank(None) => app.note("no hunk to yank"),
             DiffKey::Scrolled | DiffKey::Ignored => {}
+        }
+        return;
+    }
+
+    if let ScreenMode::Score(screen) = &mut app.screen {
+        let body_h = screen.body_h();
+        match crate::score::handle_key(screen, &key, body_h) {
+            crate::score::ScoreKey::Close => app.screen = ScreenMode::Conversation,
+            crate::score::ScoreKey::Yank(text) => {
+                match write_osc52(term_lock, &text) {
+                    Ok(()) => app.note(format!("yanked {} lines of ABC — p or Ctrl+A ] puts", text.lines().count())),
+                    Err(e) => app.note(format!("clipboard write failed: {e}")),
+                }
+                app.compose.yank_lines(&text);
+            }
+            crate::score::ScoreKey::ToggledRaw | crate::score::ScoreKey::Scrolled | crate::score::ScoreKey::Ignored => {}
         }
     }
 }

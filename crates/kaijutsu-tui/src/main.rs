@@ -95,6 +95,16 @@ struct Cli {
     /// only requested. A terminal without the protocol ignores the request.
     #[arg(long)]
     kitty_keyboard: bool,
+
+    /// Force-enable Kitty graphics protocol (Unicode placeholders for inline
+    /// ABC sheet music and the `Ctrl+A s` score viewer). Auto-enabled in plain
+    /// Kitty and Ghostty when not inside `screen` or `tmux`.
+    #[arg(long, conflicts_with = "no_kitty_graphics")]
+    kitty_graphics: bool,
+
+    /// Force-disable Kitty graphics protocol even in plain Kitty.
+    #[arg(long)]
+    no_kitty_graphics: bool,
 }
 
 fn main() -> Result<()> {
@@ -179,5 +189,12 @@ async fn run(cli: Cli) -> Result<()> {
     };
     tracing::info!(context = %start.id.short(), label = %start.label, "attached");
 
-    kaijutsu_tui::run::run(bridge, start, identity, cli.diff, cli.kitty_keyboard).await
+    let kitty_graphics = if cli.kitty_graphics {
+        Some(true)
+    } else if cli.no_kitty_graphics {
+        Some(false)
+    } else {
+        None
+    };
+    kaijutsu_tui::run::run(bridge, start, identity, cli.diff, cli.kitty_keyboard, kitty_graphics).await
 }

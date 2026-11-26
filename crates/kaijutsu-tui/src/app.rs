@@ -303,6 +303,10 @@ pub struct App {
     /// reads a live clock. [`Self::track_figure`] projects it; nothing here
     /// samples `beats` directly.
     pub track_pulse: bool,
+    /// Kitty graphics protocol cache and pending wire-command queue.
+    /// Disabled by default (`KittyStore::disabled()`) for tests and non-Kitty
+    /// terminals; enabled in [`crate::run::run`] when detected or requested.
+    pub kitty: crate::kitty::KittyStore,
 }
 
 impl App {
@@ -350,6 +354,7 @@ impl App {
             focused: true,
             rotation_primed: HashSet::new(),
             roster_changed: false,
+            kitty: crate::kitty::KittyStore::disabled(),
         }
     }
 

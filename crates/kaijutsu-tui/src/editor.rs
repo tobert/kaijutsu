@@ -43,6 +43,8 @@ pub enum ScreenMode {
     Editor(EditorScreen),
     /// A frozen diff.
     Diff(crate::diff::DiffScreen),
+    /// A frozen ABC sheet music score (`Ctrl+A s`).
+    Score(Box<crate::score::ScoreScreen>),
 }
 
 impl ScreenMode {

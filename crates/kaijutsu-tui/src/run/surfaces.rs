@@ -203,6 +203,29 @@ fn open_diff(app: &mut App, width: u16) -> Option<crate::diff::DiffScreen> {
     })
 }
 
+/// `Ctrl+A s` — open the ABC sheet music score viewer, or say why it did not.
+pub(super) fn act_open_score(app: &mut App, width: u16) {
+    match open_score(app, width) {
+        Some(screen) => {
+            app.screen = ScreenMode::Score(Box::new(screen));
+            app.clear_notice();
+        }
+        None if app.following() => app.note("no ABC score block in this context"),
+        None => app.note("no ABC score block at or above this line"),
+    }
+}
+
+fn open_score(app: &mut App, width: u16) -> Option<crate::score::ScoreScreen> {
+    let target = render::reader_target(app, width, |_, b| {
+        crate::score::openable_abc(b.content_type, &b.content).is_some()
+    })?;
+    let block = app.current_view()?.mirror.block(&target)?;
+    let how = crate::score::openable_abc(block.content_type, &block.content)?;
+    let title = format!("block #{}", block.id.seq);
+    let raw = how.source(&block.content).to_string();
+    Some(crate::score::ScoreScreen::open(title, raw))
+}
+
 /// `--diff <a> [b]` — run `kj diff` in the starting context and freeze its
 /// output into the diff screen.
 ///

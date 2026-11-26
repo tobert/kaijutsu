@@ -50,7 +50,7 @@ use self::probe::{LOOP_THREAD, ProbePanic, TASK_PANIC, panic_unwinds_the_loop};
 use self::seat::{land_draft_edit, remember_view};
 use self::signals::StopSignals;
 use self::surfaces::{attach_editor_peer, land_editor_answer, open_kj_diff};
-use self::terminal::{KITTY_REQUESTED, TermLock, enter_terminal, leave_terminal, spawn_key_reader};
+use self::terminal::{KITTY_GRAPHICS_ACTIVE, KITTY_REQUESTED, TermLock, enter_terminal, leave_terminal, spawn_key_reader};
 
 /// How often the rank, the cache figures and the pending-ask count are
 /// refreshed. Slow on purpose: none of them is an interaction-rate fact.
@@ -99,9 +99,15 @@ pub async fn run(
     identity: String,
     diff: Option<Vec<String>>,
     kitty_keyboard: bool,
+    kitty_graphics: Option<bool>,
 ) -> Result<()> {
     KITTY_REQUESTED.store(kitty_keyboard, Ordering::SeqCst);
+    let kitty_enabled = crate::kitty::detect_kitty_graphics(kitty_graphics);
+    KITTY_GRAPHICS_ACTIVE.store(kitty_enabled, Ordering::SeqCst);
     let mut app = App::new(identity);
+    if kitty_enabled {
+        app.kitty = crate::kitty::KittyStore::enabled(crate::kitty::query_cell_pixels());
+    }
     app.set_contexts(bridge.list_contexts().await?);
     // Best-effort: a kernel that cannot answer this yet just means slash
     // completion offers nothing until a later poll fills it in, never a

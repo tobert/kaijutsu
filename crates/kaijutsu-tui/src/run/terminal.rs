@@ -92,7 +92,7 @@ pub(super) fn wanted_cursor_shape(app: &App) -> CursorShape {
     match &app.screen {
         ScreenMode::Conversation => app.compose.cursor_shape(),
         ScreenMode::Editor(screen) => CursorShape::for_mode(screen.state.mode.as_deref()),
-        ScreenMode::Diff(_) => CursorShape::Block,
+        ScreenMode::Diff(_) | ScreenMode::Score(_) => CursorShape::Block,
     }
 }
 
@@ -215,6 +215,10 @@ pub(super) fn pop_title() {
 /// before the screen is taken (`run::run`), from `--kitty-keyboard`.
 pub(super) static KITTY_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Whether Kitty graphics were enabled for this session, so [`restore_terminal`]
+/// clears uploaded images on the alternate screen before leaving it.
+pub(super) static KITTY_GRAPHICS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Whether this process has a keyboard-enhancement flag stack frame pushed,
 /// the same shape as `TITLE_PUSHED`: `restore_terminal` is idempotent and
 /// runs from the exit path, the panic hook and the signal path, while a
@@ -281,6 +285,9 @@ pub fn restore_terminal() {
     // buffer, so the pop has to land before `?1049l`, not after it — the
     // reverse of the title-stack pop just below, which does not care.
     pop_kitty_keyboard();
+    if KITTY_GRAPHICS_ACTIVE.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::execute!(io::stdout(), Print(crate::kitty::encode_delete_all()));
+    }
     editor::abandon();
     pop_title();
     // `?1004l` and `?1007l` go out blind: resetting a mode the terminal
