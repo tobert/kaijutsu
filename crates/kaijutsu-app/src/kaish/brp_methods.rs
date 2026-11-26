@@ -15,6 +15,7 @@ use crate::input::context::ActiveInputContexts;
 use crate::input::map::InputMap;
 use crate::input::{Action, ActionFired, FocusArea, InputContext};
 use crate::ui::screen::Screen;
+use crate::view::boards::{BoardLocation, BoardReader};
 use crate::view::components::ContextSwitchRequested;
 use crate::view::document::DocumentCache;
 use crate::view::heroic::state::HeroicState;
@@ -80,7 +81,7 @@ struct ControlRequestView {
 }
 
 #[derive(Serialize)]
-struct StateResponse {
+struct StateResponse<'a> {
     /// The latest request for control; null when none, or once allowed.
     control_request: Option<ControlRequestView>,
     agent_control: bool,
@@ -90,6 +91,7 @@ struct StateResponse {
     contexts: Vec<String>,
     active_context_id: Option<String>,
     heroic: Option<HeroicView>,
+    boards: Option<BoardLocation<'a>>,
 }
 
 #[derive(Serialize)]
@@ -291,6 +293,7 @@ pub fn handle_state(
     active: Res<ActiveInputContexts>,
     doc_cache: Res<DocumentCache>,
     heroic: Option<Res<HeroicState>>,
+    boards: BoardReader,
 ) -> BrpResult {
     serde_json::to_value(StateResponse {
         control_request: control.request.as_ref().map(|r| ControlRequestView {
@@ -306,6 +309,7 @@ pub fn handle_state(
         focus: format!("{:?}", *focus),
         contexts: active.0.iter().map(|c| format!("{c:?}")).collect(),
         active_context_id: doc_cache.active_id().map(|id| id.to_string()),
+        boards: if *screen.get() == Screen::Boards { boards.location() } else { None },
         heroic: heroic.filter(|_| *screen.get() == Screen::Heroic).map(|scene| HeroicView {
             performers: scene.performer_ids(),
             selected: scene.selected_performer,
@@ -441,6 +445,18 @@ mod tests {
             .run_system_once_with(handle_state, None)
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn a_guide_can_read_its_board_position_with_control_off() {
+        let mut app = app(false, vec![InputContext::Boards]);
+        app.add_plugins(crate::view::boards::BoardsPlugin);
+        app.insert_resource(State::new(Screen::Boards));
+        let snapshot = state(&mut app);
+        assert_eq!(snapshot["boards"]["layer"], "Boards");
+        assert_eq!(snapshot["boards"]["loading"], true);
+        assert!(snapshot["boards"]["post"].is_null());
+        assert_eq!(snapshot["agent_control"], false);
     }
 
     /// A request works with the latch off, records itself, and leaves the

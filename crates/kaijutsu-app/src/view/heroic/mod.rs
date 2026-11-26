@@ -41,7 +41,7 @@ pub struct HeroicSavedCamera {
     projection: Option<Projection>,
     clear_color: Option<ClearColorConfig>,
     pub return_screen: Option<Screen>,
-    editor_selection: Option<kaijutsu_types::ContextId>,
+    return_selection: Option<kaijutsu_types::ContextId>,
 }
 
 /// Wires the heroic view screen, shaders, drivers, and systems into Bevy.
@@ -178,7 +178,7 @@ fn enter_heroic(
     }
 
     state.clear_driver_state();
-    state.selected_performer = saved.editor_selection.take();
+    state.selected_performer = saved.return_selection.take();
     if actor.is_some() {
         live::request_initial_tracks(actor.as_deref(), &result_channel);
     }
@@ -260,7 +260,7 @@ fn exit_heroic(
     for e in roots.iter() {
         commands.entity(e).despawn();
     }
-    saved.editor_selection = if *screen.get() == Screen::Editor { state.selected_performer } else { None };
+    saved.return_selection = if matches!(screen.get(), Screen::Editor | Screen::Boards) { state.selected_performer } else { None };
     state.clear_driver_state();
     perf_pool.root = None;
     perf_pool.slots.clear();

@@ -1081,13 +1081,12 @@ pub fn handle_dock_click(
 // DATA-GATHERING SYSTEMS (write to DockState)
 // ============================================================================
 
-/// Whether a screen detaches the HUD from the active context (see
-/// [`DockState::detached`]). `Room` is a fleet/world view — one context's
-/// cockpit readout contradicts its stance. `Editor` and `Diff` stay
-/// attached: both render content *of* the active context.
+/// Detach the HUD from the active context on fleet views (see
+/// [`DockState::detached`]). `Editor` and `Diff` render content from the
+/// active context and keep the HUD attached.
 pub(crate) fn hud_detached(screen: crate::ui::screen::Screen) -> bool {
     use crate::ui::screen::Screen;
-    matches!(screen, Screen::Room | Screen::Heroic)
+    matches!(screen, Screen::Room | Screen::Heroic | Screen::Boards)
 }
 
 /// The mode slot's label while the room owns the viewport: where you are,
@@ -1153,6 +1152,7 @@ pub fn update_mode(
         // Detached screens: the slot names the place, not a mode.
         Screen::Room => (theme.accent, room_slot_label(room.zoomed)),
         Screen::Heroic => (theme.accent, "HEROIC"),
+        Screen::Boards => (theme.accent, "BOARDS"),
     };
 
     if dock.mode.text != label || dock.mode.color != color {
@@ -1637,11 +1637,6 @@ mod tests {
         );
     }
 
-    /// Room is the fleet/world view — the HUD detaches from the active
-    /// context there. Everything else (Conversation, and the two surfaces
-    /// that render the active context's own content: Editor, Diff) stays
-    /// attached. Exhaustive over `Screen` so a future screen variant forces
-    /// a deliberate choice here.
     #[test]
     fn hud_detaches_on_fleet_views_only() {
         use crate::ui::screen::Screen;
@@ -1650,8 +1645,13 @@ mod tests {
             Screen::Editor,
             Screen::Room,
             Screen::Diff,
+            Screen::Heroic,
+            Screen::Boards,
         ] {
-            let expect = matches!(screen, Screen::Room);
+            let expect = match screen {
+                Screen::Conversation | Screen::Editor | Screen::Diff => false,
+                Screen::Room | Screen::Heroic | Screen::Boards => true,
+            };
             assert_eq!(hud_detached(screen), expect, "{screen:?}");
         }
     }
@@ -2498,6 +2498,7 @@ pub fn update_hints(
             // surface-only keys.
             Some(_) => "\u{2191}/Esc: room",
         },
+        Screen::Boards => "",
         Screen::Heroic => "0-9/\u{2190}\u{2192}: select \u{2502} r: reload theme \u{2502} Esc: clear / leave",
     };
 

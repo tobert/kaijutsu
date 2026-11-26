@@ -45,6 +45,8 @@ pub enum Screen {
     /// The heroic view — full-window 3D anticipation & commitment road
     /// (`docs/newui.md`, `view::heroic`). Reached by `Ctrl+A k`, left by `Esc`.
     Heroic,
+    /// The boards view.
+    Boards,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -102,6 +104,11 @@ impl Plugin for ScreenPlugin {
         // there is no second screen for a station dive to enter any more.
         app.add_systems(
             OnEnter(Screen::Room),
+            (hide_conversation_root, set_focus_conversation),
+        );
+
+        app.add_systems(
+            OnEnter(Screen::Boards),
             (hide_conversation_root, set_focus_conversation),
         );
 

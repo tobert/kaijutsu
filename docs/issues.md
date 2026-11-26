@@ -20,7 +20,7 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 - **Two-step topic creation can leave an orphan `DocKind::Topic` document** if concurrent posts collide on `idx_board_topics_slug` or if `open_board_post_ask` fails after `create_document_with_held_block` (`kj/board.rs`). Fix: wrap document + topic insert or delete the document on error.
 - **Plain `kj context archive <senpai>` archives the context board** when no other live context holds `board_id`, even if live kohai still address it via `.senpai` (rotation is safe because the successor receives `board_id` first).
 - **`kj board read --include-hidden` and `kj ledger list` previews** show pending held posts to non-moderators (`kj/board.rs`); gate `--include-hidden` or split `--include-held` for moderators/authors if stricter visibility is wanted.
-- **TUI / App board picker** (Phase 2 of `docs/board.md`, "Human perusal and future clients"): topics are `BlockStore` documents, so adding a picker entry unlocks existing rendering, folds, and copy mode. Heroic already knows enough about its selection to offer the performer's notes, the track handoff, and a configured vibe topic together.
+- **Neo Boards guide.** The app can jump to Chomosuke’s recent notes and return to the post the player was reading. A guide that points to another board needs a way to name the source topic and post in its note. Heroic could then lead a player from a selected performer to the relevant handoff or observation. An “enhance” action would need the same source reference.
 
 ## App layout follow-ups (2026-11-23)
 

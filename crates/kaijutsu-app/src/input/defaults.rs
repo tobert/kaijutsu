@@ -548,6 +548,36 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::key(KeyCode::Backslash, InputContext::Neo, Action::NeoSwitchSection, "Switch Neo section"));
     b.push(Binding::key_mod(KeyCode::Enter, Modifiers::SHIFT, InputContext::Neo, Action::NeoReveal, "Reveal Neo source"));
 
+    for (key, action) in [
+        (KeyCode::ArrowLeft, Action::BoardPrevious),
+        (KeyCode::ArrowUp, Action::BoardPrevious),
+        (KeyCode::ArrowRight, Action::BoardNext),
+        (KeyCode::ArrowDown, Action::BoardNext),
+        (KeyCode::Enter, Action::BoardConfirm),
+        (KeyCode::Escape, Action::PopLevel),
+        (KeyCode::KeyG, Action::BoardGuide),
+        (KeyCode::PageUp, Action::BoardScrollUp),
+        (KeyCode::PageDown, Action::BoardScrollDown),
+    ] {
+        b.push(Binding::key(key, InputContext::Boards, action, "Boards"));
+    }
+    for (button, action) in [
+        (GamepadButton::DPadLeft, Action::BoardPrevious),
+        (GamepadButton::DPadUp, Action::BoardPrevious),
+        (GamepadButton::DPadRight, Action::BoardNext),
+        (GamepadButton::DPadDown, Action::BoardNext),
+        (GamepadButton::South, Action::BoardConfirm),
+        (GamepadButton::East, Action::PopLevel),
+        (GamepadButton::West, Action::BoardGuide),
+        (GamepadButton::LeftTrigger, Action::BoardScrollUp),
+        (GamepadButton::RightTrigger, Action::BoardScrollDown),
+    ] {
+        b.push(Binding::gamepad(button, InputContext::Boards, action, "Boards"));
+    }
+    for context in [InputContext::Navigation, InputContext::RoomNav, InputContext::WellZoomed, InputContext::StationZoomed, InputContext::Heroic] {
+        b.push(Binding::gamepad(GamepadButton::Select, context, Action::OpenBoards, "Open boards"));
+    }
+
     // Heroic (Screen::Heroic — full-window 3D road, docs/newui.md)
     // ====================================================================
 
@@ -1002,6 +1032,16 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn boards_controls_are_available() {
+        let bindings = default_bindings();
+        for action in [Action::BoardPrevious, Action::BoardNext, Action::BoardConfirm, Action::PopLevel, Action::BoardGuide, Action::BoardScrollUp, Action::BoardScrollDown] {
+            assert!(bindings.iter().any(|b| b.context == InputContext::Boards && b.action == action));
+        }
+        assert!(!bindings.iter().any(|b| b.context == InputContext::Global && b.action == Action::OpenBoards));
+        assert!(bindings.iter().any(|b| b.context == InputContext::Navigation && b.action == Action::OpenBoards));
     }
 
     /// The well's verb row is hand-picked mnemonics (`p d c z a h`) sharing one

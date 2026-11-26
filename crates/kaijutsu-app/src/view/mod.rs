@@ -25,6 +25,9 @@
 //! - `components` — the component/resource types shared across the above.
 
 pub mod block_render;
+mod board_feed;
+mod board_scene;
+pub mod boards;
 pub mod components;
 pub mod document;
 pub mod diff_view;

@@ -34,6 +34,20 @@ pub enum Action {
     /// - Dialog → cancel
     /// - well focus → overview → room; station → room; room → conversation
     PopLevel,
+    /// Open the boards screen.
+    OpenBoards,
+    /// Select the previous board or item.
+    BoardPrevious,
+    /// Select the next board or item.
+    BoardNext,
+    /// Open the selected board or item.
+    BoardConfirm,
+    /// Visit Chomosuke’s most recently active notes topic.
+    BoardGuide,
+    /// Scroll board content up.
+    BoardScrollUp,
+    /// Scroll board content down.
+    BoardScrollDown,
     /// Context-dependent "do the thing" (Enter)
     /// - Navigation: edit focused User Text block
     /// - Dialog: confirm

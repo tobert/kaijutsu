@@ -373,6 +373,7 @@ fn context_priority(ctx: InputContext) -> usize {
         | InputContext::WellZoomed
         | InputContext::StationZoomed
         | InputContext::Heroic
+        | InputContext::Boards
         | InputContext::Neo => 1,
         // A held quick-context overlay outranks the surface it floats over,
         // so its Esc claims the key outright and no `PopLevel` is emitted for
@@ -400,6 +401,21 @@ mod tests {
         // machine it runs on.
         InputMap {
             bindings: super::super::defaults::default_bindings(),
+        }
+    }
+
+    #[test]
+    fn boards_gamepad_resolves_one_action_per_button() {
+        use GamepadButton::*;
+        let map = shipped_map();
+        for (button, expected) in [
+            (DPadUp, Action::BoardPrevious), (DPadDown, Action::BoardNext),
+            (South, Action::BoardConfirm), (East, Action::PopLevel), (West, Action::BoardGuide),
+            (LeftTrigger, Action::BoardScrollUp), (RightTrigger, Action::BoardScrollDown),
+        ] {
+            let fired = resolve_gamepad_bindings(&map, |b| b == button,
+                |ctx| matches!(ctx, InputContext::Global | InputContext::Boards));
+            assert_eq!(fired, vec![(expected, InputContext::Boards)], "{button:?}");
         }
     }
 

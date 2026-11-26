@@ -126,7 +126,10 @@ pub fn heroic_keyboard(
 ) {
     let ids = state.performer_ids();
     let count = ids.len();
-    for ActionFired { action, .. } in actions.read() {
+    for ActionFired { action, context } in actions.read() {
+        if !matches!(context, crate::input::InputContext::Heroic | crate::input::InputContext::Global) {
+            continue;
+        }
         match action {
             Action::StepNext if count > 0 => {
                 let next_idx = match state
@@ -576,6 +579,21 @@ pub fn sync_selection_ui(
 #[cfg(test)]
 mod score_tests {
     use super::*;
+    #[test]
+    fn boards_escape_cannot_clear_the_returning_heroic_seat() {
+        let mut app = App::new();
+        let selected = Some(kaijutsu_types::ContextId::new());
+        app.insert_resource(HeroicState { selected_performer: selected, ..default() })
+            .init_resource::<super::super::HeroicSavedCamera>()
+            .init_resource::<NextState<Screen>>()
+            .add_message::<ActionFired>()
+            .add_message::<ContextSwitchRequested>()
+            .add_systems(Update, heroic_keyboard);
+        app.world_mut().write_message(ActionFired::new(Action::PopLevel, crate::input::InputContext::Boards));
+        app.update();
+        assert_eq!(app.world().resource::<HeroicState>().selected_performer, selected);
+    }
+
     #[test]
     fn board_note_arguments_include_selected_phrase() {
         use kaijutsu_types::PrincipalId;

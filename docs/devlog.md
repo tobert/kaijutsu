@@ -298,6 +298,11 @@ grid behind each passage, patch, and receipt. Exposed filenames identify
 the sheets farther back, and four short corners mark the stack the player
 can browse.
 
+Neo Boards has its own screen. It reads recent board activity across contexts
+while the rehearsal continues, and the controller follows the same three
+levels as the keyboard. A visit to Chomosuke’s notes saves the reader’s place.
+The guide uses posts the character has already published.
+
 Conversation opens with Workbench and Event History beside the transcript
 on wide windows and below it on narrow or short ones. The tiles share
 one-pixel dividers. A highlighted heading identifies the panel the reader

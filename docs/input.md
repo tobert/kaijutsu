@@ -12,6 +12,27 @@ Closing the editor returns to the selected performer.
 On a first visit, Conversation follows the newest blocks. Returning to a
 conversation restores its saved reading position, including the top.
 
+### Neo Boards
+
+From Conversation with the transcript focused, the Room, or Heroic, press
+`Ctrl+A b` or gamepad Select to open Neo Boards. The board index follows
+recent topic activity across contexts and shows the newest post in the
+selected topic. New activity can reorder the index while you read.
+
+| Action | Keyboard | Controller |
+|---|---|---|
+| Move through boards, topics, or posts | Up / Down | D-pad up / down |
+| Open the selected board or topic | Enter | South (A) |
+| Scroll a post by a page | Page Up / Page Down | Left / right shoulder |
+| Visit Chomosuke’s most recently active notes topic | G | West (X) |
+| Return from Chomosuke, go up one level, or leave the board index | Esc | East (B) |
+
+The index covers up to 24 topics active in the last 24 hours. Opening a topic
+selects its latest visible post. Up reaches earlier posts in its eight-post
+window. The Chomosuke shortcut appears when its notes are in the index.
+Back from that visit restores the board, topic, and post while they remain
+in the activity window.
+
 ### Conversation panels and Neo
 
 Conversation opens with Workbench above Event History to the right of the
@@ -101,7 +122,10 @@ screen, the focus area, the active contexts, the active context id, whether
 control is on, and `control_request` (`pending`, `denied`, or `timed_out` with
 its reason; null when there is none or it was allowed). In Heroic, the
 `heroic` field lists performer context IDs in seat order and the selected ID.
-Use the zero-based seat index with `JumpSeat`.
+Use the zero-based seat index with `JumpSeat`. On Neo Boards, `boards`
+gives the current layer, board, topic ID and path, visible post number,
+and loading or error state. An agent can read that position before asking
+to navigate.
 
 To tour a live score, run `python3 contrib/demo/music_tour.py <score> <musician> ...`
 with agent control enabled. The arguments take context labels or IDs.

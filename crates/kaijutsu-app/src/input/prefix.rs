@@ -99,6 +99,7 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // switch-by-prompt (screen's `'` select).
         KeyCode::KeyW => Some(Action::GoToWell),
         KeyCode::KeyK => Some(Action::GoToHeroic),
+        KeyCode::KeyB => Some(Action::OpenBoards),
         KeyCode::KeyE if !shift => Some(Action::ToggleNeo),
         KeyCode::KeyE => Some(Action::ToggleConversationPanels),
         KeyCode::Quote if shift => Some(Action::GoToWell),
@@ -139,6 +140,11 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boards_chord_resolves() {
+        assert_eq!(resolve_chord(KeyCode::KeyB, false, false), Some(Action::OpenBoards));
+    }
 
     #[test]
     fn digits_resolve_to_seats_with_or_without_ctrl() {

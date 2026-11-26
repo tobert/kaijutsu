@@ -37,6 +37,8 @@ pub enum InputContext {
     StationZoomed,
     /// Screen::Heroic — the 3D anticipation & commitment road (`docs/newui.md`)
     Heroic,
+    /// The boards screen.
+    Boards,
     /// Neo is visible and the transcript has navigation focus.
     Neo,
     /// The quick-context overlay is HELD (`Ctrl+A h`, `ui::quick_context`).
@@ -207,6 +209,11 @@ pub fn derive_contexts(
             return (contexts, KeyboardGrab::None);
         }
 
+        Screen::Boards => {
+            contexts.push(InputContext::Boards);
+            return (contexts, KeyboardGrab::None);
+        }
+
         Screen::Heroic => {
             contexts.push(InputContext::Heroic);
             return (contexts, KeyboardGrab::None);
@@ -278,6 +285,15 @@ pub fn sync_input_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boards_owns_input_even_if_compose_had_focus() {
+        let (contexts, grab) = derive_contexts(
+            Screen::Boards, None, &FocusArea::Compose, false, ApprovalSurfaces::default(),
+        );
+        assert_eq!(contexts, vec![InputContext::Global, InputContext::Boards]);
+        assert_eq!(grab, KeyboardGrab::None);
+    }
 
     #[test]
     fn conversation_compose_grabs_for_vim() {
