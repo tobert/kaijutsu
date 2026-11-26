@@ -56,6 +56,7 @@ impl Plugin for HeroicPlugin {
             .register_type::<HeroicPalette>()
             .init_resource::<state::HeroicState>()
             .init_resource::<live::HeroicLiveCache>()
+            .init_resource::<live::RoomScore>()
             .init_resource::<notes::HeroicNotesRuntime>()
             .init_resource::<performers::HeroicPerformerPool>()
             .init_resource::<text::HeroicTextState>()
@@ -67,14 +68,17 @@ impl Plugin for HeroicPlugin {
             )
             .add_systems(OnEnter(Screen::Heroic), enter_heroic)
             .add_systems(OnExit(Screen::Heroic), exit_heroic)
+            .add_systems(Update,
+                (live::poll_heroic_live_data, live::apply_heroic_work_results)
+                    .chain().run_if(|screen: Res<State<Screen>>| matches!(screen.get(), Screen::Heroic | Screen::Room)))
+            .add_systems(Update, live::sync_room_score.after(live::apply_heroic_work_results)
+                .run_if(in_state(Screen::Room)))
             .add_systems(
                 Update,
                 (
                     selection::heroic_keyboard.after(InputPhase::Dispatch),
                     selection::open_board_note,
-                    live::poll_heroic_live_data,
-                    live::apply_heroic_work_results,
-                    live::ingest_heroic_cues,
+                    live::ingest_heroic_cues.after(live::apply_heroic_work_results),
                     live::sync_heroic_state,
                     sync_heroic_live_tuning,
                     environment::sync_environment,

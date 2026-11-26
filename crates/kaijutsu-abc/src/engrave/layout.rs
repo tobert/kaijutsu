@@ -344,6 +344,32 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
     )
 }
 
+/// A voice laid out on a quarter-note grid. The music starts at x = 0.
+pub struct TimedStaff {
+    pub signature: Vec<EngravingElement>,
+    pub music: Vec<EngravingElement>,
+    pub duration_beats: f64,
+}
+
+/// Space successive quarter notes `beat_width` units apart. The prefix
+/// contains the clef, key and meter for the start of this voice.
+pub fn engrave_timed_staff(tune: &Tune, voice: &Voice, spacing: f64, beat_width: f64) -> TimedStaff {
+    let key = &tune.header.key;
+    let clef = resolve_clef(&tune.header, voice);
+    let ctx = StaffCtx { y_top: 0.0, sp: spacing, scale: spacing / font_cache().upem() * 4.0, clef };
+    let played = crate::midi::expand_repeats(&voice.elements);
+    let staff = StaffInput {
+        elements: &played, key, clef,
+        pitch_offset: crate::midi::pitch_offset(&tune.header, voice),
+    };
+    let mut signature = Vec::new();
+    let (_, lines_end, end_x, music_start) =
+        render_staff(&mut signature, &tune.header, staff, ctx, true, false, Some(beat_width));
+    let music = signature.split_off(music_start);
+    signature.drain(..lines_end);
+    TimedStaff { signature, music, duration_beats: end_x / beat_width }
+}
+
 struct StaffInput<'a> {
     elements: &'a [Element],
     key: &'a Key,
@@ -384,7 +410,7 @@ fn engrave_staves<'a>(
             scale,
             clef: staff.clef,
         };
-        let (start, end, cursor) = render_staff(&mut elements, header, staff, ctx, first, last);
+        let (start, end, cursor, _) = render_staff(&mut elements, header, staff, ctx, first, last, None);
         staff_line_ranges.push(start..end);
         max_cursor = max_cursor.max(cursor);
     }
@@ -558,9 +584,8 @@ fn inline_key(field: &InfoField) -> (Key, bool) {
     )
 }
 
-/// Render one staff (one voice) at `ctx.y_top`. Returns
-/// `(staff_line_start_idx, staff_line_end_idx, final_cursor_x)`. The
-/// top-level uses the staff-line indices to normalize widths across voices.
+/// Render a voice at `ctx.y_top`. Return its staff-line range, final x and
+/// the index of its first music element after the clef, key and meter.
 fn render_staff(
     elements: &mut Vec<EngravingElement>,
     header: &Header,
@@ -568,7 +593,8 @@ fn render_staff(
     mut ctx: StaffCtx,
     show_meter: bool,
     final_system: bool,
-) -> (usize, usize, f64) {
+    beat_width: Option<f64>,
+) -> (usize, usize, f64, usize) {
     let font = font_cache();
     let sp = ctx.sp;
     let mut cursor_x: f64 = 0.0;
@@ -624,8 +650,15 @@ fn render_staff(
     cursor_x += sp * 0.5; // padding before first note
 
     // 5. Walk voice elements.
-    let unit_length = header.unit_length.unwrap_or_default();
+    let music_start = elements.len();
+    if beat_width.is_some() { cursor_x = 0.0; }
+    let mut unit_length = header.unit_length.unwrap_or_default();
     let unit_width = sp * 2.5;
+    let advance = |duration: &Duration, unit: &UnitLength| match beat_width {
+        Some(width) => absolute_ratio(duration, unit) * 4.0 * width,
+        None => duration_to_width(duration, unit_width),
+    };
+    let mut meter = header.meter.clone().unwrap_or(Meter::Common);
     let mut kit = KitPitches::new(staff.key, staff.pitch_offset);
 
     // Open volta we haven't closed yet: (x_start, label_text). Closed at
@@ -717,8 +750,8 @@ fn render_staff(
                 }
 
                 let beam_gid = beam_group_of[token_idx];
-                let cursor_after = emit_note_with(
-                    elements, note, head, cursor_x, ctx, unit_width, &unit_length, span, beam_gid.is_some(),
+                emit_note_with(
+                    elements, note, head, cursor_x, ctx, &unit_length, span, beam_gid.is_some(),
                 );
                 if let Some(gid) = beam_gid {
                     beam_stems[gid].push(BeamStem {
@@ -732,7 +765,7 @@ fn render_staff(
                         emit_beam(elements, &beam_stems[gid], ctx);
                     }
                 }
-                cursor_x = cursor_after;
+                cursor_x += advance(&note.duration, &unit_length);
 
                 // Drain pending standalone decorations onto this note,
                 // then add the note's own decorations.
@@ -759,7 +792,8 @@ fn render_staff(
                 acciaccatura,
                 notes,
             } => {
-                cursor_x = emit_grace_notes(elements, notes, *acciaccatura, cursor_x, ctx, &kit);
+                let end = emit_grace_notes(elements, notes, *acciaccatura, cursor_x, ctx, &kit);
+                if beat_width.is_none() { cursor_x = end; }
             }
             // SlurGroup is flattened to SlurStart/SlurEnd tokens before
             // this match runs, so it should never reach here.
@@ -768,7 +802,7 @@ fn render_staff(
             ),
             Element::Chord(chord) => {
                 let span = (0usize, 0usize);
-                let dur_width = duration_to_width(&chord.duration, unit_width);
+                let dur_width = advance(&chord.duration, &unit_length);
                 // Resolve accidentals in source order before sorting heads for layout.
                 let mut placed: Vec<_> = chord.notes.iter()
                     .map(|note| staff_note(note, &chord.duration, &unit_length, ctx.clef, &mut kit))
@@ -810,7 +844,9 @@ fn render_staff(
                     // Multi-measure rest: a thick H-bar centered on the middle
                     // line with vertical end caps, and the bar count above the
                     // staff (§4.5). `X` (invisible) still just takes the space.
-                    let width = unit_width * bars as f64 * 4.0;
+                    let (n, d) = meter.to_fraction();
+                    let width = f64::from(bars) * beat_width
+                        .map_or(unit_width * 4.0, |beat| beat * 4.0 * f64::from(n) / f64::from(d.max(1)));
                     if rest.visible {
                         let mid = ctx.y_at(2.0);
                         let x0 = cursor_x + ctx.sp * 0.5;
@@ -851,10 +887,10 @@ fn render_staff(
                         ctx,
                         span,
                     );
-                    cursor_x += duration_to_width(&rest.duration, unit_width);
+                    cursor_x += advance(&rest.duration, &unit_length);
                 } else {
                     // Invisible rest (`x`): occupies time, draws nothing.
-                    cursor_x += duration_to_width(&rest.duration, unit_width);
+                    cursor_x += advance(&rest.duration, &unit_length);
                 }
             }
             Element::Bar(bar) => {
@@ -871,7 +907,11 @@ fn render_staff(
                 // A bar of any variant closes an open volta.
                 close_volta_bracket(elements, &mut open_volta, cursor_x, ctx);
                 let bar_left = cursor_x;
-                cursor_x = emit_barline(elements, bar, cursor_x, ctx);
+                if beat_width.is_some() {
+                    emit_barline(elements, bar, cursor_x - sp * 0.5, ctx);
+                } else {
+                    cursor_x = emit_barline(elements, bar, cursor_x, ctx);
+                }
                 // If this bar is itself a volta opener, start a new bracket.
                 if let Some(label) = volta_label(bar) {
                     emit_volta_open(elements, bar_left, &label, ctx);
@@ -891,7 +931,7 @@ fn render_staff(
                             let head = staff_note(note, &note.duration, &unit_length, ctx.clef, &mut kit);
                             head.emit(elements, cursor_x, ctx, span);
                             emit_stem(elements, head, cursor_x, ctx, &note.duration, &unit_length, span);
-                            cursor_x += duration_to_width(&note.duration, unit_width) * scale_factor;
+                            cursor_x += advance(&note.duration, &unit_length) * scale_factor;
                         }
                         Element::Rest(rest) => {
                             elements.push(EngravingElement::Glyph {
@@ -901,14 +941,14 @@ fn render_staff(
                                 scale: ctx.scale,
                                 source_span: span,
                             });
-                            cursor_x += duration_to_width(&rest.duration, unit_width) * scale_factor;
+                            cursor_x += advance(&rest.duration, &unit_length) * scale_factor;
                         }
                         Element::Chord(chord) => {
                             for note in &chord.notes {
                                 let head = staff_note(note, &chord.duration, &unit_length, ctx.clef, &mut kit);
                                 head.emit(elements, cursor_x, ctx, span);
                             }
-                            cursor_x += duration_to_width(&chord.duration, unit_width) * scale_factor;
+                            cursor_x += advance(&chord.duration, &unit_length) * scale_factor;
                         }
                         _ => {}
                     }
@@ -957,7 +997,14 @@ fn render_staff(
             // Mid-staff inline key/clef change (§3.2/§4.6). A clef change
             // repositions the following notes and draws a new clef; a key change
             // (value starting with a root A–G) redraws the key signature here.
+            Element::InlineField(field) if beat_width.is_some() && field.field_type == 'L' => {
+                if let Some(length) = crate::midi::inline_unit_length(&field.value) { unit_length = length; }
+            }
+            Element::InlineField(field) if beat_width.is_some() && field.field_type == 'M' => {
+                meter = crate::midi::inline_meter(&field.value);
+            }
             Element::InlineField(field) if field.field_type == 'K' => {
+                let at_change = cursor_x;
                 let (new_key, signature) = inline_key(field);
                 kit.key(&new_key);
                 cursor_x += sp * 0.5;
@@ -982,6 +1029,7 @@ fn render_staff(
                     cursor_x = emit_key_signature(elements, &new_key, cursor_x, ctx);
                 }
                 cursor_x += sp * 0.5;
+                if beat_width.is_some() { cursor_x = at_change; }
             }
             // Space, LineBreak, decorations, slurs, lyrics, etc. — defer.
             _ => {}
@@ -1041,7 +1089,7 @@ fn render_staff(
         }
     }
 
-    (line_start, line_end, cursor_x)
+    (line_start, line_end, cursor_x, music_start)
 }
 
 // --- Lyrics -----------------------------------------------------------------
@@ -1630,19 +1678,16 @@ fn emit_note_with(
     head: StaffNote,
     cursor_x: f64,
     ctx: StaffCtx,
-    unit_width: f64,
     unit: &UnitLength,
     span: SourceSpan,
     beamed: bool,
-) -> f64 {
+) {
     head.emit(elements, cursor_x, ctx, span);
     emit_dots(elements, dot_count(&note.duration), cursor_x + head.width(ctx), ctx.y_at(head.pos), ctx, span);
     if !beamed {
         emit_stem(elements, head, cursor_x, ctx, &note.duration, unit, span);
         emit_flag(elements, head, cursor_x, ctx, &note.duration, unit, span);
     }
-
-    cursor_x + duration_to_width(&note.duration, unit_width)
 }
 
 /// Emit the beam(s) for one group plus the stem of every note in it.
@@ -2356,6 +2401,44 @@ mod tests {
 #[cfg(test)]
 mod system_tests {
     use super::*;
+
+    #[test]
+    fn timed_staff_places_attacks_on_the_same_grid_across_units_and_bars() {
+        let project = |body: &str| {
+            let tune = crate::parse(body).value.remove(0);
+            let staff = engrave_timed_staff(&tune, &tune.voices[0], 10.0, 40.0);
+            let notes = staff.music.iter().filter_map(|e| match e {
+                EngravingElement::Glyph { codepoint: 0xE0A2..=0xE0A4, x, .. } => Some(*x),
+                _ => None,
+            }).collect::<Vec<_>>();
+            (notes, staff.duration_beats)
+        };
+        let (bass, bass_len) = project("X:1\nM:4/4\nL:1/4\nK:C clef=bass\nC,2 z2 | D,4 |");
+        let (lead, lead_len) = project("X:1\nM:4/4\nL:1/8\nK:D\nCD EF GA Bc | d8 |");
+        assert_eq!(bass, [0.0, 160.0]);
+        assert_eq!(lead, [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0]);
+        assert_eq!((bass_len, lead_len), (8.0, 8.0));
+    }
+
+    #[test]
+    fn timed_staff_follows_repeat_playback_and_print_keeps_the_written_notes() {
+        for (body, printed_notes) in [("|:CD:|", 2), ("|:CD|1E:|2F|", 4)] {
+            let source = format!("X:1\nM:4/4\nL:1/4\nK:C\n{body}\n");
+            let tune = crate::parse(&source).value.remove(0);
+            let midi = crate::MidiParams::default();
+            let played: Vec<_> = crate::midi::events(&tune, &midi).iter()
+                .filter(|event| event.data.first().is_some_and(|status| status & 0xf0 == 0x90))
+                .map(|event| f64::from(event.tick) / f64::from(midi.ticks_per_beat)).collect();
+            let heads = |elements: &[EngravingElement]| elements.iter().filter_map(|elem| match elem {
+                EngravingElement::Glyph { codepoint: 0xE0A2..=0xE0A4, x, .. } => Some(*x),
+                _ => None,
+            }).collect::<Vec<_>>();
+            let staff = engrave_timed_staff(&tune, &tune.voices[0], 10.0, 1.0);
+            assert_eq!(heads(&staff.music), played);
+            assert_eq!(staff.duration_beats, played.last().unwrap() + 1.0);
+            assert_eq!(heads(&engrave(&tune, &EngravingOptions::default())).len(), printed_notes);
+        }
+    }
 
     fn trio() -> Tune {
         let mut source = String::from(

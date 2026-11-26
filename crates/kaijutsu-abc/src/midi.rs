@@ -154,7 +154,7 @@ fn expand_variant_endings(elements: &[Element]) -> Option<Vec<Element>> {
 ///
 /// Handles `|:` ... `:|` simple repeats and first/second variant endings
 /// (`|1 … :|2 …`); falls back to the simple form when no ending is present.
-fn expand_repeats(elements: &[Element]) -> Vec<Element> {
+pub(crate) fn expand_repeats(elements: &[Element]) -> Vec<Element> {
     // Variant endings need bespoke handling (pick the ending per pass).
     if let Some(expanded) = expand_variant_endings(elements) {
         return expanded;
@@ -861,7 +861,7 @@ fn inline_key_accidentals(value: &str) -> HashMap<NoteName, Accidental> {
 
 /// Parse an inline `[L:n/m]` value into a [`UnitLength`]. Returns `None` for a
 /// malformed value so the caller keeps the current unit length. §3.2.
-fn inline_unit_length(value: &str) -> Option<UnitLength> {
+pub(crate) fn inline_unit_length(value: &str) -> Option<UnitLength> {
     let (n, d) = value.trim().split_once('/')?;
     Some(UnitLength {
         numerator: n.trim().parse().ok()?,
@@ -870,7 +870,7 @@ fn inline_unit_length(value: &str) -> Option<UnitLength> {
 }
 
 /// Parse an inline `[M:…]` value into a [`crate::ast::Meter`]. §3.2.
-fn inline_meter(value: &str) -> crate::ast::Meter {
+pub(crate) fn inline_meter(value: &str) -> crate::ast::Meter {
     let mut fc = crate::feedback::FeedbackCollector::new();
     crate::parser::header::parse_meter(value.trim(), &mut fc)
 }

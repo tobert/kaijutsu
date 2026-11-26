@@ -10,62 +10,9 @@ use crate::engrave::ir::EngravingElement;
 /// All elements carry `data-span-start` / `data-span-end` attributes for
 /// future interactivity.
 pub fn to_svg(elements: &[EngravingElement], margin: f64, color: &str) -> String {
-    let font = font_cache();
-
-    // Compute bounding box
-    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-
-    for elem in elements {
-        match elem {
-            EngravingElement::Glyph {
-                x,
-                y,
-                scale,
-                codepoint,
-                ..
-            } => {
-                let advance = font.glyph_advance(*codepoint).unwrap_or(500.0) * scale;
-                let glyph_height = font.upem() * scale;
-                min_x = min_x.min(*x);
-                min_y = min_y.min(y - glyph_height);
-                max_x = max_x.max(x + advance);
-                max_y = max_y.max(y + glyph_height * 0.5);
-            }
-            EngravingElement::Line { x1, y1, x2, y2, .. } => {
-                min_x = min_x.min(*x1).min(*x2);
-                min_y = min_y.min(*y1).min(*y2);
-                max_x = max_x.max(*x1).max(*x2);
-                max_y = max_y.max(*y1).max(*y2);
-            }
-            EngravingElement::Text {
-                x,
-                y,
-                size,
-                content,
-                ..
-            } => {
-                min_x = min_x.min(*x);
-                min_y = min_y.min(y - size);
-                // Rough text width estimate
-                max_x = max_x.max(x + content.len() as f64 * size * 0.6);
-                max_y = max_y.max(*y);
-            }
-            EngravingElement::Path { .. } => {}
-        }
-    }
-
-    // Guard against empty
-    if min_x > max_x {
-        min_x = 0.0;
-        max_x = 100.0;
-        min_y = 0.0;
-        max_y = 100.0;
-    }
-
-    let width = (max_x - min_x) + margin * 2.0;
-    let height = (max_y - min_y) + margin * 2.0;
-    let vb_x = min_x - margin;
-    let vb_y = min_y - margin;
+    let bounds = super::ir::engraving_bounds(elements, margin);
+    let (vb_x, vb_y) = (bounds.origin_x, bounds.origin_y);
+    let (width, height) = (bounds.width, bounds.height);
 
     let mut svg = String::with_capacity(4096);
     svg.push_str(&format!(
@@ -73,6 +20,14 @@ pub fn to_svg(elements: &[EngravingElement], margin: f64, color: &str) -> String
         vb_x, vb_y, width, height, width, height
     ));
 
+    write_elements(&mut svg, elements, color);
+    svg.push_str("</svg>\n");
+    svg
+}
+
+/// Append notation inside an existing SVG coordinate system.
+pub fn write_elements(svg: &mut String, elements: &[EngravingElement], color: &str) {
+    let font = font_cache();
     for elem in elements {
         match elem {
             EngravingElement::Glyph {
@@ -128,9 +83,6 @@ pub fn to_svg(elements: &[EngravingElement], margin: f64, color: &str) -> String
             }
         }
     }
-
-    svg.push_str("</svg>\n");
-    svg
 }
 
 fn escape_xml(s: &str) -> String {

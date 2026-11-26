@@ -236,11 +236,15 @@ fn drum_name(pitch: u8) -> String {
     }
 }
 
-fn score_from_bytes(bytes: &[u8], hash: &ContentHash) -> Result<ScoreDetails, &'static str> {
+pub(super) fn verified_abc<'a>(bytes: &'a [u8], hash: &ContentHash) -> Result<&'a str, &'static str> {
     if ContentHash::from_data(bytes) != *hash {
         return Err("content hash mismatch");
     }
-    let abc = std::str::from_utf8(bytes).map_err(|_| "invalid UTF-8")?;
+    std::str::from_utf8(bytes).map_err(|_| "invalid UTF-8")
+}
+
+fn score_from_bytes(bytes: &[u8], hash: &ContentHash) -> Result<ScoreDetails, &'static str> {
+    let abc = verified_abc(bytes, hash)?;
     let parsed = kaijutsu_abc::parse_with_mode(abc, kaijutsu_abc::ParseMode::Strict);
     if parsed.has_errors() {
         return Err("invalid ABC");
@@ -302,8 +306,11 @@ pub fn open_board_note(
     }
 }
 
-fn score_at_playhead(statuses: &[WorkStatus], playhead: f64) -> Option<(Tick, &ContentHash)> {
-    let latest = statuses.iter()
+pub(super) fn score_at_playhead<'a>(
+    statuses: impl IntoIterator<Item = &'a WorkStatus>,
+    playhead: f64,
+) -> Option<(Tick, &'a ContentHash)> {
+    let latest = statuses.into_iter()
         .filter(|status| status.start.0 <= playhead.floor() as i64)
         .filter(|status| matches!(
             status.disposition,

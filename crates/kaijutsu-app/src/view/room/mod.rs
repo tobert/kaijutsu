@@ -65,6 +65,8 @@
 pub mod activity;
 pub mod bearing;
 pub mod nav;
+mod score_band;
+mod score_ink;
 mod seats;
 mod shot;
 mod switchboard;
@@ -452,6 +454,10 @@ impl Plugin for RoomPlugin {
             .init_resource::<seats::SeatsState>()
             .add_plugins(MaterialPlugin::<TraceGlowMaterial>::default())
             .add_systems(OnEnter(Screen::Room), enter_room)
+            .add_systems(Update, (
+                score_band::engrave_score.after(crate::view::heroic::live::sync_room_score),
+                score_band::show_score,
+            ).chain().run_if(in_state(Screen::Room)))
             .add_systems(OnExit(Screen::Room), (exit_room, seats::clear_seats))
             // Ambient ingest runs on **every** screen so the room opens warm —
             // the same rationale as `time_well::live::ingest_live_events` (both
@@ -635,6 +641,12 @@ fn enter_room(
     );
     crate::view::time_well::scene::arm_well(&mut well_state, &mut well_tracks);
 
+    let shell = commands.spawn((
+        score_band::WallShell, Transform::default(), Visibility::Inherited,
+        Name::new("Wall stations"), ChildOf(root),
+    )).id();
+    score_band::spawn(&mut commands, root, &mut meshes, &mut mats, &palette);
+
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
     // at every labeled one. A furnished bearing
     // (`bearing::station_is_room_furniture` — Switchboard/S's lamp grid) gets
@@ -670,7 +682,7 @@ fn enter_room(
             RoomDistraction,
             Visibility::Inherited,
             Name::new(format!("BearingMarker-{:?}", wp.bearing)),
-            ChildOf(root),
+            ChildOf(shell),
         ));
 
         if let Some(station) = wp.station {
@@ -702,7 +714,7 @@ fn enter_room(
                 Visibility::Inherited,
                 panel,
                 Name::new(format!("StationPlate-{}", station.label())),
-                ChildOf(root),
+                ChildOf(shell),
             ));
         }
     }
@@ -710,13 +722,13 @@ fn enter_room(
     // Pylon plinths + gold caps — the plain marker posts get grounded furniture
     // (`shell.md`'s "the atrium rules" read); every wall bearing wants a gold
     // cap now ([`wants_gold_cap`]).
-    spawn_pylons(&mut commands, root, &palette, &mut meshes, &mut mats);
+    spawn_pylons(&mut commands, shell, &palette, &mut meshes, &mut mats);
 
     // The octagon wall shell: eight single-sided panels enclosing the room,
     // corner mullions, hue-coded edge trim, and — on the four diagonals — the
     // violet information threads that used to stand as free-floating
     // radiators. The chamber, not room chrome (no RoomDistraction).
-    spawn_walls(&mut commands, root, &palette, &mut meshes, &mut mats, &mut glow_mats);
+    spawn_walls(&mut commands, shell, &palette, &mut meshes, &mut mats, &mut glow_mats);
 
     // The switchboard's lamp grid — the south wall's own content, mounted on
     // its panel the same way the well is mounted on the console, spawned once
@@ -724,7 +736,7 @@ fn enter_room(
     // resources `enter_room` already holds (no new system params — this
     // function is already at Bevy's function-as-system arity ceiling, its
     // own doc above has the story).
-    switchboard::spawn_switchboard(&mut commands, root, &mut meshes, &mut mats);
+    switchboard::spawn_switchboard(&mut commands, shell, &mut meshes, &mut mats);
 
     // OPTIONAL lit-chamber mode: one warm key light at the well/console center,
     // the room's visual heart. A `RoomRoot` child so it despawns with the room;
@@ -1592,6 +1604,7 @@ fn ease_shell_camera(
     time: Res<Time>,
     room: Res<RoomState>,
     well_state: Res<crate::view::time_well::scene::TimeWellState>,
+    score: Res<crate::view::heroic::live::RoomScore>,
     mut cam: Query<&mut Transform, With<RoomCamera>>,
 ) {
     let Ok(mut tf) = cam.single_mut() else {
@@ -1604,6 +1617,8 @@ fn ease_shell_camera(
             focused_ring: well_state.focused_ring,
         }),
         Some(station) => shot::RoomShot::Fullscreen(station),
+        None if room.carousel.focused_station() == Station::TimeWell
+            && score.score_context.is_some() => shot::RoomShot::ScoreOverview,
         None => shot::RoomShot::focused(room.carousel.focused_station()),
     };
     let (pos, look) = shot::resolve(want);

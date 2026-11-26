@@ -634,6 +634,13 @@ toward its seat. The room floor used to lift every trace to the same peak,
 which erased the differences in brightness the theme gave them. Keeping
 those differences lets the live signals stand out against the wiring.
 
+The rehearsal score now occupies a wider octagon around the well. Each
+flat face holds one measure of the players’ committed ABC. Printed music
+normally gives dense passages more space. In the room, every staff uses
+the same distance per quarter note so that a kick and a bass entrance at
+the same tick meet the same playhead. The app engraves the eight faces
+when their music changes and moves the band from the track clock.
+
 ## The rotation signoff (November 23)
 
 A rotation asked for from inside a context's own turn used to archive the

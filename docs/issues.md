@@ -58,6 +58,7 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 
 ## Heroic view follow-ups (2026-11-21)
 
+- A sustained chord can span several faces of the Time Well score. Only its attack carries a notehead, so the following faces can look silent from the rail. Try a tied continuation at each barline with the rehearsal pads holding a chord for sixteen beats.
 - Live kernel work updates still poll `kj transport work --track <id>` at 1 Hz via `execute_kj_quiet` (`view/heroic/live.rs`); a dedicated work-status wire event + measured performer lead field remains future work (`docs/newui.md`, "The live driver").
 - Work records identify the performer by principal. When two contexts on a track share a performer, Heroic shows both lanes and leaves their work unassigned. Context-level attribution needs the originating context on the record.
 - Audio spectrum hills currently derive 16-band energy from beat crossings and `RenderCue` onsets rather than FFT of mixed audio frames.

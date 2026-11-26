@@ -141,6 +141,8 @@ pub enum RoomShot {
     /// Pulled-back console view, framing the whole octagon — where the camera
     /// rests when no station is focused/zoomed onto a pose of its own.
     RoomOverview,
+    /// Keep the well below the score, looking across the table toward the current bar.
+    ScoreOverview,
     /// Room-scale pose for a wall station: standing on the SAME side of the
     /// room as its bearing, between the console and the wall, looking out at
     /// its marker/nameplate (the old `desired_camera`'s `Some` branch).
@@ -180,6 +182,7 @@ impl RoomShot {
 pub fn resolve(shot: RoomShot) -> (Vec3, Vec3) {
     match shot {
         RoomShot::RoomOverview => (OVERVIEW_POS, OVERVIEW_LOOK),
+        RoomShot::ScoreOverview => (Vec3::new(0.0, 395.0, 1100.0), Vec3::new(0.0, 220.0, -400.0)),
         RoomShot::Approach(station) => approach_pose(station),
         RoomShot::Fullscreen(station) => {
             let dir = bearing::focus_dir(station).expect(

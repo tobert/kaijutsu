@@ -19,7 +19,7 @@ use kaijutsu_types::{BlockKind, ContextId, PrincipalId, Role};
 use super::state::{
     ConstellationStar, HeroicLane, HeroicPerformer, HeroicState, PadFlashEvent,
 };
-use crate::connection::actor_plugin::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
+use crate::connection::actor_plugin::{RpcActor, RpcConnectionState, RpcResultChannel, RpcResultMessage, ServerEventMessage};
 use crate::connection::drift::DriftState;
 use crate::view::scene_palette::{HeroicPalette, heroic_identity_color};
 use crate::view::time_well::live::{ContextTails, WellBeatsRes, tail_lines};
@@ -31,12 +31,13 @@ const LIVE_POLL_INTERVAL_SECS: f64 = 1.0;
 #[derive(Resource, Default)]
 pub struct HeroicLiveCache {
     pub work_by_track: HashMap<String, Vec<WorkStatus>>,
-    in_flight_tracks: HashMap<String, f64>,
+    in_flight_tracks: HashMap<String, bevy::tasks::Task<()>>,
     last_track_poll: f64,
     last_work_poll: f64,
     last_beat_by_track: HashMap<String, i64>,
     performer_info: HashMap<ContextId, PerformerInfo>,
-    in_flight_performers: HashMap<ContextId, f64>,
+    in_flight_performers: HashMap<ContextId, bevy::tasks::Task<()>>,
+    connection: Option<(u64, u64)>,
 }
 
 struct PerformerInfo {
@@ -64,10 +65,12 @@ pub fn request_initial_tracks(actor: Option<&RpcActor>, result_channel: &RpcResu
         .detach();
 }
 
-/// Poll `listTracks` and `kj transport work --track <id>` while `Screen::Heroic`
-/// is active (`execute_kj_quiet` so no blocks are authored).
+/// Heroic reads work for all playing tracks. The room reads only its score
+/// track and uses the well's existing track roster poll.
 pub fn poll_heroic_live_data(
     actor: Option<Res<RpcActor>>,
+    screen: Res<State<crate::ui::screen::Screen>>,
+    connection: Res<RpcConnectionState>,
     tracks: Res<WellTracks>,
     time: Res<Time>,
     mut cache: ResMut<HeroicLiveCache>,
@@ -78,27 +81,32 @@ pub fn poll_heroic_live_data(
     };
     let now = time.elapsed_secs_f64();
 
-    if now - cache.last_track_poll >= LIVE_POLL_INTERVAL_SECS {
+    let source = (actor.generation, actor.handle.connection_epoch());
+    if cache.connection != Some(source) {
+        *cache = HeroicLiveCache { connection: Some(source), ..Default::default() };
+    }
+    let room = *screen.get() == crate::ui::screen::Screen::Room;
+    if !room && now - cache.last_track_poll >= LIVE_POLL_INTERVAL_SECS {
         cache.last_track_poll = now;
         request_initial_tracks(Some(&actor), &result_channel);
     }
 
-    // Drop stale in-flight entries (> 5s) in case a task dropped without sending.
-    cache.in_flight_tracks.retain(|_, started| now - *started < 5.0);
-
     if now - cache.last_work_poll >= LIVE_POLL_INTERVAL_SECS {
         cache.last_work_poll = now;
-        cache.in_flight_performers.retain(|_, started| now - *started < 5.0);
-        let attached_contexts = tracks.tracks.iter().filter(|t| t.playing)
-            .flat_map(|t| t.attached.iter().copied());
+        cache.in_flight_tracks.retain(|_, task| !task.is_finished());
+        cache.in_flight_performers.retain(|_, task| !task.is_finished());
+        let room_track = room_track(&tracks, connection.context_id);
+        let playing = tracks.tracks.iter().filter(|t| t.playing
+            && (!room || room_track.is_some_and(|chosen| chosen.id == t.id)));
+        let attached_contexts = playing.clone().flat_map(|t| t.attached.iter().copied());
         for context_id in attached_contexts {
+            if room && cache.in_flight_performers.len() >= 4 { break; }
             if cache.performer_info.contains_key(&context_id) || cache.in_flight_performers.contains_key(&context_id) {
                 continue;
             }
-            cache.in_flight_performers.insert(context_id, now);
             let handle = actor.handle.clone();
             let tx = result_channel.sender();
-            bevy::tasks::IoTaskPool::get()
+            let task = bevy::tasks::IoTaskPool::get()
                 .spawn(async move {
                     let argv = vec!["context".into(), "info".into(), context_id.to_hex()];
                     if let Ok(result) = handle.execute_kj_quiet(context_id, argv).await
@@ -114,19 +122,18 @@ pub fn poll_heroic_live_data(
                             context_id, principal_id, chair,
                         });
                     }
-                })
-                .detach();
+                });
+            cache.in_flight_performers.insert(context_id, task);
         }
-        for track in tracks.tracks.iter().filter(|t| t.playing) {
+        for track in playing {
             if cache.in_flight_tracks.contains_key(&track.id) {
                 continue;
             }
-            cache.in_flight_tracks.insert(track.id.clone(), now);
             let handle = actor.handle.clone();
             let tx = result_channel.sender();
             let track_id = track.id.clone();
             let ctx_id = track.score_context_id;
-            bevy::tasks::IoTaskPool::get()
+            let task = bevy::tasks::IoTaskPool::get()
                 .spawn(async move {
                     let argv = vec![
                         "transport".to_string(),
@@ -159,8 +166,8 @@ pub fn poll_heroic_live_data(
                         }
                         Err(e) => log::debug!("heroic: execute_kj_quiet failed: {e}"),
                     }
-                })
-                .detach();
+                });
+            cache.in_flight_tracks.insert(track.id.clone(), task);
         }
     }
 }
@@ -168,6 +175,7 @@ pub fn poll_heroic_live_data(
 /// Drain `TrackWorkReceived` into [`HeroicLiveCache`] and `TracksReceived` into
 /// [`WellTracks`] / [`WellBeatsRes`].
 pub fn apply_heroic_work_results(
+    screen: Option<Res<State<crate::ui::screen::Screen>>>,
     mut events: MessageReader<RpcResultMessage>,
     mut cache: ResMut<HeroicLiveCache>,
     mut tracks: ResMut<WellTracks>,
@@ -177,17 +185,16 @@ pub fn apply_heroic_work_results(
     for ev in events.read() {
         match ev {
             RpcResultMessage::TrackWorkReceived { track_id, statuses } => {
-                cache.in_flight_tracks.remove(track_id);
                 cache.work_by_track.insert(track_id.clone(), statuses.clone());
             }
             RpcResultMessage::HeroicPerformerReceived { context_id, principal_id, chair } => {
-                cache.in_flight_performers.remove(context_id);
                 cache.performer_info.insert(*context_id, PerformerInfo {
                     principal_id: *principal_id,
                     chair: chair.clone(),
                 });
             }
-            RpcResultMessage::TracksReceived { tracks: fresh } => {
+            RpcResultMessage::TracksReceived { tracks: fresh }
+                if screen.as_ref().is_none_or(|s| *s.get() == crate::ui::screen::Screen::Heroic) => {
                 if tracks.tracks != *fresh {
                     tracks.set_tracks(fresh.clone());
                 }
@@ -546,6 +553,158 @@ pub fn sync_heroic_state(
     }
 }
 
+fn room_track(tracks: &WellTracks, context: Option<ContextId>) -> Option<&kaijutsu_client::TrackInfo> {
+    context.and_then(|id| tracks.track_info_of(&id)).filter(|track| track.playing)
+        .or_else(|| tracks.tracks.iter().find(|track| track.playing && !track.attached.is_empty()))
+}
+
+#[derive(PartialEq, Eq, Clone)]
+struct ScoredChair {
+    chair: String,
+    start: i64,
+    hash: kaijutsu_cas::ContentHash,
+}
+
+/// At most three scored parts fit on a face of the room band.
+const ROOM_PARTS: usize = 3;
+
+fn room_parts(cache: &HeroicLiveCache, track: &kaijutsu_client::TrackInfo, beat: i64) -> Vec<ScoredChair> {
+    let Some(work) = cache.work_by_track.get(&track.id) else { return Vec::new() };
+    let mut principals = HashMap::new();
+    for context in &track.attached {
+        if let Some(principal) = cache.performer_info.get(context).and_then(|p| p.principal_id) {
+            *principals.entry(principal).or_insert(0) += 1;
+        }
+    }
+    let mut parts: Vec<_> = track.attached.iter().filter_map(|context| {
+        let performer = cache.performer_info.get(context)?;
+        let principal = performer.principal_id?;
+        if principals[&principal] != 1 { return None; }
+        let (start, hash) = super::selection::score_at_playhead(
+            work.iter().filter(|w| w.played_by == principal), beat as f64,
+        )?;
+        Some(ScoredChair {
+            chair: performer.chair.clone().unwrap_or_else(|| context.short()),
+            start: start.0,
+            hash: hash.clone(),
+        })
+    }).collect();
+    let order = |chair: &str| match chair {
+        "chords" | "pads" => 0, "bass" => 1, "drums" => 2, _ => 3,
+    };
+    parts.sort_by(|a, b| order(&a.chair).cmp(&order(&b.chair)).then(a.chair.cmp(&b.chair)));
+    parts.truncate(ROOM_PARTS);
+    parts
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RoomScorePart {
+    pub chair: String,
+    pub start: i64,
+    pub abc: String,
+}
+
+#[derive(Resource, Default, PartialEq, Eq)]
+pub struct RoomScore {
+    pub score_context: Option<ContextId>,
+    pub start: i64,
+    pub parts: Vec<RoomScorePart>,
+}
+
+enum AbcRead {
+    Loading(bevy::tasks::Task<Option<String>>),
+    Loaded(String),
+    RetryAt(f64),
+}
+
+#[derive(Default)]
+pub(crate) struct RoomScoreReads {
+    by_hash: HashMap<kaijutsu_cas::ContentHash, AbcRead>,
+    next_poll: f64,
+    observed: Option<(ContextId, usize, bool, Vec<ScoredChair>)>,
+}
+
+/// Share the playing track and committed ABC with the room. A repeated phrase
+/// can reuse its CAS bytes at a new tick. A skipped phrase removes its part.
+pub(crate) fn sync_room_score(
+    time: Res<Time>,
+    tracks: Res<WellTracks>,
+    beats: Res<WellBeatsRes>,
+    work: Res<HeroicLiveCache>,
+    connection: Res<RpcConnectionState>,
+    actor: Option<Res<RpcActor>>,
+    mut reads: Local<RoomScoreReads>,
+    mut score: ResMut<RoomScore>,
+) {
+    let now = time.elapsed_secs_f64();
+    if now < reads.next_poll { return; }
+    reads.next_poll = now + 0.2;
+    let Some((track, actor)) = room_track(&tracks, connection.context_id).zip(actor).filter(|_| connection.connected) else {
+        if reads.observed.take().is_some() {
+            debug!("room score: cleared, connected={} tracks={}", connection.connected, tracks.tracks.len());
+        }
+        reads.by_hash.clear();
+        score.set_if_neq(RoomScore::default());
+        return;
+    };
+    let position = beats.beat_position(&track.score_context_id, Instant::now())
+        .unwrap_or(track.playhead_tick as f64);
+    let wanted = room_parts(&work, track, position.floor() as i64);
+    let known = track.attached.iter().filter(|id| work.performer_info.contains_key(id)).count();
+    let statuses = work.work_by_track.get(&track.id);
+    let observed = (track.score_context_id, known, statuses.is_some(), wanted.clone());
+    if reads.observed.as_ref() != Some(&observed) {
+        debug!("room score {}: playhead {position:.1}, roster {}, identities {known}/{}, work {}, sources {:?}",
+            track.id, track.playhead_tick, track.attached.len(), statuses.map_or(0, Vec::len),
+            wanted.iter().map(|p| (&p.chair, p.start, &p.hash)).collect::<Vec<_>>());
+        reads.observed = Some(observed);
+    }
+    reads.by_hash.retain(|hash, read| wanted.iter().any(|part| part.hash == *hash)
+        || matches!(read, AbcRead::Loading(task) if !task.is_finished()));
+    let mut loading = reads.by_hash.values().filter(|r| matches!(r, AbcRead::Loading(_))).count();
+    let mut result = RoomScore {
+        score_context: Some(track.score_context_id),
+        start: wanted.iter().map(|p| p.start).min().unwrap_or(0),
+        parts: Vec::with_capacity(wanted.len()),
+    };
+    for part in wanted {
+        let read = reads.by_hash.entry(part.hash.clone()).or_insert(AbcRead::RetryAt(0.0));
+        if let AbcRead::Loading(task) = read
+            && let Some(source) = bevy::tasks::block_on(bevy::tasks::poll_once(task))
+        {
+            loading -= 1;
+            *read = match source {
+                Some(abc) => AbcRead::Loaded(abc),
+                None => AbcRead::RetryAt(now + 3.0),
+            };
+        }
+        match read {
+            AbcRead::Loaded(abc) => result.parts.push(RoomScorePart {
+                chair: part.chair, start: part.start, abc: abc.clone(),
+            }),
+            AbcRead::RetryAt(at) if now >= *at && loading < ROOM_PARTS => {
+                loading += 1;
+                let handle = actor.handle.clone();
+                *read = AbcRead::Loading(bevy::tasks::IoTaskPool::get().spawn(async move {
+                    let path = kaijutsu_client::SftpClient::object_path(&part.hash);
+                    match handle.vfs_read_all(path).await {
+                        Ok(bytes) => match super::selection::verified_abc(&bytes, &part.hash) {
+                            Ok(abc) => Some(abc.to_owned()),
+                            Err(e) => { log::warn!("room: invalid ABC source {}: {e}", part.hash); None }
+                        },
+                        Err(e) => { log::debug!("room: score read {}: {e}", part.hash); None }
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+    if *score != result {
+        debug!("room score {}: publishing {} staves at tick {}", track.id, result.parts.len(), result.start);
+        *score = result;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +826,38 @@ mod tests {
         assert_eq!(state.pending_flashes.len(), 1);
         assert_eq!(state.pending_flashes[0].context_id, drums);
         assert!(state.pending_flashes[0].hollow);
+    }
+
+    #[test]
+    fn room_score_uses_each_chairs_latest_committed_notation_at_the_playhead() {
+        use kaijutsu_hyoushigi::{ContentRef, Fallback};
+        let mut track = make_track("trio", true);
+        let mut cache = HeroicLiveCache::default();
+        for (i, chair) in ["drums", "pads", "bass"].iter().enumerate() {
+            let context = ContextId::new();
+            let principal = PrincipalId::new();
+            track.attached.push(context);
+            cache.performer_info.insert(context, PerformerInfo {
+                principal_id: Some(principal), chair: Some(chair.to_string()),
+            });
+            let content = ContentRef::of(chair.as_bytes(), "text/vnd.abc");
+            let past = make_work(principal, i as i64 + 4, Some(Disposition::Fallback {
+                reason: FallbackReason::Requested, policy: Fallback::UseLastGood,
+                content: Some(content.clone()),
+            }));
+            let future = make_work(principal, 32, Some(Disposition::Committed { content }));
+            let work = cache.work_by_track.entry(track.id.clone()).or_default();
+            work.extend([past, future]);
+            if *chair == "bass" {
+                work.push(make_work(principal, 16, Some(Disposition::Fallback {
+                    reason: FallbackReason::Requested, policy: Fallback::Skip, content: None,
+                })));
+            }
+        }
+        let chairs = |beat| room_parts(&cache, &track, beat).into_iter()
+            .map(|part| (part.chair, part.start)).collect::<Vec<_>>();
+        assert_eq!(chairs(8), vec![("pads".into(), 5), ("bass".into(), 6), ("drums".into(), 4)]);
+        assert_eq!(chairs(17), vec![("pads".into(), 5), ("drums".into(), 4)]);
     }
 
     #[test]
