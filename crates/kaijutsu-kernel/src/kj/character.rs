@@ -112,6 +112,13 @@ enum CharacterCommand {
         /// `--no-root`; change the console and the root flag in separate calls.
         #[arg(long = "no-console", conflicts_with_all = ["console", "root", "no_root"])]
         no_console: bool,
+        /// Allow other contexts to wake this character's contexts with `kj ping`.
+        /// On by default.
+        #[arg(long, conflicts_with = "no_pings")]
+        pings: bool,
+        /// Refuse `kj ping` wake signals sent to this character's contexts.
+        #[arg(long = "no-pings", conflicts_with = "pings")]
+        no_pings: bool,
     },
     /// The model a character runs. A context copies it when it is made, so a
     /// change reaches a running context at `kj context rotate`.
@@ -195,8 +202,8 @@ impl KjDispatcher {
             }
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
-            CharacterCommand::Set { name, root, no_root, rc_dir, console, no_console } => {
-                let change = SetChange { root, no_root, rc_dir, console, no_console };
+            CharacterCommand::Set { name, root, no_root, rc_dir, console, no_console, pings, no_pings } => {
+                let change = SetChange { root, no_root, rc_dir, console, no_console, pings, no_pings };
                 self.character_set(&name, change, caller).await
             }
             CharacterCommand::Model(cmd) => self.character_model(cmd),
@@ -889,12 +896,17 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj character show: {e}")),
                 };
                 let context_names: Vec<String> = contexts.iter().map(|c| db.context_name(*c)).collect();
+                let accepts_pings = match db.character_accepts_pings(row.principal_id) {
+                    Ok(v) => v,
+                    Err(e) => return KjResult::Err(format!("kj character show: {e}")),
+                };
                 let mut text = format!(
-                    "Character:       {}\nID:              {}\nRoot:            {}\n\
+                    "Character:       {}\nID:              {}\nRoot:            {}\nPings:           {}\n\
                      RC dir:          {}\nModel:           {}\nSlots:           {}\nCreated:         {}\nRetired:         {}",
                     row.name,
                     row.principal_id.to_hex(),
                     if row.root { "yes" } else { "no" },
+                    if accepts_pings { "yes" } else { "no" },
                     match row.rc_dir.as_deref().filter(|dir| !dir.is_empty()) {
                         Some(dir) => dir.to_string(),
                         None => format!("- (unset: kj character set {} --rc <dir>)", row.name),
@@ -931,6 +943,7 @@ impl KjDispatcher {
                     text.push_str(&format!("\nMigration note ({}): {}", note.kind, note.note));
                 }
                 let mut data = character_to_json(&row);
+                data["accepts_pings"] = serde_json::json!(accepts_pings);
                 data["migration_notes"] = serde_json::Value::Array(
                     notes.iter().map(|n| serde_json::json!({ "kind": n.kind, "note": n.note })).collect(),
                 );
@@ -962,12 +975,12 @@ impl KjDispatcher {
     /// is checked before anything commits (`docs/character.md`, "The type
     /// melts into the character").
     async fn character_set(&self, name: &str, change: SetChange, caller: &KjCaller) -> KjResult {
-        let SetChange { root, no_root, rc_dir, console, no_console } = change;
+        let SetChange { root, no_root, rc_dir, console, no_console, pings, no_pings } = change;
         let rc_dir = rc_dir.as_deref();
         let change_rc_dir_named = rc_dir.is_some();
-        if !root && !no_root && rc_dir.is_none() && console.is_none() && !no_console {
+        if !root && !no_root && rc_dir.is_none() && console.is_none() && !no_console && !pings && !no_pings {
             return KjResult::Err(
-                "kj character set: specify --root, --no-root, --rc <dir>, --console <context> or --no-console"
+                "kj character set: specify --root, --no-root, --rc <dir>, --console <context>, --no-console, --pings or --no-pings"
                     .to_string(),
             );
         }
@@ -1074,6 +1087,9 @@ impl KjDispatcher {
                 if root || no_root {
                     db.update_character_root(row.principal_id, root)?;
                 }
+                if pings || no_pings {
+                    db.set_character_accepts_pings(row.principal_id, pings)?;
+                }
                 Ok(())
             }) {
                 return KjResult::Err(format!("kj character set: {e}"));
@@ -1122,8 +1138,16 @@ impl KjDispatcher {
         } else if no_console {
             changes.push("has no console".to_string());
         }
+        if pings {
+            changes.push("accepts pings".to_string());
+        } else if no_pings {
+            changes.push("refuses pings".to_string());
+        }
         let msg = format!("{name} {}", changes.join(" and "));
-        KjResult::ok_with_data(msg, character_to_json(&updated))
+        let accepts_pings = self.kernel_db().lock().character_accepts_pings(principal_id).unwrap_or(true);
+        let mut data = character_to_json(&updated);
+        data["accepts_pings"] = serde_json::json!(accepts_pings);
+        KjResult::ok_with_data(msg, data)
     }
 
     /// `kj character set <name> --no-root` for a root: archive what the
@@ -1333,6 +1357,8 @@ struct SetChange {
     rc_dir: Option<String>,
     console: Option<String>,
     no_console: bool,
+    pings: bool,
+    no_pings: bool,
 }
 
 /// Resolve `--console <context>` for a root character: the character must be a

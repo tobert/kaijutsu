@@ -294,18 +294,18 @@ impl KernelDb {
     }
 
     /// Finish a rotation in one transaction: archive `predecessor` and its
-    /// shadows ([`Self::archive_with_shadows`], give
-    /// `successor` its label and ring placement, and point a character's
-    /// `handoff_ctx` at the successor when it named the predecessor. A
-    /// predecessor that is missing or already archived refuses. A successor
-    /// that is missing or archived refuses too, before the pointers move
-    /// ([`Self::require_live_rotation_successor`]); a refused rotation rolls
-    /// back, so the predecessor stays live. Moves a
+    /// shadows ([`Self::archive_with_shadows`]), reparent live kohai of
+    /// `predecessor` to `successor`, give `successor` its label and ring
+    /// placement, and point a character's `handoff_ctx` at the successor when
+    /// it named the predecessor. A predecessor that is missing or already
+    /// archived refuses. A successor that is missing or archived refuses too,
+    /// before the pointers move ([`Self::require_live_rotation_successor`]); a
+    /// refused rotation rolls back, so the predecessor stays live. Moves a
     /// character's `root_ctx` and `console_ctx` the same way; the archived
     /// root console then takes the successor as its senpai. Both pointers
     /// move before the archive, which would otherwise refuse a root console
-    /// and clear the console pointer. The
-    /// kernel moves no other context that answers to the predecessor.
+    /// and clear the console pointer. Archived kohai — including the
+    /// predecessor's shadows — keep their historical `senpai_ctx`.
     pub fn commit_rotation(
         &self,
         predecessor: ContextId,
@@ -329,7 +329,7 @@ impl KernelDb {
             )?;
             // Copy predecessor's working board pointer onto successor BEFORE
             // archiving predecessor so the board stays live while predecessor
-            // keeps its pointer for any kohai not yet reparented.
+            // keeps its pointer for historical/archived kohai.
             if let Some(board_id) = row.board_id {
                 db.set_context_board_id(successor, board_id)?;
             }
@@ -340,6 +340,14 @@ impl KernelDb {
                     predecessor.short()
                 )));
             }
+            // Reparent live kohai to the successor so workers follow their
+            // rotating senpai (root -> banto, banto -> senpai/kohai,
+            // senpai -> kohai). Archived kohai — including the predecessor's
+            // shadows archived above — stay pointing at the predecessor.
+            db.conn.execute(
+                "UPDATE contexts SET senpai_ctx = ?1 WHERE senpai_ctx = ?2 AND archived_at IS NULL AND context_id != ?1",
+                params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
+            )?;
             db.conn.execute(
                 "UPDATE contexts SET label = ?1, promoted_at = ?2, demoted_at = ?3 WHERE context_id = ?4",
                 params![row.label, row.promoted_at, row.demoted_at, blob_param(successor.as_bytes())],

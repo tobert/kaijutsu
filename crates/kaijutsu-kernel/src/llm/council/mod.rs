@@ -36,6 +36,12 @@ struct Turn {
     waits: SlotWaits,
 }
 
+impl Clone for Turn {
+    fn clone(&self) -> Self {
+        Turn { deadline: self.deadline, waits: SlotWaits::default() }
+    }
+}
+
 /// A client for one `council` backend.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -168,7 +174,7 @@ impl Client {
     /// one-shot wants the answer text and thinking tokens count against
     /// `max_tokens`.
     pub fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
-        BuildOpts { decide: None, ..opts.with_effort("none") }
+        BuildOpts { decide: None, ride_vibe: false, ..opts.with_effort("none") }
     }
 
     /// A streamed turn: a council v2 generation after the whole
@@ -256,6 +262,9 @@ pub struct Stream {
     slot: Option<Slot>,
     /// The server identity the reply reports.
     reply_identity: Option<generation::ReplyIdentity>,
+    live_council: Option<Arc<crate::llm::stream::LiveCouncilStats>>,
+    last_tps_tenths: Option<u32>,
+    entropies: Vec<f32>,
 }
 
 impl Stream {
@@ -328,7 +337,36 @@ impl Stream {
                 }
                 item = inner.next() => match item {
                     Some(Ok(GenerationEvent::Token(token))) => {
-                        self.first_token.get_or_insert_with(|| self.started.elapsed());
+                        let ttft = self.first_token.get_or_insert_with(|| self.started.elapsed());
+                        if let Some(tps) = token.tps
+                            && tps.is_finite()
+                            && tps > 0.0
+                        {
+                            self.last_tps_tenths = Some((tps * 10.0).round() as u32);
+                        }
+                        if token.h.is_finite() && token.h >= 0.0 {
+                            self.entropies.push(token.h as f32);
+                            if self.entropies.len() > 8 {
+                                self.entropies.remove(0);
+                            }
+                        }
+                        if let Some(live) = &self.live_council {
+                            live.ttft_ms.store(ttft.as_millis().clamp(1, u32::MAX as u128) as u32, std::sync::atomic::Ordering::Relaxed);
+                            let phase_str = match token.phase {
+                                gogi_proto::generation::Phase::Reasoning => Some("thinking"),
+                                gogi_proto::generation::Phase::Content => Some("writing"),
+                                gogi_proto::generation::Phase::Call => Some("calling"),
+                                gogi_proto::generation::Phase::Unknown => None,
+                            };
+                            *live.phase.lock() = phase_str;
+                            if let Some(tenths) = self.last_tps_tenths {
+                                live.tps_tenths.store(tenths, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if !self.entropies.is_empty() {
+                                let spark = kaijutsu_types::vibe::format_entropy_spark(&self.entropies, 4);
+                                *live.entropy_spark.lock() = spark;
+                            }
+                        }
                         let reply = self.reply.as_mut().expect("the reply lives until done");
                         self.pending.extend(reply.phased(token.phase, &token.piece));
                     }
@@ -341,7 +379,12 @@ impl Stream {
                         let timing = Timing {
                             first_token_ms: self.first_token.unwrap_or_default().as_millis() as u64,
                             wall_ms: self.started.elapsed().as_millis() as u64,
+                            last_tps_tenths: self.last_tps_tenths,
+                            entropies: std::mem::take(&mut self.entropies),
                         };
+                        if let Some(live) = &self.live_council {
+                            *live.phase.lock() = None;
+                        }
                         let identity = self.reply_identity.take().expect("a stream names its server");
                         let reply = self.reply.take().expect("done comes once");
                         match reply.done(*done, &identity.model, &identity.weight_hash, timing) {
@@ -385,7 +428,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::llm::ToolDefinition;
+    use crate::llm::{ToolDefinition, UsageExtra};
 
     /// A 402 is a refusal that repeating cannot fix.
     #[test]
@@ -412,6 +455,8 @@ mod tests {
             controls: Vec::new(),
             decide: None,
             vfs: None,
+            ride_vibe: true,
+            live_council: None,
             trace: None,
         }
     }
@@ -1128,6 +1173,9 @@ mod tests {
             first_token: None,
             slot: None,
             reply_identity: None,
+            live_council: None,
+            last_tps_tenths: None,
+            entropies: Vec::new(),
         };
         stream.cancel();
         let events = drain(&mut stream).await;
@@ -1315,5 +1363,93 @@ mod tests {
         let events = drain(&mut stream).await;
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })), "{events:?}");
         assert_eq!(endpoint.busy_in_a_row(), 0);
+    }
+
+    #[tokio::test]
+    async fn ride_vibe_decisions_and_live_telemetry() {
+        let spec_val: serde_json::Value = serde_json::from_str(crate::config_seed::DEFAULT_COUNCIL_VIBE).unwrap();
+        let spec = gogi_proto::spec::parse_spec(&spec_val, &gogi_proto::spec::SpecRules::default()).unwrap();
+        let spec_id = spec.id();
+
+        let done_payload = json!({
+            "model": "gemma-4",
+            "finish": "end_turn",
+            "content": "OK",
+            "reasoning": "",
+            "tool_calls": [],
+            "head": snap_id(2),
+            "seed": 11,
+            "snapshots": [],
+            "usage": {"prompt": 10, "completion": 2, "kept": 0, "fed": 10, "reasoning": 0},
+            "stats": {
+                "content": {
+                    "tokens": 2,
+                    "mean_logprob": -0.2,
+                    "min_logprob": -0.4,
+                    "mean_entropy": 0.5,
+                    "max_entropy": 0.8
+                }
+            },
+            "decisions": [{
+                "spec_id": spec_id,
+                "when": "after",
+                "answers": {
+                    "vibe": {
+                        "type": "choice",
+                        "choice": "flow",
+                        "probabilities": {"flow": 0.82, "probe": 0.18},
+                        "confidence": 0.82,
+                        "logprobs": {"flow": -0.2, "probe": -1.7},
+                        "mass": -0.02
+                    }
+                }
+            }]
+        });
+        let tok_payload = json!({"id": 1, "piece": "OK", "phase": "content", "p": 0.9, "h": 0.5, "n": 1, "tps": 50.0});
+        let stream_sse = format!("event: token\ndata: {tok_payload}\n\nevent: done\ndata: {done_payload}\n\n");
+        let (base, seen) = serve(vec![
+            serving(json!(["generate", "ride"])),
+            http(200, json!({"spec_id": spec_id, "spec": spec_val}).to_string()),
+            sse(stream_sse),
+            // Second call uses one_shot_opts: no spec post and no riding decision.
+            generation("One.", json!([]), 2),
+        ])
+        .await;
+        let c = Client::new("nagaya", &base, Duration::from_secs(5)).unwrap();
+        let live = Arc::new(crate::llm::stream::LiveCouncilStats::default());
+        let stream_opts = opts(64).with_ride_vibe(true).with_live_council(live.clone());
+        let mut stream = c.stream(stream_opts, vec![Message::user("hi")]).await.unwrap();
+        let events = drain(&mut stream).await;
+        let done_event = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done { extra: Some(UsageExtra::Council(ex)), .. } => Some(ex.clone()),
+                _ => None,
+            })
+            .expect("council usage extra");
+        assert_eq!(done_event.vibe.as_deref(), Some("🌊"));
+        assert_eq!(done_event.tps_tenths, Some(500));
+        assert_eq!(done_event.mean_entropy_milli, Some(500));
+        assert!(done_event.entropy_spark.is_some());
+        assert_eq!(live.tps_tenths.load(std::sync::atomic::Ordering::Relaxed), 500);
+        assert!(live.phase.lock().is_none(), "phase clears when stream ends");
+
+        {
+            let requests = seen.lock().unwrap();
+            assert!(requests.iter().any(|r| r.path == "/council/v2/specs"), "posted vibe spec");
+            let gen_req = requests.iter().find(|r| r.path == "/council/v2/generations").expect("generation request");
+            let body: serde_json::Value = serde_json::from_str(&gen_req.body).unwrap();
+            assert_eq!(body["decisions"][0]["spec_id"], spec_id);
+            assert_eq!(body["decisions"][0]["when"], "after");
+        }
+
+        // one_shot_opts suppresses riding decisions even when the model declares `ride`.
+        let one_shot = c.one_shot_opts(opts(64));
+        let mut s2 = c.stream(one_shot, vec![Message::user("hi")]).await.unwrap();
+        let _ = drain(&mut s2).await;
+        let requests = seen.lock().unwrap();
+        let last_gen = requests.iter().rev().find(|r| r.path == "/council/v2/generations").unwrap();
+        let body: serde_json::Value = serde_json::from_str(&last_gen.body).unwrap();
+        assert!(body.get("decisions").is_none_or(|d| d.as_array().is_some_and(Vec::is_empty)));
     }
 }

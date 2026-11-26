@@ -126,7 +126,7 @@ if test -n "$routes"; then
   out="$out
 Where to send what you cannot do:"
   for i in 0 1 2 3 4 5 6 7; do
-    what="$(jq -n -r --arg r "$routes" --argjson i "$i" '$r | split("\n") | map(select(contains(": "))) | .[$i] // "" | split(": ")[0] | .[0:80]' || true)"
+    what="$(jq -n -r --arg r "$routes" --argjson i "$i" '$r | split("\n") | map(select(contains(": "))) | .[$i] // "" | split(": ")[0] // "" | .[0:80]' || true)"
     target="$(jq -n -r --arg r "$routes" --argjson i "$i" '$r | split("\n") | map(select(contains(": "))) | .[$i] // "" | split(": ")[1:] | join(": ") | gsub("^ +| +$"; "") | .[0:80]' || true)"
     if test -z "$what"; then
       continue

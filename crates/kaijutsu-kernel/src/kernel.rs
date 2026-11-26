@@ -239,6 +239,8 @@ pub struct Kernel {
     cc_inbox: OnceLock<Arc<crate::cc_inbox::CcInboxHandle>>,
     /// The host file watcher behind `kj watch`.
     path_watcher: crate::path_watch::PathWatcher,
+    /// Ephemeral per-context HUD telemetry (`hud.rs`).
+    hud: crate::hud::KernelHudStore,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -524,6 +526,7 @@ impl Kernel {
             runtime_worker_shutdown,
             cc_inbox: OnceLock::new(),
             path_watcher: Default::default(),
+            hud: Default::default(),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
         kernel.rc_settlements.recover().expect("recover rc lifecycle settlements");
@@ -540,6 +543,9 @@ impl Kernel {
 
     /// Conversation ownership and interrupts shared by all model entry paths.
     pub fn turns(&self) -> &crate::runtime::turn_state::TurnState { &self.turn_state }
+
+    /// Ephemeral per-context HUD telemetry.
+    pub fn hud(&self) -> &crate::hud::KernelHudStore { &self.hud }
 
     /// Model turns waiting on their own asks.
     pub(crate) fn held_asks(&self) -> &crate::runtime::held_asks::HeldAsks { &self.held_asks }

@@ -516,7 +516,11 @@ pub struct ContextInfo {
     pub is_console: bool,
     /// An MCP session: its parent is some character's MCP hub.
     pub is_mcp_session: bool,
+    /// Live context HUD telemetry and posture (`kaijutsu_types::ContextHud`).
+    pub hud: kaijutsu_types::ContextHud,
 }
+
+pub use kaijutsu_types::ContextHud;
 
 /// A context's cost: micro-dollars over the calls a price covered, and how
 /// many calls were and were not priced.
@@ -3670,6 +3674,33 @@ fn parse_context_info(
         is_root_console: reader.get_is_root_console(),
         is_console: reader.get_is_console(),
         is_mcp_session: reader.get_is_mcp_session(),
+        hud: {
+            let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+            let tps = reader.get_council_tps();
+            kaijutsu_types::ContextHud {
+                is_council_backend: reader.get_is_council_backend(),
+                held_refusal: reader.get_held_refusal(),
+                control_count: reader.get_control_count(),
+                decide_program: non_empty(reader.get_decide_program()?.to_str()?),
+                gate_label: non_empty(reader.get_gate_label()?.to_str()?),
+                bump_streak: reader.get_bump_streak(),
+                bump_limit: reader.get_bump_limit(),
+                last_bump_flavor: non_empty(reader.get_last_bump_flavor()?.to_str()?),
+                judging_tool: non_empty(reader.get_judging_tool()?.to_str()?),
+                judging_started_at: match reader.get_judging_started_at() {
+                    0 => None,
+                    ts => Some(ts),
+                },
+                vibe: non_empty(reader.get_vibe()?.to_str()?),
+                council_phase: non_empty(reader.get_council_phase()?.to_str()?),
+                council_tps: (tps.is_finite() && tps >= 0.0).then_some(tps),
+                council_ttft_ms: match reader.get_council_ttft_ms() {
+                    0 => None,
+                    ms => Some(ms),
+                },
+                council_entropy: non_empty(reader.get_council_entropy()?.to_str()?),
+            }
+        },
     })
 }
 
@@ -6234,5 +6265,55 @@ mod tests {
 
         assert_eq!(parsed.nick, "mcp/toad");
         assert_eq!(parsed.attached_at, 1_754_800_000_000);
+    }
+
+    #[test]
+    fn test_parse_context_info_hud_roundtrip() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder.set_id(&[7u8; 16]);
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let empty = parse_context_info(&reader).unwrap();
+        assert_eq!(empty.hud, kaijutsu_types::ContextHud::default());
+
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder.set_id(&[8u8; 16]);
+        builder.set_is_council_backend(true);
+        builder.set_held_refusal(true);
+        builder.set_control_count(2);
+        builder.set_decide_program("haiku");
+        builder.set_gate_label("jev-1.13");
+        builder.set_bump_streak(1);
+        builder.set_bump_limit(3);
+        builder.set_last_bump_flavor("network");
+        builder.set_judging_tool("shell_write");
+        builder.set_judging_started_at(1_700_000_001_000);
+        builder.set_vibe("🌊");
+        builder.set_council_phase("thinking");
+        builder.set_council_tps(58.4);
+        builder.set_council_ttft_ms(140);
+        builder.set_council_entropy("▂▃▅▂");
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let full = parse_context_info(&reader).unwrap();
+        assert!(full.hud.is_council_backend);
+        assert!(full.hud.held_refusal);
+        assert_eq!(full.hud.control_count, 2);
+        assert_eq!(full.hud.decide_program.as_deref(), Some("haiku"));
+        assert_eq!(full.hud.gate_label.as_deref(), Some("jev-1.13"));
+        assert_eq!(full.hud.bump_streak, 1);
+        assert_eq!(full.hud.bump_limit, 3);
+        assert_eq!(full.hud.last_bump_flavor.as_deref(), Some("network"));
+        assert_eq!(full.hud.judging_tool.as_deref(), Some("shell_write"));
+        assert_eq!(full.hud.judging_started_at, Some(1_700_000_001_000));
+        assert_eq!(full.hud.vibe.as_deref(), Some("🌊"));
+        assert_eq!(full.hud.council_phase.as_deref(), Some("thinking"));
+        assert!((full.hud.council_tps.unwrap() - 58.4).abs() < 0.01);
+        assert_eq!(full.hud.council_ttft_ms, Some(140));
+        assert_eq!(full.hud.council_entropy.as_deref(), Some("▂▃▅▂"));
     }
 }

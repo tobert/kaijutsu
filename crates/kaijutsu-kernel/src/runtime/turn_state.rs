@@ -145,12 +145,15 @@ pub(crate) enum Wake {
     /// joins the request after the tool's round, behind the round's results,
     /// and like a drift never extends or starts a turn.
     Attachment,
+    /// A ping from another context (`kj ping`). Continues a running turn, or
+    /// starts one follow-up turn if undelivered when the turn finishes.
+    Ping { principal: PrincipalId },
 }
 
 impl Wake {
     pub(crate) fn continues_turn(&self) -> bool {
         match self {
-            Self::Submit { .. } => true,
+            Self::Submit { .. } | Self::Ping { .. } => true,
             Self::Completion { resume_allowed, .. } => *resume_allowed,
             Self::Drift | Self::Attachment => false,
         }

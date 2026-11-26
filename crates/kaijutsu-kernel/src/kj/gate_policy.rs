@@ -457,7 +457,7 @@ impl TierTable {
 /// The parsed `gate.toml`: the global tier, one tier per rc directory, per
 /// character and for roots, and the council's settings when the file
 /// declares them.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GateConfig {
     global: TierTable,
     rc: BTreeMap<String, TierTable>,
@@ -467,9 +467,28 @@ pub(crate) struct GateConfig {
     /// `[guardian]`, or its defaults when the file has none.
     guardian: GuardianConfig,
     judge: Option<JudgePolicy>,
+    /// Treat pure fd-dup redirects (`2>&1`, `1>&2`) and output redirects to
+    /// literal `/dev/null` as inert for `allow` shape checks. Defaults to `true`.
+    ignore_inert_redirects: bool,
     /// The `[rc.<dir>]` and `[character.<name>]` sections that name no rc
     /// directory or character, found by [`load_config`].
     nobody: Vec<Section>,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            global: TierTable::default(),
+            rc: BTreeMap::new(),
+            character: BTreeMap::new(),
+            root: None,
+            council: None,
+            guardian: GuardianConfig::default(),
+            judge: None,
+            ignore_inert_redirects: true,
+            nobody: Vec::new(),
+        }
+    }
 }
 
 /// How the kernel pools the council's per-context reads.
@@ -600,6 +619,9 @@ pub(crate) struct GuardianConfig {
     pub(crate) house_rules_tokens: u64,
     /// The decisions judge allows when p(allow) reaches this, in (0, 1].
     pub(crate) allow_at: f64,
+    /// Attach the operational-weather `vibe` question on decisions judge calls
+    /// and `council` generations. On by default.
+    pub(crate) vibe: bool,
 }
 
 impl Default for GuardianConfig {
@@ -609,6 +631,7 @@ impl Default for GuardianConfig {
             transcript_tokens: 8_000,
             house_rules_tokens: DEFAULT_GUARDIAN_HOUSE_RULES_TOKENS,
             allow_at: 0.9,
+            vibe: true,
         }
     }
 }
@@ -773,6 +796,7 @@ struct GuardianToml {
     transcript_tokens: Option<i64>,
     house_rules_tokens: Option<i64>,
     allow_at: Option<f64>,
+    vibe: Option<bool>,
 }
 
 /// `[rc.<dir>.guardian]`, `[character.<name>.guardian]` or `[root.guardian]`.
@@ -782,9 +806,15 @@ struct GuardianSwitchToml {
     enabled: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct GateToml {
+    #[serde(default = "default_true")]
+    ignore_inert_redirects: bool,
     #[serde(default)]
     global: TierToml,
     #[serde(default)]
@@ -921,6 +951,7 @@ impl GateConfig {
             council: None,
             guardian,
             judge,
+            ignore_inert_redirects: raw.ignore_inert_redirects,
             nobody: Vec::new(),
         };
         for (dir, tier) in &raw.rc {
@@ -1002,6 +1033,7 @@ impl GateConfig {
                 Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => v,
                 Some(v) => return Err(GateConfigError::Parse(format!("[guardian] allow_at: {v} must satisfy 0 < allow_at <= 1"))),
             },
+            vibe: raw.vibe.unwrap_or(defaults.vibe),
         })
     }
 
@@ -1767,10 +1799,11 @@ pub(crate) fn evaluate(
     }
 
     let family = family_layer_per_gated_statement(db, spec, &caller, &context)?;
+    let ignore_inert = layers.config.ignore_inert_redirects;
     let edge = |cmd: &PlannedCommand| {
-        senpai_edge_drift(db, cmd, &caller)
-            .or_else(|| senpai_edge_archive(db, cmd, &caller))
-            .or_else(|| mcp_session_create(db, cmd, &caller))
+        senpai_edge_drift(db, cmd, &caller, ignore_inert)
+            .or_else(|| senpai_edge_archive(db, cmd, &caller, ignore_inert))
+            .or_else(|| mcp_session_create(db, cmd, &caller, ignore_inert))
     };
     let lower = lower_layers_per_gated_statement(spec, layers, &edge);
     // The acts that always ask, per gated statement: decided over every
@@ -1860,7 +1893,7 @@ fn family_layer_per_gated_statement(
     let mut out = Vec::with_capacity(n);
     for group in groups {
         let planned: Vec<&PlannedCommand> = group.iter().flat_map(|s| s.plan.commands.iter()).collect();
-        if planned.iter().all(|cmd| command_keys(cmd).is_none()) {
+        if planned.iter().all(|cmd| command_keys(cmd, true).is_none()) {
             out.push(PolicyVerdict::Uncovered);
             continue;
         }
@@ -1868,7 +1901,7 @@ fn family_layer_per_gated_statement(
         let mut all_allowed = !planned.is_empty();
         let mut deny: Option<Decision> = None;
         for cmd in planned {
-            let Some(keys) = command_keys(cmd) else {
+            let Some(keys) = command_keys(cmd, true) else {
                 all_allowed = false;
                 continue;
             };
@@ -1920,7 +1953,7 @@ pub(crate) fn family_keys_for_program(statements: &[PlannedStatement]) -> Result
     let mut keys: Vec<String> = Vec::new();
     for cmd in statements.iter().flat_map(|s| s.plan.commands.iter()) {
         let refuse = |why: &str| FamilyRefusal(format!("`{}` {why}", command_clause(cmd)));
-        if !cmd.redirects.is_empty() {
+        if !cmd.redirects.iter().all(is_inert_redirect) {
             return Err(refuse("has a redirect"));
         }
         if cmd.background {
@@ -1929,7 +1962,7 @@ pub(crate) fn family_keys_for_program(statements: &[PlannedStatement]) -> Result
         if !cmd.heredocs.is_empty() {
             return Err(refuse("carries a heredoc"));
         }
-        let Some(k) = command_keys(cmd) else {
+        let Some(k) = command_keys(cmd, true) else {
             return Err(refuse(
                 "has an argument that is not plain text, or names no kj verb",
             ));
@@ -2082,8 +2115,16 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
 /// heredoc), since the decision reads the target out of the arguments. `None`
 /// for anything else; the verb itself still refuses a target that is not
 /// live.
-fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
-    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+fn redirects_ok(cmd: &PlannedCommand, ignore_inert_redirects: bool) -> bool {
+    if ignore_inert_redirects {
+        cmd.redirects.iter().all(is_inert_redirect)
+    } else {
+        cmd.redirects.is_empty()
+    }
+}
+
+fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller, ignore_inert: bool) -> Option<Decision> {
+    if cmd.name != "kj" || !redirects_ok(cmd, ignore_inert) || cmd.background || !cmd.heredocs.is_empty() {
         return None;
     }
     let here = caller.context_id?;
@@ -2144,8 +2185,8 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
 /// decision reads the target out of the arguments. `None` for anything else;
 /// the verb still refuses a target it may not archive, and the archive of a
 /// console still always asks.
-fn senpai_edge_archive(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
-    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+fn senpai_edge_archive(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller, ignore_inert: bool) -> Option<Decision> {
+    if cmd.name != "kj" || !redirects_ok(cmd, ignore_inert) || cmd.background || !cmd.heredocs.is_empty() {
         return None;
     }
     let here = caller.context_id?;
@@ -2332,14 +2373,14 @@ pub(crate) fn command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> Polic
 /// The command's most specific key, or its name when it has none — what
 /// the uncovered tier reports it allowed.
 fn command_key(cmd: &PlannedCommand) -> String {
-    command_keys(cmd)
+    command_keys(cmd, true)
         .and_then(|keys| keys.candidates.into_iter().next())
         .unwrap_or_else(|| cmd.name.clone())
 }
 
 /// [`command_verdict`] without the uncovered tier: the keyed layers alone.
 fn keyed_command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> PolicyVerdict {
-    if let Some(keys) = command_keys(cmd) {
+    if let Some(keys) = command_keys(cmd, layers.config.ignore_inert_redirects) {
         // The performer's sections, latest first, then `[global]`: the
         // first deny, ask or usable allow for any of the command's keys
         // decides, most specific key first within a table.
@@ -2383,9 +2424,19 @@ struct CommandKeys {
     structural_ok: bool,
 }
 
+/// True for redirects that never touch the filesystem: fd merges (`2>&1`,
+/// `1>&2`) or output discarded to literal `/dev/null`.
+fn is_inert_redirect(r: &kaish_types::plan::PlannedRedirect) -> bool {
+    match r.kind.as_str() {
+        "2>&1" | "1>&2" => true,
+        ">" | ">>" | "2>" | "&>" => r.target.literal_value() == Some("/dev/null"),
+        _ => false,
+    }
+}
+
 /// The config keys one command can match. `None` when an argument is not
 /// plain text (nothing to key on) or a `kj` call names no verb.
-fn command_keys(cmd: &PlannedCommand) -> Option<CommandKeys> {
+fn command_keys(cmd: &PlannedCommand, ignore_inert_redirects: bool) -> Option<CommandKeys> {
     use kaish_types::plan::PlannedValue;
     let mut args = Vec::with_capacity(cmd.args.len());
     for arg in &cmd.args {
@@ -2395,7 +2446,12 @@ fn command_keys(cmd: &PlannedCommand) -> Option<CommandKeys> {
             _ => return None,
         }
     }
-    let plain_shape = cmd.redirects.is_empty() && !cmd.background && cmd.heredocs.is_empty();
+    let redirects_ok = if ignore_inert_redirects {
+        cmd.redirects.iter().all(is_inert_redirect)
+    } else {
+        cmd.redirects.is_empty()
+    };
+    let plain_shape = redirects_ok && !cmd.background && cmd.heredocs.is_empty();
     if cmd.name == "kj" {
         super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
         let root = super::kj_command();
@@ -2657,8 +2713,8 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
 /// redirect, background flag or heredoc), since the decision reads the
 /// parent out of the arguments. `None` for anything else, including a
 /// caller whose lineage has no live root or whose root has no hub.
-fn mcp_session_create(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
-    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+fn mcp_session_create(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller, ignore_inert: bool) -> Option<Decision> {
+    if cmd.name != "kj" || !redirects_ok(cmd, ignore_inert) || cmd.background || !cmd.heredocs.is_empty() {
         return None;
     }
     let here = caller.context_id?;
@@ -4417,6 +4473,10 @@ enabled = false
         assert!(m.contains("extra"), "{m}");
         let m = council_err("[global.guardian]\nenabled = true\n");
         assert!(m.contains("[global.guardian]"), "{m}");
+        let on = config("[rc.sol.guardian]\nenabled = true\n");
+        assert!(on.guardian_for(Some(&dir("sol"))).unwrap().vibe);
+        let off = config("[guardian]\nvibe = false\n[rc.sol.guardian]\nenabled = true\n");
+        assert!(!off.guardian_for(Some(&dir("sol"))).unwrap().vibe);
     }
 
     #[test]
@@ -4781,6 +4841,47 @@ enabled = true
             let m = council_err(&council_with("allow_at = 0.98", &format!("{field} = \"x\"\nallow_at = 0.98")));
             assert!(m.contains(field) && m.contains("delete"), "{field}: {m}");
         }
+    }
+
+    #[test]
+    fn inert_redirects_are_ignored_for_allow_by_default_and_can_be_disabled() {
+        let default_cfg = GateConfig::parse(
+            "[global]\nallow = [\"kj handoff note\", \"rg\"]\n",
+        )
+        .unwrap();
+        assert!(default_cfg.ignore_inert_redirects);
+        assert!(matches!(
+            first_verdict("kj handoff note 'hi' 2>&1", &default_cfg, Some("banto")),
+            PolicyVerdict::Allow(_)
+        ));
+        assert!(matches!(
+            first_verdict("rg foo src 2>/dev/null", &default_cfg, Some("banto")),
+            PolicyVerdict::Allow(_)
+        ));
+        // Real file redirects still never auto-allow.
+        assert!(matches!(
+            first_verdict("kj handoff note 'hi' > /tmp/out.txt", &default_cfg, Some("banto")),
+            PolicyVerdict::Uncovered
+        ));
+        assert!(matches!(
+            first_verdict("rg foo src > log.txt 2>&1", &default_cfg, Some("banto")),
+            PolicyVerdict::Uncovered
+        ));
+
+        // Setting `ignore_inert_redirects = false` restores strict rejection.
+        let strict_cfg = GateConfig::parse(
+            "ignore_inert_redirects = false\n[global]\nallow = [\"kj handoff note\", \"rg\"]\n",
+        )
+        .unwrap();
+        assert!(!strict_cfg.ignore_inert_redirects);
+        assert!(matches!(
+            first_verdict("kj handoff note 'hi' 2>&1", &strict_cfg, Some("banto")),
+            PolicyVerdict::Uncovered
+        ));
+        assert!(matches!(
+            first_verdict("rg foo src 2>/dev/null", &strict_cfg, Some("banto")),
+            PolicyVerdict::Uncovered
+        ));
     }
 
     #[test]

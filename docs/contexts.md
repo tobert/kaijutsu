@@ -121,11 +121,17 @@ blocks:
 
 ## Orchestration and peers
 
-- **Driving and waiting.** `kj drive <ctx> [prompt]` starts one autonomous turn
+- **Driving, pinging, and waiting.** `kj drive <ctx> [prompt]` starts one autonomous turn
   on a target context. A seat that holds `drive` without `operator` (a kohai)
   may drive only itself and its senpai (`.senpai`); `operator` reaches any
   context. `--if-idle` starts the turn only when the target has none running,
-  and a busy target is left alone with nothing written. `kj wait [<ctx>] [--since <cursor>] [--timeout <secs>]`
+  and a busy target is left alone with nothing written. `kj ping <ctx>` is an
+  opaque worker-level wake signal with no sender-authored message: the kernel
+  writes a trusted notice naming the sender and any recent shared board
+  activity, then wakes the target (or feeds the running turn's ingress so
+  repeated pings coalesce). Consoles (`console_ctx`) and characters with
+  `--no-pings` refuse pings; contexts that cannot run turns accept the ping as
+  a no-op. `kj wait [<ctx>] [--since <cursor>] [--timeout <secs>]`
   waits for accepted turns, a background shell `--operation`, an `--ask`
   decision, or a kaish `--job`, returning the newest blocks and a `cursor` for
   the next wait (`status: idle | ask | running`).

@@ -28,10 +28,12 @@ enum Phase {
 }
 
 /// What the provider measured around one generation.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct Timing {
     pub(super) first_token_ms: u64,
     pub(super) wall_ms: u64,
+    pub(super) last_tps_tenths: Option<u32>,
+    pub(super) entropies: Vec<f32>,
 }
 
 pub(super) enum Reply {
@@ -154,6 +156,55 @@ impl PhasedReply {
                 ReplyToolCall::Unparsed { id, name, raw, error, .. } => Ok(Call::Unparsed { id, name, raw, error }),
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let mut vibe = None;
+        for decision in &done.decisions {
+            if let Some(val) = decision.answers.get("vibe") {
+                if let Ok(gogi_proto::decision::ReadAnswer::Choice(c)) =
+                    serde_json::from_value::<gogi_proto::decision::ReadAnswer>(val.clone())
+                {
+                    vibe = kaijutsu_types::vibe::format_vibe_glyphs(
+                        c.probabilities.iter().map(|(k, v)| (k.as_str(), *v)),
+                    );
+                } else if val.get("type").and_then(|t| t.as_str()) == Some("choice")
+                    && let Some(probs) = val.get("probabilities").and_then(|p| p.as_object())
+                {
+                    vibe = kaijutsu_types::vibe::format_vibe_glyphs(
+                        probs.iter().filter_map(|(k, v)| Some((k.as_str(), v.as_f64()?))),
+                    );
+                }
+            }
+        }
+
+        let tps_tenths = timing.last_tps_tenths.or_else(|| {
+            if done.usage.completion > 0 && timing.wall_ms > timing.first_token_ms {
+                let dt = (timing.wall_ms - timing.first_token_ms) as f64;
+                if dt > 0.0 {
+                    Some(((done.usage.completion as f64 * 10_000.0) / dt).round() as u32)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        let stats_ref = done.stats.as_ref().and_then(|s| s.content.as_ref().or(s.reasoning.as_ref()));
+        let mean_entropy_milli = stats_ref.and_then(|s| {
+            if s.mean_entropy.is_finite() && s.mean_entropy >= 0.0 {
+                Some((s.mean_entropy * 1000.0).round() as u32)
+            } else {
+                None
+            }
+        });
+
+        let entropy_spark = if !timing.entropies.is_empty() {
+            kaijutsu_types::vibe::format_entropy_spark(&timing.entropies, 4)
+        } else {
+            mean_entropy_milli.and_then(|m| {
+                kaijutsu_types::vibe::format_entropy_spark(&[m as f32 / 1000.0], 4)
+            })
+        };
+
         let extra = CouncilUsageExtra {
             kept: done.usage.kept,
             fed: done.usage.fed,
@@ -162,6 +213,10 @@ impl PhasedReply {
             seed: done.seed,
             model: model.to_string(),
             weight_hash: weight_hash.to_string(),
+            vibe,
+            tps_tenths,
+            mean_entropy_milli,
+            entropy_spark,
         };
         let usage = (done.usage.prompt, done.usage.completion, extra);
         // A reply cut at the context's end is cut like one at max_tokens.
@@ -423,6 +478,10 @@ mod tests {
             seed: Some(7),
             model: "m".into(),
             weight_hash: "w".into(),
+            vibe: None,
+            tps_tenths: None,
+            mean_entropy_milli: None,
+            entropy_spark: None,
         };
         let events = Reply::whole("  hello\n", (10, 0, extra())).unwrap();
         assert_eq!(

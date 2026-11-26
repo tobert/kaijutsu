@@ -267,6 +267,9 @@ enum BoardCommand {
         /// Include topics whose posts are all hidden or held pending review.
         #[arg(long = "include-hidden")]
         include_hidden: bool,
+        /// Exclude topics whose latest visible post was authored by the caller.
+        #[arg(long)]
+        others: bool,
     },
     /// Search non-archived topics by regex (default) or semantic similarity.
     Search {
@@ -498,8 +501,8 @@ impl KjDispatcher {
             BoardCommand::Read { topic, tail, after, include_hidden } => {
                 self.board_read(&topic, tail, after, include_hidden, caller)
             }
-            BoardCommand::Recent { board, since, limit, include_hidden } => {
-                self.board_recent(board.as_deref(), &since, limit, include_hidden, caller)
+            BoardCommand::Recent { board, since, limit, include_hidden, others } => {
+                self.board_recent(board.as_deref(), &since, limit, include_hidden, others, caller)
             }
             BoardCommand::Search { query, board, semantic, regex: _, limit } => {
                 self.board_search(&query, board.as_deref(), semantic, limit, caller).await
@@ -966,6 +969,7 @@ impl KjDispatcher {
         since: &str,
         limit: usize,
         include_hidden: bool,
+        others_only: bool,
         caller: &KjCaller,
     ) -> KjResult {
         let duration_ms = match parse_duration_ms(since) {
@@ -987,7 +991,7 @@ impl KjDispatcher {
                 None => None,
             };
 
-            let query_limit = if include_hidden { Some(limit) } else { None };
+            let query_limit = if include_hidden && !others_only { Some(limit) } else { None };
             match db.list_recent_topics(board_filter, Some(since_ms), query_limit) {
                 Ok(rows) => rows,
                 Err(e) => return KjResult::Err(format!("kj board recent: {e}")),
@@ -996,6 +1000,21 @@ impl KjDispatcher {
 
         if !include_hidden {
             topics.retain(|t| self.topic_has_visible_posts(t.document_id));
+        }
+        if others_only {
+            topics.retain(|t| {
+                self.block_store()
+                    .non_draft_snapshots(t.document_id)
+                    .ok()
+                    .and_then(|snaps| {
+                        snaps
+                            .into_iter()
+                            .rev()
+                            .find(|b| include_hidden || !b.excluded)
+                            .map(|b| b.author() != caller.actor_id)
+                    })
+                    .unwrap_or(false)
+            });
         }
         topics.truncate(limit);
 
@@ -2037,6 +2056,10 @@ impl KjDispatcher {
         ) {
             return KjResult::Err(format!("kj board edit: {e}"));
         }
+        let _ = self
+            .kernel_db()
+            .lock()
+            .touch_topic_last_post_at(topic.document_id, now_millis() as i64);
 
         KjResult::ok_with_data(
             format!(

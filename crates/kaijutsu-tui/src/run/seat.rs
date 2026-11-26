@@ -219,34 +219,56 @@ fn draft_edit_failure(error: &dyn std::fmt::Display) -> String {
     format!("draft edit failed: {error:#}")
 }
 
+/// Recognize `:kj context switch <full-context-id>` so the TUI can switch seats
+/// directly without running `execute_kj` inside an archived predecessor context.
+fn direct_switch_target(argv: &[String]) -> Option<ContextId> {
+    if argv.len() == 3
+        && argv[0] == "context"
+        && matches!(argv[1].as_str(), "switch" | "sw")
+    {
+        ContextId::parse(&argv[2]).ok()
+    } else {
+        None
+    }
+}
+
 /// Dispatch one submitted `:` line (`docs/tui.md`, "The `:` line"). The tui
 /// parses it itself (`cmdline::parse`) — the core's own `:w`/`:q` ex-command
 /// dialect answers the alternate-screen editor, not this bar.
 pub(super) async fn handle_colon_line(bridge: &KernelBridge, app: &mut App, ctx: ContextId, line: String, feeds: &mut Feeds) {
     match cmdline::parse(&line) {
-        ColonVerb::Kj(argv) => match bridge.execute_kj(ctx, argv).await {
-            Ok(result) if result.latch.is_some() => {
-                app.note(result.latch.map(|l| l.message).unwrap_or_default());
+        ColonVerb::Kj(argv) => {
+            // Switching by explicit context id works even when the current
+            // context has just been archived (e.g. rotation follow prompt),
+            // whereas `execute_kj(archived_ctx, ...)` is refused by the server.
+            if let Some(target_id) = direct_switch_target(&argv) {
+                switch_seat(bridge, app, target_id, feeds).await;
+                return;
             }
-            Ok(result) => {
-                // Any kj verb may have changed the roster (fork, promote,
-                // archive); the picker and the rank should not wait a tick.
-                app.roster_changed = true;
-                let said = result.stdout.lines().next().unwrap_or("done").to_string();
-                match follow_target(result.data.as_ref(), ctx) {
-                    Ok(Some(id)) => {
-                        switch_seat(bridge, app, id, feeds).await;
-                        // A failed switch left its own notice; keep it.
-                        if app.current == Some(id) {
-                            app.note(said);
-                        }
-                    }
-                    Ok(None) => app.note(said),
-                    Err(e) => app.note(format!("{said}; cannot follow: {e}")),
+            match bridge.execute_kj(ctx, argv).await {
+                Ok(result) if result.latch.is_some() => {
+                    app.note(result.latch.map(|l| l.message).unwrap_or_default());
                 }
+                Ok(result) => {
+                    // Any kj verb may have changed the roster (fork, promote,
+                    // archive); the picker and the rank should not wait a tick.
+                    app.roster_changed = true;
+                    let said = result.stdout.lines().next().unwrap_or("done").to_string();
+                    match follow_target(result.data.as_ref(), ctx) {
+                        Ok(Some(id)) => {
+                            switch_seat(bridge, app, id, feeds).await;
+                            // A failed switch left its own notice; keep it.
+                            if app.current == Some(id) {
+                                app.note(said);
+                            }
+                        }
+                        Ok(None) => app.note(said),
+                        Err(e) => app.note(format!("{said}; cannot follow: {e}")),
+                    }
+                }
+                Err(e) => app.note(format!(":kj failed: {e:#}")),
             }
-            Err(e) => app.note(format!(":kj failed: {e:#}")),
-        },
+        }
         ColonVerb::Shell(statement) => match bridge.shell_execute(ctx, &statement).await {
             Ok(_) => app.clear_notice(),
             Err(e) => app.note(format!("shell failed: {e}")),

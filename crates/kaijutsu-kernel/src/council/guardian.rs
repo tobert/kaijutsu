@@ -222,6 +222,8 @@ pub(crate) struct Judged {
     pub(crate) policy_digest: String,
     pub(crate) deadline_ms: u64,
     pub(crate) elapsed: std::time::Duration,
+    /// Operational weather glyphs from an auxiliary `vibe` choice question.
+    pub(crate) vibe: Option<String>,
 }
 
 impl Judged {
@@ -241,6 +243,7 @@ impl Judged {
             policy_digest: String::new(),
             deadline_ms: config.deadline_ms,
             elapsed: std::time::Duration::ZERO,
+            vibe: None,
         }
     }
 

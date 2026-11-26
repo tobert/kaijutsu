@@ -5267,10 +5267,16 @@ esac
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
-            let (cards, errors, _) = arrival_card_for(&d, &caller, "senpai", "lead-a", &[]).await;
+            let (cards, errors, lead_a) = arrival_card_for(&d, &caller, "senpai", "lead-a", &[]).await;
             assert!(errors.is_empty(), "{errors:?}");
             let text = &cards[0].content;
             assert!(text.contains("Kernel administration: banto is not running; ask the person"), "{text}");
+            // The route loop walks 8 slots; the empty ones past the last route
+            // must not spill jq errors into the captured rc output.
+            let noisy: Vec<String> = d.block_store().block_snapshots(lead_a).unwrap().into_iter()
+                .filter(|b| b.content.contains("jq runtime error"))
+                .map(|b| b.content).collect();
+            assert!(noisy.is_empty(), "arrival rc wrote jq errors:\n{noisy:#?}");
 
             let (_, errors, banto) = arrival_card_for(&d, &caller, "banto", "banto", &[]).await;
             assert!(errors.is_empty(), "{errors:?}");

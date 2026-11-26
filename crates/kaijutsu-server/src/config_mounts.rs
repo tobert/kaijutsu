@@ -97,7 +97,7 @@ impl ConfigMounts {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let parsed: toml::Value = text
+        let parsed: toml::Table = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         if let Some(workspace) = parsed.get("workspace") {

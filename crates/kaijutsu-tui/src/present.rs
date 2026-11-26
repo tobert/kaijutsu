@@ -551,7 +551,10 @@ pub fn block_version(block: &BlockSnapshot, collapsed: bool) -> u64 {
     v = v.wrapping_mul(31).wrapping_add(u64::from(collapsed));
     v = v.wrapping_mul(31).wrapping_add(u64::from(block.excluded));
     v = v.wrapping_mul(31).wrapping_add(u64::from(block.is_error));
-    v = v.wrapping_mul(31).wrapping_add(block.summary.as_deref().map_or(0, |s| s.len() as u64 + 1));
+    let summary_hash = block.summary.as_deref().map_or(0, |s| {
+        s.bytes().fold(1u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)))
+    });
+    v = v.wrapping_mul(31).wrapping_add(summary_hash);
     v
 }
 

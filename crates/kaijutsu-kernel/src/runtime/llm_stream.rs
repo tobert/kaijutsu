@@ -407,6 +407,24 @@ async fn wake_undelivered_input(
         && let Err(error) = super::prompt::follow_up(kernel, context_id, block, principal, session)
     {
         failures.push((block, format!("Input sent during the turn could not start the next turn: {error}")));
+    } else if submit.is_none() {
+        let ping = undelivered.iter().rev().find_map(|input| match &input.wake {
+            Wake::Ping { principal } => Some((input.block, *principal)),
+            _ => None,
+        });
+        if let Some((block, principal)) = ping {
+            let request = super::turn_request::TurnRequest {
+                context_id,
+                after_block_id: block,
+                content: String::new(),
+                principal_id: principal,
+                continuation_epoch: None,
+                score: None,
+            };
+            if let Err(error) = kernel.request_turn_if_idle(request) {
+                tracing::debug!(%context_id, %error, "ping follow-up turn was not admitted");
+            }
+        }
     }
     for input in &undelivered {
         if let Wake::Completion { source, .. } = &input.wake
@@ -3474,15 +3492,39 @@ async fn run_llm_stream(
             Err(e) => (Vec::new(), Some(format!("Could not read the control list of this context: {e}"))),
         };
 
-        let build_opts = apply_tunables(
+        let is_council_provider = matches!(provider.as_ref(), Provider::Council(_));
+        let (ride_vibe, live_council, _council_hud_guard) = if is_council_provider {
+            let ride = match crate::kj::gate_policy::load_config(kernel.vfs(), &kernel_db).await {
+                Ok(cfg) => {
+                    let db = kernel_db.lock();
+                    let perf = crate::kj::gate_policy::performer_of(&db, Some(context_id)).ok().flatten();
+                    crate::kj::gate_policy::guardian_for_context(&db, &cfg, context_id, perf.as_ref())
+                        .ok()
+                        .flatten()
+                        .map_or(true, |g| g.vibe)
+                }
+                Err(_) => true,
+            };
+            let stats = Arc::new(crate::llm::stream::LiveCouncilStats::default());
+            let guard = kernel.hud().begin_council_stream(context_id, stats.clone());
+            (ride, Some(stats), Some(guard))
+        } else {
+            (false, None, None)
+        };
+
+        let mut build_opts = apply_tunables(
             BuildOpts::with_output_limit(&model_name, max_output_tokens)
                 .with_system(&system_prompt)
                 .with_tools(offered.to_vec())
                 .with_cache_breakpoints(cache_breakpoints)
                 .with_controls(controls)
-                .with_vfs(kernel.vfs().clone()),
+                .with_vfs(kernel.vfs().clone())
+                .with_ride_vibe(ride_vibe),
             &tunables,
         );
+        if let Some(stats) = live_council {
+            build_opts = build_opts.with_live_council(stats);
+        }
 
         // `retry_disposition` decides which startup failures keep the
         // bounded backoff and which are permanent refusals that stop after
@@ -3590,6 +3632,7 @@ async fn run_llm_stream(
         // Process stream events
         let attempt_start_block = last_block_id;
         let mut open_content: Option<OpenContent> = None;
+        let mut step_text_block: Option<kaijutsu_types::BlockId> = None;
         // Each pending invocation already has a durable call block, in the
         // order the provider sent the calls. A call whose arguments did not
         // parse carries the error it is answered with instead of dispatching;
@@ -3747,6 +3790,7 @@ async fn run_llm_stream(
                     turn_lease.track_block(block_id);
                     last_block_id = block_id;
                     open_content = Some(OpenContent::Text(block_id));
+                    step_text_block = Some(block_id);
                     // This is the turn's model-text output. A later text
                     // block in the same turn supersedes it — Completed
                     // carries the LAST one, the model's final say.
@@ -3828,6 +3872,15 @@ async fn run_llm_stream(
                         &extra,
                         &stop_reason,
                     )?;
+                    if let Some(crate::llm::UsageExtra::Council(c)) = &extra {
+                        kernel.hud().record_council_done(context_id, c);
+                        if let Some(block_id) = step_text_block
+                            && let Some(stamp) = crate::hud::council_divider_stamp(c)
+                            && let Err(error) = documents.set_summary(context_id, &block_id, stamp)
+                        {
+                            tracing::warn!(%error, "Failed to persist council telemetry summary");
+                        }
+                    }
 
                     if cancel_deadline.is_some() {
                         // Usage may arrive during cancellation, but its notice

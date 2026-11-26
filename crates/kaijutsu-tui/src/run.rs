@@ -350,7 +350,7 @@ async fn event_loop(
                 apply_feed(bridge, app, context_id, event, &mut wires.feeds);
             }
             received = wires.server_events.recv() => {
-                on_server_event(bridge, app, &mut ls.frame, received).await;
+                on_server_event(bridge, app, &mut ls.frame, &mut ls.refresh, received).await;
             }
             Some(open) = wires.editor_opens.recv() => {
                 editor::enter_editor(app, open);

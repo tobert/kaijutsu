@@ -65,6 +65,9 @@ pub mod theme;
 pub mod tick;
 pub mod timeout;
 pub mod track;
+pub mod vibe;
+
+pub use vibe::ContextHud;
 
 // Re-export kaish output types for structured tool results.
 pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};

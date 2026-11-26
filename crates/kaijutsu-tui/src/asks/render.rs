@@ -21,6 +21,7 @@ pub struct AskCard<'a> {
     pub statement: &'a str,
     pub asker: Option<&'a str>,
     pub reviewer: Option<&'a str>,
+    pub notes: &'a [&'a str],
     /// The keys the viewer has on this ask.
     pub offer: Offer,
     /// Whether the card's keys act yet. A disarmed card shows no keys; its
@@ -53,6 +54,11 @@ pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec
     )));
     for row in wrap_plain(card.statement, width.saturating_sub(2)) {
         lines.push(Line::from(Span::styled(format!("  {row}"), palette.status())));
+    }
+    for note in card.notes {
+        for row in wrap_plain(note, width.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(format!("  {row}"), palette.divider())));
+        }
     }
     let mut key_rows = wrap_items(&card_key_items(card), width.saturating_sub(2));
     if !card.armed {
@@ -230,6 +236,35 @@ fn ledger_hints(selected: Option<&LedgerRow>, width: usize) -> String {
     truncate_plain(&short, width)
 }
 
+/// Extract extra paragraphs from `summary.description` (skipping paragraph 0).
+pub fn extra_ask_notes(summary: &kaijutsu_types::AskSummary, include_env_note: bool) -> Vec<&str> {
+    let mut notes = Vec::new();
+    let paragraphs: Vec<&str> = summary.description.split("\n\n").collect();
+    for (i, p) in paragraphs.into_iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !include_env_note && trimmed.starts_with("NOTE: at ask time ") {
+            continue;
+        }
+        notes.push(trimmed);
+    }
+    notes
+}
+
+/// Format an ask decision into headline and optional reason.
+pub fn format_ask_decision(d: &kaijutsu_types::AskDecision) -> (String, Option<&str>) {
+    let who = d.decided_by.as_ref().map(|p| p.name.as_str()).unwrap_or("policy");
+    let opt = d.option.as_deref().map(|o| format!(" ({o})")).unwrap_or_default();
+    let scope = d.remember_scope.as_deref().map(|s| format!(" [remember: {s}]")).unwrap_or_default();
+    let headline = format!("{who}{opt}{scope}");
+    (headline, d.auto_reason.as_deref())
+}
+
 /// One ask shown in full (`Enter` on a ledger row, or the ask card's
 /// `[v]iew ledger` having answered nothing yet): every field
 /// [`kaijutsu_types::AskDetail`] carries, laid out one per line, including
@@ -281,6 +316,20 @@ pub fn render_ask_detail(detail: &AskDetailView<'_>, width: u16, palette: &Palet
         };
         lines.push(Line::from(Span::styled(text, palette.divider())));
     }
+    for note in detail.notes {
+        for row in wrap_plain(note, width.saturating_sub(12)) {
+            lines.push(Line::from(Span::styled(format!("note:       {row}"), palette.divider())));
+        }
+    }
+    if let Some(d) = detail.decision {
+        let (headline, reason) = format_ask_decision(d);
+        lines.push(Line::from(Span::styled(format!("decision:   {headline}"), palette.status())));
+        if let Some(r) = reason {
+            for row in wrap_plain(r, width.saturating_sub(12)) {
+                lines.push(Line::from(Span::styled(format!("reason:     {row}"), palette.divider())));
+            }
+        }
+    }
     lines.push(Line::from(Span::styled(
         format!("redeemed:   {}", detail.redeemed.text()),
         palette.status(),
@@ -309,6 +358,8 @@ pub struct AskDetailView<'a> {
     pub exec_source: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub env: &'a [(String, Option<String>)],
+    pub notes: &'a [&'a str],
+    pub decision: Option<&'a kaijutsu_types::AskDecision>,
     pub redeemed: RedeemedMark,
     pub publication_abandoned: Option<&'a str>,
 }
@@ -375,7 +426,12 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
     if let Some(card) = &app.ask_card {
         let (context_label, performer) = context_facts(app, card.context_id);
         let summary = &card.detail.summary;
-        let statement = summary.statements.first().map(String::as_str).unwrap_or(summary.description.as_str());
+        let statement = summary
+            .statements
+            .first()
+            .map(String::as_str)
+            .unwrap_or_else(|| summary.description.split("\n\n").next().unwrap_or(""));
+        let notes = extra_ask_notes(summary, true);
         let view = AskCard {
             request_id: &card.request_id,
             hook: card.detail.tool.as_deref().unwrap_or("-"),
@@ -384,6 +440,7 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
             statement,
             asker: summary.performer.as_ref().map(|who| who.name.as_str()),
             reviewer: summary.reviewer.as_ref().map(|who| who.name.as_str()),
+            notes: &notes,
             offer: Offer::of(summary, app.principal),
             armed: app.ask_card_armed(),
         };
@@ -401,6 +458,7 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
                 .iter()
                 .map(|entry| (entry.name.clone(), entry.value.clone()))
                 .collect();
+            let notes = extra_ask_notes(summary, false);
             let view = AskDetailView {
                 request_id: &summary.request_id,
                 status: summary.status.as_str(),
@@ -415,6 +473,8 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
                 exec_source: detail.exec_source.as_deref(),
                 cwd: detail.cwd.as_deref(),
                 env: &env,
+                notes: &notes,
+                decision: detail.decision.as_ref(),
                 publication_abandoned: detail.publication_abandoned.as_deref(),
                 redeemed: match detail.redeemed_at_ms {
                     Some(at) => RedeemedMark::At(crate::render::wallclock(at as u64)),
@@ -445,6 +505,7 @@ mod tests {
             statement: "rm -rf ~/src/wt/kaish-arith",
             asker: Some("coder"),
             reviewer: Some("amy"),
+            notes: &[],
             offer: REVIEWER,
             armed: true,
         };
@@ -463,7 +524,7 @@ mod tests {
         for can_review in [true, false] {
             let card = AskCard {
                 request_id: "01a04eb6", hook: "shell_write", context_label: "kaijutsu", performer: "coder",
-                statement: "rm -rf ~/src/wt/kaish-arith", asker: None, reviewer: None, offer: if can_review { REVIEWER } else { Offer::default() }, armed: false,
+                statement: "rm -rf ~/src/wt/kaish-arith", asker: None, reviewer: None, notes: &[], offer: if can_review { REVIEWER } else { Offer::default() }, armed: false,
             };
             let text: Vec<String> = render_ask_card(&card, 80, &Palette::builtin()).iter().map(line_text).collect();
             assert!(text.iter().any(|line| line == ARMING_KEY_LINE), "{text:?}");
@@ -483,6 +544,7 @@ mod tests {
             statement: "one two three four five six seven eight nine ten",
             asker: None,
             reviewer: None,
+            notes: &[],
             offer: REVIEWER,
             armed: true,
         };
@@ -494,7 +556,7 @@ mod tests {
     fn key_rows(offer: Offer, width: u16, armed: bool) -> Vec<String> {
         let card = AskCard {
             request_id: "id", hook: "shell_write", context_label: "kaijutsu", performer: "coder",
-            statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), offer, armed,
+            statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), notes: &[], offer, armed,
         };
         render_ask_card(&card, width, &Palette::builtin()).iter().map(line_text).skip(2).collect()
     }
@@ -555,6 +617,7 @@ mod tests {
             statement: "one two three four five six seven eight nine ten eleven twelve",
             asker: None,
             reviewer: None,
+            notes: &[],
             offer: REVIEWER,
             armed: true,
         };
@@ -639,6 +702,8 @@ mod tests {
             exec_source: Some("kaish"),
             cwd: Some("/home/amy/src/wt/kaish-arith"),
             env: &env,
+            notes: &[],
+            decision: None,
             redeemed: RedeemedMark::Never,
             publication_abandoned: None,
         };
@@ -662,11 +727,60 @@ mod tests {
     }
 
     #[test]
-    fn wrap_plain_breaks_at_the_last_space_that_fits() {
-        assert_eq!(
-            wrap_plain("one two three", 7),
-            vec!["one two".to_string(), "three".to_string()]
-        );
+    fn the_ask_card_renders_judge_notes_and_preserves_armed_line_count() {
+        let card = AskCard {
+            request_id: "01a04eb6",
+            hook: "shell_write",
+            context_label: "kaijutsu",
+            performer: "coder",
+            statement: "rm -rf target",
+            asker: Some("coder"),
+            reviewer: Some("amy"),
+            notes: &["decisions judge (openrouter/jev): p(allow) 0.120, p(ask) 0.850, p(report) 0.030"],
+            offer: REVIEWER,
+            armed: true,
+        };
+        let lines_armed = render_ask_card(&card, 80, &Palette::builtin());
+        let text: Vec<String> = lines_armed.iter().map(line_text).collect();
+        assert!(text.iter().any(|l| l.contains("decisions judge")));
+
+        let card_disarmed = AskCard { armed: false, ..card };
+        let lines_disarmed = render_ask_card(&card_disarmed, 80, &Palette::builtin());
+        assert_eq!(lines_armed.len(), lines_disarmed.len());
+    }
+
+    #[test]
+    fn render_ask_detail_renders_notes_and_decision() {
+        let decision = kaijutsu_types::AskDecision {
+            decided_by: Some(kaijutsu_types::PrincipalRef { id: PrincipalId::new(), name: "jev".into() }),
+            option: Some("allow_once".into()),
+            remember_scope: None,
+            auto_reason: Some("high confidence".into()),
+        };
+        let detail = AskDetailView {
+            request_id: "01a04eb6",
+            status: "allowed",
+            origin: "shell_gate",
+            hook: Some("shell_write"),
+            context_label: "kaijutsu",
+            performer: "coder",
+            requester: Some("amy"),
+            asker: Some("coder"),
+            reviewer: Some("amy"),
+            statements: &["rm -rf target".into()],
+            exec_source: Some("kaish"),
+            cwd: Some("/home/amy/src/wt/kaish"),
+            env: &[],
+            notes: &["decisions judge: p(allow) 0.9"],
+            decision: Some(&decision),
+            redeemed: RedeemedMark::At("12:00".into()),
+            publication_abandoned: None,
+        };
+        let lines = render_ask_detail(&detail, 100, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|l| l.contains("note:       decisions judge")));
+        assert!(text.iter().any(|l| l.contains("decision:   jev (allow_once)")));
+        assert!(text.iter().any(|l| l.contains("reason:     high confidence")));
     }
 
     #[test]

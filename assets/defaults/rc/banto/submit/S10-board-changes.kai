@@ -1,0 +1,49 @@
+# banto: before each turn, surface board topics updated by other characters
+# since the last turn as a turn-scoped system notification (never bloats history).
+#
+# Uses BANTO_BOARD_SEEN_EPOCH in context env to track the high-water mark; on
+# the first turn of a fresh context it initializes the cursor to now and stays
+# quiet so old history is not re-announced.
+set -e
+
+now="$(date '+%s')"
+info="$(kj context info --json)"
+who="$(echo $info | jq -r '.performer_name // "banto"')"
+board_handle="${who}/${who}"
+seen="$(echo $info | jq -r '.env.BANTO_BOARD_SEEN_EPOCH // ""')"
+
+if [[ -z "$seen" ]]; then
+  kj context set --env "BANTO_BOARD_SEEN_EPOCH=$now"
+  echo "board-changes: initialized cursor at $now"
+  exit 0
+fi
+
+elapsed=$((now - seen))
+if [[ "$elapsed" -lt 1 ]]; then
+  elapsed=1
+fi
+
+set +e
+changes="$(kj board recent --board "$board_handle" --others --since "${elapsed}s" --limit 10 2>/dev/null)"
+rc=$?
+set -e
+
+kj context set --env "BANTO_BOARD_SEEN_EPOCH=$now"
+
+if [[ "$rc" -ne 0 ]]; then
+  echo "board-changes: probe failed (rc=$rc)"
+  exit 0
+fi
+
+case "$changes" in
+  ""|*"(no recent topics)"*)
+    echo "board-changes: quiet (${elapsed}s)"
+    exit 0
+    ;;
+esac
+
+kj block create --role system --kind notification --turn-scoped --content "=== Board activity on $board_handle (last ${elapsed}s) ===
+Other characters updated these topics since your last turn. Use \`kj board read '<id>'\` to inspect.
+
+$changes"
+echo "board-changes: notified (${elapsed}s)"

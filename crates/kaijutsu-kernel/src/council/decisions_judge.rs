@@ -20,6 +20,63 @@ pub(crate) const SPEC: &str = "decisions";
 /// The choice question's id.
 pub(crate) const QUESTION: &str = "verdict";
 
+/// Auxiliary operational-weather question id.
+pub(crate) const VIBE_QUESTION: &str = "vibe";
+
+/// Config path for the operational-weather spec under `/config/kernel/`.
+pub(crate) const VIBE_SPEC_PATH: &str = "council/vibe.json";
+
+/// Build an optional [`Choice`] question from the `vibe` council spec JSON.
+pub(crate) fn vibe_choice_from_spec_json(text: &str) -> Result<Choice, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    let spec = gogi_proto::spec::parse_spec(&value, &gogi_proto::spec::SpecRules::default())
+        .map_err(|e| format!("invalid council spec: {e:?}"))?;
+    let q = spec
+        .questions
+        .iter()
+        .find(|q| q.id == VIBE_QUESTION)
+        .ok_or_else(|| format!("spec lacks question {VIBE_QUESTION:?}"))?;
+    let gogi_proto::spec::QuestionKind::Choice { options, .. } = &q.kind else {
+        return Err(format!("question {VIBE_QUESTION:?} is not a choice"));
+    };
+    let instructions = if spec.instructions.trim().is_empty() {
+        q.instructions.clone()
+    } else {
+        format!("{}\n\n{}", spec.instructions.trim_end(), q.instructions)
+    };
+    Ok(Choice::new(
+        instructions,
+        options.iter().map(|(id, opt)| (id.as_str(), opt.as_str())),
+    )
+    .optional())
+}
+
+async fn load_vibe_question(kernel: &crate::Kernel) -> Option<Choice> {
+    use crate::vfs::VfsOps as _;
+    let path = kaijutsu_types::paths::config_path(VIBE_SPEC_PATH);
+    match kernel.vfs().read_all(std::path::Path::new(&path)).await {
+        Ok(bytes) => match std::str::from_utf8(&bytes).map_err(|e| e.to_string()).and_then(vibe_choice_from_spec_json) {
+            Ok(choice) => Some(choice),
+            Err(why) => {
+                tracing::warn!(target: "kaijutsu::council", path = %path, error = %why, "ignoring invalid vibe spec");
+                None
+            }
+        },
+        Err(e) if e.is_not_found() => {
+            let root = std::path::Path::new(kaijutsu_types::paths::CONFIG_ROOT);
+            if kernel.vfs().getattr(root).await.is_ok() {
+                None
+            } else {
+                vibe_choice_from_spec_json(crate::config_seed::DEFAULT_COUNCIL_VIBE).ok()
+            }
+        }
+        Err(e) => {
+            tracing::warn!(target: "kaijutsu::council", path = %path, error = %e, "could not read vibe spec");
+            None
+        }
+    }
+}
+
 /// How the policy's `outcome` reads as the `verdict` options, appended to
 /// the policy so the question cannot drift from what [`classify`] reads.
 pub(crate) const VERDICT_MAPPING: &str = "# Verdict
@@ -117,7 +174,12 @@ pub(crate) async fn judge(
     };
     let deadline = std::time::Duration::from_millis(config.deadline_ms);
     let state = serde_json::Value::String(evidence.prompt);
-    let questions = std::collections::BTreeMap::from([(QUESTION.to_string(), question)]);
+    let mut questions = std::collections::BTreeMap::from([(QUESTION.to_string(), question)]);
+    if config.vibe
+        && let Some(vibe_q) = load_vibe_question(kernel).await
+    {
+        questions.insert(VIBE_QUESTION.to_string(), vibe_q);
+    }
     let response = match client.decide(&bound.slot.model, state, questions, deadline).await {
         Ok(response) => response,
         Err(e) => {
@@ -145,6 +207,11 @@ pub(crate) async fn judge(
     };
     judged.outcome = classify(&answer.choice, p, config.allow_at);
     judged.answer = Some(Answer::Choice { p, allow_at: config.allow_at });
+    judged.vibe = response.answers.get(VIBE_QUESTION).and_then(|vibe_ans| {
+        kaijutsu_types::vibe::format_vibe_glyphs(
+            vibe_ans.probabilities.iter().map(|(k, v)| (k.as_str(), *v)),
+        )
+    });
     judged.elapsed = started.elapsed();
     judged
 }
@@ -196,5 +263,14 @@ mod tests {
         let q = question("Judge it.\n");
         assert!(q.instructions.starts_with("Judge it.\n\n# Verdict"), "{}", q.instructions);
         assert_eq!(q.options.keys().map(String::as_str).collect::<Vec<_>>(), ["allow", "ask", "report"]);
+    }
+
+    #[test]
+    fn vibe_spec_parses_into_optional_eight_option_choice() {
+        let q = vibe_choice_from_spec_json(crate::config_seed::DEFAULT_COUNCIL_VIBE).unwrap();
+        assert!(q.optional);
+        assert_eq!(q.options.len(), 8);
+        assert!(q.options.contains_key("flow"));
+        assert!(q.options.contains_key("tea"));
     }
 }

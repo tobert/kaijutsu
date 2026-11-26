@@ -12,8 +12,29 @@ use std::time::Duration;
 
 use kaijutsu_types::{AskSummary, BlockId, BlockKind, BlockSnapshot, Status};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::present::Palette;
+
+/// Return the display column width of a string.
+pub(crate) fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Clip a string to at most `max_cols` display columns, never splitting a 2-column glyph.
+pub(crate) fn clip_cols(s: &str, max_cols: usize) -> String {
+    let mut out = String::new();
+    let mut cols = 0;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cols + w > max_cols {
+            break;
+        }
+        out.push(ch);
+        cols += w;
+    }
+    out
+}
 
 /// What one unsettled tool call is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,14 +149,21 @@ pub fn animating(entries: &[Entry]) -> bool {
     entries.iter().any(|e| e.doing == Doing::Running)
 }
 
-/// The separator / in-flight row at `width`:
-/// - When idle (`entries` empty and not `streaming`), a clean horizontal rule
-///   (`─`) in the divider style so the transcript and compose area are clearly
-///   separated without an empty tinted slab.
-/// - When `streaming` with no unsettled tool calls, a subtle animated
-///   `─ ◐ streaming… ───` indicator on the rule.
-/// - When tool calls are in flight, each entry as a tinted chip followed by a
-///   rule filling the rest of the width. Always exactly `width` display cells.
+/// Context-level live telemetry and posture shown on the separator strip
+/// alongside unsettled tool calls.
+#[derive(Debug, Clone, Default)]
+pub struct StripHud<'a> {
+    pub hud: Option<&'a kaijutsu_types::ContextHud>,
+    /// Streaming phase observed on the open block in `ContextMirror`
+    /// (`"thinking"` or `"writing"`), ahead of the next `listContexts` poll.
+    pub open_phase: Option<&'a str>,
+    pub bg_running: u32,
+    pub bg_oldest_age: Option<Duration>,
+    pub bg_failed_code: Option<i32>,
+    pub now_millis: u64,
+}
+
+/// The separator / in-flight row at `width`, with default (empty) [`StripHud`].
 pub fn strip_line(
     entries: &[Entry],
     width: u16,
@@ -143,51 +171,254 @@ pub fn strip_line(
     phase: u8,
     streaming: bool,
 ) -> Line<'static> {
+    strip_line_with_hud(entries, width, palette, phase, streaming, &StripHud::default())
+}
+
+/// The separator / in-flight row at `width`:
+/// - Left side: `⛔ HELD` refusal chip, active gate judging chip, unsettled tool
+///   chips (or live streaming/council phase + token rate + entropy sparkline),
+///   and background shell job chips.
+/// - Right side of the `─` rule: bump streak, residual control count, `--decide`
+///   program, active gate judge, and operational weather glyphs + council timing
+///   when width allows. Always exactly `width` display cells.
+pub fn strip_line_with_hud(
+    entries: &[Entry],
+    width: u16,
+    palette: &Palette,
+    phase: u8,
+    streaming: bool,
+    strip_hud: &StripHud<'_>,
+) -> Line<'static> {
+    use ratatui::style::Style;
+
     let width = usize::from(width.max(1));
-    if entries.is_empty() {
-        if !streaming {
-            return Line::from(Span::styled("─".repeat(width), palette.divider()));
-        }
-        let label = format!("─ {} streaming… ", SPINNER[usize::from(phase % PHASES)]);
-        let label_w = label.chars().count();
-        if label_w >= width {
-            let clipped: String = label.chars().take(width).collect();
-            return Line::from(Span::styled(clipped, palette.status()));
-        }
-        return Line::from(vec![
-            Span::styled("─ ".to_string(), palette.divider()),
-            Span::styled(
-                format!("{} streaming… ", SPINNER[usize::from(phase % PHASES)]),
-                palette.status(),
-            ),
-            Span::styled("─".repeat(width - label_w), palette.divider()),
-        ]);
+    let hud = strip_hud.hud;
+    let spinner = SPINNER[usize::from(phase % PHASES)];
+
+    struct Chip {
+        text: String,
+        style: Style,
+        lead_rule: bool,
+    }
+
+    let mut left: Vec<Chip> = Vec::new();
+    if hud.is_some_and(|h| h.held_refusal) {
+        left.push(Chip {
+            text: " ⛔ HELD · refusal ".to_string(),
+            style: palette.warning(),
+            lead_rule: false,
+        });
+    }
+    if let Some(h) = hud
+        && let Some(tool) = h.judging_tool.as_deref()
+    {
+        let age_ms = strip_hud
+            .now_millis
+            .saturating_sub(h.judging_started_at.unwrap_or(strip_hud.now_millis));
+        let age = crate::status::format_age(Duration::from_millis(age_ms));
+        let gate = h.gate_label.as_deref().map(|g| format!(" ({g})")).unwrap_or_default();
+        left.push(Chip {
+            text: format!(" {spinner} {tool} · judging{gate} · {age} "),
+            style: palette.strip_region(&Doing::Running, phase),
+            lead_rule: false,
+        });
+    }
+    for entry in entries {
+        left.push(Chip {
+            text: format!(" {} ", entry_text(entry, phase)),
+            style: palette.strip_region(&entry.doing, phase),
+            lead_rule: false,
+        });
+    }
+    let has_judging = hud.is_some_and(|h| h.judging_tool.is_some());
+    if entries.is_empty() && !has_judging && streaming {
+        let is_council = hud.is_some_and(|h| h.is_council_backend);
+        let text = if is_council {
+            let word = strip_hud
+                .open_phase
+                .or_else(|| hud.and_then(|h| h.council_phase.as_deref()))
+                .unwrap_or("streaming");
+            let tps = hud
+                .and_then(|h| h.council_tps)
+                .map(|r| format!(" · {r:.1}t/s"))
+                .unwrap_or_default();
+            let ent = hud
+                .and_then(|h| h.council_entropy.as_deref())
+                .map(|e| format!(" · H {e}"))
+                .unwrap_or_default();
+            let ell = if tps.is_empty() && ent.is_empty() { "…" } else { "" };
+            format!("{spinner} {word}{ell}{tps}{ent} ")
+        } else {
+            let word = if strip_hud.open_phase == Some("thinking") {
+                "thinking…"
+            } else {
+                "streaming…"
+            };
+            format!("{spinner} {word} ")
+        };
+        left.push(Chip {
+            text,
+            style: palette.status(),
+            lead_rule: left.is_empty(),
+        });
+    }
+    if strip_hud.bg_running > 0 {
+        let age = strip_hud
+            .bg_oldest_age
+            .map(|d| format!(" · {}", crate::status::format_age(d)))
+            .unwrap_or_default();
+        left.push(Chip {
+            text: format!(" ⚙ {} bg{age} ", strip_hud.bg_running),
+            style: palette.status(),
+            lead_rule: false,
+        });
+    } else if let Some(code) = strip_hud.bg_failed_code {
+        left.push(Chip {
+            text: format!(" ✗ bg exit {code} "),
+            style: palette.warning(),
+            lead_rule: false,
+        });
     }
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
-    for (i, entry) in entries.iter().enumerate() {
-        let text = format!(" {} ", entry_text(entry, phase));
+    for (i, chip) in left.iter().enumerate() {
+        if chip.lead_rule {
+            let full = format!("─ {}", chip.text);
+            let full_w = display_width(&full);
+            if full_w >= width {
+                let clipped = clip_cols(&full, width);
+                let w = display_width(&clipped);
+                spans.push(Span::styled(clipped, chip.style));
+                if w < width {
+                    spans.push(Span::styled(" ".repeat(width - w), palette.divider()));
+                }
+                return Line::from(spans);
+            }
+            spans.push(Span::styled("─ ".to_string(), palette.divider()));
+            spans.push(Span::styled(chip.text.clone(), chip.style));
+            used += full_w;
+            continue;
+        }
         let sep = if i == 0 { 0 } else { 1 };
-        let cell = text.chars().count();
+        let cell = display_width(&chip.text);
         if used + sep + cell > width {
-            let left = width.saturating_sub(used + sep);
-            if left > 1 {
+            let left_cols = width.saturating_sub(used + sep);
+            if left_cols > 1 {
                 if sep == 1 {
                     spans.push(Span::styled(" ".to_string(), palette.divider()));
+                    used += 1;
                 }
-                let clipped: String = text.chars().take(left - 1).collect::<String>() + "…";
-                spans.push(Span::styled(clipped, palette.strip_region(&entry.doing, phase)));
-                used = width;
+                let clipped = clip_cols(&chip.text, left_cols - 1);
+                let w = display_width(&clipped);
+                spans.push(Span::styled(format!("{clipped}…"), chip.style));
+                used += w + 1;
+            } else if left_cols == 1 {
+                if sep == 1 {
+                    spans.push(Span::styled(" ".to_string(), palette.divider()));
+                    used += 1;
+                }
+                spans.push(Span::styled("…".to_string(), chip.style));
+                used += 1;
             }
             break;
         }
         if sep == 1 {
             spans.push(Span::styled(" ".to_string(), palette.divider()));
         }
-        spans.push(Span::styled(text, palette.strip_region(&entry.doing, phase)));
+        spans.push(Span::styled(chip.text.clone(), chip.style));
         used += sep + cell;
     }
+
+    // Assemble right-side posture & council/weather badges, ordered by display
+    // position `(order, priority, text, style)` so low-priority items drop first
+    // on narrow terminals while survivors stay in reading order.
+    let mut right_candidates: Vec<(u8, u8, String, Style)> = Vec::new();
+    if let Some(h) = hud {
+        if h.bump_streak > 0 {
+            let count = if h.bump_limit > 0 {
+                format!("{}/{}", h.bump_streak, h.bump_limit)
+            } else {
+                h.bump_streak.to_string()
+            };
+            let flavor = h
+                .last_bump_flavor
+                .as_deref()
+                .map(|f| format!(" ({f})"))
+                .unwrap_or_default();
+            right_candidates.push((0, 0, format!("bump {count}{flavor}"), palette.warning()));
+        }
+        if h.control_count > 0 {
+            right_candidates.push((1, 2, format!("⌖ ctl×{}", h.control_count), palette.divider()));
+        }
+        if let Some(prog) = h.decide_program.as_deref() {
+            right_candidates.push((2, 3, format!("decide:{prog}"), palette.divider()));
+        }
+        if h.judging_tool.is_none()
+            && let Some(gate) = h.gate_label.as_deref()
+        {
+            right_candidates.push((3, 4, format!("⚖ {gate}"), palette.divider()));
+        }
+        let mut council_tail: Vec<String> = Vec::new();
+        if let Some(vibe) = h.vibe.as_deref() {
+            council_tail.push(vibe.to_string());
+        }
+        if h.is_council_backend && !streaming {
+            if let Some(tps) = h.council_tps {
+                council_tail.push(format!("{tps:.0}t/s"));
+            }
+            if let Some(ttft) = h.council_ttft_ms {
+                if ttft >= 1000 {
+                    council_tail.push(format!("ttft {:.1}s", ttft as f32 / 1000.0));
+                } else {
+                    council_tail.push(format!("ttft {ttft}ms"));
+                }
+            }
+            if let Some(ent) = h.council_entropy.as_deref() {
+                council_tail.push(format!("H {ent}"));
+            }
+        }
+        if !council_tail.is_empty() {
+            let joined = match (h.vibe.is_some(), council_tail.len()) {
+                (true, n) if n > 1 => format!("{} {}", council_tail[0], council_tail[1..].join(" · ")),
+                _ => council_tail.join(" · "),
+            };
+            right_candidates.push((4, 1, joined, palette.status()));
+        }
+    }
+
+    if !right_candidates.is_empty() && used + 4 < width {
+        right_candidates.sort_by_key(|c| c.1);
+        let mut kept: Vec<(u8, String, Style)> = Vec::new();
+        for (order, _prio, text, style) in right_candidates {
+            let mut trial = kept.clone();
+            trial.push((order, text, style));
+            trial.sort_by_key(|c| c.0);
+            let trial_w: usize = 3 // leading `" "` + trailing `" ─"`
+                + trial.iter().map(|(_, t, _)| display_width(t)).sum::<usize>()
+                + trial.len().saturating_sub(1) * 3; // `" · "`
+            if used + 2 + trial_w <= width {
+                kept = trial;
+            }
+        }
+        if !kept.is_empty() {
+            let right_w: usize = 3
+                + kept.iter().map(|(_, t, _)| display_width(t)).sum::<usize>()
+                + kept.len().saturating_sub(1) * 3;
+            let rule_w = width - used - right_w;
+            spans.push(Span::styled("─".repeat(rule_w), palette.divider()));
+            spans.push(Span::styled(" ".to_string(), palette.divider()));
+            for (idx, (_, text, style)) in kept.into_iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::styled(" · ".to_string(), palette.divider()));
+                }
+                spans.push(Span::styled(text, style));
+            }
+            spans.push(Span::styled(" ─".to_string(), palette.divider()));
+            return Line::from(spans);
+        }
+    }
+
     if used < width {
         spans.push(Span::styled("─".repeat(width - used), palette.divider()));
     }
@@ -469,18 +700,101 @@ mod tests {
     }
 
     #[test]
-    fn one_line_arg_is_the_single_string_member_or_nothing() {
-        assert_eq!(one_line_arg(r#"{"command":"kj ledger list"}"#).as_deref(), Some("kj ledger list"));
-        assert_eq!(one_line_arg(r#"{"path":"a.rs"}"#).as_deref(), Some("a.rs"));
-        assert_eq!(one_line_arg("\"bare\"").as_deref(), Some("bare"));
-        assert_eq!(
-            one_line_arg("{\"command\":\"cat <<'EOF'\\nline one\\nEOF\"}").as_deref(),
-            Some("cat <<'EOF' line one EOF"),
-            "a heredoc folds onto one line"
-        );
-        assert_eq!(one_line_arg(r#"{"path":"a.rs","range":"1:4"}"#), None, "two members is a shape, not an arg");
-        assert_eq!(one_line_arg(r#"{"n":3}"#), None);
-        assert_eq!(one_line_arg("not json"), None);
-        assert_eq!(one_line_arg(r#"{"command":"   "}"#), None);
+    fn strip_line_unicode_width_accuracy() {
+        let ctx = ContextId::new();
+        let c = call(ctx, 1, Status::Waiting, "shell", r#"{"command":"cargo test"}"#, 0);
+        let r = result(ctx, 2, Status::Waiting, c.id, "gate", 0);
+        let asks = BTreeMap::from([(c.id, "01a0686d-895e-7b31-aa17-e497ed849f67".to_string())]);
+        let waiting = entries([&c, &r].into_iter(), 1000, &asks);
+        for width in [24u16, 80] {
+            let line = strip_line(&waiting, width, &Palette::builtin(), 0, false);
+            let rendered = text(&line);
+            assert_eq!(UnicodeWidthStr::width(rendered.as_str()), usize::from(width), "width {width}");
+        }
+
+        let c_emoji = call(ctx, 3, Status::Running, "shell", r#"{"command":"🌊🔍 cargo test"}"#, 0);
+        let entries_emoji = entries([&c_emoji].into_iter(), 1000, &NoAsks::new());
+        for width in [20u16, 80] {
+            let line = strip_line(&entries_emoji, width, &Palette::builtin(), 0, false);
+            let rendered = text(&line);
+            assert_eq!(UnicodeWidthStr::width(rendered.as_str()), usize::from(width), "emoji width {width}");
+        }
+    }
+
+    #[test]
+    fn strip_hud_renders_refusal_judging_background_posture_and_council_vibe() {
+        let hud = kaijutsu_types::ContextHud {
+            is_council_backend: true,
+            held_refusal: true,
+            control_count: 2,
+            decide_program: Some("haiku".into()),
+            gate_label: Some("jev-1.13".into()),
+            bump_streak: 1,
+            bump_limit: 3,
+            last_bump_flavor: Some("network".into()),
+            judging_tool: None,
+            judging_started_at: None,
+            vibe: Some("🌊🔍".into()),
+            council_phase: None,
+            council_tps: Some(58.4),
+            council_ttft_ms: Some(140),
+            council_entropy: Some("▂▃▅▂".into()),
+        };
+        let strip_hud = StripHud {
+            hud: Some(&hud),
+            open_phase: None,
+            bg_running: 1,
+            bg_oldest_age: Some(Duration::from_secs(12)),
+            bg_failed_code: None,
+            now_millis: 50_000,
+        };
+        let wide = text(&strip_line_with_hud(&[], 130, &Palette::builtin(), 0, false, &strip_hud));
+        assert_eq!(UnicodeWidthStr::width(wide.as_str()), 130);
+        assert!(wide.contains("⛔ HELD · refusal"), "{wide:?}");
+        assert!(wide.contains("⚙ 1 bg · 12s"), "{wide:?}");
+        assert!(wide.contains("bump 1/3 (network)"), "{wide:?}");
+        assert!(wide.contains("⌖ ctl×2"), "{wide:?}");
+        assert!(wide.contains("decide:haiku"), "{wide:?}");
+        assert!(wide.contains("⚖ jev-1.13"), "{wide:?}");
+        assert!(wide.contains("🌊🔍 58t/s · ttft 140ms · H ▂▃▅▂"), "{wide:?}");
+
+        // Narrow widths drop lower-priority right items while keeping exact column count.
+        for width in [16u16, 42, 68, 96] {
+            let line = strip_line_with_hud(&[], width, &Palette::builtin(), 1, false, &strip_hud);
+            let rendered = text(&line);
+            assert_eq!(UnicodeWidthStr::width(rendered.as_str()), usize::from(width), "width {width}: {rendered:?}");
+        }
+
+        // Council streaming renders live phase, token rate, and entropy sparkline on the left.
+        let streaming_hud = StripHud {
+            hud: Some(&kaijutsu_types::ContextHud {
+                is_council_backend: true,
+                vibe: Some("🌊".into()),
+                council_tps: Some(61.2),
+                council_entropy: Some("▁▂▃▂".into()),
+                ..Default::default()
+            }),
+            open_phase: Some("thinking"),
+            ..Default::default()
+        };
+        let stream_line = text(&strip_line_with_hud(&[], 90, &Palette::builtin(), 1, true, &streaming_hud));
+        assert_eq!(UnicodeWidthStr::width(stream_line.as_str()), 90);
+        assert!(stream_line.contains("◓ thinking · 61.2t/s · H ▁▂▃▂"), "{stream_line:?}");
+        assert!(stream_line.contains("🌊"), "{stream_line:?}");
+
+        // Active gate model call renders animated judging chip on the left.
+        let judging_hud = StripHud {
+            hud: Some(&kaijutsu_types::ContextHud {
+                gate_label: Some("jev-1.13".into()),
+                judging_tool: Some("shell_write".into()),
+                judging_started_at: Some(1_000),
+                ..Default::default()
+            }),
+            now_millis: 3_000,
+            ..Default::default()
+        };
+        let judging_line = text(&strip_line_with_hud(&[], 80, &Palette::builtin(), 0, true, &judging_hud));
+        assert_eq!(UnicodeWidthStr::width(judging_line.as_str()), 80);
+        assert!(judging_line.contains("◐ shell_write · judging (jev-1.13) · 2s"), "{judging_line:?}");
     }
 }

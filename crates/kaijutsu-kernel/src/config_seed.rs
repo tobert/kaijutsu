@@ -62,6 +62,11 @@ pub const DEFAULT_GUARDIAN_POLICY: &str = include_str!("../../../assets/defaults
 pub const DEFAULT_COUNCIL_DIRECTION_CHECK: &str =
     include_str!("../../../assets/defaults/council/direction-check.json");
 
+/// Embedded council spec for operational weather riding decisions, seeded to
+/// `/config/kernel/council/vibe.json`.
+pub const DEFAULT_COUNCIL_VIBE: &str =
+    include_str!("../../../assets/defaults/council/vibe.json");
+
 /// Embedded continuation-window policy for automatic gate-resume turns.
 pub const DEFAULT_CONTINUATION_CONFIG: &str =
     include_str!("../../../assets/defaults/continuation.toml");
@@ -121,6 +126,7 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("council/bump.md"), DEFAULT_COUNCIL_BUMP_MESSAGE),
         (config_path("council/program-gate.json"), DEFAULT_COUNCIL_PROGRAM_GATE),
         (config_path("council/direction-check.json"), DEFAULT_COUNCIL_DIRECTION_CHECK),
+        (config_path("council/vibe.json"), DEFAULT_COUNCIL_VIBE),
         (config_path("council/guardian.md"), DEFAULT_GUARDIAN_POLICY),
         (config_path("continuation.toml"), DEFAULT_CONTINUATION_CONFIG),
         (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
@@ -288,6 +294,11 @@ mod tests {
         assert!(names.contains(&config_path("council/shell-gate.json").as_str()));
         assert!(names.contains(&config_path("council/program-gate.json").as_str()));
         assert!(names.contains(&config_path("council/direction-check.json").as_str()));
+        assert!(names.contains(&config_path("council/vibe.json").as_str()));
+        let vibe_json: serde_json::Value = serde_json::from_str(DEFAULT_COUNCIL_VIBE).expect("vibe.json is JSON");
+        let vibe_spec = gogi_proto::spec::parse_spec(&vibe_json, &gogi_proto::spec::SpecRules::default())
+            .expect("vibe.json parses as a valid council v2 spec");
+        assert_eq!(vibe_spec.name, "vibe");
         assert!(names.contains(&config_path("continuation.toml").as_str()));
         assert!(names.contains(&config_path("distillation.md").as_str()));
         assert!(names.contains(&config_path("continuation.md").as_str()));

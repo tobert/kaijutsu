@@ -31,6 +31,8 @@ min_sweep="$(echo $info | jq -r '.env.BANTO_MIN_SWEEP_SECS // "3000"')"
 idle_sweep="$(echo $info | jq -r '.env.BANTO_IDLE_SWEEP // "1"')"
 born_ctx="$(echo $info | jq -r '.env.BANTO_CTX_ID // ""')"
 born_epoch="$(echo $info | jq -r '.env.BANTO_BORN_EPOCH // ""')"
+who="$(echo $info | jq -r '.performer_name // "banto"')"
+board_seen="$(echo $info | jq -r '.env.BANTO_BOARD_SEEN_EPOCH // ""')"
 
 # Track this context's own age (resets cleanly after a rotation).
 if [[ "$born_ctx" != "$ctx_id" ]] || [[ -z "$born_epoch" ]]; then
@@ -38,7 +40,15 @@ if [[ "$born_ctx" != "$ctx_id" ]] || [[ -z "$born_epoch" ]]; then
   kj context set --env "BANTO_CTX_ID=$ctx_id"
   kj context set --env "BANTO_BORN_EPOCH=$now"
 fi
+if [[ -z "$board_seen" ]]; then
+  board_seen="$now"
+  kj context set --env "BANTO_BOARD_SEEN_EPOCH=$now"
+fi
 age_hrs=$(( (now - born_epoch) / 3600 ))
+board_elapsed=$((now - board_seen))
+if [[ "$board_elapsed" -lt 1 ]]; then
+  board_elapsed=1
+fi
 
 # -- probes: raw data, never exit nonzero on probe failure.
 urgent=0
@@ -68,7 +78,20 @@ else
   roster_count="$(echo $raw_roster | jq -r 'length')"
 fi
 
-state_sig="asks=$asks_count:roster=$roster_count"
+set +e
+raw_board="$(kj board recent --board "${who}/${who}" --others --since "${board_elapsed}s" --limit 10 --json)"
+rc_board=$?
+set -e
+if [[ "$rc_board" -ne 0 ]]; then
+  board_count="0"
+else
+  board_count="$(echo $raw_board | jq -r 'length')"
+  if [[ "$board_count" -gt 0 ]]; then
+    urgent=1
+  fi
+fi
+
+state_sig="asks=$asks_count:board=$board_count:roster=$roster_count"
 changed=0
 if [[ "$state_sig" != "$last_state" ]]; then
   changed=1

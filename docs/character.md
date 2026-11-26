@@ -6,7 +6,7 @@ Design and current behavior. Built: the sheet, the keyring, attribution, the han
 
 | Part | Contract |
 |---|---|
-| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, `root_ctx`, `rc_dir` (directory under `/config/rc/`), and root pointers `console_ctx` and `mcp_hub_ctx`. `kj character create [--root] [--rc <dir>]|list|show|set --root|--no-root|--rc <dir>|--console <ctx>|--no-console|retire`. |
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, `root_ctx`, `rc_dir` (directory under `/config/rc/`), `accepts_pings` (default `true`), and root pointers `console_ctx` and `mcp_hub_ctx`. `kj character create [--root] [--rc <dir>]|list|show|set --root|--no-root|--rc <dir>|--console <ctx>|--no-console|--pings|--no-pings|retire`. |
 | Bootstrap | `kaijutsu-server bootstrap` runs `init`, creates missing shipped characters, and binds console models. `kaijutsu-server init --as <name> --key <pubkey-file>` creates the first root character. |
 | Root context | Each live root character has one `root_ctx`: labeled with the character's name, played by it, with no parent and no senpai (root console). |
 | Person | A person is a root character. Contexts performed by a person run no model turns, draft as shell, and skip self-review checks. |

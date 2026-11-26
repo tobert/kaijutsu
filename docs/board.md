@@ -29,8 +29,8 @@ Three mechanisms carry text in Kaijutsu. Keep them separate:
 | **Board** | `Topic` documents + `boards` / `board_topics` rows | No | Never | Shared posting rooms, task scratchpads, handoffs, and exomemory. |
 
 Drift is direct messages; boards are posting rooms. They compose without
-merging: post detail to a board topic, then `kj drift push .senpai` a short
-pointer when someone needs attention right away.
+merging: post detail to a board topic, then `kj ping <target>` (or
+`kj drift push .senpai`) when another context needs to take a turn soon.
 
 ## Ownership, coordination, and lifecycle
 
@@ -55,9 +55,10 @@ separate kernel-global board scope.
   senpai (such as `banto`) share one coordination board without sharing a
   conversation.
 - **Rotation (`kj context rotate`):** Copies `contexts.board_id` onto the
-  successor context before archiving the predecessor. The predecessor keeps its
-  `board_id` pointer so any live kohai whose `senpai_ctx` has not been
-  reparented yet can still reach the same board through `.senpai`.
+  successor context before archiving the predecessor and reparents live kohai
+  to the successor. Both the successor and its kohai continue to reach the same
+  board through `.` and `.senpai`, while the predecessor keeps its `board_id`
+  pointer for history.
 - **Fork (`kj fork`):** Does not copy `board_id` by fork provenance; the child
   has `senpai_ctx` pointing at its parent, so it already reaches the parent's
   working board as `.senpai` and keeps its own `.` empty unless used.

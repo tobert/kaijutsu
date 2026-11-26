@@ -29,7 +29,7 @@ pub(crate) const SENPAI_VERBS: &[&str] = &[
 #[cfg(test)]
 pub(crate) const WORKER_VERBS: &[&str] = &[
     "block", "board", "cache", "cas", "context", "diff", "drift", "fork", "stage", "handoff",
-    "kaish", "models", "search", "shadow", "synth", "vfs", "vi", "wait", "watch", "workspace",
+    "kaish", "models", "ping", "search", "shadow", "synth", "vfs", "vi", "wait", "watch", "workspace",
 ];
 
 /// Short forms of top-level verbs, and the verb each one names.

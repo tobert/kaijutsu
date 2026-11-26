@@ -117,13 +117,61 @@ impl Client {
         let max_tokens = reply_max_tokens(&self.name, opts.required_max_tokens()?, identity.limits.context_tokens)?;
         let sample = (opts.temperature.is_some() || opts.top_p.is_some())
             .then(|| Sample { temperature: opts.temperature, top_p: opts.top_p, ..Sample::default() });
+
+        let mut decisions = Vec::new();
+        let mut ride_spec = None;
+        use crate::vfs::VfsOps as _;
+        if opts.ride_vibe && identity.has(Capability::Ride) {
+            let vibe_path = kaijutsu_types::paths::config_path("council/vibe.json");
+            let mut vibe_bytes = None;
+            if let Some(vfs) = &opts.vfs {
+                match vfs.read_all(std::path::Path::new(&vibe_path)).await {
+                    Ok(b) => vibe_bytes = Some(b),
+                    Err(e) if e.is_not_found() => {
+                        let config_root = std::path::Path::new(kaijutsu_types::paths::CONFIG_ROOT);
+                        if vfs.read_all(config_root).await.is_ok() || vfs.readdir(config_root).await.is_ok() {
+                            // /config/kernel mounted, operator deleted vibe.json -> skip riding
+                        } else {
+                            vibe_bytes = Some(crate::config_seed::DEFAULT_COUNCIL_VIBE.as_bytes().to_vec());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to read council/vibe.json: {e}");
+                    }
+                }
+            } else {
+                vibe_bytes = Some(crate::config_seed::DEFAULT_COUNCIL_VIBE.as_bytes().to_vec());
+            }
+
+            if let Some(bytes) = vibe_bytes {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                        match gogi_proto::spec::parse_spec(&val, &gogi_proto::spec::SpecRules::default()) {
+                            Ok(spec) => {
+                                self.ensure_spec(&turn, &spec).await.map_err(|(_, e)| e)?;
+                                decisions.push(gogi_proto::generation::RidingDecision {
+                                    spec_id: spec.id(),
+                                    ask: None,
+                                    when: gogi_proto::generation::RideWhen::After,
+                                });
+                                ride_spec = Some(spec);
+                            }
+                            Err(e) => {
+                                tracing::warn!("failed to parse council/vibe.json spec: {e:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let request = GenerationRequest {
             model: identity.model.clone(),
             context: Context { thinking, tools, queue: None, control: opts.controls.clone(), messages },
             max_tokens,
             sample,
             stream: Some(true),
-            decisions: Vec::new(),
+            decisions,
             class: None,
             priority: None,
             output: None,
@@ -131,19 +179,33 @@ impl Client {
         };
         let started = std::time::Instant::now();
         let mut recorded = false;
+        let client_self = self.clone();
+        let ride_spec_clone = ride_spec;
         let (slot, inner) = self
             .call(&turn, true, |_| {
                 // A `429` resend inside one call is the same request; it is written once.
                 if !std::mem::replace(&mut recorded, true) {
                     crate::llm::request_dump::record(
-                        opts.trace.as_deref(), &self.name, &opts.model, &self.base_url,
+                        opts.trace.as_deref(), &client_self.name, &opts.model, &client_self.base_url,
                         opts.system.as_deref(), &history, &request,
                     );
                 }
-                async {
-                    let opened = self.client.generate_stream(&request, self.timeout).await;
+                let client_ref = client_self.clone();
+                let spec_ref = ride_spec_clone.clone();
+                let turn_ref = turn.clone();
+                let req_ref = request.clone();
+                async move {
+                    let mut opened = client_ref.client.generate_stream(&req_ref, client_ref.timeout).await;
+                    if opened.as_ref().is_err_and(|e| e.status() == Some(404)) && !req_ref.decisions.is_empty() {
+                        if let Some(spec) = &spec_ref {
+                            client_ref.specs.lock().remove(&spec.id());
+                            if client_ref.ensure_spec(&turn_ref, spec).await.is_ok() {
+                                opened = client_ref.client.generate_stream(&req_ref, client_ref.timeout).await;
+                            }
+                        }
+                    }
                     if opened.as_ref().is_err_and(CouncilError::refuses_thinking) {
-                        self.forget_identity();
+                        client_ref.forget_identity();
                     }
                     opened
                 }
@@ -160,6 +222,9 @@ impl Client {
             first_token: None,
             slot,
             reply_identity: Some(ReplyIdentity { model: identity.model, weight_hash: identity.weight_hash }),
+            live_council: opts.live_council,
+            last_tps_tenths: None,
+            entropies: Vec::new(),
         })
     }
 }

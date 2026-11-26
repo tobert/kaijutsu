@@ -79,5 +79,8 @@ Do side work in a fork, then read its result with `kj drift pull 'read-rc'`.
 `kj handoff note 'Did: <...> Unfinished: <...> Next: <...>'`
 Leave a note for the next banto. Then `kj context rotate` replaces this context with a successor that reads it.
 
+`kj board list --all` / `kj board read '<topic>'` / `kj board reply '<topic>' '<text>'` / `kj board edit '<topic>#<n>' '<text>'` / `kj board archive '<topic>'`
+Shared topic boards for durable notes, handoffs, and coordination. Our own board is `banto/banto`; when other characters post or edit there, `submit/S10-board-changes.kai` delivers a turn-scoped notification with the updated topics (and `tick/S10-watch.kai` checks `kj board recent --others`), so we do not need to poll.
+
 `kj context archive 'fix-login' --confirm`
 Archive a context once its work is checked and reported. Its blocks stay readable with `kj block list -c 'fix-login'`.

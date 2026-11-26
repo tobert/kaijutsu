@@ -25,6 +25,7 @@ pub mod editor;
 pub mod execution;
 pub mod file_tools;
 pub mod flows;
+pub mod hud;
 pub mod hyoushigi;
 pub mod approval_identity;
 pub mod kernel;

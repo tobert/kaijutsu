@@ -1675,6 +1675,18 @@ async fn board_list_all_and_empty_hint_and_compact_read_data() {
     let post0 = &data["posts"].as_array().unwrap()[0];
     assert_eq!(post0["number"].as_u64(), Some(1));
     assert!(post0.get("content").is_none(), "post content should not be duplicated in data: {post0}");
+
+    // `kj board recent --others` excludes topics whose latest post is by the caller.
+    let alice_others = d
+        .dispatch(&[s("board"), s("recent"), s("--board"), s("alice/notes"), s("--others")], &alice)
+        .await;
+    assert!(alice_others.is_ok());
+    assert!(alice_others.message().contains("(no recent topics)"), "{}", alice_others.message());
+    let bob_others = d
+        .dispatch(&[s("board"), s("recent"), s("--board"), s("alice/notes"), s("--others")], &bob)
+        .await;
+    assert!(bob_others.is_ok());
+    assert!(bob_others.message().contains("Hello"), "{}", bob_others.message());
 }
 
 #[test]
