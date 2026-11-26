@@ -3632,6 +3632,7 @@ async fn run_llm_stream(
         // Process stream events
         let attempt_start_block = last_block_id;
         let mut open_content: Option<OpenContent> = None;
+        let mut step_text_block: Option<kaijutsu_types::BlockId> = None;
         // Each pending invocation already has a durable call block, in the
         // order the provider sent the calls. A call whose arguments did not
         // parse carries the error it is answered with instead of dispatching;
@@ -3789,6 +3790,7 @@ async fn run_llm_stream(
                     turn_lease.track_block(block_id);
                     last_block_id = block_id;
                     open_content = Some(OpenContent::Text(block_id));
+                    step_text_block = Some(block_id);
                     // This is the turn's model-text output. A later text
                     // block in the same turn supersedes it — Completed
                     // carries the LAST one, the model's final say.
@@ -3872,6 +3874,12 @@ async fn run_llm_stream(
                     )?;
                     if let Some(crate::llm::UsageExtra::Council(c)) = &extra {
                         kernel.hud().record_council_done(context_id, c);
+                        if let Some(block_id) = step_text_block
+                            && let Some(stamp) = crate::hud::council_divider_stamp(c)
+                            && let Err(error) = documents.set_summary(context_id, &block_id, stamp)
+                        {
+                            tracing::warn!(%error, "Failed to persist council telemetry summary");
+                        }
                     }
 
                     if cancel_deadline.is_some() {

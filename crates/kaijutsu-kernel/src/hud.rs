@@ -228,6 +228,24 @@ pub fn short_decide_program(path: &str) -> Option<String> {
     Some(file.strip_suffix(".json").unwrap_or(file).to_string())
 }
 
+/// Compact post-generation telemetry stamp for a Council `Model` block divider
+/// (`"🌊 · 31.4t/s · H ▂▃▅"`, `"31.4t/s · H ▂▃▅"`).
+pub fn council_divider_stamp(extra: &CouncilUsageExtra) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(vibe) = extra.vibe.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(vibe.to_string());
+    }
+    if let Some(tenths) = extra.tps_tenths.filter(|&t| t > 0) {
+        parts.push(format!("{:.1}t/s", tenths as f32 / 10.0));
+    }
+    if let Some(spark) = extra.entropy_spark.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("H {spark}"));
+    } else if let Some(milli) = extra.mean_entropy_milli {
+        parts.push(format!("H {:.2}", milli as f32 / 1000.0));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// Assemble [`ContextHud`] snapshots for `listed` contexts in one batched pass.
 pub async fn build_context_huds(
     kernel: &crate::Kernel,
@@ -334,5 +352,24 @@ mod tests {
         assert_eq!(short_prob(0.999), "1.00");
         assert_eq!(short_prob(0.04), ".04");
         assert_eq!(short_decide_program("/config/kernel/council/haiku.json"), Some("haiku".into()));
+    }
+
+    #[test]
+    fn council_divider_stamp_formats_vibe_tps_and_entropy() {
+        let mut extra = CouncilUsageExtra::default();
+        assert_eq!(council_divider_stamp(&extra), None);
+
+        extra.tps_tenths = Some(314);
+        extra.entropy_spark = Some("▂▃▅".to_string());
+        assert_eq!(
+            council_divider_stamp(&extra).as_deref(),
+            Some("31.4t/s · H ▂▃▅")
+        );
+
+        extra.vibe = Some("🌊".to_string());
+        assert_eq!(
+            council_divider_stamp(&extra).as_deref(),
+            Some("🌊 · 31.4t/s · H ▂▃▅")
+        );
     }
 }

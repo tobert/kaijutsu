@@ -101,6 +101,31 @@ struct BlockPlan {
     collapsed: bool,
 }
 
+/// Find a telemetry summary on a contiguous non-tool `Text` block sharing
+/// `speaker`, so a `Thinking -> Text` run surfaces the reply's summary on the
+/// run's single divider without overwriting the folded thinking stub.
+fn run_text_summary<'a>(
+    app: &App,
+    info: Option<&kaijutsu_client::ContextInfo>,
+    tail: &'a [BlockSnapshot],
+    speaker: &str,
+) -> Option<&'a str> {
+    for next in tail {
+        if next.status == Status::Draft {
+            continue;
+        }
+        if next.kind == kaijutsu_types::BlockKind::ToolCall || app.speaker_for(next, info) != speaker {
+            break;
+        }
+        if next.kind == kaijutsu_types::BlockKind::Text
+            && let Some(s) = next.summary.as_deref().filter(|s| !s.is_empty())
+        {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// Every block of the current context that belongs in the transcript, with
 /// its speaker, stamp, divider decision and fold resolved.
 ///
@@ -120,24 +145,36 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     let mut out = Vec::new();
     let mut last_speaker: Option<String> = None;
     let mut last_block = None;
-    for block in view.mirror.blocks() {
+    let blocks = view.mirror.blocks();
+    for (idx, block) in blocks.iter().enumerate() {
         if block.status == Status::Draft {
             continue;
         }
         let speaker = app.speaker_for(block, info);
         let pair = crate::present::continues_pair(last_block, block);
-        let show_divider = !pair && last_speaker.as_deref() != Some(speaker.as_str());
+        // Tool calls always keep their pair header so preceding reasoning or
+        // text by the same model does not hide their command or gate verdict.
+        let show_divider = !pair
+            && (block.kind == kaijutsu_types::BlockKind::ToolCall
+                || last_speaker.as_deref() != Some(speaker.as_str()));
         let gap = !pair && speaker_gap(show_divider, last_speaker.as_deref());
         last_speaker = Some(speaker.clone());
         last_block = Some((block.id, block.kind));
         if crate::inflight::takes_from_stream(block) {
             continue;
         }
-        let stamp = match (block.kind, block.summary.as_deref().filter(|s| !s.is_empty())) {
-            (kaijutsu_types::BlockKind::ToolCall, Some(gate)) => {
-                format!("{gate} · {}", wallclock(block.created_at))
+        let meta = match block.kind {
+            kaijutsu_types::BlockKind::ToolCall | kaijutsu_types::BlockKind::Text => {
+                block.summary.as_deref().filter(|s| !s.is_empty())
             }
-            _ => wallclock(block.created_at),
+            kaijutsu_types::BlockKind::Thinking if show_divider => {
+                run_text_summary(app, info, &blocks[idx + 1..], &speaker)
+            }
+            _ => None,
+        };
+        let stamp = match meta {
+            Some(meta) => format!("{meta} · {}", wallclock(block.created_at)),
+            None => wallclock(block.created_at),
         };
         out.push((
             block.clone(),
@@ -1966,5 +2003,58 @@ mod tests {
             drawn[0].contains("jev-1.13 🌊 ✓ .97 · "),
             "expected settled gate stamp on tool divider: {drawn:?}"
         );
+    }
+
+    #[test]
+    fn tool_call_after_thinking_keeps_its_pair_header_and_gate_stamp() {
+        let (mut app, id) = fixture();
+        let thinking = reasoning(id, 1, Status::Done, 2);
+        let mut call = block(
+            id,
+            2,
+            BlockKind::ToolCall,
+            Role::Model,
+            Status::Done,
+            r#"{"command":"cargo test"}"#,
+        );
+        call.tool_name = Some("shell_write".to_string());
+        call.tool_input = Some(r#"{"command":"cargo test"}"#.to_string());
+        call.summary = Some("jev-1.13 🌊 ✓ .97".to_string());
+        let mut res = block(id, 3, BlockKind::ToolResult, Role::Tool, Status::Done, "ok");
+        res.tool_name = Some("shell_write".to_string());
+        res.tool_call_id = Some(call.id);
+        snapshot(&mut app, id, vec![thinking, call, res]);
+
+        let drawn = text_of(&transcript_all_lines(&mut app, 96));
+        let header = drawn
+            .iter()
+            .find(|line| line.starts_with("─ deepseek-v4 · shell_write ─ cargo test"))
+            .unwrap_or_else(|| panic!("expected ToolCall header after Thinking: {drawn:?}"));
+        assert!(
+            header.contains("jev-1.13 🌊 ✓ .97 · "),
+            "expected gate stamp on ToolCall header: {header:?}"
+        );
+    }
+
+    #[test]
+    fn model_divider_before_time_carries_council_summary_and_keeps_thinking_stub() {
+        let (mut app, id) = fixture();
+        let mut thinking = reasoning(id, 1, Status::Done, 3);
+        thinking.summary = Some("check the crate layout".to_string());
+        let mut answer = block(id, 2, BlockKind::Text, Role::Model, Status::Done, "All set.");
+        answer.summary = Some("🌊 · 31.4t/s · H ▂▃▅".to_string());
+        snapshot(&mut app, id, vec![thinking, answer]);
+
+        let drawn = text_of(&transcript_all_lines(&mut app, 96));
+        assert!(
+            drawn[0].starts_with("─ deepseek-v4 · coder ─")
+                && drawn[0].contains("🌊 · 31.4t/s · H ▂▃▅ · "),
+            "expected model telemetry before time on divider: {drawn:?}"
+        );
+        assert_eq!(
+            drawn[1], "▸ thinking · 3 lines · check the crate layout",
+            "thinking stub must preserve its own summary: {drawn:?}"
+        );
+        assert_eq!(drawn[2], "All set.", "{drawn:?}");
     }
 }
