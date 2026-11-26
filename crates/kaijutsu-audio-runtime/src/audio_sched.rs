@@ -119,13 +119,40 @@ fn open_output(name: Option<&str>, failed: Arc<AtomicBool>) -> Result<MixerDevic
     let host = cpal::default_host();
     let device = match name {
         Some(name) => {
-            let mut matches = host.output_devices().map_err(|e| e.to_string())?
-                .filter(|d| d.description().is_ok_and(|description| description.name() == name));
-            let device = matches.next().ok_or_else(|| format!("audio output '{name}' not found; run --list-outputs"))?;
-            if matches.next().is_some() {
-                return Err(format!("audio output '{name}' is ambiguous"));
+            let devices: Vec<_> = host.output_devices().map_err(|e| e.to_string())?.collect();
+            let mut id_matches = devices
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.id().is_ok_and(|id| id.to_string() == name))
+                .map(|(i, _)| i);
+            if let Some(idx) = id_matches.next() {
+                if id_matches.next().is_some() {
+                    return Err(format!("audio output id '{name}' is ambiguous"));
+                }
+                devices.into_iter().nth(idx).expect("index in bounds")
+            } else {
+                let mut name_matches: Vec<usize> = devices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.description().is_ok_and(|description| description.name() == name))
+                    .map(|(i, _)| i)
+                    .collect();
+                match name_matches.len() {
+                    0 => return Err(format!("audio output '{name}' not found; run --list-outputs")),
+                    1 => devices.into_iter().nth(name_matches.remove(0)).expect("index in bounds"),
+                    _ => {
+                        let ids: Vec<String> = name_matches
+                            .iter()
+                            .filter_map(|&i| devices[i].id().ok().map(|id| id.to_string()))
+                            .collect();
+                        return Err(format!(
+                            "audio output '{name}' is ambiguous ({} matches); select one by id via --list-outputs: {}",
+                            name_matches.len(),
+                            ids.join(", ")
+                        ));
+                    }
+                }
             }
-            device
         }
         None => host.default_output_device().ok_or("no default audio output; select --output or use --no-audio")?,
     };
@@ -140,7 +167,13 @@ fn open_output(name: Option<&str>, failed: Arc<AtomicBool>) -> Result<MixerDevic
 pub fn output_names() -> Result<Vec<String>, String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     cpal::default_host().output_devices().map_err(|e| e.to_string())?
-        .map(|device| device.description().map(|description| description.name().to_string()).map_err(|e| e.to_string()))
+        .map(|device| {
+            let name = device.description().map(|d| d.name().to_string()).map_err(|e| e.to_string())?;
+            match device.id() {
+                Ok(id) => Ok(format!("{id}\t{name}")),
+                Err(_) => Ok(name),
+            }
+        })
         .collect()
 }
 
