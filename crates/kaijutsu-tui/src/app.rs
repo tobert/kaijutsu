@@ -307,6 +307,9 @@ pub struct App {
     /// Disabled by default (`KittyStore::disabled()`) for tests and non-Kitty
     /// terminals; enabled in [`crate::run::run`] when detected or requested.
     pub kitty: crate::kitty::KittyStore,
+    /// Cached inline ABC score measurements so `plan_rows` and key paths never
+    /// re-engrave or upload off-screen blocks.
+    pub inline_scores: crate::score::InlineScoreCache,
 }
 
 impl App {
@@ -355,6 +358,7 @@ impl App {
             rotation_primed: HashSet::new(),
             roster_changed: false,
             kitty: crate::kitty::KittyStore::disabled(),
+            inline_scores: crate::score::InlineScoreCache::new(),
         }
     }
 

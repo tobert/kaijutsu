@@ -50,7 +50,7 @@ pub const DIACRITICS: [char; 64] = [
 ];
 
 /// Pixel dimensions of one terminal character cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CellPixels {
     pub width: u16,
     pub height: u16,

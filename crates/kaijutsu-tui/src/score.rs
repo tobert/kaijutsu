@@ -12,7 +12,7 @@
 //!   In `screen`, plain SSH, or `vt100` tests (`!kitty.enabled`), renders
 //!   structured metadata + raw ABC text.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -23,7 +23,7 @@ use kaijutsu_abc::engrave::{
     layout::engrave_systems,
     svg::to_svg,
 };
-use kaijutsu_types::ContentType;
+use kaijutsu_types::{BlockId, BlockSnapshot, ContentType, Status};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
@@ -48,9 +48,14 @@ const FULLSCREEN_MAX_ROWS_PER_SYSTEM: u16 = 18;
 pub enum OpenAbc {
     /// `ContentType::Abc` — authoritative.
     Declared,
-    /// A fenced ```` ```abc ```` code block inside `Plain` or `Markdown`.
-    Fenced { inner: String },
-    /// Bare ABC notation (`X:` header + `K:` key) inside `Plain` or `Markdown`.
+    /// A fenced ```` ```abc ```` code block inside `Plain` or `Markdown`,
+    /// preserving any prose before and after the fence.
+    Fenced {
+        before: String,
+        inner: String,
+        after: String,
+    },
+    /// Bare ABC notation (`X:` header + `K:` key) inside `Plain`.
     Sniffed,
 }
 
@@ -59,18 +64,25 @@ impl OpenAbc {
     pub fn source<'a>(&'a self, block_text: &'a str) -> &'a str {
         match self {
             Self::Declared | Self::Sniffed => block_text,
-            Self::Fenced { inner } => inner.as_str(),
+            Self::Fenced { inner, .. } => inner.as_str(),
         }
     }
 }
 
 /// Decide whether a block can open as an ABC score.
+///
+/// `ContentType::Markdown` only matches explicit ```` ```abc ```` fences so
+/// prose explaining ABC syntax (`X:1`, `K:C`) is never hijacked as a score.
 pub fn openable_abc(content_type: ContentType, text: &str) -> Option<OpenAbc> {
     match content_type {
         ContentType::Abc => Some(OpenAbc::Declared),
-        ContentType::Plain | ContentType::Markdown => {
-            if let Some(inner) = extract_abc_fence(text) {
-                return Some(OpenAbc::Fenced { inner });
+        ContentType::Markdown => {
+            let (before, inner, after) = extract_abc_fence(text)?;
+            Some(OpenAbc::Fenced { before, inner, after })
+        }
+        ContentType::Plain => {
+            if let Some((before, inner, after)) = extract_abc_fence(text) {
+                return Some(OpenAbc::Fenced { before, inner, after });
             }
             if looks_like_bare_abc(text) {
                 return Some(OpenAbc::Sniffed);
@@ -81,32 +93,37 @@ pub fn openable_abc(content_type: ContentType, text: &str) -> Option<OpenAbc> {
     }
 }
 
-/// Extract the first ```` ```abc ```` fenced block from markdown/plain text.
-fn extract_abc_fence(text: &str) -> Option<String> {
-    let mut in_fence = false;
-    let mut buf = String::new();
-    for line in text.lines() {
+/// Extract the first ```` ```abc ```` fenced block along with any prose before
+/// and after it.
+fn extract_abc_fence(text: &str) -> Option<(String, String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut start = None;
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if !in_fence {
-            if let Some(rest) = trimmed.strip_prefix("```") {
-                let lang = rest.trim().to_ascii_lowercase();
-                if lang == "abc" || lang == "abc-notation" {
-                    in_fence = true;
-                }
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            let lang = rest.trim().to_ascii_lowercase();
+            if lang == "abc" || lang == "abc-notation" {
+                start = Some(idx);
+                break;
             }
-        } else if trimmed.starts_with("```") {
-            let trimmed_buf = buf.trim();
-            if !trimmed_buf.is_empty() {
-                return Some(trimmed_buf.to_string());
-            }
-            in_fence = false;
-            buf.clear();
-        } else {
-            buf.push_str(line);
-            buf.push('\n');
         }
     }
-    None
+    let start = start?;
+    let mut end = None;
+    for (idx, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim().starts_with("```") {
+            end = Some(idx);
+            break;
+        }
+    }
+    let end = end?;
+    let inner = lines[start + 1..end].join("\n");
+    if inner.trim().is_empty() {
+        return None;
+    }
+    let before = lines[..start].join("\n").trim().to_string();
+    let after = lines[end + 1..].join("\n").trim().to_string();
+    Some((before, inner.trim().to_string(), after))
 }
 
 /// Heuristic for bare ABC: an `X:` reference line and a `K:` key line.
@@ -273,10 +290,272 @@ pub(crate) fn notation_color(palette: &Palette) -> &'static str {
     }
 }
 
+/// Pre-measured inline ABC layout cached per `(block, version, width, cell_px, fg)`.
+///
+/// Measurement (`plan_rows` / `row_index`) reads `total_rows` directly without
+/// rasterizing or uploading anything to Kitty; drawing (`transcript_window`)
+/// uploads only systems intersecting the visible window.
+#[derive(Debug, Clone)]
+pub struct InlineScoreEntry {
+    before_lines: Vec<Line<'static>>,
+    header: Line<'static>,
+    systems: Vec<EngravedSystem>,
+    footer: Option<Line<'static>>,
+    after_lines: Vec<Line<'static>>,
+    raw_abc: String,
+    pub truncated: bool,
+    pub total_rows: usize,
+}
+
+impl InlineScoreEntry {
+    /// Render only the visible slice `[skip .. skip + take)` of this inline score,
+    /// lazily uploading only systems that intersect the visible viewport.
+    pub fn render_slice(
+        &self,
+        width: u16,
+        skip: usize,
+        take: usize,
+        kitty: &mut KittyStore,
+    ) -> Vec<Line<'static>> {
+        if take == 0 {
+            return Vec::new();
+        }
+        let win_start = skip;
+        let win_end = skip.saturating_add(take);
+        let mut out = Vec::with_capacity(take.min(self.total_rows));
+        let mut cur = 0usize;
+
+        let push_lines = |out: &mut Vec<Line<'static>>, cur: &mut usize, lines: &[Line<'static>]| {
+            for line in lines {
+                if *cur >= win_start && *cur < win_end {
+                    out.push(line.clone());
+                }
+                *cur += 1;
+                if *cur >= win_end {
+                    break;
+                }
+            }
+        };
+
+        push_lines(&mut out, &mut cur, &self.before_lines);
+        if cur < win_end {
+            push_lines(&mut out, &mut cur, std::slice::from_ref(&self.header));
+        }
+        for sys in &self.systems {
+            if cur >= win_end {
+                break;
+            }
+            let sys_rows = usize::from(sys.rows);
+            let sys_end = cur + sys_rows;
+            if sys_end > win_start && cur < win_end {
+                let s_skip = win_start.saturating_sub(cur);
+                let s_take = (win_end - cur.max(win_start)).min(sys_rows.saturating_sub(s_skip));
+                if let Some(img) = kitty.ensure_svg(sys.key, &sys.svg, width, INLINE_MAX_ROWS_PER_SYSTEM) {
+                    let mut pl = placeholder_lines(img.id, img.cols, img.rows);
+                    while pl.len() < sys_rows {
+                        pl.push(Line::default());
+                    }
+                    out.extend(pl.into_iter().skip(s_skip).take(s_take));
+                } else {
+                    for _ in 0..s_take {
+                        out.push(Line::default());
+                    }
+                }
+            }
+            cur = sys_end;
+        }
+        if cur < win_end
+            && let Some(footer) = &self.footer
+        {
+            push_lines(&mut out, &mut cur, std::slice::from_ref(footer));
+        }
+        if cur < win_end {
+            push_lines(&mut out, &mut cur, &self.after_lines);
+        }
+        out
+    }
+
+    /// Plain-text projection with the exact same `total_rows` height, used by
+    /// copy-mode search and yank so `U+10EEEE` placeholder bytes never leak
+    /// into the clipboard or vi registers.
+    pub fn render_plain_lines(&self) -> Vec<Line<'static>> {
+        let mut out = Vec::with_capacity(self.total_rows);
+        out.extend(self.before_lines.iter().cloned());
+        out.push(self.header.clone());
+        let sys_total: usize = self.systems.iter().map(|s| usize::from(s.rows)).sum();
+        let mut raw_iter = self.raw_abc.lines();
+        for _ in 0..sys_total {
+            let text = raw_iter.next().unwrap_or("");
+            out.push(Line::from(text.to_string()));
+        }
+        if let Some(footer) = &self.footer {
+            out.push(footer.clone());
+        }
+        out.extend(self.after_lines.iter().cloned());
+        debug_assert_eq!(out.len(), self.total_rows);
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct InlineCacheKey {
+    block_id: BlockId,
+    version: u64,
+    width: u16,
+    cell_px: CellPixels,
+    fg: &'static str,
+}
+
+/// Per-session cache of measured inline ABC layouts (including negative hits).
+#[derive(Default)]
+pub struct InlineScoreCache {
+    entries: HashMap<InlineCacheKey, Option<InlineScoreEntry>>,
+}
+
+impl InlineScoreCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Measure a settled block for inline ABC rendering without rasterizing or
+    /// uploading any Kitty images. Caches negative results so non-ABC blocks
+    /// cost one hash lookup on subsequent frames and keystrokes.
+    pub fn measure(
+        &mut self,
+        block: &BlockSnapshot,
+        version: u64,
+        width: u16,
+        cell_px: CellPixels,
+        palette: &Palette,
+    ) -> Option<&InlineScoreEntry> {
+        if width < 20 || !matches!(block.status, Status::Done | Status::Error) {
+            return None;
+        }
+        let fg = notation_color(palette);
+        let key = InlineCacheKey {
+            block_id: block.id,
+            version,
+            width,
+            cell_px,
+            fg,
+        };
+        if !self.entries.contains_key(&key) {
+            // Simple cap to keep memory bounded across long sessions.
+            if self.entries.len() >= 1024 {
+                self.entries.clear();
+            }
+            let built = build_inline_entry(block.content_type, &block.content, width, cell_px, palette, fg);
+            self.entries.insert(key, built);
+        }
+        self.entries.get(&key).and_then(|v| v.as_ref())
+    }
+}
+
+fn wrap_prose_lines(text: &str, width: u16, palette: &Palette) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let w = usize::from(width.max(1));
+    let mut out = Vec::new();
+    for para in text.lines() {
+        if para.trim().is_empty() {
+            out.push(Line::default());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in para.split_whitespace() {
+            if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > w {
+                out.push(Line::from(Span::styled(std::mem::take(&mut cur), palette.compose())));
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+        if !cur.is_empty() {
+            out.push(Line::from(Span::styled(cur, palette.compose())));
+        }
+    }
+    out
+}
+
+fn build_inline_entry(
+    content_type: ContentType,
+    text: &str,
+    width: u16,
+    cell_px: CellPixels,
+    palette: &Palette,
+    fg: &'static str,
+) -> Option<InlineScoreEntry> {
+    let how = openable_abc(content_type, text)?;
+    let (before_lines, after_lines) = match &how {
+        OpenAbc::Fenced { before, after, .. } => (
+            wrap_prose_lines(before, width, palette),
+            wrap_prose_lines(after, width, palette),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+    let raw = how.source(text);
+    let tunes = parse_all_tunes(raw).ok()?;
+    let tune = tunes.first()?;
+    let meta = ScoreMeta::from_tune(tune, raw);
+    let mut systems = engrave_measured_systems(
+        raw,
+        0,
+        tune,
+        width,
+        INLINE_MAX_ROWS_PER_SYSTEM,
+        cell_px,
+        fg,
+    );
+    if systems.is_empty() {
+        return None;
+    }
+    let total_systems = systems.len();
+    let truncated = total_systems > INLINE_MAX_SYSTEMS || tunes.len() > 1;
+    systems.truncate(INLINE_MAX_SYSTEMS);
+
+    let tune_note = if tunes.len() > 1 {
+        format!(" · tune 1/{}", tunes.len())
+    } else {
+        String::new()
+    };
+    let header = Line::from(Span::styled(
+        format!("{}{tune_note}  (Ctrl+A s)", meta.summary_line("score")),
+        palette.score_heading(),
+    ));
+    let footer = if total_systems > INLINE_MAX_SYSTEMS {
+        let more = total_systems - INLINE_MAX_SYSTEMS;
+        Some(Line::from(Span::styled(
+            format!(
+                "… +{more} more {} (Ctrl+A s to open full score)",
+                if more == 1 { "system" } else { "systems" }
+            ),
+            palette.score_dim(),
+        )))
+    } else {
+        None
+    };
+
+    let sys_rows: usize = systems.iter().map(|s| usize::from(s.rows)).sum();
+    let total_rows =
+        before_lines.len() + 1 + sys_rows + usize::from(footer.is_some()) + after_lines.len();
+    Some(InlineScoreEntry {
+        before_lines,
+        header,
+        systems,
+        footer,
+        after_lines,
+        raw_abc: raw.to_string(),
+        truncated,
+        total_rows,
+    })
+}
+
 /// Render an ABC block inline for the conversation transcript (Slice 2).
 ///
-/// Returns `None` when Kitty graphics are disabled, when the block is not an
-/// ABC score, or when parsing fails — callers fall back to normal text lines.
+/// Convenience helper for direct unit tests; `render.rs` uses [`InlineScoreCache`]
+/// so measurement never triggers rasterization or off-screen uploads.
 pub fn inline_abc_lines(
     content_type: ContentType,
     text: &str,
@@ -287,45 +566,9 @@ pub fn inline_abc_lines(
     if !kitty.enabled || width < 20 {
         return None;
     }
-    let how = openable_abc(content_type, text)?;
-    let raw = how.source(text);
-    let tune = parse_first_tune(raw).ok()?;
-    let meta = ScoreMeta::from_tune(&tune, raw);
     let fg = notation_color(palette);
-    let systems = engrave_measured_systems(
-        raw,
-        0,
-        &tune,
-        width,
-        INLINE_MAX_ROWS_PER_SYSTEM,
-        kitty.cell_px,
-        fg,
-    );
-    if systems.is_empty() {
-        return None;
-    }
-
-    let mut out = Vec::new();
-    let header = format!("{}  (Ctrl+A s)", meta.summary_line("score"));
-    out.push(Line::from(Span::styled(header, palette.score_heading())));
-
-    let shown = systems.len().min(INLINE_MAX_SYSTEMS);
-    for sys in systems.iter().take(shown) {
-        if let Some(img) = kitty.ensure_svg(sys.key, &sys.svg, width, INLINE_MAX_ROWS_PER_SYSTEM) {
-            out.extend(placeholder_lines(img.id, img.cols, img.rows));
-        }
-    }
-    if systems.len() > shown {
-        let more = systems.len() - shown;
-        out.push(Line::from(Span::styled(
-            format!(
-                "… +{more} more {} (Ctrl+A s to open full score)",
-                if more == 1 { "system" } else { "systems" }
-            ),
-            palette.score_dim(),
-        )));
-    }
-    Some(out)
+    let entry = build_inline_entry(content_type, text, width, kitty.cell_px, palette, fg)?;
+    Some(entry.render_slice(width, 0, entry.total_rows, kitty))
 }
 
 /// Cached per-system engravings for one tune at a fixed `(width, cell_px, fg)`.
@@ -705,11 +948,47 @@ mod tests {
         assert_eq!(openable_abc(ContentType::Plain, "hello world"), None);
         assert_eq!(openable_abc(ContentType::Plain, SAMPLE_ABC), Some(OpenAbc::Sniffed));
 
-        let fenced = format!("Here is a tune:\n```abc\n{SAMPLE_ABC}```\n");
-        let Some(OpenAbc::Fenced { inner }) = openable_abc(ContentType::Markdown, &fenced) else {
+        let fenced = format!("Here is a tune:\n```abc\n{SAMPLE_ABC}```\nI raised the tempo.\n");
+        let Some(OpenAbc::Fenced { before, inner, after }) = openable_abc(ContentType::Markdown, &fenced) else {
             panic!("expected fenced abc");
         };
+        assert_eq!(before, "Here is a tune:");
         assert!(inner.starts_with("X:1"));
+        assert_eq!(after, "I raised the tempo.");
+
+        // Bare ABC in Markdown prose (e.g. explaining ABC syntax) is NOT hijacked.
+        assert_eq!(openable_abc(ContentType::Markdown, SAMPLE_ABC), None);
+    }
+
+    #[test]
+    fn mixed_markdown_preserves_prose_and_plain_lines_omit_placeholders() {
+        let palette = Palette::tokyo_midnight();
+        let mut kitty = KittyStore::enabled(CellPixels { width: 10, height: 20 });
+        let md = format!("Intro prose.\n```abc\n{SAMPLE_ABC}```\nOutro prose.\n");
+        let entry = build_inline_entry(
+            ContentType::Markdown,
+            &md,
+            80,
+            kitty.cell_px,
+            &palette,
+            notation_color(&palette),
+        )
+        .expect("builds inline entry");
+
+        // Measurement queued zero Kitty uploads.
+        assert!(kitty.take_pending_wire().is_empty());
+
+        let drawn = entry.render_slice(80, 0, entry.total_rows, &mut kitty);
+        assert_eq!(drawn.len(), entry.total_rows);
+        let first: String = drawn[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let last: String = drawn.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first.contains("Intro prose."), "got {first:?}");
+        assert!(last.contains("Outro prose."), "got {last:?}");
+
+        // Plain lines for copy-mode search/yank match total_rows and never leak U+10EEEE.
+        let plain = entry.render_plain_lines();
+        assert_eq!(plain.len(), entry.total_rows);
+        assert!(plain.iter().all(|l| l.spans.iter().all(|s| !s.content.contains(PLACEHOLDER_CHAR))));
     }
 
     #[test]

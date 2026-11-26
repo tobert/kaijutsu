@@ -266,10 +266,93 @@ fn waiting_line(app: &App) -> Option<Line<'static>> {
     ))
 }
 
-/// Render one block's lines for the transcript: inline Kitty ABC score when
-/// graphics are enabled and the block holds an uncollapsed parseable ABC tune,
-/// otherwise the wrap cache's normal styled text lines.
-fn block_rendered_lines(
+/// Measure a block's row count without rasterizing or uploading Kitty images.
+///
+/// For settled uncollapsed ABC blocks when Kitty graphics are active, this hits
+/// `app.inline_scores` (O(1) on repeat frames and keystrokes); otherwise it
+/// uses the wrap cache.
+fn measure_block_rows(
+    app: &mut App,
+    block: &BlockSnapshot,
+    item: &BlockPlan,
+    performer: &str,
+    width: u16,
+) -> usize {
+    let palette = app.palette;
+    if !item.collapsed && app.kitty.enabled && is_settled(block) {
+        let ver = crate::present::block_version(block, item.collapsed);
+        if let Some(entry) = app.inline_scores.measure(block, ver, width, app.kitty.cell_px, &palette) {
+            return usize::from(item.show_divider) + entry.total_rows;
+        }
+    }
+    let view = block_view(item, performer, block);
+    let lineage = app.lineage_for(block);
+    let view = crate::present::BlockView { lineage, ..view };
+    app.wrap.lines(block, &view, width, &palette).len()
+}
+
+/// Render the visible slice `[skip .. skip + room)` of one block for the
+/// transcript window, returning `(lines, score_truncated)`.
+///
+/// Only visible inline ABC systems are rasterized/uploaded to Kitty.
+fn render_block_window_slice(
+    app: &mut App,
+    block: &BlockSnapshot,
+    item: &BlockPlan,
+    performer: &str,
+    width: u16,
+    skip: usize,
+    room: usize,
+) -> (Vec<Line<'static>>, bool) {
+    let palette = app.palette;
+    let view = block_view(item, performer, block);
+    let lineage = app.lineage_for(block);
+    let view = crate::present::BlockView { lineage, ..view };
+    if !item.collapsed && app.kitty.enabled && is_settled(block) {
+        let ver = crate::present::block_version(block, item.collapsed);
+        let entry = app
+            .inline_scores
+            .measure(block, ver, width, app.kitty.cell_px, &palette)
+            .cloned();
+        if let Some(entry) = entry {
+            let mut out = Vec::with_capacity(room);
+            let mut rem_skip = skip;
+            let mut rem_take = room;
+            if item.gap {
+                if rem_skip == 0 && rem_take > 0 {
+                    out.push(Line::default());
+                    rem_take -= 1;
+                } else {
+                    rem_skip = rem_skip.saturating_sub(1);
+                }
+            }
+            if item.show_divider {
+                if rem_skip == 0 && rem_take > 0 {
+                    let (header, _) = crate::present::divider_text(&view, width);
+                    out.push(Line::from(ratatui::text::Span::styled(header, palette.divider())));
+                    rem_take -= 1;
+                } else {
+                    rem_skip = rem_skip.saturating_sub(1);
+                }
+            }
+            if rem_take > 0 {
+                out.extend(entry.render_slice(width, rem_skip, rem_take, &mut app.kitty));
+            }
+            return (out, entry.truncated);
+        }
+    }
+    let mut block_lines = app.wrap.lines(block, &view, width, &palette).to_vec();
+    if item.gap {
+        block_lines.insert(0, Line::default());
+    }
+    let drawn: Vec<Line<'static>> = block_lines.into_iter().skip(skip).take(room).collect();
+    (drawn, false)
+}
+
+/// Render one block's plain-text lines for copy-mode search and yank, matching
+/// the exact row count of [`measure_block_rows`] without emitting `U+10EEEE`
+/// placeholder glyphs or triggering Kitty uploads.
+fn render_block_plain_lines(
     app: &mut App,
     block: &BlockSnapshot,
     item: &BlockPlan,
@@ -280,21 +363,16 @@ fn block_rendered_lines(
     let view = block_view(item, performer, block);
     let lineage = app.lineage_for(block);
     let view = crate::present::BlockView { lineage, ..view };
-    if !item.collapsed
-        && app.kitty.enabled
-        && let Some(mut score_lines) = crate::score::inline_abc_lines(
-            block.content_type,
-            &block.content,
-            width,
-            &palette,
-            &mut app.kitty,
-        )
-    {
-        if item.show_divider {
-            let (header, _) = crate::present::divider_text(&view, width);
-            score_lines.insert(0, Line::from(ratatui::text::Span::styled(header, palette.divider())));
+    if !item.collapsed && app.kitty.enabled && is_settled(block) {
+        let ver = crate::present::block_version(block, item.collapsed);
+        if let Some(entry) = app.inline_scores.measure(block, ver, width, app.kitty.cell_px, &palette) {
+            let mut lines = entry.render_plain_lines();
+            if item.show_divider {
+                let (header, _) = crate::present::divider_text(&view, width);
+                lines.insert(0, Line::from(ratatui::text::Span::styled(header, palette.divider())));
+            }
+            return lines;
         }
-        return score_lines;
     }
     app.wrap.lines(block, &view, width, &palette).to_vec()
 }
@@ -339,20 +417,14 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
             row += block_rows;
             continue;
         }
-        let mut block_lines = block_rendered_lines(app, block, item, &performer, width);
-        if item.gap {
-            block_lines.insert(0, Line::default());
-        }
         let skip = start.saturating_sub(row);
-        let mut drawn: Vec<Line<'static>> = block_lines.into_iter().skip(skip).collect();
         let room = height - lines.len();
-        // The head may be above the window without hiding anything the
-        // player is reading; a tail the window could not fit is a different
-        // matter, and so is a fold, whose text was never drawn.
-        let cropped = drawn.len() > room;
-        drawn.truncate(room);
+        let remaining_in_block = block_rows.saturating_sub(skip);
+        let cropped = remaining_in_block > room;
+        let (drawn, score_truncated) =
+            render_block_window_slice(app, block, item, &performer, width, skip, room);
         if !drawn.is_empty() {
-            let whole = !cropped && !item.collapsed;
+            let whole = !cropped && !item.collapsed && !score_truncated;
             edge = Some((block.id, whole.then(|| block.content.chars().count() as u64)));
         }
         lines.extend(drawn);
@@ -396,7 +468,7 @@ fn plan_rows(app: &mut App, width: u16) -> Option<PlannedRows> {
     let performer = performer_of(app);
     let mut rows: Vec<crate::copy::RowBlock> = Vec::with_capacity(plan.len());
     for (block, item) in &plan {
-        let counted = block_rendered_lines(app, block, item, &performer, width).len();
+        let counted = measure_block_rows(app, block, item, &performer, width);
         // `render_block` puts the divider first when there is one, and the
         // gap row goes above that.
         let leading = usize::from(item.gap) + usize::from(item.show_divider);
@@ -430,7 +502,7 @@ pub fn transcript_all_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
     };
     let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.iter().map(|r| r.rows).sum());
     for (block, item) in &plan {
-        let mut block_lines = block_rendered_lines(app, block, item, &performer, width);
+        let mut block_lines = render_block_plain_lines(app, block, item, &performer, width);
         if item.gap {
             block_lines.insert(0, Line::default());
         }
