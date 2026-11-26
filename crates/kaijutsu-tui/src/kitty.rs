@@ -217,6 +217,34 @@ pub struct RasterizedSvg {
     pub rgba: Vec<u8>,
 }
 
+/// Compute the exact `(cols, rows, scale)` a graphic of intrinsic size
+/// `(svg_w, svg_h)` takes inside `max_cols × max_rows` cells at `cell_px`.
+/// Shared by measurement passes and [`rasterize_svg`] so layout row counts and
+/// uploaded image dimensions are guaranteed to agree.
+pub fn fit_svg_cells(
+    svg_w: f32,
+    svg_h: f32,
+    max_cols: u16,
+    max_rows: u16,
+    cell_px: CellPixels,
+) -> Option<(u16, u16, f32)> {
+    if svg_w <= 0.0 || svg_h <= 0.0 || max_cols == 0 || max_rows == 0 {
+        return None;
+    }
+    let max_px_w = (u32::from(max_cols) * u32::from(cell_px.width)).min(MAX_RASTER_DIM);
+    let max_px_h = (u32::from(max_rows) * u32::from(cell_px.height)).min(MAX_RASTER_DIM);
+    if max_px_w == 0 || max_px_h == 0 {
+        return None;
+    }
+    let scale = (max_px_w as f32 / svg_w).min(max_px_h as f32 / svg_h);
+    let px_w = ((svg_w * scale).round() as u32).clamp(1, max_px_w);
+    let px_h = ((svg_h * scale).round() as u32).clamp(1, max_px_h);
+    let cols = (px_w.div_ceil(u32::from(cell_px.width)) as u16).clamp(1, max_cols);
+    let rows = (px_h.div_ceil(u32::from(cell_px.height)) as u16)
+        .clamp(1, max_rows.min(DIACRITICS.len() as u16));
+    Some((cols, rows, scale))
+}
+
 /// Parse and rasterize an SVG string into a straight-alpha RGBA8 buffer fitted
 /// within `max_cols × max_rows` cells at `cell_px` resolution.
 pub fn rasterize_svg(
@@ -234,28 +262,7 @@ pub fn rasterize_svg(
     };
     let tree = usvg::Tree::from_str(svg, &opts).ok()?;
     let size = tree.size();
-    let svg_w = size.width();
-    let svg_h = size.height();
-    if svg_w <= 0.0 || svg_h <= 0.0 {
-        return None;
-    }
-
-    let max_px_w = (u32::from(max_cols) * u32::from(cell_px.width)).min(MAX_RASTER_DIM);
-    let max_px_h = (u32::from(max_rows) * u32::from(cell_px.height)).min(MAX_RASTER_DIM);
-    if max_px_w == 0 || max_px_h == 0 {
-        return None;
-    }
-
-    // Scale to fill available width (scores have aspect ratio, not fixed CSS px),
-    // clamped by max_px_h so tall scores never exceed max_rows.
-    let scale_w = max_px_w as f32 / svg_w;
-    let scale_h = max_px_h as f32 / svg_h;
-    let scale = scale_w.min(scale_h);
-    let px_w = ((svg_w * scale).round() as u32).clamp(1, max_px_w);
-    let px_h = ((svg_h * scale).round() as u32).clamp(1, max_px_h);
-
-    let cols = (px_w.div_ceil(u32::from(cell_px.width)) as u16).clamp(1, max_cols);
-    let rows = (px_h.div_ceil(u32::from(cell_px.height)) as u16).clamp(1, max_rows.min(DIACRITICS.len() as u16));
+    let (cols, rows, scale) = fit_svg_cells(size.width(), size.height(), max_cols, max_rows, cell_px)?;
 
     // Render into the exact cell-grid pixel box so Kitty's 1:1 placement has no
     // aspect distortion (transparent padding fills the few slack pixels).

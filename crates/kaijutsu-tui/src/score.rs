@@ -17,12 +17,17 @@ use std::hash::{Hash, Hasher};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kaijutsu_abc::ast::Tune;
-use kaijutsu_abc::engrave::{EngravingOptions, layout::engrave_systems, svg::to_svg};
+use kaijutsu_abc::engrave::{
+    EngravingOptions,
+    ir::engraving_bounds,
+    layout::engrave_systems,
+    svg::to_svg,
+};
 use kaijutsu_types::ContentType;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use crate::kitty::{KittyStore, placeholder_lines};
+use crate::kitty::{CellPixels, KittyStore, fit_svg_cells, placeholder_lines};
 use crate::present::Palette;
 
 /// Default body height before the first frame stamps the real one.
@@ -174,11 +179,11 @@ fn raw_header_value(raw: &str, prefix: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Parse the first tune from an ABC string.
-pub fn parse_first_tune(raw: &str) -> Result<Tune, String> {
+/// Parse all tunes from an ABC string.
+pub fn parse_all_tunes(raw: &str) -> Result<Vec<Tune>, String> {
     let parsed = kaijutsu_abc::parse(raw);
-    if let Some(tune) = parsed.value.into_iter().next() {
-        Ok(tune)
+    if !parsed.value.is_empty() {
+        Ok(parsed.value)
     } else if let Some(fb) = parsed.feedback.first() {
         Err(fb.message.clone())
     } else {
@@ -186,20 +191,35 @@ pub fn parse_first_tune(raw: &str) -> Result<Tune, String> {
     }
 }
 
-/// Foreground hex color for engraved notation matching the current ground.
-fn notation_color(palette: &Palette) -> &'static str {
-    if palette.light_ground {
-        "#1f2335"
-    } else {
-        "#c0caf5"
-    }
+/// Parse the first tune from an ABC string.
+pub fn parse_first_tune(raw: &str) -> Result<Tune, String> {
+    parse_all_tunes(raw).map(|mut v| v.remove(0))
 }
 
-/// Engrave `tune` into per-system SVG strings sized for `cols` terminal columns.
-fn engrave_system_svgs(tune: &Tune, cols: u16, cell_px_w: u16, fg_hex: &str) -> Vec<String> {
+/// One pre-engraved system ready for measurement or lazy Kitty upload.
+#[derive(Debug, Clone)]
+pub(crate) struct EngravedSystem {
+    pub svg: String,
+    pub rows: u16,
+    pub key: u64,
+}
+
+/// Engrave `tune` into per-system SVGs with precomputed terminal row heights.
+pub(crate) fn engrave_measured_systems(
+    raw: &str,
+    tune_idx: usize,
+    tune: &Tune,
+    cols: u16,
+    max_rows_per_system: u16,
+    cell_px: CellPixels,
+    fg_hex: &str,
+) -> Vec<EngravedSystem> {
+    if cols == 0 {
+        return Vec::new();
+    }
     // Map terminal pixel width to SVG user units (staff_spacing=10.0 looks crisp
-    // at ~1.5-2.0 px per SVG unit on HiDPI/regular Kitty displays).
-    let px_w = f64::from(cols.max(20)) * f64::from(cell_px_w.max(6));
+    // at ~1.6 px per SVG unit on Kitty displays).
+    let px_w = f64::from(cols.max(20)) * f64::from(cell_px.width.max(6));
     let svg_width = (px_w / 1.6).clamp(320.0, 1400.0);
     let opts = EngravingOptions {
         staff_spacing: 10.0,
@@ -209,18 +229,48 @@ fn engrave_system_svgs(tune: &Tune, cols: u16, cell_px_w: u16, fg_hex: &str) -> 
     let systems = engrave_systems(tune, &opts, svg_width);
     systems
         .iter()
-        .map(|elems| to_svg(elems, opts.margin, &opts.color))
+        .enumerate()
+        .filter_map(|(idx, elems)| {
+            let bounds = engraving_bounds(elems, opts.margin);
+            let (_, rows, _) = fit_svg_cells(
+                bounds.width.round() as f32,
+                bounds.height.round() as f32,
+                cols,
+                max_rows_per_system,
+                cell_px,
+            )?;
+            let svg = to_svg(elems, opts.margin, &opts.color);
+            let key = cache_key(raw, tune_idx, idx, cols, max_rows_per_system, fg_hex);
+            Some(EngravedSystem { svg, rows, key })
+        })
         .collect()
 }
 
-fn cache_key(raw: &str, system_idx: usize, cols: u16, max_rows: u16, fg_hex: &str) -> u64 {
+fn cache_key(
+    raw: &str,
+    tune_idx: usize,
+    system_idx: usize,
+    cols: u16,
+    max_rows: u16,
+    fg_hex: &str,
+) -> u64 {
     let mut h = DefaultHasher::new();
     raw.hash(&mut h);
+    tune_idx.hash(&mut h);
     system_idx.hash(&mut h);
     cols.hash(&mut h);
     max_rows.hash(&mut h);
     fg_hex.hash(&mut h);
     h.finish()
+}
+
+/// Foreground hex color for engraved notation matching the current ground.
+pub(crate) fn notation_color(palette: &Palette) -> &'static str {
+    if palette.light_ground {
+        "#1f2335"
+    } else {
+        "#c0caf5"
+    }
 }
 
 /// Render an ABC block inline for the conversation transcript (Slice 2).
@@ -242,8 +292,16 @@ pub fn inline_abc_lines(
     let tune = parse_first_tune(raw).ok()?;
     let meta = ScoreMeta::from_tune(&tune, raw);
     let fg = notation_color(palette);
-    let svgs = engrave_system_svgs(&tune, width, kitty.cell_px.width, fg);
-    if svgs.is_empty() {
+    let systems = engrave_measured_systems(
+        raw,
+        0,
+        &tune,
+        width,
+        INLINE_MAX_ROWS_PER_SYSTEM,
+        kitty.cell_px,
+        fg,
+    );
+    if systems.is_empty() {
         return None;
     }
 
@@ -251,29 +309,43 @@ pub fn inline_abc_lines(
     let header = format!("{}  (Ctrl+A s)", meta.summary_line("score"));
     out.push(Line::from(Span::styled(header, palette.score_heading())));
 
-    let shown = svgs.len().min(INLINE_MAX_SYSTEMS);
-    for (idx, svg) in svgs.iter().take(shown).enumerate() {
-        let key = cache_key(raw, idx, width, INLINE_MAX_ROWS_PER_SYSTEM, fg);
-        if let Some(img) = kitty.ensure_svg(key, svg, width, INLINE_MAX_ROWS_PER_SYSTEM) {
+    let shown = systems.len().min(INLINE_MAX_SYSTEMS);
+    for sys in systems.iter().take(shown) {
+        if let Some(img) = kitty.ensure_svg(sys.key, &sys.svg, width, INLINE_MAX_ROWS_PER_SYSTEM) {
             out.extend(placeholder_lines(img.id, img.cols, img.rows));
         }
     }
-    if svgs.len() > shown {
-        let more = svgs.len() - shown;
+    if systems.len() > shown {
+        let more = systems.len() - shown;
         out.push(Line::from(Span::styled(
-            format!("… +{more} more {} (Ctrl+A s to open full score)", if more == 1 { "system" } else { "systems" }),
+            format!(
+                "… +{more} more {} (Ctrl+A s to open full score)",
+                if more == 1 { "system" } else { "systems" }
+            ),
             palette.score_dim(),
         )));
     }
     Some(out)
 }
 
+/// Cached per-system engravings for one tune at a fixed `(width, cell_px, fg)`.
+struct ScoreEngraveCache {
+    tune_idx: usize,
+    width: u16,
+    cell_px: CellPixels,
+    fg: &'static str,
+    systems: Vec<EngravedSystem>,
+    /// Total rows across all systems + 1-row gaps between systems.
+    total_rows: usize,
+}
+
 /// Full-screen ABC score viewer (`ScreenMode::Score`, Slice 1).
 pub struct ScoreScreen {
     pub title: String,
     pub raw_abc: String,
-    parsed: Result<Tune, String>,
-    meta: Option<ScoreMeta>,
+    parsed: Result<Vec<Tune>, String>,
+    tune_idx: usize,
+    engrave_cache: Option<ScoreEngraveCache>,
     pub show_raw: bool,
     top: usize,
     body_h: usize,
@@ -294,13 +366,13 @@ impl ScoreScreen {
     pub fn open(title: impl Into<String>, raw_abc: impl Into<String>) -> Self {
         let title = title.into();
         let raw_abc = raw_abc.into();
-        let parsed = parse_first_tune(&raw_abc);
-        let meta = parsed.as_ref().ok().map(|t| ScoreMeta::from_tune(t, &raw_abc));
+        let parsed = parse_all_tunes(&raw_abc);
         Self {
             title,
             raw_abc,
             parsed,
-            meta,
+            tune_idx: 0,
+            engrave_cache: None,
             show_raw: false,
             top: 0,
             body_h: DEFAULT_BODY_LINES,
@@ -311,16 +383,88 @@ impl ScoreScreen {
         self.body_h
     }
 
-    pub fn scroll(&mut self, delta: isize, total: usize) {
-        let max_top = total.saturating_sub(self.body_h);
-        if delta < 0 {
-            self.top = self.top.saturating_sub(delta.unsigned_abs());
+    pub fn tune_count(&self) -> usize {
+        self.parsed.as_ref().map_or(0, Vec::len)
+    }
+
+    pub fn step_tune(&mut self, delta: isize) -> bool {
+        let count = self.tune_count();
+        if count <= 1 {
+            return false;
+        }
+        let next = (self.tune_idx as isize + delta).rem_euclid(count as isize) as usize;
+        if next != self.tune_idx {
+            self.tune_idx = next;
+            self.top = 0;
+            self.engrave_cache = None;
+            true
         } else {
-            self.top = (self.top + delta as usize).min(max_top);
+            false
         }
     }
 
+    pub fn scroll(&mut self, delta: isize) {
+        if delta < 0 {
+            self.top = self.top.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.top = self.top.saturating_add(delta as usize);
+        }
+    }
+
+    fn active_meta(&self) -> Option<ScoreMeta> {
+        let tunes = self.parsed.as_ref().ok()?;
+        let tune = tunes.get(self.tune_idx)?;
+        Some(ScoreMeta::from_tune(tune, &self.raw_abc))
+    }
+
+    /// Ensure `engrave_cache` matches `(tune_idx, width, cell_px, fg)` — no
+    /// work is done when scrolling at a constant terminal size.
+    fn ensure_engraved(&mut self, width: u16, cell_px: CellPixels, fg: &'static str) -> bool {
+        let hit = self.engrave_cache.as_ref().is_some_and(|c| {
+            c.tune_idx == self.tune_idx
+                && c.width == width
+                && c.cell_px == cell_px
+                && c.fg == fg
+        });
+        if hit {
+            return true;
+        }
+        let Ok(tunes) = &self.parsed else {
+            return false;
+        };
+        let Some(tune) = tunes.get(self.tune_idx) else {
+            return false;
+        };
+        let systems = engrave_measured_systems(
+            &self.raw_abc,
+            self.tune_idx,
+            tune,
+            width,
+            FULLSCREEN_MAX_ROWS_PER_SYSTEM,
+            cell_px,
+            fg,
+        );
+        if systems.is_empty() {
+            self.engrave_cache = None;
+            return false;
+        }
+        let total_rows: usize = systems.iter().map(|s| usize::from(s.rows)).sum::<usize>()
+            + systems.len().saturating_sub(1);
+        self.engrave_cache = Some(ScoreEngraveCache {
+            tune_idx: self.tune_idx,
+            width,
+            cell_px,
+            fg,
+            systems,
+            total_rows,
+        });
+        true
+    }
+
     /// Build one frame of the full-screen score viewer.
+    ///
+    /// Only systems intersecting `self.top..self.top + body_h` are uploaded to
+    /// Kitty, so multi-page scores never churn or evict visible images.
     pub fn frame(
         &mut self,
         width: u16,
@@ -332,74 +476,127 @@ impl ScoreScreen {
         let body_h = height.saturating_sub(2);
         self.body_h = body_h;
 
+        let fg = notation_color(palette);
+        let use_kitty = !self.show_raw
+            && kitty.enabled
+            && width >= 20
+            && self.ensure_engraved(width, kitty.cell_px, fg);
+
+        let (visible_body, total_rows, rendered_kitty) = if use_kitty {
+            let cache = self.engrave_cache.as_ref().expect("just populated");
+            let total = cache.total_rows;
+            let max_top = total.saturating_sub(body_h);
+            if self.top > max_top {
+                self.top = max_top;
+            }
+            let win_start = self.top;
+            let win_end = win_start.saturating_add(body_h);
+            let mut rows_out = Vec::with_capacity(body_h);
+            let mut cur_row = 0usize;
+            let mut any_uploaded = false;
+            for (idx, sys) in cache.systems.iter().enumerate() {
+                if idx > 0 {
+                    if cur_row >= win_start && cur_row < win_end {
+                        rows_out.push(Line::default());
+                    }
+                    cur_row += 1;
+                }
+                let sys_rows = usize::from(sys.rows);
+                let sys_end = cur_row + sys_rows;
+                if sys_end > win_start && cur_row < win_end {
+                    let skip = win_start.saturating_sub(cur_row);
+                    let take = (win_end - cur_row.max(win_start)).min(sys_rows.saturating_sub(skip));
+                    if let Some(img) = kitty.ensure_svg(
+                        sys.key,
+                        &sys.svg,
+                        width,
+                        FULLSCREEN_MAX_ROWS_PER_SYSTEM,
+                    ) {
+                        any_uploaded = true;
+                        let mut pl = placeholder_lines(img.id, img.cols, img.rows);
+                        // Guard in case rasterized rows differed by 1.
+                        while pl.len() < sys_rows {
+                            pl.push(Line::default());
+                        }
+                        rows_out.extend(pl.into_iter().skip(skip).take(take));
+                    } else {
+                        for _ in 0..take {
+                            rows_out.push(Line::default());
+                        }
+                    }
+                }
+                cur_row = sys_end;
+                if cur_row >= win_end {
+                    break;
+                }
+            }
+            if any_uploaded {
+                (rows_out, total, true)
+            } else {
+                let raw = self.raw_body_lines(palette, kitty.enabled);
+                let max_top = raw.len().saturating_sub(body_h);
+                if self.top > max_top {
+                    self.top = max_top;
+                }
+                let total = raw.len();
+                let slice: Vec<Line<'static>> = raw.into_iter().skip(self.top).take(body_h).collect();
+                (slice, total, false)
+            }
+        } else {
+            let raw = self.raw_body_lines(palette, kitty.enabled);
+            let max_top = raw.len().saturating_sub(body_h);
+            if self.top > max_top {
+                self.top = max_top;
+            }
+            let total = raw.len();
+            let slice: Vec<Line<'static>> = raw.into_iter().skip(self.top).take(body_h).collect();
+            (slice, total, false)
+        };
+
         let mode_tag = if self.show_raw {
             "raw"
-        } else if kitty.enabled && self.parsed.is_ok() {
+        } else if rendered_kitty {
             "kitty"
         } else {
             "text"
         };
-        let header_text = match &self.meta {
-            Some(m) => format!(" {}  [{mode_tag}]", m.summary_line(&self.title)),
-            None => format!(" ♪ {}  [{mode_tag}]", self.title),
+        let tune_suffix = if self.tune_count() > 1 {
+            format!(" · tune {}/{}", self.tune_idx + 1, self.tune_count())
+        } else {
+            String::new()
+        };
+        let header_text = match self.active_meta() {
+            Some(m) => format!(" {}{tune_suffix}  [{mode_tag}]", m.summary_line(&self.title)),
+            None => format!(" ♪ {}{tune_suffix}  [{mode_tag}]", self.title),
         };
         let header = Line::from(Span::styled(
             header_text,
             palette.score_heading().add_modifier(Modifier::BOLD),
         ));
 
-        let body = self.body_lines(width, palette, kitty);
-        let max_top = body.len().saturating_sub(body_h);
-        if self.top > max_top {
-            self.top = max_top;
-        }
-
         let mut out = Vec::with_capacity(height);
         out.push(header);
-        for line in body.iter().skip(self.top).take(body_h) {
-            out.push(line.clone());
-        }
+        out.extend(visible_body);
         while out.len() < height - 1 {
             out.push(Line::default());
         }
 
+        let tune_hint = if self.tune_count() > 1 {
+            " · [/] tune"
+        } else {
+            ""
+        };
         let footer_text = format!(
-            " j/k scroll · r {} · y yank · q/Esc close  ({}/{})",
+            " j/k scroll{tune_hint} · r {} · y yank · q/Esc close  ({}/{})",
             if self.show_raw { "score" } else { "raw" },
-            (self.top + 1).min(body.len().max(1)),
-            body.len().max(1),
+            (self.top + 1).min(total_rows.max(1)),
+            total_rows.max(1),
         );
         out.push(Line::from(Span::styled(footer_text, palette.score_dim())));
         out
     }
 
-    fn body_lines(
-        &self,
-        width: u16,
-        palette: &Palette,
-        kitty: &mut KittyStore,
-    ) -> Vec<Line<'static>> {
-        if !self.show_raw
-            && kitty.enabled
-            && let Ok(tune) = &self.parsed
-        {
-            let fg = notation_color(palette);
-            let svgs = engrave_system_svgs(tune, width, kitty.cell_px.width, fg);
-            let mut out = Vec::new();
-            for (idx, svg) in svgs.iter().enumerate() {
-                if idx > 0 {
-                    out.push(Line::default());
-                }
-                let key = cache_key(&self.raw_abc, idx, width, FULLSCREEN_MAX_ROWS_PER_SYSTEM, fg);
-                if let Some(img) = kitty.ensure_svg(key, svg, width, FULLSCREEN_MAX_ROWS_PER_SYSTEM) {
-                    out.extend(placeholder_lines(img.id, img.cols, img.rows));
-                }
-            }
-            if !out.is_empty() {
-                return out;
-            }
-        }
-
+    fn raw_body_lines(&self, palette: &Palette, kitty_enabled: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if let Err(err) = &self.parsed {
             lines.push(Line::from(Span::styled(
@@ -407,7 +604,7 @@ impl ScoreScreen {
                 palette.alarm(),
             )));
             lines.push(Line::default());
-        } else if !self.show_raw && !kitty.enabled {
+        } else if !self.show_raw && !kitty_enabled {
             lines.push(Line::from(Span::styled(
                 "kitty graphics unavailable in this terminal — showing raw ABC (use --kitty-graphics in plain kitty)",
                 palette.score_dim(),
@@ -418,7 +615,10 @@ impl ScoreScreen {
             let trimmed = raw_line.trim_start();
             let style = if trimmed.starts_with('%') {
                 palette.score_dim()
-            } else if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' && trimmed.as_bytes()[0].is_ascii_alphabetic() {
+            } else if trimmed.len() >= 2
+                && trimmed.as_bytes()[1] == b':'
+                && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            {
                 palette.score_heading()
             } else {
                 palette.score_code()
@@ -442,28 +642,42 @@ pub fn handle_key(screen: &mut ScoreScreen, key: &KeyEvent, body_h: usize) -> Sc
             ScoreKey::ToggledRaw
         }
         KeyCode::Char('y') => ScoreKey::Yank(screen.raw_abc.clone()),
+        KeyCode::Char('[') => {
+            if screen.step_tune(-1) {
+                ScoreKey::Scrolled
+            } else {
+                ScoreKey::Ignored
+            }
+        }
+        KeyCode::Char(']') => {
+            if screen.step_tune(1) {
+                ScoreKey::Scrolled
+            } else {
+                ScoreKey::Ignored
+            }
+        }
         KeyCode::Char('j') | KeyCode::Down => {
-            screen.scroll(1, usize::MAX);
+            screen.scroll(1);
             ScoreKey::Scrolled
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            screen.scroll(-1, usize::MAX);
+            screen.scroll(-1);
             ScoreKey::Scrolled
         }
         KeyCode::Char('d') if ctrl => {
-            screen.scroll(half, usize::MAX);
+            screen.scroll(half);
             ScoreKey::Scrolled
         }
         KeyCode::Char('u') if ctrl => {
-            screen.scroll(-half, usize::MAX);
+            screen.scroll(-half);
             ScoreKey::Scrolled
         }
         KeyCode::PageDown | KeyCode::Char(' ') => {
-            screen.scroll(page, usize::MAX);
+            screen.scroll(page);
             ScoreKey::Scrolled
         }
         KeyCode::PageUp => {
-            screen.scroll(-page, usize::MAX);
+            screen.scroll(-page);
             ScoreKey::Scrolled
         }
         KeyCode::Char('g') | KeyCode::Home => {
@@ -532,5 +746,53 @@ mod tests {
         assert!(joined.contains("EBBA"));
 
         assert_eq!(handle_key(&mut screen, &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 22), ScoreKey::Close);
+    }
+
+    #[test]
+    fn score_screen_g_then_j_does_not_overflow_and_uploads_lazily() {
+        let long_abc = format!(
+            "X:1\nT:Long\nM:4/4\nL:1/8\nK:C\n{}\n",
+            "CDEF GABc|cBAG FEDC|".repeat(24)
+        );
+        let palette = Palette::tokyo_midnight();
+        let mut kitty = KittyStore::enabled(CellPixels { width: 10, height: 20 });
+        let mut screen = ScoreScreen::open("block #2", long_abc);
+
+        // First frame at a tiny height only uploads the top visible system(s).
+        let _ = screen.frame(60, 8, &palette, &mut kitty);
+        let sys_count = screen.engrave_cache.as_ref().map_or(0, |c| c.systems.len());
+        assert!(sys_count >= 3, "expected multiple systems, got {sys_count}");
+        let initial_uploads = kitty.take_pending_wire().len() / 2;
+        assert!(
+            initial_uploads < sys_count,
+            "lazy upload should not upload all {sys_count} systems for an 8-row viewport (uploaded {initial_uploads})"
+        );
+
+        // `G` followed immediately by `j` before the next frame must not overflow.
+        handle_key(&mut screen, &KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE), 6);
+        handle_key(&mut screen, &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), 6);
+        let bottom = screen.frame(60, 8, &palette, &mut kitty);
+        assert_eq!(bottom.len(), 8);
+    }
+
+    #[test]
+    fn score_screen_steps_between_multiple_tunes() {
+        let two_tunes = "X:1\nT:First\nK:C\nCDEF|\n\nX:2\nT:Second\nK:G\nGABc|\n";
+        let palette = Palette::tokyo_midnight();
+        let mut kitty = KittyStore::disabled();
+        let mut screen = ScoreScreen::open("block #3", two_tunes);
+        assert_eq!(screen.tune_count(), 2);
+
+        let f1 = screen.frame(80, 12, &palette, &mut kitty);
+        let h1: String = f1[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(h1.contains("tune 1/2"), "got {h1:?}");
+
+        assert_eq!(
+            handle_key(&mut screen, &KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), 10),
+            ScoreKey::Scrolled
+        );
+        let f2 = screen.frame(80, 12, &palette, &mut kitty);
+        let h2: String = f2[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(h2.contains("tune 2/2"), "got {h2:?}");
     }
 }
