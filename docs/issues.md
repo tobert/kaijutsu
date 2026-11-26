@@ -334,6 +334,14 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
 
 ## Music refresh: live run findings (2026-11-14)
 
+- **Rehearsal kernel stopped answering SSH during playback.** On November 25,
+  the 130 BPM trio and its score observer were playing on `probe16`. After
+  the first three phrases committed, the viewer and MIDI bridge both lost
+  their connections. The listening process stopped writing logs and failed
+  to exit on SIGTERM. Restarting restored access and resumed the track
+  from tick 5098 after the viewer had shown tick 5290. The last log recorded an
+  endpoint cooldown. The cause of the stall is unknown. Capture thread
+  stacks if it recurs.
 - **Endpoint cooldown & stop behavior.** Unloaded models trigger endpoint-wide cooldowns; stopped tracks leave admitted turns retrying until interrupted.
 - **Model pacing & thinking.** Thinking models struggle with tight phrase deadlines (`--effort none` vs `--thinking-style off`); output bounds need strict enforcement.
 - **Audio sink and track management.** Sinks share context tags and flush states; transport deletion and track naming need CLI refinements.
