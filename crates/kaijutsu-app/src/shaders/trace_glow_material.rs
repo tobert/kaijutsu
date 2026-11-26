@@ -7,10 +7,8 @@
 //! spawned element (phase/rate/trough baked in at spawn time from
 //! `bearing::hash01`), zero per-frame material churn: here nothing EVER
 //! needs a second write.
-//! - **mode 0 — traveling wave** (floor traces, wall trim): one bright crest
-//!   glides along `uv.x` (`bearing::ribbon_vertices`'s cumulative-arclength
-//!   parametrization, or a length-tracking quad UV — `room::glow_quad_mesh`)
-//!   while the rest of the element rests at `trough`.
+//! - **mode 0 — traveling wave**. A crest follows the floor trace along
+//!   its cumulative arc length in `uv.x`.
 //! - **mode 1 — breathing** (terminal pads, the inscribed ring): a slow
 //!   uniform sine breath, ignoring `uv` entirely — safe on primitives with
 //!   their own UV convention (`Torus`, `Annulus`) that this material never
@@ -19,16 +17,15 @@
 //! `color` may carry brightness above 1.0 at the crest/breath's peak — the
 //! app camera's threshold-1.0 bloom pass (`main::setup_camera`) haloes it
 //! softly. Floor traces and terminal pads keep the theme's authored
-//! brightness up to the scene crest limit. Wall trim and the inscribed ring
-//! use the full crest. Each material supplies its own trough fraction.
+//! brightness up to the scene crest limit. The inscribed ring
+//! uses the full crest. Each material supplies its own trough fraction.
 
 use bevy::prelude::*;
 use bevy::material::AlphaMode;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
-/// Material for one glowing decoration element: a floor-trace ribbon, a
-/// terminal pad disc, an inscribed-ring annulus, or a wall-trim strip.
+/// Glow for the floor traces, terminal pads, inscribed ring and lineage drapes.
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct TraceGlowMaterial {
     /// Linear RGB at the crest. Values above one can bloom.
@@ -57,12 +54,6 @@ impl Material for TraceGlowMaterial {
     }
 
     fn alpha_mode(&self) -> AlphaMode {
-        // Opaque, DEFAULT cull (no `cull_mode` override here): the wall-trim
-        // quads are single-sided, inward-facing, and the octagon's
-        // dollhouse-cutaway read depends on the pipeline's default back-face
-        // culling (`bearing`'s own module doc has the mechanics) — this
-        // material must never defeat it. The floor ribbons face up and the
-        // camera is always above, so the same default cull never hides them.
         AlphaMode::Opaque
     }
 }

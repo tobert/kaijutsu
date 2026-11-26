@@ -7,11 +7,8 @@
 // params = [phase, rate, trough, mode]
 //   mode 0 — traveling wave: one crest glides along uv.x at `rate`
 //     cycles/second, offset by `phase` (a `[0,1)` cycle-fraction). uv.x is
-//     the element's own length fraction (`bearing::ribbon_vertices`'
-//     cumulative arclength for floor traces, `room::glow_quad_mesh`'s
-//     length-tracking UV for wall trim) — ONE wrap baked in (a single crest
-//     per element; multiple wraps would need `uv.x * wraps` before the
-//     fract() below, not needed by any element today).
+//     the fraction of the distance along the ribbon. One crest crosses
+//     its length in each cycle.
 //   mode 1 — breathing: uniform sine pulse, ignores uv entirely — safe on
 //     primitives with their own UV convention (Torus, Annulus) this
 //     material never has to match.

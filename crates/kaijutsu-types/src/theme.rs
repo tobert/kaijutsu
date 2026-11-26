@@ -233,7 +233,7 @@ pub struct ThemeData {
     /// ladder, live-signal gains, and the camera post chain. `serde(default)`
     /// on purpose — themes written before this section existed must keep
     /// parsing (the live kernel theme.toml predates it). See `docs/newui.md`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "read_scene")]
     pub scene: SceneData,
 
     /// The heroic view (`[heroic]` table): framing targets, hues, OKLCH rainbow,
@@ -415,6 +415,23 @@ pub struct SceneData {
     pub lighting: SceneLightingData,
 }
 
+/// Load materialized themes that still contain settings for the room walls and pylons.
+fn read_scene<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<SceneData, D::Error> {
+    let mut scene = serde_json::Value::deserialize(deserializer)?;
+    for (section, retired) in [
+        ("hues", &["wall_base", "wall_mullion", "violet_thread"][..]),
+        ("tiers", &["trough_wall_trim", "marker"]),
+        ("gains", &["beat", "active", "focus_lift"]),
+    ] {
+        if let Some(table) = scene.get_mut(section).and_then(serde_json::Value::as_object_mut) {
+            for key in retired {
+                table.remove(*key);
+            }
+        }
+    }
+    serde_json::from_value(scene).map_err(serde::de::Error::custom)
+}
+
 /// `[scene.hues]` — identity hues, hex sRGB. Brightness lives in the tiers;
 /// a hue's brightest channel should sit near full so tier math means what it
 /// says.
@@ -427,10 +444,8 @@ pub struct SceneHuesData {
     pub gold: String,
     /// Hardware: sockets, pegs, jacks.
     pub brass: String,
-    /// Information-violet: radiator glass backdrop.
+    /// Violet floor traces.
     pub violet_glass: String,
-    /// Information-violet: thread/content strips.
-    pub violet_thread: String,
     /// The well's electric indigo-violet (ring deck + track rays).
     pub neon: String,
     /// Terrace glyph rings: a paler tint of `neon`.
@@ -446,8 +461,6 @@ pub struct SceneHuesData {
     pub trace_gold: String,
     /// Structural near-blacks (silhouette tiers, not brightness).
     pub table: String,
-    pub wall_base: String,
-    pub wall_mullion: String,
     pub dark_surface: String,
 }
 
@@ -460,7 +473,6 @@ impl Default for SceneHuesData {
             gold: "#ffe59e".into(),
             brass: "#ddc489".into(),
             violet_glass: "#55386c".into(),
-            violet_thread: "#c476e1".into(),
             neon: "#ad95f3".into(),
             terrace: "#c4b3f9".into(),
             ask: "#fff5c2".into(),
@@ -469,8 +481,6 @@ impl Default for SceneHuesData {
             trace_green: "#598b6c".into(),
             trace_gold: "#958159".into(),
             table: "#32353f".into(),
-            wall_base: "#464556".into(),
-            wall_mullion: "#383844".into(),
             dark_surface: "#1d1e26".into(),
         }
     }
@@ -482,16 +492,12 @@ impl Default for SceneHuesData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SceneTiersData {
-    /// Station markers at rest.
-    pub marker: f32,
-    /// Gold architectural trim (table rims, pylon caps).
+    /// Gold table rims.
     pub trim: f32,
     /// Ceiling for ANY decoration crest (>1.0 = soft bloom halo).
     pub crest: f32,
     /// Floor traces at rest.
     pub trough_wiring: f32,
-    /// Wall trim breathing floor.
-    pub trough_wall_trim: f32,
     /// Terminal pads breathing floor.
     pub trough_pads: f32,
     /// The calmest breathers (inscribed floor ring).
@@ -501,11 +507,9 @@ pub struct SceneTiersData {
 impl Default for SceneTiersData {
     fn default() -> Self {
         Self {
-            marker: 0.42,
             trim: 0.50,
             crest: 1.25,
             trough_wiring: 0.55,
-            trough_wall_trim: 0.60,
             trough_pads: 0.65,
             trough_subtle: 0.75,
         }
@@ -517,12 +521,6 @@ impl Default for SceneTiersData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SceneGainsData {
-    /// Tracker marker beat thump.
-    pub beat: f32,
-    /// Tracker marker active lift.
-    pub active: f32,
-    /// Station focus lift.
-    pub focus_lift: f32,
     /// Well reading-card border gain.
     pub reading_border: f32,
     /// Well HUD border gain.
@@ -532,9 +530,6 @@ pub struct SceneGainsData {
 impl Default for SceneGainsData {
     fn default() -> Self {
         Self {
-            beat: 2.8,
-            active: 0.5,
-            focus_lift: 0.35,
             reading_border: 1.6,
             hud_border: 1.8,
         }
@@ -570,16 +565,9 @@ impl Default for ScenePostData {
     }
 }
 
-/// `[scene.lighting]` — the OPTIONAL hybrid lit-chamber mode (`docs/newui.md`,
-/// the two-lane contract; `docs/scenes/shell.md`, "all-unlit discipline").
-/// Off by default: the room renders exactly as the all-unlit shell. On, only
-/// the chamber SHELL (floor disc, wall panel bases, vault dome, console table)
-/// turns into low-albedo lit `StandardMaterial` catching one warm key light at
-/// the well; every content-bearing surface (traces, cards, lamps, threads,
-/// gold trim, glyphs) stays unlit and emissive so the tier ladder's
-/// bloom-at-1.0 rule holds. Colors are sRGB hex (linearized for the light);
-/// intensity/range are in Bevy's photometric units against the room's own
-/// large world scale, a first-guess tuned live over BRP.
+/// `[scene.lighting]` controls the optional warm key light on the floor,
+/// vault and console table. Traces, cards, lamps, gold trim and glyphs use
+/// unlit materials. Light colors use sRGB hex and intensity uses lumens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SceneLightingData {
@@ -594,10 +582,9 @@ pub struct SceneLightingData {
     /// Key light luminous power (lumens). Large: the room is ~1300 units, not
     /// meters, so inverse-square falloff needs a big first guess.
     pub key_light_intensity: f32,
-    /// Key light cutoff radius — covers the floor disc (`FLOOR_RADIUS` 1300)
-    /// and the walls.
+    /// Key light cutoff radius, covering the floor disc.
     pub key_light_range: f32,
-    /// Faint warm fill so the far walls are not pure black.
+    /// Faint warm ambient fill for the chamber.
     pub ambient_color: String,
     /// Ambient fill brightness (cd/m^2).
     pub ambient_brightness: f32,
@@ -941,6 +928,40 @@ mod tests {
     }
 
     #[test]
+    fn a_materialized_wall_theme_keeps_its_active_settings() {
+        let base = DEFAULT_THEME_TOML.split("\n[scene.hues]").next().unwrap();
+        let theme: ThemeData = toml::from_str(&format!(r##"{base}
+[scene.hues]
+wall_base = "#010203"
+wall_mullion = "#ffffff"
+violet_thread = "#888888"
+violet_glass = "#123456"
+[scene.tiers]
+marker = 0.42
+trough_wall_trim = 0.6
+crest = 1.1
+[scene.gains]
+beat = 2.8
+active = 0.5
+focus_lift = 0.35
+hud_border = 2.0
+"##)).unwrap();
+        assert_eq!(theme.scene.hues.violet_glass, "#123456");
+        assert_eq!(theme.scene.tiers.crest, 1.1);
+        assert_eq!(theme.scene.gains.hud_border, 2.0);
+        let active = toml::Value::try_from(theme.scene).unwrap();
+        for (section, retired) in [
+            ("hues", &["wall_base", "wall_mullion", "violet_thread"][..]),
+            ("tiers", &["trough_wall_trim", "marker"]),
+            ("gains", &["beat", "active", "focus_lift"]),
+        ] {
+            for key in retired {
+                assert!(active[section].get(*key).is_none(), "{section}.{key}");
+            }
+        }
+    }
+
+    #[test]
     fn unknown_scene_key_is_refused() {
         let base = DEFAULT_THEME_TOML.split("\n[scene.hues]").next().unwrap();
         for table in ["scene", "scene.hues", "scene.tiers", "scene.gains", "scene.post", "scene.lighting"] {
@@ -961,7 +982,6 @@ mod tests {
         let t = SceneTiersData::default();
         for (name, trough) in [
             ("wiring", t.trough_wiring),
-            ("wall_trim", t.trough_wall_trim),
             ("pads", t.trough_pads),
             ("subtle", t.trough_subtle),
         ] {

@@ -1,40 +1,8 @@
-//! Pure room geometry (`docs/scenes/shell.md`, "Geometry and bearings"): the
-//! compass **bearings** stations sit at, the carousel→bearing mapping, the
-//! camera-orbit math that faces a bearing, and the procedural-mesh vertex
-//! helpers for the floor traces and the vault gradient.
-//!
-//! No Bevy types — `[f32; 3]` points (x, y, z; the room floor is XZ, +Y up)
-//! and plain `f32`, unit-tested, same stance as `view/time_well/card.rs`.
-//! The Bevy glue in [`super`] turns these arrays into `Vec3`/`Transform`s and
-//! `Mesh`es.
+//! Compass bearings, score facets, floor traces, and vault geometry in room space.
+//! The floor lies in XZ with +Y up and north along −Z.
 
-use super::nav::Station;
-
-// ── Bearings ────────────────────────────────────────────────────────────────
-
-/// A stable compass placement in the circular room. Cardinals sit on the wall;
-/// `Center` is the console (the time well). The floor is XZ with +Y up, so a
-/// bearing's [`dir`](Bearing::dir) is a unit XZ vector (y = 0):
-/// North = −Z (into the room), South = +Z (toward the entering camera),
-/// East = +X, West = −X. `Center` has no direction (`[0,0,0]`).
-///
-/// These are **hand-assigned and stable** — a bearing you learn is an address
-/// (the track-rays lesson, `docs/scenes/README.md`). Settling of open question
-/// 1 in `shell.md`: TimeWell = center, Switchboard = S; W, E, and N stay
-/// reserved (empty wall panels, no station).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bearing {
-    /// `#[allow(dead_code)]`: the freeze-fix slice (2026-07-11) dropped
-    /// `activity::event_bearing`'s Center arms (the only production site
-    /// that ever constructed this variant — see that fn's own doc), so
-    /// `cargo build` now sees it as never constructed outside
-    /// `#[cfg(test)]`. Kept, not removed: `index()`/`dir()`'s match arms and
-    /// `wall_placements()`'s Center-exclusion comment ("center has no wall")
-    /// both still lean on the variant existing, and room geometry may
-    /// construct a real `Center` value again if room-wide chatter ever gets
-    /// wired into the well's own glow.
-    #[allow(dead_code)]
-    Center,
     North,
     East,
     South,
@@ -42,26 +10,9 @@ pub enum Bearing {
 }
 
 impl Bearing {
-    /// How many bearings — the width of the per-bearing activity array
-    /// ([`super::activity::BearingActivity`]).
-    pub const COUNT: usize = 5;
-
-    /// Dense index for array keying (`Center` = 0 … `West` = 4).
-    pub fn index(self) -> usize {
-        match self {
-            Bearing::Center => 0,
-            Bearing::North => 1,
-            Bearing::East => 2,
-            Bearing::South => 3,
-            Bearing::West => 4,
-        }
-    }
-
-    /// Unit XZ direction from the room center toward this bearing's wall
-    /// (`[0,0,0]` for `Center`). +Y is 0 — bearings are floor directions.
+    /// Unit direction on the room floor.
     pub fn dir(self) -> [f32; 3] {
         match self {
-            Bearing::Center => [0.0, 0.0, 0.0],
             Bearing::North => [0.0, 0.0, -1.0],
             Bearing::East => [1.0, 0.0, 0.0],
             Bearing::South => [0.0, 0.0, 1.0],
@@ -70,206 +21,25 @@ impl Bearing {
     }
 }
 
-/// Normalized NE diagonal — where the `Radiators` carousel entry points the
-/// camera (a between-station wall panel, not a cardinal station). `√½`.
-pub const RADIATOR_FOCUS_DIR: [f32; 3] = [core::f32::consts::FRAC_1_SQRT_2, 0.0, -core::f32::consts::FRAC_1_SQRT_2];
-
-/// The four between-station wall bearings (the diagonals) where the violet
-/// information radiators stand: NE, SE, SW, NW.
-pub const RADIATOR_DIRS: [[f32; 3]; 4] = [
+/// Diagonals clockwise from northeast, shared by the floor traces and score.
+pub const DIAGONAL_DIRS: [[f32; 3]; 4] = [
     [core::f32::consts::FRAC_1_SQRT_2, 0.0, -core::f32::consts::FRAC_1_SQRT_2], // NE
     [core::f32::consts::FRAC_1_SQRT_2, 0.0, core::f32::consts::FRAC_1_SQRT_2],  // SE
     [-core::f32::consts::FRAC_1_SQRT_2, 0.0, core::f32::consts::FRAC_1_SQRT_2], // SW
     [-core::f32::consts::FRAC_1_SQRT_2, 0.0, -core::f32::consts::FRAC_1_SQRT_2], // NW
 ];
 
-/// The direction the camera should face when a station is focused, or `None`
-/// for the console (`TimeWell`), which frames the room from the overview pose.
-/// `Radiators` faces a between-station wall panel ([`RADIATOR_FOCUS_DIR`]).
-/// This is the carousel→bearing mapping the camera dolly reads.
-pub fn focus_dir(station: Station) -> Option<[f32; 3]> {
-    match station {
-        Station::TimeWell => None,
-        Station::Switchboard => Some(Bearing::South.dir()),
-        Station::Radiators => Some(RADIATOR_FOCUS_DIR),
-    }
+/// Centers of the eight score facets clockwise from north.
+pub fn octagon_centers(apothem: f32) -> [[f32; 3]; 8] {
+    let [ne, se, sw, nw] = DIAGONAL_DIRS;
+    [Bearing::North.dir(), ne, Bearing::East.dir(), se,
+        Bearing::South.dir(), sw, Bearing::West.dir(), nw]
+        .map(|[x, _, z]| [x * apothem, 0.0, z * apothem])
 }
 
-// ── Wall placements ───────────────────────────────────────────────────────────
-
-/// One occupied wall bearing: which station stands there (if any — the reserved
-/// South marker has no station), its facing direction, and its marker hue
-/// (linear rgb, the LDR identity colour lifted to HDR only on live activity).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WallPlacement {
-    pub station: Option<Station>,
-    pub bearing: Bearing,
-    pub dir: [f32; 3],
-    /// Linear-rgb identity hue for the marker pylon.
-    pub hue: [f32; 3],
-}
-
-/// The four cardinal wall placements, in `Station::ALL`-adjacent order (W, E,
-/// N, S). W, E, and N stay reserved (`station: None` — plain empty panels,
-/// each with only a dim, short waymarker post, `MARKER_HEIGHT_RESERVED`'s
-/// use case). South carries a real station — [`Station::Switchboard`] (the
-/// presence-lamp wall, `view::room::switchboard`) — so it gets a marker, a
-/// nameplate, and a gold cap the same as every other built bearing
-/// (`super::wants_gold_cap` gates purely on `station.is_some()`, no
-/// special-casing needed). The switchboard stays a cool instrument-panel
-/// steel — the signal lives in its lamp grid, not its pylon. **Amy-tunable.**
-pub fn wall_placements() -> [WallPlacement; 4] {
-    [
-        WallPlacement {
-            station: None,
-            bearing: Bearing::West,
-            dir: Bearing::West.dir(),
-            hue: [0.90, 0.28, 0.34],
-        },
-        WallPlacement {
-            station: None,
-            bearing: Bearing::East,
-            dir: Bearing::East.dir(),
-            hue: [1.00, 0.60, 0.22],
-        },
-        WallPlacement {
-            station: None,
-            bearing: Bearing::North,
-            dir: Bearing::North.dir(),
-            hue: [0.40, 0.85, 0.52],
-        },
-        WallPlacement {
-            station: Some(Station::Switchboard),
-            bearing: Bearing::South,
-            dir: Bearing::South.dir(),
-            hue: [0.58, 0.62, 0.72],
-        },
-    ]
-}
-
-/// Whether `station`'s wall bearing is occupied by the station's OWN
-/// instrument rather than a marker pylon + nameplate — true for
-/// [`Station::TimeWell`], whose own ring-carousel furniture occupies the
-/// room's center bearing directly (there is no wall placement for `TimeWell`
-/// in [`wall_placements`] to skip in the first place — center has no wall —
-/// so this row matters for callers reasoning generically over "does this
-/// station have its own room-furniture," not for `enter_room`'s
-/// wall-placement loop specifically), and for [`Station::Switchboard`]: its
-/// lamp grid mounts ON the wall panel, so the marker pylon that used to stand
-/// planted dead-center in FRONT of the grid, occluding the middle columns, is
-/// skipped the same way. `enter_room`'s wall-placement loop reads this to
-/// skip the marker/plinth/cap/plate for a furnished bearing — the station's
-/// own wall-mounted face stands in for both; a future in-room station rides
-/// the same gate. Pure — no Bevy types — so the gating is unit-testable
-/// without spawning anything (mirrors `super::wants_gold_cap`'s shape).
-pub fn station_is_room_furniture(station: Station) -> bool {
-    matches!(station, Station::TimeWell | Station::Switchboard)
-}
-
-// ── Octagon wall shell (`shell.md`'s cutaway centerpiece) ───────────────────
-//
-// Eight flat wall panels enclosing the room: faces on the four cardinals and
-// the four `RADIATOR_DIRS` diagonals, `apothem` out from center. Every panel
-// is a SINGLE-SIDED, inward-facing quad: `octagon_panels`' `yaw` is the
-// outward angle (the `dir_theta` convention) `super`'s Bevy glue feeds into
-// the same `looking_at(2×pos, Y)` trick `spawn_radiators` proved — local +Z
-// (the mesh's front normal) ends up pointing at the console, so a camera
-// standing beyond the panel (outside the octagon) sees its BACK — culled, by
-// `StandardMaterial`'s default `cull_mode` — and the chamber shows through.
-// A `Cuboid` or an explicit `cull_mode: None` on any wall part defeats this.
-
-/// One octagon wall face. `center` is room-space, `y = 0` (the caller picks
-/// the panel's vertical placement); `yaw` is the outward-facing angle the
-/// face points along (`super` turns this into a `looking_at` transform, not
-/// a raw rotation, so no Bevy `Quat` convention needs matching here); and
-/// `bearing` names the cardinal identity hue the face's edge trim reads —
-/// `None` on the four diagonals, which dress in the violet information
-/// family instead.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OctagonPanel {
-    pub center: [f32; 3],
-    pub yaw: f32,
-    pub bearing: Option<Bearing>,
-}
-
-/// The eight octagon faces, `apothem` out from center: N, NE, E, SE, S, SW,
-/// W, NW in order. The diagonals are literally [`RADIATOR_DIRS`] (the same
-/// four directions the floor's violet stub routes already fan toward), so a
-/// re-placed diagonal can't drift out of sync between the wall and the
-/// floor. Each face sits exactly 45° from its neighbours by construction.
-pub fn octagon_panels(apothem: f32) -> [OctagonPanel; 8] {
-    let faces: [([f32; 3], Option<Bearing>); 8] = [
-        (Bearing::North.dir(), Some(Bearing::North)),
-        (RADIATOR_DIRS[0], None), // NE
-        (Bearing::East.dir(), Some(Bearing::East)),
-        (RADIATOR_DIRS[1], None), // SE
-        (Bearing::South.dir(), Some(Bearing::South)),
-        (RADIATOR_DIRS[2], None), // SW
-        (Bearing::West.dir(), Some(Bearing::West)),
-        (RADIATOR_DIRS[3], None), // NW
-    ];
-    let mut out = [OctagonPanel { center: [0.0; 3], yaw: 0.0, bearing: None }; 8];
-    for (i, (dir, bearing)) in faces.into_iter().enumerate() {
-        out[i] = OctagonPanel {
-            center: [apothem * dir[0], 0.0, apothem * dir[2]],
-            yaw: dir_theta(dir),
-            bearing,
-        };
-    }
-    out
-}
-
-/// A regular octagon's flat-side width at `apothem` (the standard n-gon
-/// relation, `n = 8`: side `= 2·apothem·tan(π/n)`) — the panel's FULL width,
-/// touching its neighbours at the corners; `super` trims a small gap off
-/// this for the corner mullions to stand in.
+/// Full width of one facet between adjacent corners of a regular octagon.
 pub fn octagon_panel_width(apothem: f32) -> f32 {
     2.0 * apothem * core::f32::consts::FRAC_PI_8.tan()
-}
-
-/// Distance from center to an octagon vertex (where two panels meet) at
-/// `apothem` — the standard n-gon relation `circumradius = apothem / cos(π/n)`.
-/// Always a touch past `apothem` itself (`cos(π/8) < 1`).
-pub fn octagon_circumradius(apothem: f32) -> f32 {
-    apothem / core::f32::consts::FRAC_PI_8.cos()
-}
-
-/// The eight corner-mullion placements: one between every adjacent pair of
-/// [`octagon_panels`] faces, sitting on the circumradius, facing outward
-/// along the bisector of its two neighbours (`yaw + π/8` past the panel it
-/// follows — cos/sin are periodic, so this needs no unwrapping at the
-/// West→NW seam where the raw `atan2` values jump). The same inward-facing,
-/// single-sided recipe applies.
-pub fn octagon_corners(apothem: f32) -> [([f32; 3], f32); 8] {
-    let panels = octagon_panels(apothem);
-    let r = octagon_circumradius(apothem);
-    let mut out = [([0.0; 3], 0.0); 8];
-    for (i, p) in panels.iter().enumerate() {
-        let theta = p.yaw + core::f32::consts::FRAC_PI_8;
-        out[i] = ([r * theta.cos(), 0.0, r * theta.sin()], theta);
-    }
-    out
-}
-
-// ── Camera approach ────────────────────────────────────────────────────────────
-
-/// Camera position for the **approach** pose: standing on the SAME side of
-/// the room as the focused bearing, between the console and the wall — "walk
-/// toward the station you're studying" (`shell.md`'s travel-by-intent dolly).
-/// Replaces the old across-the-room orbit, whose opposite-side eye put the
-/// console *and* the diametrically opposite pylon in the sight line, fully
-/// occluding the focused station. `r` is the distance out from center along
-/// the bearing axis; `height` the world-Y eye lift.
-pub fn approach_camera(dir: [f32; 3], r: f32, height: f32) -> [f32; 3] {
-    [dir[0] * r, height, dir[2] * r]
-}
-
-/// The look-at point for the approach pose: the bearing's marker at the wall
-/// (`wall_r` — the same radius the marker pylons stand at), held at `look_h`
-/// (nameplate height) — frames the plate square-on, straight ahead of the eye
-/// on the same side of the room (never back through the console).
-pub fn approach_look(dir: [f32; 3], wall_r: f32, look_h: f32) -> [f32; 3] {
-    [dir[0] * wall_r, look_h, dir[2] * wall_r]
 }
 
 // ── Procedural-mesh vertex helpers ─────────────────────────────────────────────
@@ -384,9 +154,7 @@ pub fn dir_theta(dir: [f32; 3]) -> f32 {
     dir[2].atan2(dir[0])
 }
 
-/// Linear interpolation, `t` typically in `[0, 1]` — shared by the board's
-/// jitter ([`expand_bundle`]) and the radiator thread-strip variation
-/// (`super`).
+/// Linear interpolation for the floor traces.
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -477,8 +245,7 @@ pub struct RouteBundle {
     pub arc_range: (f32, f32),
     /// `(min, max)` terminal-pad radius.
     pub pad_range: (f32, f32),
-    /// Etched hue family (linear rgb, dim — LDR; `mod.rs`'s `TRACE_*` /
-    /// `RADIATOR_COLOR` constants).
+    /// Linear RGB color of the etched floor trace.
     pub hue: [f32; 3],
     /// `(min, max)` brightness multiplier on `hue`.
     pub brightness_range: (f32, f32),
@@ -628,7 +395,6 @@ mod tests {
         assert_eq!(Bearing::South.dir(), [0.0, 0.0, 1.0]);
         assert_eq!(Bearing::East.dir(), [1.0, 0.0, 0.0]);
         assert_eq!(Bearing::West.dir(), [-1.0, 0.0, 0.0]);
-        assert_eq!(Bearing::Center.dir(), [0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -642,116 +408,23 @@ mod tests {
     }
 
     #[test]
-    fn bearing_indices_are_dense_and_distinct() {
-        let all = [
-            Bearing::Center,
-            Bearing::North,
-            Bearing::East,
-            Bearing::South,
-            Bearing::West,
-        ];
-        let mut seen = [false; Bearing::COUNT];
-        for b in all {
-            assert!(b.index() < Bearing::COUNT);
-            assert!(!seen[b.index()], "index reused");
-            seen[b.index()] = true;
-        }
-        assert!(seen.iter().all(|&s| s), "every slot used");
-    }
-
-    #[test]
-    fn radiator_focus_dir_is_a_unit_ne_diagonal() {
-        let d = RADIATOR_FOCUS_DIR;
-        let len = (d[0] * d[0] + d[2] * d[2]).sqrt();
-        assert!((len - 1.0).abs() < 1e-6, "unit length: {len}");
-        assert!(d[0] > 0.0 && d[2] < 0.0, "points north-east (+X, −Z)");
-    }
-
-    // ── carousel → bearing mapping ──
-
-    #[test]
-    fn console_focus_is_the_overview_no_direction() {
-        assert_eq!(focus_dir(Station::TimeWell), None);
-    }
-
-    #[test]
-    fn stations_map_to_their_stable_bearings() {
-        assert_eq!(focus_dir(Station::Switchboard), Some(Bearing::South.dir()));
-        assert_eq!(focus_dir(Station::Radiators), Some(RADIATOR_FOCUS_DIR));
-    }
-
-    #[test]
-    fn west_east_north_bearings_stay_reserved() {
-        let placements = wall_placements();
-        for b in [Bearing::West, Bearing::East, Bearing::North] {
-            let wp = placements.iter().find(|p| p.bearing == b).unwrap();
-            assert_eq!(wp.station, None, "{b:?} should have no station");
-        }
-    }
-
-    #[test]
-    fn south_bearing_now_carries_the_switchboard_station() {
-        // South used to be the grey, station-less reserved stub; the
-        // switchboard slice gave it a real station identity — locks the
-        // change in so a future edit can't silently un-reserve it back to
-        // `None` (`docs/scenes/shell.md`'s old "future MCP broker
-        // switchboard" placeholder, now built).
-        let placements = wall_placements();
-        let south = placements.iter().find(|p| p.bearing == Bearing::South).unwrap();
-        assert_eq!(south.station, Some(Station::Switchboard));
-    }
-
-    // ── station-furniture gate ──
-
-    /// Expected `station_is_room_furniture` result, one row per station — see
-    /// `room/mod.rs`'s `EXPECTED_ZOOMABLE` for why this is a table to append
-    /// a row to, not a boolean expression concurrent lanes would both need to
-    /// edit.
-    const EXPECTED_ROOM_FURNITURE: &[(Station, bool)] = &[
-        (Station::TimeWell, true),
-        // The switchboard's lamp grid mounts ON the wall panel. The lane that
-        // built it first kept the generic marker + nameplate, but the first
-        // live look (2026-08-10) showed the marker pylon planted dead-center
-        // in FRONT of the lamp grid, occluding the middle columns — the
-        // exact occlusion this gate exists to prevent. The grid is the
-        // station's face; furniture like the well's.
-        (Station::Switchboard, true),
-        (Station::Radiators, false),
-    ];
-
-    #[test]
-    fn room_furniture_stations_match_the_expected_table() {
-        assert_eq!(
-            EXPECTED_ROOM_FURNITURE.len(),
-            Station::ALL.len(),
-            "every station needs a row in EXPECTED_ROOM_FURNITURE"
-        );
-        for (s, expected) in EXPECTED_ROOM_FURNITURE {
-            assert_eq!(station_is_room_furniture(*s), *expected, "{s:?}: room-furniture mismatch");
-        }
-    }
-
-    // ── octagon wall shell ──
-
-    #[test]
-    fn octagon_panels_diagonals_are_literally_the_radiator_dirs() {
+    fn octagon_diagonals_follow_the_floor_traces() {
         let apothem = 800.0;
-        let panels = octagon_panels(apothem);
+        let panels = octagon_centers(apothem);
         for (slot, k) in [1usize, 3, 5, 7].iter().enumerate() {
-            let expect = RADIATOR_DIRS[slot];
+            let expect = DIAGONAL_DIRS[slot];
             assert_eq!(
-                panels[*k].center,
+                panels[*k],
                 [apothem * expect[0], 0.0, apothem * expect[2]],
-                "octagon face {k} should be RADIATOR_DIRS[{slot}]"
+                "octagon face {k} should be DIAGONAL_DIRS[{slot}]"
             );
-            assert_eq!(panels[*k].bearing, None, "diagonal faces carry no cardinal identity");
         }
     }
 
     #[test]
     fn octagon_panels_cardinals_match_their_bearings() {
         let apothem = 800.0;
-        let panels = octagon_panels(apothem);
+        let panels = octagon_centers(apothem);
         for (i, b) in [
             (0usize, Bearing::North),
             (2, Bearing::East),
@@ -759,35 +432,24 @@ mod tests {
             (6, Bearing::West),
         ] {
             let d = b.dir();
-            assert_eq!(panels[i].center, [apothem * d[0], 0.0, apothem * d[2]]);
-            assert_eq!(panels[i].bearing, Some(b));
+            assert_eq!(panels[i], [apothem * d[0], 0.0, apothem * d[2]]);
         }
     }
 
     #[test]
     fn octagon_panels_all_sit_on_the_apothem_circle() {
-        for p in octagon_panels(800.0) {
-            let r = (p.center[0] * p.center[0] + p.center[2] * p.center[2]).sqrt();
+        for p in octagon_centers(800.0) {
+            let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
             assert!((r - 800.0).abs() < 1e-3, "panel at r={r}, expected apothem 800");
         }
     }
 
     #[test]
-    fn octagon_panels_yaw_matches_its_own_center_direction() {
-        for p in octagon_panels(800.0) {
-            assert!(
-                (dir_theta(p.center) - p.yaw).abs() < 1e-5,
-                "yaw should be the outward angle of its own position: {p:?}"
-            );
-        }
-    }
-
-    #[test]
     fn octagon_panels_are_evenly_spaced_45_degrees_apart() {
-        let panels = octagon_panels(800.0);
+        let panels = octagon_centers(800.0);
         for i in 0..8 {
-            let a = panels[i].yaw;
-            let b = panels[(i + 1) % 8].yaw;
+            let a = dir_theta(panels[i]);
+            let b = dir_theta(panels[(i + 1) % 8]);
             // Unwrap the one seam where the raw atan2 values jump backwards
             // (West, θ=π → NW, θ=−3π/4): every other neighbour pair already
             // steps forward by +π/4.
@@ -809,49 +471,6 @@ mod tests {
         let expected = 2.0 * apothem * (std::f32::consts::PI / 8.0).tan();
         assert!((octagon_panel_width(apothem) - expected).abs() < 1e-3);
         assert!(octagon_panel_width(apothem) > 0.0);
-    }
-
-    #[test]
-    fn octagon_circumradius_is_a_touch_past_the_apothem() {
-        let apothem = 800.0;
-        let r = octagon_circumradius(apothem);
-        assert!(r > apothem, "the vertex sits farther out than the flat face: {r}");
-        assert!((r - apothem / (std::f32::consts::PI / 8.0).cos()).abs() < 1e-3);
-    }
-
-    #[test]
-    fn octagon_corners_sit_on_the_circumradius_bisecting_their_two_panels() {
-        let apothem = 800.0;
-        let panels = octagon_panels(apothem);
-        let circumradius = octagon_circumradius(apothem);
-        for (i, (pos, theta)) in octagon_corners(apothem).into_iter().enumerate() {
-            let r = (pos[0] * pos[0] + pos[2] * pos[2]).sqrt();
-            assert!((r - circumradius).abs() < 1e-3, "corner {i} at r={r}");
-            assert!(
-                (theta - (panels[i].yaw + core::f32::consts::FRAC_PI_8)).abs() < 1e-5,
-                "corner {i} bisects panel {i} and its next neighbour"
-            );
-        }
-    }
-
-    // ── camera approach ──
-
-    #[test]
-    fn facing_east_puts_the_camera_on_the_east_side_approaching_the_wall() {
-        let d = Bearing::East.dir();
-        let cam = approach_camera(d, 160.0, 190.0);
-        assert!(cam[0] > 0.0, "camera stands on the same (east) side: {cam:?}");
-        assert_eq!(cam[1], 190.0, "lifted to the given eye height");
-        let look = approach_look(d, 620.0, 150.0);
-        assert!(look[0] > cam[0], "looks further east, out toward the wall: {look:?}");
-    }
-
-    #[test]
-    fn facing_west_mirrors_facing_east() {
-        let cam_e = approach_camera(Bearing::East.dir(), 160.0, 190.0);
-        let cam_w = approach_camera(Bearing::West.dir(), 160.0, 190.0);
-        assert_eq!(cam_e[0], -cam_w[0], "mirror across the room");
-        assert_eq!(cam_e[2], cam_w[2]);
     }
 
     // ── arc / ribbon / dome ──

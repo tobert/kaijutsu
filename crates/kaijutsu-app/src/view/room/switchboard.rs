@@ -1,39 +1,6 @@
-//! The south wall's switchboard: a grid of presence lamps, one per
-//! non-archived kernel context, reading as a machine-room status wall from
-//! across the room (`shell.md`'s old "future MCP broker switchboard"
-//! placeholder — built here). Dense warm glow = busy fleet, dark = everyone
-//! asleep; no lamp ever needs to be legible at room scale, only its
-//! brightness/color/motion.
-//!
-//! **Design split** (mirrors [`super::activity`]'s stance): the recency
-//! curve, the roster selection/cap, the grid layout math, and the
-//! ember/flash state machine are pure — no Bevy types, unit-tested below.
-//! Only the spawn/reconcile/sync systems at the bottom touch `bevy`,
-//! [`kaijutsu_client::ContextInfo`], or [`kaijutsu_client::ServerEvent`].
-//!
-//! **CPU-driven, not `TraceGlowMaterial`.** Every other faint moving glow in
-//! this room (`super`'s module doc) rides [`crate::shaders::TraceGlowMaterial`]
-//! for zero-CPU, GPU-time-only animation. A lamp can't: its brightness/hue
-//! depend on per-context state that changes at *poll* and *event* cadence
-//! (recency decay, a sticky error ember, a completion flash), not on
-//! `globals.time` alone. So lamps stay plain unlit [`StandardMaterial`]s,
-//! written from the CPU each frame — quantized through [`super::quantize`]/
-//! [`super::set_glow`] (the well's settled-material discipline) so an idle
-//! lamp population stops touching `Assets<StandardMaterial>` once its
-//! recency curve has flattened and no flash is in flight. `Running`'s
-//! "breathing" is still `trace_glow.wesl`'s mode-1 sine formula
-//! ([`breathing_multiplier`]) — just evaluated on the CPU against
-//! `Time::elapsed_secs()` instead of `globals.time`, so it can be summed with
-//! the other per-frame state before one material write.
-//!
-//! **Slots, not entities.** [`LAMP_CAP`] lamp tiles spawn once per room visit
-//! at fixed grid positions ([`lamp_grid_local_xy`]) and are never
-//! spawned/despawned again — a context taking or leaving the visible roster
-//! only changes which context a slot's material reflects
-//! ([`SwitchboardState::order`]), never the entity count. An unfilled slot
-//! (fewer than [`LAMP_CAP`] live contexts) just renders fully off — visually
-//! identical to "very inactive," which is the intended read for an empty
-//! socket in a status-lamp wall.
+//! The south switchboard shows up to 24 recently active contexts.
+//! Each fixed lamp slot reflects recency, running turns, asks, errors, and
+//! completions. Empty slots go dark.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,7 +9,7 @@ use bevy::prelude::*;
 use kaijutsu_client::{ContextInfo, ServerEvent};
 use kaijutsu_types::{ContextId, Status};
 
-use super::bearing::{self, Bearing};
+use super::bearing;
 use crate::connection::actor_plugin::ServerEventMessage;
 use crate::connection::drift::DriftState;
 use crate::view::scene_geometry;
@@ -91,13 +58,11 @@ const ASK_BRIGHTNESS: f32 = 1.15;
 const BREATH_RATE: f32 = 1.4;
 const BREATH_TROUGH: f32 = 0.62;
 
-/// Lamp tile size and grid gap (world units) and how far it stands proud of
-/// the wall panel — a touch more than [`super::WALL_THREAD_PROUD`]'s, the
-/// panel's other foreground-content idiom, for the same reason: lamps are
-/// this panel's featured content, not its trim.
+/// Lamp dimensions and spacing in room units.
 const LAMP_SIZE: f32 = 46.0;
 const LAMP_GAP: f32 = 14.0;
-const LAMP_PROUD: f32 = 3.0;
+/// Center of the lamp grid on the south bearing, facing the well.
+pub(super) const CENTER: Vec3 = Vec3::new(0.0, 280.0, scene_geometry::ROOM_APOTHEM - 3.0);
 
 /// A saturated red-orange coal — distinct from the warm gold base at a
 /// glance, the mission's "clearly distinct across the room."
@@ -364,48 +329,25 @@ impl SwitchboardState {
 #[derive(Component)]
 pub(crate) struct SwitchboardLamp(usize);
 
-/// The south octagon panel's room-space transform — the same `looking_at`
-/// composition `super::spawn_walls` uses for every cardinal panel, derived
-/// independently here (not shared state) since [`spawn_switchboard`] runs as
-/// a plain helper, not a system, and has no panel entity to read a
-/// `Transform` off of.
-fn south_panel_transform() -> Transform {
-    let panels = bearing::octagon_panels(scene_geometry::WALL_APOTHEM);
-    let panel = panels
-        .iter()
-        .find(|p| p.bearing == Some(Bearing::South))
-        .expect("south is one of the eight octagon panels");
-    let pos = Vec3::new(panel.center[0], super::WALL_HEIGHT * 0.5, panel.center[2]);
-    let outward = Vec3::new(pos.x * 2.0, pos.y, pos.z * 2.0);
-    Transform::from_translation(pos).looking_at(outward, Vec3::Y)
-}
-
-/// Spawn the switchboard's [`LAMP_CAP`] lamp-tile slots on the south wall
-/// panel, each starting fully off (`Vec3::ZERO` — [`sync_switchboard_glow`]
-/// lights them from [`SwitchboardState`] every frame after). Called from
-/// `enter_room` (`super`) with resources it already holds — see the call
-/// site's own comment for why no new system params land on `enter_room`
-/// itself.
+/// Spawn the switchboard's fixed grid. Each slot starts dark.
 pub(crate) fn spawn_switchboard(
     commands: &mut Commands,
     root: Entity,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
 ) {
-    let panel_tf = south_panel_transform();
+    let mount = Transform::from_translation(CENTER).looking_to(Vec3::Z, Vec3::Y);
     let mesh = meshes.add(Rectangle::new(LAMP_SIZE, LAMP_SIZE));
     for i in 0..LAMP_CAP {
         let (x, y) = lamp_grid_local_xy(i, LAMP_SIZE, LAMP_GAP);
-        let local = Vec3::new(x, y, LAMP_PROUD);
+        let local = Vec3::new(x, y, 0.0);
         let mat = mats.add(super::unlit(super::lin_v(Vec3::ZERO)));
         commands.spawn((
             SwitchboardLamp(i),
-            // No RoomDistraction: the lamp grid is the station's own chamber
-            // content, not room chrome — it stays lit through station dives.
             Mesh3d(mesh.clone()),
             MeshMaterial3d(mat),
-            Transform::from_translation(panel_tf.transform_point(local))
-                .with_rotation(panel_tf.rotation),
+            Transform::from_translation(mount.transform_point(local))
+                .with_rotation(mount.rotation),
             Visibility::Inherited,
             Name::new(format!("SwitchboardLamp{i}")),
             ChildOf(root),
@@ -420,7 +362,7 @@ pub(crate) fn spawn_switchboard(
 /// [`LampSignal`] (the poll-driven half of ember clearing;
 /// `ingest_switchboard_events` below is the push-driven half). Runs
 /// **ungated** across every screen (`RoomPlugin`'s registration) so the
-/// roster stays current while you're elsewhere, same as `ingest_room_activity`.
+/// roster stays current while you're elsewhere, across station changes.
 pub(crate) fn reconcile_switchboard(drift: Res<DriftState>, mut state: ResMut<SwitchboardState>) {
     if !drift.is_changed() {
         return;
@@ -510,9 +452,7 @@ pub(crate) fn sync_switchboard_glow(
         let asking = ledger.context_is_asking(entry.context_id);
         let sig = state.signals.entry(entry.context_id).or_default();
         let age_secs = now_ms.saturating_sub(entry.effective_activity_ms) as f32 / 1000.0;
-        // Per-lamp phase offset so a full wall of `Running` lamps doesn't
-        // breathe in lockstep — same `hash01` desync idiom `spawn_walls`
-        // uses for its trim phases.
+        // Give each running lamp its own breathing phase.
         let phase = bearing::hash01(lamp.0 as u32 * 7919 + 11) * std::f32::consts::TAU;
         let brightness = super::quantize(lamp_brightness(
             age_secs,

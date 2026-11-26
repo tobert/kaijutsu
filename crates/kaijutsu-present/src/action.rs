@@ -171,7 +171,7 @@ pub enum Action {
     DebugToggle,
 
     // ========================================================================
-    // Scene navigation (RoomNav / WellZoomed / StationZoomed)
+    // Scene navigation (RoomNav / WellZoomed)
     // ========================================================================
     /// Step forward within the current level: next carousel station, next
     /// ring seat (spinning it to the gate), next ledger row, one line down

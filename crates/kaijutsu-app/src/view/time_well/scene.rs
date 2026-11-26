@@ -270,8 +270,7 @@ impl Default for TimeWellState {
             placement_pending: HashSet::new(),
             hero: false,
             // The very first dive also needs its card text built — there is
-            // no prior `arm_dive` call to have armed it (mirrors
-            // `RoomState::plates_dirty`'s "fresh state starts dirty" stance).
+            // no prior `arm_dive` call to have armed it.
             card_text_dirty: true,
             lineage_drape_material: None,
         }
@@ -988,12 +987,7 @@ pub fn handle_go_to_well(
 /// - `ActivateHorizon` (`h`) — dive into the event horizon. A stub in v1:
 ///   logs, does nothing (see its arm below).
 ///
-/// PopLevel/Esc (focus-aware) is handled below: from focus it backs out to the ring
-/// overview; from the overview it leaves the well — `room.zoomed = None`,
-/// the same generic zoom-out every `station_is_zoomable` station uses now
-/// (Slice C — the well is no longer a screen cut sitting BELOW the room, so
-/// "leave the well" surfaces to the room's own ambient view, not straight to
-/// Conversation the way the old `Screen::TimeWell` scene cut did).
+/// Back leaves the focused card for its ring, then the ring for the room.
 pub fn well_keyboard(
     mut actions: MessageReader<crate::input::ActionFired>,
     mut state: ResMut<TimeWellState>,
@@ -1592,8 +1586,6 @@ pub(crate) mod tests {
     fn well_zoomed_true_only_when_the_room_is_zoomed_onto_the_well() {
         let mut room = crate::view::room::RoomState::default();
         assert!(!well_zoomed(&room), "unzoomed room is not well-zoomed");
-        room.zoomed = Some(crate::view::room::nav::Station::Radiators);
-        assert!(!well_zoomed(&room), "zoomed on a different station is not well-zoomed");
         room.zoomed = Some(crate::view::room::nav::Station::TimeWell);
         assert!(well_zoomed(&room), "zoomed on TimeWell IS well-zoomed");
     }

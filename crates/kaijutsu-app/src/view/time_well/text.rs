@@ -646,9 +646,7 @@ pub fn build_card_scenes(
     let Some(atlas) = atlas.as_deref_mut() else {
         return; // atlas not ready yet; same retry contract
     };
-    // Only clear the arm once glyphs are actually about to be committed for
-    // every card (below) — same "don't eat the flag on a scheduling surprise"
-    // discipline as `room::room_plate_text`'s `any` guard.
+    // Clear the dirty flag once glyphs can be committed for every card.
     let colors = CardTextColors::from(&*theme);
     let rebuild_all = state.card_text_dirty || *last_colors != Some(colors);
     let changed_set: std::collections::HashSet<Entity> = changed.iter().collect();

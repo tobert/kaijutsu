@@ -32,9 +32,6 @@ pub enum InputContext {
     RoomNav,
     /// Screen::Room, zoomed into the time well
     WellZoomed,
-    /// Screen::Room, zoomed into a station with no keyboard of its own
-    /// (Radiators)
-    StationZoomed,
     /// Screen::Heroic — the 3D anticipation & commitment road (`docs/newui.md`)
     Heroic,
     /// The boards screen.
@@ -202,9 +199,8 @@ pub fn derive_contexts(
         // positively — conversation contexts simply aren't derived here.
         Screen::Room => {
             contexts.push(match zoomed {
-                None => InputContext::RoomNav,
+                None | Some(Station::Switchboard) => InputContext::RoomNav,
                 Some(Station::TimeWell) => InputContext::WellZoomed,
-                Some(_) => InputContext::StationZoomed,
             });
             return (contexts, KeyboardGrab::None);
         }
@@ -367,19 +363,6 @@ mod tests {
         );
         assert!(ctxs.contains(&InputContext::WellZoomed));
         assert!(!ctxs.contains(&InputContext::RoomNav));
-    }
-
-    #[test]
-    fn room_zoomed_plain_station() {
-        let (ctxs, _) = derive_contexts(
-            Screen::Room,
-            Some(Station::Radiators),
-            &FocusArea::Conversation,
-            false,
-            surfaces(false, false),
-        );
-        assert!(ctxs.contains(&InputContext::StationZoomed));
-        assert!(!ctxs.contains(&InputContext::WellZoomed));
     }
 
     #[test]

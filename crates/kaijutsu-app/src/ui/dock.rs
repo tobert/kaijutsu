@@ -2472,6 +2472,7 @@ pub fn update_hints(
     }
 
     use crate::ui::screen::Screen;
+    use crate::view::room::nav::Station;
     let hints = match screen.get() {
         Screen::Conversation if neo.enabled && *focus_area == FocusArea::Conversation => {
             "[]: select \u{2502} \\: section \u{2502} Shift+Enter: source \u{2502} ^A e: exit"
@@ -2489,15 +2490,13 @@ pub fn update_hints(
         Screen::Diff => {
             "j/k: line \u{2502} ]c/[c: hunk \u{2502} V: select \u{2502} y: yank \u{2502} q: close"
         }
-        Screen::Room => match room.zoomed {
-            None => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: zoom \u{2502} Esc: conversation",
-            Some(crate::view::room::nav::Station::TimeWell) => {
-                "0-9/\u{2190}\u{2192}\u{2191}\u{2193}: seat & ring \u{2502} Enter: focus/commit \u{2502} c/p/d/z/a: act \u{2502} Esc: room"
-            }
-            // The plain panels (Radiators) share `plain_zoom_keyboard`'s
-            // surface-only keys.
-            Some(_) => "\u{2191}/Esc: room",
-        },
+        Screen::Room if room.zoomed == Some(Station::TimeWell) => {
+            "0-9/\u{2190}\u{2192}\u{2191}\u{2193}: seat & ring \u{2502} Enter: focus/commit \u{2502} c/p/d/z/a: act \u{2502} Esc: room"
+        }
+        Screen::Room if room.carousel.focused_station() == Station::Switchboard => {
+            "\u{2190}\u{2192}: station \u{2502} Esc: conversation"
+        }
+        Screen::Room => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: zoom \u{2502} Esc: conversation",
         Screen::Boards => "",
         Screen::Heroic => "0-9/\u{2190}\u{2192}: select \u{2502} r: reload theme \u{2502} Esc: clear / leave",
     };

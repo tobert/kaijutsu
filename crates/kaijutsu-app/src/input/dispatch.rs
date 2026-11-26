@@ -371,7 +371,6 @@ fn context_priority(ctx: InputContext) -> usize {
         | InputContext::TextInput
         | InputContext::RoomNav
         | InputContext::WellZoomed
-        | InputContext::StationZoomed
         | InputContext::Heroic
         | InputContext::Boards
         | InputContext::Neo => 1,

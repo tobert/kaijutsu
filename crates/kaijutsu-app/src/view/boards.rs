@@ -150,7 +150,7 @@ fn board_actions(
         if event.action == Action::OpenBoards {
             if matches!(screen.get(), Screen::Conversation | Screen::Heroic | Screen::Room)
                 && active.0.iter().any(|ctx| matches!(ctx, InputContext::Navigation | InputContext::Heroic
-                    | InputContext::RoomNav | InputContext::WellZoomed | InputContext::StationZoomed))
+                    | InputContext::RoomNav | InputContext::WellZoomed))
                 && !active.contains(InputContext::QuickContext)
             {
                 nav.return_to = *screen.get();
@@ -193,12 +193,12 @@ mod tests {
         app.add_plugins(bevy::state::app::StatesPlugin).init_state::<Screen>()
             .add_message::<ActionFired>().init_resource::<BoardFeed>().init_resource::<BoardNav>()
             .init_resource::<RoomState>()
-            .insert_resource(ActiveInputContexts(vec![InputContext::StationZoomed]))
+            .insert_resource(ActiveInputContexts(vec![InputContext::WellZoomed]))
             .add_systems(Update, board_actions);
         app.world_mut().resource_mut::<NextState<Screen>>().set(Screen::Room);
         app.update();
-        app.world_mut().resource_mut::<RoomState>().zoomed = Some(Station::Radiators);
-        app.world_mut().write_message(ActionFired::new(Action::OpenBoards, InputContext::StationZoomed));
+        app.world_mut().resource_mut::<RoomState>().zoomed = Some(Station::TimeWell);
+        app.world_mut().write_message(ActionFired::new(Action::OpenBoards, InputContext::WellZoomed));
         app.update();
         app.update();
         assert_eq!(*app.world().resource::<State<Screen>>().get(), Screen::Boards);
@@ -207,6 +207,6 @@ mod tests {
         app.update();
         app.update();
         assert_eq!(*app.world().resource::<State<Screen>>().get(), Screen::Room);
-        assert_eq!(app.world().resource::<RoomState>().zoomed, Some(Station::Radiators));
+        assert_eq!(app.world().resource::<RoomState>().zoomed, Some(Station::TimeWell));
     }
 }

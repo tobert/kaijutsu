@@ -30,9 +30,8 @@ kind of signal. A miss and a fallback still need gestures of their own.
 
 ## Try the score around the well
 
-During a rehearsal, eight flat faces carry the score around the table.
-Their distance from the center is six percent greater than that of the
-old walls. Each face holds one measure. The staves sit one above another
+Eight flat faces carry the rehearsal score around the open table.
+Each face holds one measure. The staves sit one above another
 and share a horizontal beat scale. The current bar passes in front of the
 player, where one playhead crosses all the parts. Longer phrases continue
 onto the next set of eight measures.
@@ -40,8 +39,8 @@ onto the next set of eight measures.
 Try this from the well overview with the drums, bass and chords playing.
 Follow one kick and bass entrance through the playhead. Check whether the
 five staff lines stay distinct on the front face and whether you can
-follow a part onto the next flat face. The south switchboard remains a
-separate stop on the controller carousel.
+follow a part onto the next flat face. Press Left or Right to face the freestanding Switchboard, then press
+again to return to the well.
 
 ## A closer visit
 

@@ -185,8 +185,7 @@ bright_white = "#ece7fa"
 bg = "#05070b"             # the octagon's void (room clear color)
 gold = "#ffe59e"           # the room's one metal
 brass = "#ddc489"          # sockets, pegs, jacks
-violet_glass = "#55386c"   # information-violet: radiator glass
-violet_thread = "#c476e1"  # information-violet: threads/content
+violet_glass = "#55386c"   # violet floor traces
 neon = "#ad95f3"           # the well's electric indigo-violet
 terrace = "#c4b3f9"        # terrace glyphs: paler tint of neon
 ask = "#fff5c2"            # a context with an approval ask pending
@@ -195,24 +194,17 @@ trace_cyan = "#3f737e"
 trace_green = "#598b6c"
 trace_gold = "#958159"
 table = "#32353f"          # structural near-blacks
-wall_base = "#464556"
-wall_mullion = "#383844"
 dark_surface = "#1d1e26"
 
 [scene.tiers]
-marker = 0.42        # station markers at rest
 trim = 0.50          # gold architectural trim
 crest = 1.25         # ceiling for any decoration crest (>1.0 blooms softly)
 trough_wiring = 0.55 # floor traces at rest
-trough_wall_trim = 0.60
 trough_pads = 0.65
 trough_subtle = 0.75 # the calmest breathers
 # invariant (tested): every trough × crest < 1.0
 
 [scene.gains]
-beat = 2.8           # tracker marker beat thump
-active = 0.5
-focus_lift = 0.35
 reading_border = 1.6
 hud_border = 1.8
 
@@ -230,8 +222,8 @@ chamber_roughness = 0.5      # wet-asphalt sheen on the lit shell surfaces
 chamber_reflectance = 0.3    # a small specular kick
 key_light_color = "#ffc58f"  # one warm key light at the well (~3200K)
 key_light_intensity = 5.0e8  # lumens; large — the room is ~1300 units, not metric
-key_light_range = 2000.0     # cutoff radius, covers the floor disc and walls
-ambient_color = "#ffe6cc"    # faint warm fill so far walls are not pure black
+key_light_range = 2000.0     # cutoff radius, covers the floor disc
+ambient_color = "#ffe6cc"    # faint warm fill on the chamber
 ambient_brightness = 150.0
 
 # ─── The heroic view (docs/newui.md) ─────────────────────────────────────────

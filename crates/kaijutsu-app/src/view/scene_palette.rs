@@ -36,10 +36,8 @@ pub struct ScenePalette {
     pub gold: LinearRgba,
     /// Hardware: sockets, pegs, jacks.
     pub brass: LinearRgba,
-    /// Information-violet: radiator glass backdrop.
+    /// Violet floor traces.
     pub violet_glass: LinearRgba,
-    /// Information-violet: thread/content strips.
-    pub violet_thread: LinearRgba,
     /// The well's electric indigo-violet (ring deck + track rays).
     pub neon: LinearRgba,
     /// Terrace glyph rings: a paler tint of `neon`.
@@ -54,23 +52,16 @@ pub struct ScenePalette {
     pub trace_gold: LinearRgba,
     /// Structural near-blacks (silhouettes, not brightness).
     pub table: LinearRgba,
-    pub wall_base: LinearRgba,
-    pub wall_mullion: LinearRgba,
     pub dark_surface: LinearRgba,
 
     // ── Brightness tier ladder ──
-    pub marker: f32,
     pub trim: f32,
     pub crest: f32,
     pub trough_wiring: f32,
-    pub trough_wall_trim: f32,
     pub trough_pads: f32,
     pub trough_subtle: f32,
 
     // ── Live-signal gains (allowed to sustain HDR) ──
-    pub gain_beat: f32,
-    pub gain_active: f32,
-    pub gain_focus_lift: f32,
     pub gain_reading_border: f32,
     pub gain_hud_border: f32,
 
@@ -91,7 +82,7 @@ pub struct ScenePalette {
     pub key_light: LinearRgba,
     pub key_light_intensity: f32,
     pub key_light_range: f32,
-    /// Faint warm ambient fill so the far walls are not pure black.
+    /// Faint warm ambient fill for the chamber.
     pub ambient: LinearRgba,
     pub ambient_brightness: f32,
 }
@@ -127,7 +118,6 @@ impl ScenePalette {
             gold: hue("gold", &h.gold, d.gold),
             brass: hue("brass", &h.brass, d.brass),
             violet_glass: hue("violet_glass", &h.violet_glass, d.violet_glass),
-            violet_thread: hue("violet_thread", &h.violet_thread, d.violet_thread),
             neon: hue("neon", &h.neon, d.neon),
             terrace: hue("terrace", &h.terrace, d.terrace),
             ask: hue("ask", &h.ask, d.ask),
@@ -136,21 +126,14 @@ impl ScenePalette {
             trace_green: hue("trace_green", &h.trace_green, d.trace_green),
             trace_gold: hue("trace_gold", &h.trace_gold, d.trace_gold),
             table: hue("table", &h.table, d.table),
-            wall_base: hue("wall_base", &h.wall_base, d.wall_base),
-            wall_mullion: hue("wall_mullion", &h.wall_mullion, d.wall_mullion),
             dark_surface: hue("dark_surface", &h.dark_surface, d.dark_surface),
 
-            marker: t.marker,
             trim: t.trim,
             crest: t.crest,
             trough_wiring: t.trough_wiring,
-            trough_wall_trim: t.trough_wall_trim,
             trough_pads: t.trough_pads,
             trough_subtle: t.trough_subtle,
 
-            gain_beat: g.beat,
-            gain_active: g.active,
-            gain_focus_lift: g.focus_lift,
             gain_reading_border: g.reading_border,
             gain_hud_border: g.hud_border,
 
@@ -192,7 +175,6 @@ impl Default for ScenePalette {
             gold: lin(1.00, 0.78, 0.34),
             brass: lin(0.72, 0.55, 0.25),
             violet_glass: lin(0.090, 0.040, 0.150),
-            violet_thread: lin(0.550, 0.180, 0.750),
             neon: lin(0.42, 0.30, 0.90),
             terrace: lin(0.55, 0.45, 0.95),
             ask: lin(1.00, 0.913, 0.540),
@@ -201,21 +183,14 @@ impl Default for ScenePalette {
             trace_green: lin(0.100, 0.260, 0.150),
             trace_gold: lin(0.300, 0.220, 0.100),
             table: lin(0.032, 0.036, 0.050),
-            wall_base: lin(0.062, 0.060, 0.094),
-            wall_mullion: lin(0.040, 0.040, 0.058),
             dark_surface: lin(0.012, 0.013, 0.019),
 
-            marker: 0.42,
             trim: 0.50,
             crest: 1.25,
             trough_wiring: 0.55,
-            trough_wall_trim: 0.60,
             trough_pads: 0.65,
             trough_subtle: 0.75,
 
-            gain_beat: 2.8,
-            gain_active: 0.5,
-            gain_focus_lift: 0.35,
             gain_reading_border: 1.6,
             gain_hud_border: 1.8,
 
@@ -469,7 +444,6 @@ mod tests {
         close(compiled.gold, parsed.gold, "gold");
         close(compiled.brass, parsed.brass, "brass");
         close(compiled.violet_glass, parsed.violet_glass, "violet_glass");
-        close(compiled.violet_thread, parsed.violet_thread, "violet_thread");
         close(compiled.neon, parsed.neon, "neon");
         close(compiled.terrace, parsed.terrace, "terrace");
         close(compiled.ask, parsed.ask, "ask");
@@ -478,13 +452,10 @@ mod tests {
         close(compiled.trace_green, parsed.trace_green, "trace_green");
         close(compiled.trace_gold, parsed.trace_gold, "trace_gold");
         close(compiled.table, parsed.table, "table");
-        close(compiled.wall_base, parsed.wall_base, "wall_base");
-        close(compiled.wall_mullion, parsed.wall_mullion, "wall_mullion");
         close(compiled.dark_surface, parsed.dark_surface, "dark_surface");
         close(compiled.key_light, parsed.key_light, "key_light");
         close(compiled.ambient, parsed.ambient, "ambient");
         assert_eq!(compiled.crest, parsed.crest);
-        assert_eq!(compiled.gain_beat, parsed.gain_beat);
         assert_eq!(compiled.tonemapper, parsed.tonemapper);
         assert_eq!(compiled.bloom_intensity, parsed.bloom_intensity);
         assert_eq!(compiled.lit_chamber, parsed.lit_chamber);
@@ -527,7 +498,6 @@ mod tests {
         let p = ScenePalette::from_scene_data(&SceneData::default());
         for (name, trough) in [
             ("wiring", p.trough_wiring),
-            ("wall_trim", p.trough_wall_trim),
             ("pads", p.trough_pads),
             ("subtle", p.trough_subtle),
         ] {

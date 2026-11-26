@@ -525,23 +525,6 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
-    // StationZoomed (zoomed station with no keyboard of its own)
-    // ====================================================================
-
-    b.push(Binding::key(
-        KeyCode::ArrowUp,
-        InputContext::StationZoomed,
-        Action::PopLevel,
-        "Back to room",
-    ));
-    b.push(Binding::key(
-        KeyCode::Escape,
-        InputContext::StationZoomed,
-        Action::PopLevel,
-        "Back to room",
-    ));
-
-    // ====================================================================
     // Neo workspace navigation leaves the transcript's vi motions in place.
     b.push(Binding::key(KeyCode::BracketLeft, InputContext::Neo, Action::StepPrev, "Previous Neo record"));
     b.push(Binding::key(KeyCode::BracketRight, InputContext::Neo, Action::StepNext, "Next Neo record"));
@@ -574,7 +557,7 @@ pub fn default_bindings() -> Vec<Binding> {
     ] {
         b.push(Binding::gamepad(button, InputContext::Boards, action, "Boards"));
     }
-    for context in [InputContext::Navigation, InputContext::RoomNav, InputContext::WellZoomed, InputContext::StationZoomed, InputContext::Heroic] {
+    for context in [InputContext::Navigation, InputContext::RoomNav, InputContext::WellZoomed, InputContext::Heroic] {
         b.push(Binding::gamepad(GamepadButton::Select, context, Action::OpenBoards, "Open boards"));
     }
 

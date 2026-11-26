@@ -15,12 +15,12 @@ use super::{RoomState, Station, score_ink};
 use super::{bearing, scene_geometry};
 
 const FACES: usize = 8;
-const RADIUS: f32 = scene_geometry::WALL_APOTHEM * 1.06;
-const CENTER_Y: f32 = super::WALL_HEIGHT * 0.56;
+const RADIUS: f32 = scene_geometry::ROOM_APOTHEM * 1.06;
+const CENTER_Y: f32 = 313.6;
 
 fn face_pose(index: usize) -> Transform {
-    let panel = bearing::octagon_panels(RADIUS)[index];
-    let center = Vec3::new(panel.center[0], CENTER_Y, panel.center[2]);
+    let [x, _, z] = bearing::octagon_centers(RADIUS)[index];
+    let center = Vec3::new(x, CENTER_Y, z);
     Transform::from_translation(center).looking_to(center - Vec3::Y * CENTER_Y, Vec3::Y)
 }
 
@@ -29,7 +29,7 @@ fn window_index(beat: f64, phrase_start: i64, bar_beats: f64) -> usize {
 }
 
 #[derive(Component)]
-pub(super) struct WallShell;
+pub(super) struct SwitchboardDisplay;
 
 #[derive(Component)]
 pub(super) struct Playhead;
@@ -160,20 +160,23 @@ pub(super) fn show_score(
     score: Res<RoomScore>,
     beats: Res<WellBeatsRes>,
     tracks: Res<WellTracks>,
-    mut band: Query<(&ScoreBand, &mut Transform, &mut Visibility), (Without<WallShell>, Without<Playhead>)>,
-    mut wall: Query<&mut Visibility, (With<WallShell>, Without<Playhead>)>,
+    mut band: Query<(&ScoreBand, &mut Transform, &mut Visibility), (Without<SwitchboardDisplay>, Without<Playhead>)>,
+    mut switchboards: Query<&mut Visibility, (With<SwitchboardDisplay>, Without<Playhead>)>,
     mut cursor: Query<(&mut Transform, &mut Visibility), With<Playhead>>,
 ) {
-    let (Ok((band, mut ring, mut visible)), Ok(mut shell), Ok((mut line, mut line_visible))) =
-        (band.single_mut(), wall.single_mut(), cursor.single_mut()) else { return };
     let music_view = room.carousel.focused_station() != Station::Switchboard;
-    let show = music_view && !band.spans.is_empty();
-    visible.set_if_neq(if show { Visibility::Inherited } else { Visibility::Hidden });
-    shell.set_if_neq(if music_view && score.score_context.is_some() {
+    let switchboard_visibility = if music_view && score.score_context.is_some() {
         Visibility::Hidden
     } else {
         Visibility::Inherited
-    });
+    };
+    for mut display in &mut switchboards {
+        display.set_if_neq(switchboard_visibility);
+    }
+    let (Ok((band, mut ring, mut visible)), Ok((mut line, mut line_visible))) =
+        (band.single_mut(), cursor.single_mut()) else { return };
+    let show = music_view && !band.spans.is_empty();
+    visible.set_if_neq(if show { Visibility::Inherited } else { Visibility::Hidden });
     let (beat, rolling) = score_position(&score, &beats, &tracks);
     let window_start = band.requested.map_or(0.0, |key| key.window as f64 * band.meter * FACES as f64);
     let phase = beat - score.start as f64 - window_start;
@@ -195,6 +198,44 @@ pub(super) fn show_score(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn visibility_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<RoomState>().init_resource::<RoomScore>()
+            .init_resource::<WellBeatsRes>().init_resource::<WellTracks>()
+            .add_systems(Update, show_score);
+        app
+    }
+
+    #[test]
+    fn score_visibility_follows_station_focus_in_an_open_room() {
+        let mut app = visibility_app();
+        let band = app.world_mut().spawn((ScoreBand {
+            faces: Vec::new(), meter: 4.0, requested: None, task: None, spans: vec![(0.0, 4.0)],
+        }, Transform::default(), Visibility::Hidden)).id();
+        app.world_mut().spawn((Playhead, Transform::default(), Visibility::Hidden));
+        app.update();
+        assert_eq!(app.world().get::<Visibility>(band), Some(&Visibility::Inherited));
+        app.world_mut().resource_mut::<RoomState>().carousel =
+            super::super::nav::StationCarousel::new(Station::Switchboard);
+        app.update();
+        assert_eq!(app.world().get::<Visibility>(band), Some(&Visibility::Hidden));
+    }
+
+    #[test]
+    fn switchboard_lamps_follow_focus_while_the_score_loads() {
+        let mut app = visibility_app();
+        let display = app.world_mut().spawn((SwitchboardDisplay, Visibility::Hidden)).id();
+        app.update();
+        assert_eq!(app.world().get::<Visibility>(display), Some(&Visibility::Inherited));
+        app.world_mut().resource_mut::<RoomScore>().score_context = Some(kaijutsu_types::ContextId::new());
+        app.update();
+        assert_eq!(app.world().get::<Visibility>(display), Some(&Visibility::Hidden));
+        app.world_mut().resource_mut::<RoomState>().carousel =
+            super::super::nav::StationCarousel::new(Station::Switchboard);
+        app.update();
+        assert_eq!(app.world().get::<Visibility>(display), Some(&Visibility::Inherited));
+    }
 
     #[test]
     fn adjacent_staff_edges_meet_and_face_the_well() {

@@ -640,6 +640,9 @@ normally gives dense passages more space. In the room, every staff uses
 the same distance per quarter note so that a kick and a bass entrance at
 the same tick meet the same playhead. The app engraves the eight faces
 when their music changes and moves the band from the track clock.
+The south Switchboard stands on its own. Removing the enclosing panels
+also removed the Radiators carousel stop, whose content was the lighting
+on the diagonal panels.
 
 ## The rotation signoff (November 23)
 
