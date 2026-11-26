@@ -557,7 +557,7 @@ fn enter_room(
     mut ring_mats: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
     mut terrace_mats: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<IsDefaultUiCamera>>,
     existing: Query<Entity, With<RoomRoot>>,
 ) {
     // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`

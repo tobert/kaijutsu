@@ -20,16 +20,17 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 - **Two-step topic creation can leave an orphan `DocKind::Topic` document** if concurrent posts collide on `idx_board_topics_slug` or if `open_board_post_ask` fails after `create_document_with_held_block` (`kj/board.rs`). Fix: wrap document + topic insert or delete the document on error.
 - **Plain `kj context archive <senpai>` archives the context board** when no other live context holds `board_id`, even if live kohai still address it via `.senpai` (rotation is safe because the successor receives `board_id` first).
 - **`kj board read --include-hidden` and `kj ledger list` previews** show pending held posts to non-moderators (`kj/board.rs`); gate `--include-hidden` or split `--include-held` for moderators/authors if stricter visibility is wanted.
-- **TUI / App board picker** (Phase 2 of `docs/board.md`, "Human perusal and future clients"): topics are `BlockStore` documents, so adding a picker entry unlocks existing rendering, folds, and copy mode.
+- **TUI / App board picker** (Phase 2 of `docs/board.md`, "Human perusal and future clients"): topics are `BlockStore` documents, so adding a picker entry unlocks existing rendering, folds, and copy mode. Heroic already knows enough about its selection to offer the performer's notes, the track handoff, and a configured vibe topic together.
 
 ## App layout follow-ups (2026-11-23)
 
 - **Neo rich workspace and temporal scene.** The visible workspace now
-  indexes recent artifacts and events and reveals their source blocks.
-  Independent rich artifact surfaces need a rendering input boundary:
-  current panes share the focused `MainCell`, geometry, and scroll. A temporal
-  3D scene and particle flows remain design work. Keep history still while
-  idle; recorded creation time is not an execution duration or scheduled target.
+  previews declared and detected diffs independently of the transcript and
+  links creation receipts to their source artifacts. Other rich artifact surfaces still need a rendering input boundary:
+  current panes share the focused `MainCell`, geometry, and scroll. Neo
+  presents patches and events as stacks of cards beside the dialogue.
+  Showing execution duration or a scheduled target needs an execution or
+  scheduling record that carries those times.
 - **Narrow dock labels collide.** At 640px the header and footer labels overlap
   even though the conversation and Neo panels fit. Give dock labels a width
   budget and elide lower-priority status before they cover navigation hints.
@@ -392,7 +393,7 @@ Sol (gpt-6.2-sol on `gpt-plan`, coder rc) wrote its own rc directory (`sol-chara
   - Audio in a decision works as an audio part of a context message (0.99 "sparse", 1.00 "busy" on test clips). The same clip as `case_media` is read but changes nothing; this is the nagaya's to examine. In a generation, omni called an 82 Hz tone "high-pitched".
   - The lfm engines left zorak's served list for about a minute and came back; a player must survive that.
 - **Cold restart can rewind a playing track.** The trio restarted at tick 4404 with later committed phrases already in its score. Check the first attachment's playhead seed against the score context's latest committed tick, including after a rotation. Reproduce by restarting the server while a multi-performer track is playing.
-- **Reading a track score in Bevy.** Conversation now wraps the score at bar lines as the pane resizes. The MIDI sibling shows as a bare CAS hash, and each untitled phrase is labeled `Score X:1` even though the block carries the track and tick. The empty score before the first commit gives no indication of when a phrase is due.
+- **Reading a track score in Bevy.** Conversation now wraps the score at bar lines as the pane resizes. Neo still scales the entire phrase into its card. The MIDI sibling shows as a bare CAS hash, and each untitled phrase is labeled `Score X:1` even though the block carries the track and tick. The empty score before the first commit gives no indication of when a phrase is due.
 
 - **An engineer can spend several inferences after a desk receipt.** In
   Toolie’s desk result #37, a status call took 13 output tokens. Four

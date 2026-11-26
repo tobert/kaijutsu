@@ -266,8 +266,52 @@ amber in history. The history is still while idle.
 The integrated tests cover source reveal, selection across updates, context
 switches, and viewer round trips. The TUI still builds with the shared action
 variants. A running isolated app verified keyboard selection and source reveal,
-plus 1280px side panels and a 640px layout below the transcript. Independent
-rich workbench surfaces and a temporal 3D scene remain future work.
+plus 1280px side panels and a 640px layout below the transcript.
+
+The Workbench now reads a diff by source block ID with its own row budget.
+It shares the transcript's diff parser and theme colors. Editing the source
+refreshes the preview even when its title stays the same. Each panel keeps
+its selection across transcript scrolls and unrelated events. History uses
+the call ID to name a shell result and to find the artifact when switching
+panels. The number of intervening History events describes document order.
+An ordinary `diff -u` result exposed a gap in the explicitly typed fixture.
+The Workbench and full viewer now recognize parsed patches in plain output.
+A trailing exit marker stays in the source. A `diff_block` receipt points at
+the separate artifact it created. For typed `kj diff` results the transcript
+reads the patch body while the structured sideband carries provenance.
+The first perspective scene encoded calls and results as bars. Amy found the
+diff and event text more informative. Conversation now has an expandable
+text rail, and Neo uses perspective for the documents themselves. Selecting
+an event brings its linked patch forward while the dialogue stays anchored
+to the reader. The two layouts share the block index and selection.
+
+Neo gives each visible turn a shallow fold and runs a thread through the
+selected call, its receipt, and its patch. The notch uses the call's place
+in the block log even when another turn arrived before the receipt. An
+isolated MCP kohai exposed both forms of shell output. A result can hold
+the patch itself, or a single `diff_block` command can return the ID of a
+separate patch. Following those IDs keeps independently authored patches
+distinct even when their text matches.
+
+Neo shares Heroic's dusk sky and floor colors. Smoked sheets cover the
+grid behind each passage, patch, and receipt. Exposed filenames identify
+the sheets farther back, and four short corners mark the stack the player
+can browse.
+
+Conversation opens with Workbench and Event History beside the transcript
+on wide windows and below it on narrow or short ones. The tiles share
+one-pixel dividers. A highlighted heading identifies the panel the reader
+can browse. Event History uses the same selected-event details as Neo.
+A patch and its creation receipt can be separate blocks. Looking up the
+returned block ID in both directions lets a reader browse from the patch
+to the result and back while keeping their transcript position.
+
+Mounted kaish writes can also populate Workbench during a shell call.
+The kernel captures the previous text at file replacement and groups edits
+by command and path. It publishes a typed diff through the context change
+feed and updates the same block on later writes. The parent command gives
+the reader a source before its result arrives. A trace block keeps that
+preview out of the model's conversation history.
 
 ## The file cache learns what vim already knew (August 18–20)
 
@@ -564,7 +608,8 @@ the text. The score writer now uses the same resolved bytes for both.
 In Bevy, one of five staff lines survived fitting an eight-bar phrase to a
 930-pixel column. Giving strokes a minimum width of one physical pixel
 kept all five visible. The bass chair and its decision program declare
-bass clef.
+bass clef. Neo includes ABC in its artifact stack and reveals the selected
+phrase in Conversation.
 
 The drum chair spells a kick as `C,,` to play GM note 36. The engraver
 places that kick in the bottom space, the snare in the second space from

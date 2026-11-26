@@ -26,6 +26,13 @@ pub use components::{bevy_color_to_brush, color_to_rgba8};
 pub use plugin::KjTextPlugin;
 pub use resources::{ShapingFonts, SvgFontDb, TextMetrics};
 
+pub fn tool_input_head(block: &kaijutsu_types::BlockSnapshot, field: &str, max: usize) -> Option<String> {
+    let input: serde_json::Value = serde_json::from_str(block.tool_input.as_deref()?).ok()?;
+    let value = input.get(field)?.as_str()?;
+    let line = value.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(truncate_chars(line, max))
+}
+
 /// Char-aware truncation (safe for multi-byte UTF-8).
 ///
 /// Returns the original string if it fits within `max` chars,

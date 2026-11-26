@@ -442,7 +442,15 @@ pub fn sync_block_content(
         let fold = if block.collapsed { fold_line(&block) } else { None };
         let folded = fold.is_some();
         let text = fold.unwrap_or_else(|| {
-            format_single_block(&block, local_ctx, &|pid| editor.block_snapshot(pid))
+            // A typed diff's content is the patch; its structured output carries
+            // provenance and must not replace the patch passed to the parser.
+            if block.kind == BlockKind::ToolResult
+                && block.content_type == kaijutsu_types::ContentType::Diff
+            {
+                block.content.clone()
+            } else {
+                format_single_block(&block, local_ctx, &|pid| editor.block_snapshot(pid))
+            }
         });
 
         let color = theme.block_color(&block);
@@ -1024,6 +1032,39 @@ mod tests {
             "the preview's own text is what gets shaped: {:?}",
             entry.text,
         );
+    }
+
+    #[test]
+    fn a_diff_result_with_provenance_shapes_its_patch() {
+        use kaijutsu_types::{BlockSnapshotBuilder, ContextId, OutputData, PrincipalId};
+
+        let mut app = content_app();
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let id = BlockId::new(ctx, principal, 1);
+        let patch = "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let result = BlockSnapshotBuilder::new(id, BlockKind::ToolResult)
+            .role(Role::Tool).status(Status::Done).content_type(ContentType::Diff)
+            .content(patch)
+            .output(OutputData::new().with_rich_json(serde_json::json!({"files_changed": 1})))
+            .build();
+        let mut editor = CellEditor::new();
+        editor.rebuild_from(ctx, principal, [&result], |_| false, None).unwrap();
+        let cell = app.world_mut().spawn((editor, MainCell, ConversationGeometry::default())).id();
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(cell);
+        app.update();
+
+        let entry = cache(&app).get(&id).unwrap();
+        assert_eq!(entry.rich, Some(RichKindInfo::Diff));
+        assert!(entry.text.contains("new"), "{}", entry.text);
+        assert!(!entry.text.contains("no file sections"), "{}", entry.text);
+        let version = entry.version;
+
+        edit_block(&mut app, id, "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+updated\n");
+        app.update();
+        let updated = cache(&app).get(&id).unwrap();
+        assert!(updated.text.contains("updated"), "{}", updated.text);
+        assert!(updated.version > version);
     }
 
     /// A folded block shapes its one fold line: reasoning shows the kernel's

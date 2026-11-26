@@ -179,7 +179,11 @@ timing), and `approval-ledger` (asks and standing rules).
 For GUI work, Amy starts `./contrib/kaijutsu-runner.sh` in her Wayland
 session. We operate that runner with
 `./contrib/kj status|tail|pause|resume|rebuild|restart`, and check the app
-with BRP tools plus screenshots.
+with BRP tools plus screenshots. For a manual GUI development build, use
+`cargo build -p kaijutsu-app --features dynamic_linking` to shorten Bevy
+relinks. The runner enables the same feature for debug runs and rebuilds.
+Pass `--release` to the runner for a release build without the Bevy shared
+library.
 
 We read the relevant contract before changing these areas:
 

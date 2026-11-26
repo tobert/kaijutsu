@@ -150,6 +150,8 @@ pub enum LineTone {
     Warn,
     /// A failure.
     Bad,
+    /// A line in a diff.
+    Diff(crate::text::diff::DiffLineClass),
 }
 
 /// One rendered line.
@@ -583,6 +585,7 @@ pub(crate) fn tone_color(tone: LineTone, theme: &Theme) -> Color {
         LineTone::Dim => theme.fg_dim,
         LineTone::Warn => theme.warning,
         LineTone::Bad => theme.error,
+        LineTone::Diff(class) => crate::text::rich::diff_line_color(class, theme),
     }
 }
 

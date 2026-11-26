@@ -27,7 +27,7 @@
 
 use bevy::prelude::*;
 
-use kaijutsu_types::BlockId;
+use kaijutsu_types::{BlockId, BlockKind};
 use kaijutsu_diff::{DiffCore, DiffIntent, YankKind, limits::MAX_RENDER_BYTES};
 use kaijutsu_types::ContentType;
 
@@ -45,57 +45,66 @@ pub mod render;
 /// Any stable content hash would do; this is `DefaultHasher` because the
 /// question it answers is only ever "is this the same bytes I parsed?" — never
 /// "which bytes were they", and never across processes.
-fn content_hash(text: &str) -> u64 {
+pub(super) fn content_hash(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     h.finish()
 }
 
-/// Does this block's content type mean the viewer should open on it?
-///
-/// The two mechanisms `docs/diff.md` describes, with their two failure
-/// policies intact: a **declared** `ContentType::Diff` always opens (an error
-/// state if it doesn't parse — the block asked to be a diff and is wrong about
-/// it), while `Plain` opens only if the content actually parses as a diff.
-/// Sniffing may enrich, never accuse.
-pub fn openable_diff(content_type: ContentType, text: &str) -> Option<OpenAs> {
-    match content_type {
-        ContentType::Diff => Some(OpenAs::Declared),
-        ContentType::Plain => {
-            // A leading ` ```diff ` fence first (a model writing prose fences
-            // its diffs), then the bare text — the same mechanism, and the
-            // same "the fence must lead the block" rule, the inline sniff
-            // uses, so the preview and the viewer never disagree about what
-            // is a diff.
-            let inner = crate::text::rich::extract_fenced_block(text, "diff").unwrap_or(text);
-            let model = kaijutsu_diff::parse_with(
-                inner,
-                &kaijutsu_diff::DiffOptions {
-                    profile: crate::text::diff::diff_profile_for(ContentType::Plain),
-                    ..Default::default()
-                },
-            )
-            .ok()?;
-            // An empty parse is not a diff (`parse` accepts empty input).
-            (!model.files.is_empty()).then(|| OpenAs::Sniffed {
-                inner: inner.to_string(),
-            })
-        }
-        ContentType::Markdown | ContentType::Abc | ContentType::Svg | ContentType::Media => None,
+/// The source to parse when a block can contain a diff. Only an explicit
+/// diff fence opts a Markdown block into the diff viewer.
+pub(super) fn diff_body(kind: BlockKind, content_type: ContentType, text: &str) -> Option<&str> {
+    if content_type == ContentType::Diff {
+        return Some(text);
     }
+    if !matches!(content_type, ContentType::Plain | ContentType::Markdown) {
+        return None;
+    }
+    if text.trim_start().starts_with("```diff") {
+        return crate::text::rich::extract_fenced_block(text, "diff");
+    }
+    if content_type != ContentType::Plain || !(text.starts_with("diff --git ")
+        || text.starts_with("--- ") || text.starts_with(kaijutsu_diff::TRUNCATION_MARKER_PREFIX))
+    {
+        return None;
+    }
+
+    // A shell result can print an exit marker after its last hunk. A line
+    // inside a hunk has a prefix, including a space for unchanged text.
+    if kind == BlockKind::ToolResult
+        && let Some((patch, last)) = text.trim_end_matches(['\r', '\n']).rsplit_once('\n')
+        && let Some(code) = last.strip_prefix("[exit ").and_then(|s| s.strip_suffix(']'))
+        && code.parse::<i32>().is_ok()
+    {
+        return Some(patch);
+    }
+    Some(text)
+}
+
+pub(super) fn is_patch(body: &str) -> bool {
+    kaijutsu_diff::parse(body).is_ok_and(|model| !model.files.is_empty())
+}
+
+/// Declared diffs open even when malformed. Inferred diffs must parse.
+fn openable_diff(kind: BlockKind, content_type: ContentType, text: &str) -> Option<OpenAs<'_>> {
+    if content_type == ContentType::Diff {
+        return Some(OpenAs::Declared);
+    }
+    let inner = diff_body(kind, content_type, text)?;
+    is_patch(inner).then_some(OpenAs::Sniffed { inner })
 }
 
 /// How a block earned the viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OpenAs {
+pub enum OpenAs<'a> {
     /// `content_type == Diff` — authoritative; opens even if it won't parse.
     Declared,
     /// Plain text that sniffed as a diff. Carries the diff body actually
     /// found, so a fenced block is viewed without its fence.
     Sniffed {
         /// The diff body itself.
-        inner: String,
+        inner: &'a str,
     },
 }
 
@@ -168,11 +177,11 @@ pub fn open_session(
     block_id: BlockId,
     title: String,
     content: &str,
-    how: &OpenAs,
+    how: &OpenAs<'_>,
 ) -> DiffViewSession {
     let (body, declared) = match how {
         OpenAs::Declared => (content, ContentType::Diff),
-        OpenAs::Sniffed { inner, .. } => (inner.as_str(), ContentType::Plain),
+        OpenAs::Sniffed { inner, .. } => (*inner, ContentType::Plain),
     };
     let options = kaijutsu_diff::DiffOptions {
         profile: crate::text::diff::diff_profile_for(declared),
@@ -242,7 +251,7 @@ fn handle_open_diff_viewer(
     let Some(block) = editor.block_snapshot(&block_id) else {
         return;
     };
-    let Some(how) = openable_diff(block.content_type, &block.content) else {
+    let Some(how) = openable_diff(block.kind, block.content_type, &block.content) else {
         return;
     };
 
@@ -255,7 +264,7 @@ fn handle_open_diff_viewer(
 /// block that [`openable_diff`] accepts (`kaijutsu_present::reader::target`).
 fn diff_target(blocks: &[kaijutsu_types::BlockSnapshot], reader: Option<BlockId>) -> Option<BlockId> {
     kaijutsu_present::reader::target(blocks, reader, |b| {
-        openable_diff(b.content_type, &b.content).is_some()
+        openable_diff(b.kind, b.content_type, &b.content).is_some()
     })
 }
 
@@ -402,7 +411,7 @@ fn refresh_session(
         );
         return;
     };
-    let Some(how) = openable_diff(block.content_type, &block.content) else {
+    let Some(how) = openable_diff(block.kind, block.content_type, &block.content) else {
         warn!(
             "diff viewer: cannot refresh — block {:?} is no longer a diff",
             session.block_id
@@ -461,7 +470,8 @@ impl Plugin for DiffViewPlugin {
             .add_systems(
                 PostUpdate,
                 (
-                    render::build_diff_surface.after(bevy::ui::UiSystems::Layout),
+                    render::build_diff_surface.after(bevy::ui::UiSystems::Layout)
+                        .before(crate::view::block_render::resize_block_textures),
                     render::sync_diff_cursor.after(render::build_diff_surface),
                 )
                     .run_if(in_state(Screen::Diff)),
@@ -480,7 +490,7 @@ mod tests {
     }
 
     fn session(content: &str, ct: ContentType) -> DiffViewSession {
-        let how = openable_diff(ct, content).expect("openable");
+        let how = openable_diff(BlockKind::Text, ct, content).expect("openable");
         open_session(block_id(), "t".into(), content, &how)
     }
 
@@ -500,7 +510,7 @@ mod tests {
         // about it, which is a state the reader must SEE, not one to hide by
         // refusing to open.
         assert_eq!(
-            openable_diff(ContentType::Diff, "not a diff at all\n"),
+            openable_diff(BlockKind::Text, ContentType::Diff, "not a diff at all\n"),
             Some(OpenAs::Declared)
         );
         let s = session("not a diff at all\n", ContentType::Diff);
@@ -514,15 +524,26 @@ mod tests {
 
     #[test]
     fn plain_text_opens_only_when_it_really_is_a_diff() {
-        assert_eq!(openable_diff(ContentType::Plain, "hello\nworld\n"), None);
-        assert_eq!(openable_diff(ContentType::Plain, ""), None);
+        assert_eq!(openable_diff(BlockKind::Text, ContentType::Plain, "hello\nworld\n"), None);
+        assert_eq!(openable_diff(BlockKind::Text, ContentType::Plain, ""), None);
         assert!(
             openable_diff(
+                BlockKind::Text,
                 ContentType::Plain,
                 &fixtures::read("canonical/single_file_modify.diff")
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn only_a_terminal_exit_line_outside_a_tool_result_patch_is_removed() {
+        let patch = "--- story.v1\t2026-01-01\n+++ story.v2\t2026-01-02\n@@ -0,0 +1 @@\n+[exit 1]";
+        let text = format!("{patch}\n[exit 1]\n");
+        assert_eq!(openable_diff(BlockKind::ToolResult, ContentType::Plain, &text),
+            Some(OpenAs::Sniffed { inner: patch }));
+        assert!(openable_diff(BlockKind::Text, ContentType::Plain, &text).is_none());
+        assert!(openable_diff(BlockKind::ToolResult, ContentType::Plain, &format!("{patch}\nunknown output\n[exit 1]")).is_none());
     }
 
     /// The fence must LEAD the block — the same rule `extract_fenced_block`
@@ -532,7 +553,7 @@ mod tests {
     fn a_fenced_diff_opens_on_the_fence_contents() {
         let inner = fixtures::read("canonical/single_file_modify.diff");
         let fenced = format!("```diff\n{inner}```\n");
-        let how = openable_diff(ContentType::Plain, &fenced).expect("the fence sniffs");
+        let how = openable_diff(BlockKind::Text, ContentType::Plain, &fenced).expect("the fence sniffs");
         let OpenAs::Sniffed { inner: body } = &how else {
             panic!("a fence is a sniff, not a declaration");
         };
@@ -548,7 +569,7 @@ mod tests {
         // Prose before the fence is not a fenced block here, and the bare
         // text does not parse either — so it simply does not open.
         assert_eq!(
-            openable_diff(ContentType::Plain, &format!("here you go:\n\n{fenced}")),
+            openable_diff(BlockKind::Text, ContentType::Plain, &format!("here you go:\n\n{fenced}")),
             None,
         );
     }
@@ -562,7 +583,7 @@ mod tests {
             ContentType::Svg,
             ContentType::Media,
         ] {
-            assert_eq!(openable_diff(ct, &diffy), None, "{ct:?} must not open");
+            assert_eq!(openable_diff(BlockKind::Text, ct, &diffy), None, "{ct:?} must not open");
         }
     }
 

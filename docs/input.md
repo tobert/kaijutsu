@@ -12,14 +12,51 @@ Closing the editor returns to the selected performer.
 On a first visit, Conversation follows the newest blocks. Returning to a
 conversation restores its saved reading position, including the top.
 
-### Neo workspace
+### Conversation panels and Neo
 
-In the app, `Ctrl+A e` toggles Neo while the conversation is on screen. The
-workbench lists recent artifact blocks, and the event history lists recent
-tool, diagnostic, and context activity. In conversation navigation, `[` and
-`]` select a record, `\` switches sections, and `Shift+Enter` reveals the exact
-source block in the transcript. Open a revealed diff with `v`. Both panels
-show up to 48 records from the latest 1,024 blocks in the active context.
+Conversation opens with Workbench above Event History to the right of the
+transcript. In narrow or short windows the two panels sit side by side below
+the transcript. Press `Ctrl+A` then `Shift+E` to hide or show both panels.
+Press `Ctrl+A` then lowercase `e` to enter Neo. The same chord returns to
+Conversation with the previous panel layout.
+
+Neo puts recent dialogue near the reader's position on the left. Patches
+and ABC scores stack in the upper right. Selecting a score shows its
+notation, and `Shift+Enter` opens that phrase in Conversation. Events stack below.
+Corner brackets mark the stack that receives keyboard input. Press `\`
+to switch stacks and `[` or `]` to browse. Selecting a call or
+receipt with a linked patch brings that patch forward. Unrelated events
+leave the current patch in place. `Shift+Enter` returns to the transcript
+at the selected source. Press `v` on a revealed diff to open the full viewer.
+
+A thread joins the selected event to the call's position between dialogue
+turns. If the result contains a patch or the creation receipt names its
+block ID, the thread also reaches that patch. “Earlier call” and “Later
+call” mark calls outside the visible passage. A patch with no recorded
+link stands alone. A glint runs once along a newly selected thread.
+The Heroic reduced-motion setting keeps the thread still.
+
+In Conversation, the highlighted heading marks the panel that receives
+`[` and `]`. Press either key to browse from the displayed record. Selecting
+a patch shows its linked result in Event History. When a short patch
+leaves space in Workbench, the filenames beside `[` and `]` show where
+each key will take you. Switching panels with
+`\` lets you browse from that result. A selected command shows its exit
+status and output when available. Its linked artifact appears in Workbench.
+Browsing leaves the transcript in place until you press `Shift+Enter`
+to reveal the active record.
+When a shell call writes a workspace text file, its patch appears while the
+call runs. Later writes in that call update the same card. If the call
+touches several files, selecting one keeps that file's patch in view when
+switching to its event and back. See [Kaish execution and hooks](rc.md#kaish-execution-and-hooks)
+for the mounts and write operations that produce patches.
+
+Workbench includes declared diffs, parsed unified patches from text and
+tool output, and typed SVG, score, media, file, and resource blocks. A
+patch may appear in a leading diff fence or before a printed `[exit N]`.
+History names shell calls and results by command. Its markers show the
+selected record and linked call or result. Each panel indexes up to 48
+records from the latest 1,024 blocks in the active context.
 
 ## The vi editor and registers
 

@@ -100,6 +100,7 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         KeyCode::KeyW => Some(Action::GoToWell),
         KeyCode::KeyK => Some(Action::GoToHeroic),
         KeyCode::KeyE if !shift => Some(Action::ToggleNeo),
+        KeyCode::KeyE => Some(Action::ToggleConversationPanels),
         KeyCode::Quote if shift => Some(Action::GoToWell),
         KeyCode::Quote => Some(Action::PromptContextSwitch),
         // n / p — walk ring-0 seats.
@@ -184,6 +185,7 @@ mod tests {
     fn e_toggles_the_neo_workspace() {
         for ctrl in [false, true] {
             assert_eq!(resolve_chord(KeyCode::KeyE, ctrl, false), Some(Action::ToggleNeo));
+            assert_eq!(resolve_chord(KeyCode::KeyE, ctrl, true), Some(Action::ToggleConversationPanels));
         }
     }
 

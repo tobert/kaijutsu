@@ -167,7 +167,7 @@ fn enter_heroic(
     actor: Option<Res<RpcActor>>,
     result_channel: Res<RpcResultChannel>,
     mut saved: ResMut<HeroicSavedCamera>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform, &mut Projection), With<Camera3d>>,
+    mut app_camera: Query<(Entity, &mut Camera, &mut Transform, &mut Projection), With<IsDefaultUiCamera>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     existing: Query<Entity, With<HeroicRoot>>,
     mut assets: HeroicSpawnAssets,

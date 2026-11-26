@@ -372,18 +372,9 @@ fn main() {
         .run();
 }
 
-/// Setup the single, always-on app camera.
-///
-/// It is a `Camera3d` (not `Camera2d`) so the time well's 3D card meshes and the
-/// conversation UI share **one** camera — the well no longer spawns its own, and
-/// the old two-camera composite (3D background + 2D overlay) is gone. Bevy UI
-/// renders on whatever camera is the default UI target; with a single camera that
-/// is this one (`IsDefaultUiCamera` makes it explicit), and the UI pass runs
-/// *after* tonemapping/bloom, so conversation UI is untouched by either.
-///
-/// `Hdr` + `Bloom` make the 3D well cards glow (the main pass is tonemapped); the
-/// conversation UI renders after tonemapping, so its colors are placeholder-only
-/// and not a concern here (per Amy).
+/// The default UI camera draws the well and the conversation to the window.
+/// Heroic and Room share this camera. Neo renders its cards to a UI image
+/// with a separate camera. The window's UI pass runs after bloom and tonemapping.
 fn setup_camera(
     mut commands: Commands,
     theme: Res<ui::theme::Theme>,

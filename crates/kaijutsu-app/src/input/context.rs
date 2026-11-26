@@ -265,7 +265,7 @@ pub fn sync_input_context(
     };
     let (mut contexts, new_grab) =
         derive_contexts(*screen.get(), room.zoomed, &focus, quick.held, approval);
-    if contexts.contains(&InputContext::Navigation) && neo.is_some_and(|neo| neo.enabled) {
+    if contexts.contains(&InputContext::Navigation) && neo.is_some_and(|neo| neo.active()) {
         contexts.push(InputContext::Neo);
     }
     active.0 = contexts;

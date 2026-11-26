@@ -213,8 +213,10 @@ pub enum Action {
     GoToHeroic,
     /// Open a board note for the selected Heroic performer.
     HeroicBoardNote,
-    /// `Ctrl+A e` — toggle the Neo workspace beside the conversation.
+    /// `Ctrl+A e` — toggle the spatial conversation view.
     ToggleNeo,
+    /// `Ctrl+A E` — toggle the conversation panels.
+    ToggleConversationPanels,
     /// Switch between the Neo workbench and event history.
     NeoSwitchSection,
     /// Reveal the selected Neo record's source block in the transcript.

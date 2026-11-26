@@ -23,7 +23,7 @@
 //!     ConversationContainer2
 //! ```
 //!
-//! Focus is tracked via `PaneFocus` marker + accent border on the
+//! Focus is tracked via `PaneFocus` and an accent mark inside the
 //! focused conversation container. Input is an ephemeral overlay
 //! (not part of the tiling tree).
 
@@ -48,6 +48,9 @@ pub struct TilingRoot;
 /// Despawned when the pane gains focus (block rendering takes over).
 #[derive(Component)]
 pub struct UnfocusedPaneSummary;
+
+#[derive(Component)]
+pub struct PaneFocusMark;
 
 // ============================================================================
 // STATE
@@ -135,7 +138,7 @@ fn spawn_conversation_content(
     theme: &Theme,
     conv_root: Entity,
 ) {
-    spawn_content_subtree(commands, &tree.root, theme, conv_root, tree, 1.0);
+    spawn_content_subtree(commands, &tree.root, theme, conv_root, tree.focused, 1.0, UiRect::ZERO);
 }
 
 /// Recursively spawn a content subtree as Bevy flex entities.
@@ -148,9 +151,10 @@ fn spawn_content_subtree(
     node: &TileNode,
     theme: &Theme,
     parent: Entity,
-    tree: &TilingTree,
+    focused: PaneId,
     flex_grow: f32,
-) {
+    border: UiRect,
+) -> bool {
     match node {
         TileNode::Split {
             id,
@@ -179,28 +183,33 @@ fn spawn_content_subtree(
                         },
                         flex_direction: flex_dir,
                         overflow: Overflow::clip(),
+                        border,
                         ..default()
                     },
+                    BorderColor::all(theme.border),
                 ))
                 .id();
             commands.entity(parent).add_child(entity);
 
+            let divider = match direction {
+                SplitDirection::Row => UiRect::left(px(1.0)),
+                SplitDirection::Column => UiRect::top(px(1.0)),
+            };
+            let mut child_border = UiRect::ZERO;
             for (i, child) in children.iter().enumerate() {
                 let child_ratio = ratios.get(i).copied().unwrap_or(1.0);
-                spawn_content_subtree(commands, child, theme, entity, tree, child_ratio);
+                if spawn_content_subtree(commands, child, theme, entity, focused, child_ratio, child_border) {
+                    child_border = divider;
+                }
             }
+            true
         }
 
         TileNode::Leaf {
             id,
             content: PaneContent::Conversation { document_id },
         } => {
-            let is_focused = tree.focused == *id;
-            let border_color = if is_focused {
-                theme.accent
-            } else {
-                theme.border
-            };
+            let is_focused = focused == *id;
 
             let mut entity_cmd = commands.spawn((
                 PaneMarker {
@@ -232,19 +241,33 @@ fn spawn_content_subtree(
                     // taffy `ScrollPosition`.
                     overflow: Overflow::clip(),
                     padding: UiRect::axes(Val::Px(4.0), Val::Px(4.0)),
-                    border: UiRect::all(Val::Px(2.0)),
+                    border,
                     ..default()
                 },
-                BorderColor::all(border_color),
+                BorderColor::all(theme.border),
             ));
             if is_focused {
                 entity_cmd.insert(PaneFocus);
             }
-            let entity = entity_cmd.id();
+            let entity = entity_cmd.with_child((
+                PaneFocusMark,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(1.0),
+                    left: px(4.0),
+                    width: px(48.0),
+                    height: px(3.0),
+                    ..default()
+                },
+                ZIndex(1),
+                BackgroundColor(theme.accent),
+                Visibility::Hidden,
+            )).id();
             commands.entity(parent).add_child(entity);
+            true
         }
 
-        _ => {} // Non-conversation leaves ignored
+        _ => false,
     }
 }
 
@@ -252,7 +275,7 @@ fn spawn_content_subtree(
 // FOCUS SYSTEM
 // ============================================================================
 
-/// System that maintains the `PaneFocus` marker and updates focus borders.
+/// Maintain `PaneFocus`, transcript dividers, and the inset focus mark.
 ///
 /// Adds `PaneFocus` to the focused conversation pane.
 pub fn update_pane_focus(
@@ -261,7 +284,8 @@ pub fn update_pane_focus(
     theme: Res<Theme>,
     pane_markers: Query<(Entity, &PaneMarker)>,
     focused_panes: Query<Entity, With<PaneFocus>>,
-    mut conv_borders: Query<(&PaneMarker, &mut BorderColor), With<ConversationContainer>>,
+    mut dividers: Query<&mut BorderColor, With<PaneMarker>>,
+    mut marks: Query<(&ChildOf, &mut BackgroundColor, &mut Visibility), With<PaneFocusMark>>,
 ) {
     if !tree.is_changed() && !theme.is_changed() {
         return;
@@ -282,15 +306,17 @@ pub fn update_pane_focus(
         }
     }
 
-    // Update border colors on conversation containers (focus indicator)
-    let has_multiple = conv_borders.iter().count() > 1;
-    for (marker, mut border) in conv_borders.iter_mut() {
-        let is_focused = marker.pane_id == tree.focused;
-        *border = if is_focused && has_multiple {
-            BorderColor::all(theme.accent)
-        } else {
-            BorderColor::all(theme.border)
-        };
+    if theme.is_changed() {
+        for mut border in &mut dividers {
+            border.set_if_neq(BorderColor::all(theme.border));
+        }
+    }
+    let has_multiple = marks.iter().count() > 1;
+    for (parent, mut color, mut visibility) in &mut marks {
+        let focused = has_multiple
+            && pane_markers.get(parent.parent()).is_ok_and(|(_, marker)| marker.pane_id == tree.focused);
+        color.set_if_neq(BackgroundColor(theme.accent));
+        visibility.set_if_neq(if focused { Visibility::Inherited } else { Visibility::Hidden });
     }
 }
 
@@ -738,33 +764,76 @@ mod border_theme_tests {
     }
 
     #[test]
-    fn pane_borders_follow_theme_without_tree_changes() {
-        for multiple in [false, true] {
-            let mut app = App::new();
-            let mut tree = TilingTree::default_layout();
-            let focused = tree.focused;
-            let other = multiple.then(|| tree.split(focused, SplitDirection::Row).unwrap());
-            app.insert_resource(tree).init_resource::<Theme>();
-            app.add_systems(Update, update_pane_focus);
-            let spawn = |world: &mut World, pane_id| world.spawn((
-                PaneMarker { pane_id, content: PaneContent::Conversation { document_id: String::new() } },
-                ConversationContainer,
-                BorderColor::all(Color::NONE),
-            )).id();
-            let first = spawn(app.world_mut(), focused);
-            let second = other.map(|id| spawn(app.world_mut(), id));
-            app.update();
-            let (accent, border) = (Color::srgb(0.2, 0.8, 0.3), Color::srgb(0.7, 0.3, 0.1));
-            let mut theme = app.world_mut().resource_mut::<Theme>();
-            theme.accent = accent;
-            theme.border = border;
-            app.update();
-            assert_eq!(*app.world().get::<BorderColor>(first).unwrap(), BorderColor::all(if multiple { accent } else { border }));
-            assert!(app.world().get::<PaneFocus>(first).is_some());
-            if let Some(second) = second {
-                assert_eq!(*app.world().get::<BorderColor>(second).unwrap(), BorderColor::all(border));
-                assert!(app.world().get::<PaneFocus>(second).is_none());
+    fn transcript_borders_draw_each_split_once_and_leave_outer_edges_clear() {
+        let mut app = App::new();
+        app.insert_resource(TilingTree::default_layout())
+            .init_resource::<Theme>()
+            .init_resource::<ReconcilerState>()
+            .add_systems(Update, (reconcile_tiling_tree, update_pane_focus).chain());
+        app.world_mut().spawn(TilingRoot);
+        app.world_mut().spawn(super::super::state::ConversationRoot);
+        app.update();
+
+        let first = app.world().resource::<TilingTree>().focused;
+        let border = |app: &mut App, id| {
+            let world = app.world_mut();
+            world.query::<(&PaneMarker, &Node)>().iter(world)
+                .find_map(|(marker, node)| (marker.pane_id == id).then_some(node.border)).unwrap()
+        };
+        assert_eq!(border(&mut app, first), UiRect::ZERO);
+
+        let mut tree = app.world_mut().resource_mut::<TilingTree>();
+        let second = tree.split(first, SplitDirection::Row).unwrap();
+        let third = tree.split(second, SplitDirection::Column).unwrap();
+        let vertical_split = tree.root.find_parent(second).unwrap().0;
+        app.update();
+
+        assert_eq!(border(&mut app, first), UiRect::ZERO);
+        assert_eq!(border(&mut app, second), UiRect::ZERO);
+        assert_eq!(border(&mut app, third), UiRect::top(px(1.0)));
+        assert_eq!(border(&mut app, vertical_split), UiRect::left(px(1.0)));
+    }
+
+    #[test]
+    fn divider_colors_follow_theme_and_focus_moves_between_split_panes() {
+        let mut app = App::new();
+        let mut tree = TilingTree::default_layout();
+        let first = tree.focused;
+        let second = tree.split(first, SplitDirection::Row).unwrap();
+        app.insert_resource(tree)
+            .init_resource::<Theme>()
+            .init_resource::<ReconcilerState>()
+            .add_systems(Update, (reconcile_tiling_tree, update_pane_focus).chain());
+        app.world_mut().spawn(TilingRoot);
+        app.world_mut().spawn(super::super::state::ConversationRoot);
+        let check_marks = |app: &mut App, selected| {
+            let world = app.world_mut();
+            let accent = world.resource::<Theme>().accent;
+            let mut marks = world.query_filtered::<
+                (&ChildOf, &Node, &BackgroundColor, &Visibility), With<PaneFocusMark>,
+            >();
+            assert_eq!(marks.iter(world).count(), 2);
+            for (parent, node, mark_color, visibility) in marks.iter(world) {
+                let focused = world.get::<PaneMarker>(parent.parent()).unwrap().pane_id == selected;
+                assert_eq!(world.get::<PaneFocus>(parent.parent()).is_some(), focused);
+                assert_eq!(*visibility, if focused { Visibility::Inherited } else { Visibility::Hidden });
+                assert!(matches!(node.height, Val::Px(height) if height > 1.0 && height <= 4.0));
+                assert_eq!(mark_color.0, accent);
             }
+        };
+        app.update();
+        check_marks(&mut app, first);
+
+        let divider = Color::srgb(0.7, 0.3, 0.1);
+        let mut theme = app.world_mut().resource_mut::<Theme>();
+        theme.accent = Color::srgb(0.2, 0.8, 0.3);
+        theme.border = divider;
+        app.world_mut().resource_mut::<TilingTree>().focus(second);
+        app.update();
+        check_marks(&mut app, second);
+        let world = app.world_mut();
+        for border in world.query_filtered::<&BorderColor, With<PaneMarker>>().iter(world) {
+            assert_eq!(*border, BorderColor::all(divider));
         }
     }
 }

@@ -2428,6 +2428,7 @@ pub fn update_hints(
     screen: Res<State<crate::ui::screen::Screen>>,
     room: Res<crate::view::room::RoomState>,
     prefix: Res<crate::input::prefix::PrefixState>,
+    neo: Res<crate::view::neo::NeoMode>,
     ledger: Res<crate::connection::ledger::LedgerMirror>,
     notice: Res<crate::ui::ask_sheet::AskNotice>,
     control: Res<crate::agent_control::AgentControl>,
@@ -2439,6 +2440,7 @@ pub fn update_hints(
         && !screen.is_changed()
         && !room.is_changed()
         && !prefix.is_changed()
+        && !neo.is_changed()
         && !ledger.is_changed()
         && !notice.is_changed()
     {
@@ -2461,7 +2463,7 @@ pub fn update_hints(
     // not the reference.
     if prefix.armed() {
         let hints = "^A: 0-9 seat \u{2502} ^A last \u{2502} q close \u{2502} \
-                     w well \u{2502} ' switch \u{2502} A rename \u{2502} d detach \u{2502} h hold";
+                     w well \u{2502} e spatial \u{2502} E panels \u{2502} ' switch \u{2502} A rename \u{2502} d detach \u{2502} h hold";
         let text = hints_with_notice(hints, ledger.pending_count(), notice);
         if dock.hints.text != text {
             dock.hints.text = text;
@@ -2471,6 +2473,9 @@ pub fn update_hints(
 
     use crate::ui::screen::Screen;
     let hints = match screen.get() {
+        Screen::Conversation if neo.enabled && *focus_area == FocusArea::Conversation => {
+            "[]: select \u{2502} \\: section \u{2502} Shift+Enter: source \u{2502} ^A e: exit"
+        }
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => {
                 "Esc Enter: submit \u{2502} Ctrl+Z: shell \u{2502} Esc Esc: dismiss"
@@ -2480,7 +2485,7 @@ pub fn update_hints(
             }
             FocusArea::Dialog => "Enter: confirm \u{2502} Esc: cancel \u{2502} j/k: navigate",
         },
-        Screen::Editor => "Esc: back to conversation \u{2502} (editor)",
+        Screen::Editor => ":wq save and close \u{2502} :q! discard and close",
         Screen::Diff => {
             "j/k: line \u{2502} ]c/[c: hunk \u{2502} V: select \u{2502} y: yank \u{2502} q: close"
         }

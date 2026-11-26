@@ -175,15 +175,6 @@ fn head_line(content: &str) -> Option<String> {
     Some(crate::text::truncate_chars(line.trim(), TAIL_LINE_CHARS))
 }
 
-/// The `command` string from a tool call's input JSON, if it has one — the
-/// human-recognizable line for shell-shaped tools. `None` for other tools or
-/// unparseable input.
-fn command_arg_head(block: &BlockSnapshot) -> Option<String> {
-    let input = block.tool_input.as_deref()?;
-    let v: serde_json::Value = serde_json::from_str(input).ok()?;
-    head_line(v.get("command")?.as_str()?)
-}
-
 /// Map an inserted block to a tail line, or `None` for blocks that carry no
 /// glanceable signal (thinking, structural kinds).
 ///
@@ -223,7 +214,7 @@ pub fn tail_line(block: &BlockSnapshot) -> Option<TailLine> {
             // IS the story: a tail of bare "▸ shell" ×4 told nothing
             // (live-verify, 2026-07-04).
             let name = block.tool_name.as_deref().unwrap_or("tool");
-            let text = match command_arg_head(block) {
+            let text = match crate::text::tool_input_head(block, "command", TAIL_LINE_CHARS) {
                 Some(cmd) => format!("{name}: {cmd}"),
                 None => name.to_string(),
             };

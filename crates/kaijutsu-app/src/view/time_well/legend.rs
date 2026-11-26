@@ -108,7 +108,7 @@ pub fn toggle_legend(
     mut commands: Commands,
     mut actions: MessageReader<crate::input::ActionFired>,
     existing: Query<Entity, With<WellLegend>>,
-    camera: Query<(Entity, &Projection), With<Camera3d>>,
+    camera: Query<(Entity, &Projection), With<IsDefaultUiCamera>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -205,7 +205,7 @@ pub fn toggle_legend(
 /// projection (cheap — one `Vec3` + one scale) so it tracks window-aspect/FOV
 /// changes.
 pub fn position_legend(
-    camera: Query<&Projection, With<Camera3d>>,
+    camera: Query<&Projection, With<IsDefaultUiCamera>>,
     mut legend: Query<&mut Transform, With<WellLegend>>,
 ) {
     let Ok(mut tf) = legend.single_mut() else {

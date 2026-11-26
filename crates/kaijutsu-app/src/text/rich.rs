@@ -196,7 +196,7 @@ pub fn build_output_span_brushes(
 }
 
 /// The theme color for a diff line class.
-fn diff_line_color(
+pub(crate) fn diff_line_color(
     class: super::diff::DiffLineClass,
     theme: &crate::ui::theme::Theme,
 ) -> Color {
