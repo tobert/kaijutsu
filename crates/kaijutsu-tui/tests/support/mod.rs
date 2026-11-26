@@ -48,6 +48,7 @@ pub struct EphemeralServer {
     /// file for the `kaijutsu-tui` binary.
     pub root_key: Arc<russh::keys::PrivateKey>,
     cancel: Arc<tokio::sync::Notify>,
+    runtime: tokio::runtime::Handle,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -71,7 +72,7 @@ impl EphemeralServer {
                 let bound = listener.local_addr().expect("read bound addr");
 
                 let config = kaijutsu_server::SshServerConfig::ephemeral(bound.port());
-                ready_tx.send((bound, config.root_key())).expect("report bound addr + key");
+                ready_tx.send((bound, config.root_key(), tokio::runtime::Handle::current())).expect("report bound addr + key");
                 let server = kaijutsu_server::SshServer::new(config);
                 tokio::select! {
                     res = server.run_on_listener(listener) => {
@@ -84,10 +85,30 @@ impl EphemeralServer {
             });
         });
 
-        let (addr, root_key) = ready_rx
+        let (addr, root_key, runtime) = ready_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("ephemeral server bound a port");
-        Self { addr, root_key, cancel, join: Some(join) }
+        Self { addr, root_key, cancel, runtime, join: Some(join) }
+    }
+
+    /// Hold this isolated server's single-thread runtime until the guard drops.
+    pub fn pause(&self) -> ServerPause {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.recv();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).expect("server entered pause");
+        ServerPause(resume_tx)
+    }
+}
+
+pub struct ServerPause(std::sync::mpsc::Sender<()>);
+
+impl Drop for ServerPause {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
     }
 }
 
@@ -148,6 +169,15 @@ fn with_kernel<T>(
     });
     drop(local);
     out
+}
+
+pub fn live_context_ids(server: &EphemeralServer, label: &str) -> Vec<kaijutsu_types::ContextId> {
+    with_kernel(server, async |kernel| {
+        kernel.list_contexts().await.expect("list contexts").into_iter()
+            .filter(|info| !info.archived && info.label == label)
+            .map(|info| info.id)
+            .collect()
+    })
 }
 
 /// Every context's draft as the kernel holds it for `server`'s root

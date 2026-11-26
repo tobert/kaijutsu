@@ -34,11 +34,19 @@ use support::{
 const CONNECT: Duration = Duration::from_secs(15);
 
 fn spawn_session(rows: u16, cols: u16) -> (EphemeralServer, tempfile::TempDir, TuiSession) {
+    spawn_session_with_env(rows, cols, &[])
+}
+
+fn spawn_session_with_env(rows: u16, cols: u16, env: &[(&str, &str)]) -> (EphemeralServer, tempfile::TempDir, TuiSession) {
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
     let key_path = write_ephemeral_key(&server, key_dir.path());
-    let session = TuiSession::spawn(server.addr, &key_path, rows, cols);
+    let session = TuiSession::spawn_with_env(server.addr, &key_path, rows, cols, env);
     (server, key_dir, session)
+}
+
+fn spawn_debug_session(rows: u16, cols: u16) -> (EphemeralServer, tempfile::TempDir, TuiSession) {
+    spawn_session_with_env(rows, cols, &[("RUST_LOG", "warn,kaijutsu_tui=debug")])
 }
 
 /// Type `:q` and wait for the client to exit.
@@ -204,9 +212,9 @@ fn a_burst_longer_than_one_read_reaches_the_draft_whole() {
 }
 
 /// A submit right behind a burst carries every keystroke: the client flushes
-/// its queued draft edits before the kernel snapshots the draft. The burst
-/// is long so its edits are still on the wire when `Enter` arrives; a
-/// submit that did not wait would snapshot a prefix.
+/// its queued draft edits before the kernel snapshots the draft. The server
+/// is paused until the client handles `Enter`, so the edits are still in
+/// flight when the submit starts.
 ///
 /// The context gets a performer so the submit commits; the ephemeral
 /// kernel has no model, so the turn then fails to start, after the user
@@ -214,10 +222,12 @@ fn a_burst_longer_than_one_read_reaches_the_draft_whole() {
 #[test]
 fn a_submit_right_after_typing_carries_every_keystroke() {
     let _serial = serial();
-    let (server, _key_dir, session) = spawn_session(24, 80);
+    let (server, key_dir, session) = spawn_debug_session(24, 80);
     wait_for_attach(&session);
     support::cast_a_performer(&server);
 
+    // Keep draft edits in flight until the local editor has handled the burst.
+    let pause = server.pause();
     let typed = format!("{}endmark", "word ".repeat(200));
     session.send(&format!("i{typed}"));
     // The screen answers from the local buffer, well ahead of the kernel.
@@ -227,13 +237,13 @@ fn a_submit_right_after_typing_carries_every_keystroke() {
     session.send("\x1b");
     let normal = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "-- NORMAL --"));
     assert!(normal, "{}", session.dump("after Esc"));
-    let queued = support::kernel_drafts(&server);
-    assert!(
-        queued.iter().all(|d| !d.contains("endmark")),
-        "the burst must still be on the wire for this probe to mean anything: {} chars landed",
-        queued.iter().map(|d| d.len()).max().unwrap_or(0)
-    );
     session.send("\r");
+    let log = TuiSession::log_path(&key_dir.path().join("id_ed25519"));
+    let submitted = session.wait_until(Duration::from_secs(10), |_| {
+        std::fs::read_to_string(&log).is_ok_and(|text| text.contains("submitting the draft"))
+    });
+    assert!(submitted, "{}", session.dump("waiting for submit"));
+    drop(pause);
 
     // Submitted: the band is back to one empty draft line, the transcript
     // above it ends with the whole text, and the kernel's draft is empty.
@@ -411,7 +421,7 @@ fn fill_transcript(session: &TuiSession) {
 /// The transcript rows, trailing blanks trimmed: a repaint leaves the cells
 /// a highlighted row cleared, and that is not a scroll.
 fn transcript_rows(session: &TuiSession) -> Vec<String> {
-    session.screen_text()[..20].iter().map(|l| l.trim_end().to_string()).collect()
+    session.screen_text()[..TRANSCRIPT_ROWS].iter().map(|l| l.trim_end().to_string()).collect()
 }
 
 /// How many lines the transcript moved up between two readings: the offset
@@ -1894,7 +1904,7 @@ fn switching_through_the_picker_loads_the_new_contexts_draft() {
             && picker_row_for(&rows, kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT).is_none()
             // The filter line has closed: frames are drawn as keys land, so
             // the list narrows while `/altseat` is still being typed.
-            && rows.iter().any(|l| l.contains("Enter switch"))
+            && rows[0].contains("filter: altseat")
     });
     assert!(filtered, "the filter never narrowed to the fork: {}", session.dump("filter"));
     for _ in 0..tabs_to_section(&session.screen_text(), "altseat") {
@@ -1957,8 +1967,10 @@ fn seat_of(session: &TuiSession, label: &str) -> usize {
 #[test]
 fn ctrl_a_r_rotates_the_seat_and_follows_its_successor() {
     let _serial = serial();
-    let (_server, _key_dir, session) = spawn_session(24, 100);
+    let (server, key_dir, session) = spawn_debug_session(24, 100);
     wait_for_attach(&session);
+    let before = support::live_context_ids(&server, "probe");
+    assert_eq!(before.len(), 1);
 
     session.send("ipredecessor-draft\x1b");
     assert!(
@@ -1974,9 +1986,17 @@ fn ctrl_a_r_rotates_the_seat_and_follows_its_successor() {
     );
     session.send("\r");
     let followed = session.wait_until(Duration::from_secs(20), |screen| {
-        screen_contains_str(screen, "rotated") && !screen_contains_str(screen, "predecessor-draft")
+        screen_contains_str(screen, "Rotated probe") && !screen_contains_str(screen, "predecessor-draft")
     });
     assert!(followed, "the client did not follow the successor: {}", session.dump("after rotate"));
+    let after = support::live_context_ids(&server, "probe");
+    assert_eq!(after.len(), 1);
+    assert_ne!(before, after);
+    let log = TuiSession::log_path(&key_dir.path().join("id_ed25519"));
+    let watching = format!("watching context feed context={}", after[0].short());
+    assert!(session.wait_until(Duration::from_secs(10), |_| {
+        std::fs::read_to_string(&log).is_ok_and(|text| text.contains(&watching))
+    }), "the client did not watch the successor: {}", session.dump("after rotate"));
 }
 
 /// `Ctrl+A '` prefills `kj context switch `; the structured run is pinned,

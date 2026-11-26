@@ -2131,9 +2131,13 @@ red = "#ff5c8a"
         assert!(Palette::try_from_theme_toml("not valid toml = [").is_err());
         let shipped = include_str!("../../../assets/defaults/theme.toml");
         let palette = Palette::try_from_theme_toml(shipped).unwrap();
-        assert_eq!(palette.status().fg, Some(Color::Rgb(164, 135, 255)));
-        // #a487ff4d blended over #131020 must not be opaque #a487ff
-        assert_ne!(palette.copy_selection().bg, Some(Color::Rgb(164, 135, 255)));
+        let colors = toml::from_str::<toml::Table>(shipped).unwrap();
+        let bg = parse_hex_color(colors["bg"].as_str().unwrap(), None).unwrap();
+        let accent = parse_hex_color(colors["accent"].as_str().unwrap(), Some(bg)).unwrap();
+        let selection = parse_hex_color(colors["selection_bg"].as_str().unwrap(), Some(bg)).unwrap();
+        assert_eq!(palette.status().fg, Some(accent));
+        assert_eq!(palette.copy_selection().bg, Some(selection));
+        assert_eq!(parse_hex_color("#ff008080", Some(Color::Rgb(0, 0, 0))), Some(Color::Rgb(128, 0, 64)));
     }
 
     #[test]
