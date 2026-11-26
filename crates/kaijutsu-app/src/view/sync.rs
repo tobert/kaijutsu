@@ -436,7 +436,10 @@ pub fn handle_context_switch(
 
         // Save the outgoing context's scroll position (view state).
         if let Some(active_id) = doc_cache.active_id() {
-            scroll_offsets.0.insert(active_id, scroll_state.offset);
+            scroll_offsets.0.insert(active_id, super::document::SavedScrollPosition {
+                offset: scroll_state.offset,
+                content_height: scroll_state.content_height,
+            });
         }
 
         doc_cache.set_active(ctx_id);
@@ -451,21 +454,13 @@ pub fn handle_context_switch(
             next_screen.set(target);
         }
 
-        // Restore the incoming context's saved scroll (default: top).
-        //
-        // `following` is deliberately flattened to false here, even for a
-        // context that was at the bottom when last viewed: a context switch
-        // is a jump to a fixed remembered offset, not a live "go to bottom"
-        // request, so it should never auto-engage follow. If the restored
-        // context happens to be at the bottom and the user wants live
-        // tracking again, `scroll_by`/`ScrollToEnd`/a submit re-engages it
-        // through the normal explicit paths.
-        if doc_cache.contains(ctx_id) {
-            let offset = scroll_offsets.0.get(&ctx_id).copied().unwrap_or(0.0);
-            scroll_state.offset = offset;
-            scroll_state.target_offset = offset;
+        if let Some(position) = scroll_offsets.0.get(&ctx_id) {
+            scroll_state.offset = position.offset;
+            scroll_state.target_offset = position.offset;
+            scroll_state.content_height = position.content_height;
             scroll_state.following = false;
-            info!("Context switch complete: {} (scroll: {:.0})", ctx_id, offset);
+        } else {
+            scroll_state.start_following();
         }
     }
 }
@@ -611,6 +606,66 @@ mod tests {
             screen_revealing_switched_context(Screen::Room),
             Some(Screen::Conversation)
         );
+    }
+
+    #[test]
+    fn context_switch_opens_at_the_tail_unless_a_reading_position_was_saved() {
+        use crate::cell::{ContextSwitchRequested, DocumentCache, EditorEntities, PendingContextSwitch, ScrollOffsets};
+        use crate::connection::{BootstrapChannel, RpcConnectionState};
+
+        let mut app = App::new();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.add_message::<ContextSwitchRequested>()
+            .init_resource::<DocumentCache>()
+            .init_resource::<ScrollOffsets>()
+            .init_resource::<PendingContextSwitch>()
+            .init_resource::<RpcConnectionState>()
+            .insert_resource(BootstrapChannel { tx, rx: std::sync::Mutex::new(rx) })
+            .insert_resource(State::new(Screen::Conversation))
+            .init_resource::<NextState<Screen>>()
+            .init_resource::<Time>()
+            .init_resource::<crate::input::ScrollConfig>()
+            .init_resource::<EditorEntities>()
+            .insert_resource(ConversationScrollState {
+                following: false,
+                content_height: 1800.0,
+                visible_height: 400.0,
+                pending_scroll_anchor: Some(23.0),
+                ..Default::default()
+            })
+            .add_systems(Update, (handle_context_switch, crate::view::scroll::smooth_scroll).chain());
+
+        let (read_from_top, unread) = (ContextId::new(), ContextId::new());
+        {
+            let mut docs = app.world_mut().resource_mut::<DocumentCache>();
+            for id in [read_from_top, unread] {
+                docs.install(id, kaijutsu_client::ContextMirror::new(id), None, || id.short());
+            }
+            docs.set_active(read_from_top);
+        }
+        app.world_mut().write_message(ContextSwitchRequested { context_id: unread });
+        app.update();
+        let scroll = app.world().resource::<ConversationScrollState>();
+        assert_eq!(scroll.offset, 1400.0, "the unknown position opens at the bottom");
+
+        app.world_mut().resource_mut::<ConversationScrollState>().content_height = 2200.0;
+        app.update();
+        assert_eq!(app.world().resource::<ConversationScrollState>().offset, 1800.0,
+            "follow the tail as the incoming transcript is measured");
+
+        app.world_mut().write_message(ContextSwitchRequested { context_id: read_from_top });
+        app.update();
+        let scroll = app.world().resource::<ConversationScrollState>();
+        assert_eq!(scroll.offset, 0.0, "the top is a valid saved position");
+        assert!(!scroll.following);
+
+        app.world_mut().resource_mut::<ConversationScrollState>().content_height = 500.0;
+        app.world_mut().write_message(ContextSwitchRequested { context_id: unread });
+        app.update();
+        let scroll = app.world().resource::<ConversationScrollState>();
+        assert_eq!(scroll.target_offset, 1800.0,
+            "the shorter outgoing transcript must not clamp the saved position");
     }
 
     fn rotate_data(from: ContextId, successor: ContextId) -> serde_json::Value {

@@ -12,12 +12,15 @@ use std::ops::{Deref, DerefMut};
 use bevy::prelude::*;
 use kaijutsu_types::ContextId;
 
-/// Per-context conversation scroll offset — pure *view* state, so it lives
-/// app-side rather than on the client's document store (which owns document
-/// data, not how the app scrolls it). Saved when leaving a context and restored
-/// on switch-back. Entries for evicted contexts are harmless (one `f32` each).
+/// The transcript height supplies scroll bounds until the next layout pass.
+pub struct SavedScrollPosition {
+    pub offset: f32,
+    pub content_height: f32,
+}
+
+/// Reading positions saved when the app switches conversations.
 #[derive(Resource, Default)]
-pub struct ScrollOffsets(pub HashMap<ContextId, f32>);
+pub struct ScrollOffsets(pub HashMap<ContextId, SavedScrollPosition>);
 
 /// App-side Bevy `Resource` wrapping the client-owned [`DocumentStore`].
 ///

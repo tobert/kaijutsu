@@ -343,8 +343,8 @@ pub fn sync_tiling_visuals(
 ///
 /// When the focused pane changes:
 /// 1. **Save** outgoing: scroll state → old PaneSavedState
-/// 2. **Restore** incoming: new PaneSavedState → scroll state
-/// 3. If document_id differs, fire ContextSwitchRequested
+/// 2. If the context differs, request a switch and leave its scroll state to
+///    the context switch handler. Otherwise restore the incoming pane state.
 pub fn handle_pane_focus_change(
     tree: Res<TilingTree>,
     mut last_focused: Local<Option<PaneId>>,
@@ -385,20 +385,12 @@ pub fn handle_pane_focus_change(
         }
     }
 
-    // ── Restore incoming pane (always, even after 2→1 close) ─────────
-    let mut incoming_doc_id = String::new();
-    for (marker, saved) in saved_states.iter() {
-        if marker.pane_id == current {
-            scroll_state.offset = saved.scroll_offset;
-            scroll_state.target_offset = saved.scroll_target;
-            scroll_state.following = saved.following;
-            incoming_doc_id = saved.document_id.clone();
-            break;
-        }
-    }
+    let Some((_, incoming)) = saved_states.iter().find(|(marker, _)| marker.pane_id == current) else {
+        return;
+    };
 
     // ── Fire context switch if document differs (multi-pane only) ────
-    if !single_pane && !incoming_doc_id.is_empty() {
+    if !single_pane && !incoming.document_id.is_empty() {
         let outgoing_doc_id = saved_states
             .iter()
             .find_map(|(marker, saved)| {
@@ -410,7 +402,7 @@ pub fn handle_pane_focus_change(
             })
             .unwrap_or_default();
 
-        if incoming_doc_id != outgoing_doc_id
+        if incoming.document_id != outgoing_doc_id
             && let Some(TileNode::Leaf {
                 content: PaneContent::Conversation { document_id },
                 ..
@@ -420,11 +412,17 @@ pub fn handle_pane_focus_change(
             if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(document_id) {
                 switch_writer.write(crate::cell::ContextSwitchRequested { context_id: ctx_id });
                 info!("Pane focus change: switching context to '{}'", document_id);
+                return;
             } else {
                 warn!("Pane focus change: invalid context ID '{}'", document_id);
             }
         }
     }
+
+    // ── Restore incoming pane (also after 2→1 close) ────────────────
+    scroll_state.offset = incoming.scroll_offset;
+    scroll_state.target_offset = incoming.scroll_target;
+    scroll_state.following = incoming.following;
 }
 
 // ============================================================================
@@ -678,6 +676,66 @@ mod short_id_tests {
 #[cfg(test)]
 mod border_theme_tests {
     use super::*;
+
+    #[test]
+    fn focus_switch_keeps_outgoing_scroll_until_context_switch() {
+        let mut tree = TilingTree::default_layout();
+        let first = tree.focused;
+        let second = tree.split(first, SplitDirection::Row).unwrap();
+        let first_doc = kaijutsu_types::ContextId::new().to_string();
+        let second_doc = kaijutsu_types::ContextId::new().to_string();
+        tree.set_conversation_document(first, &first_doc);
+        tree.set_conversation_document(second, &second_doc);
+        let mut app = App::new();
+        app.insert_resource(tree)
+            .insert_resource(crate::cell::ConversationScrollState {
+                offset: 100.0,
+                target_offset: 100.0,
+                following: false,
+                ..default()
+            })
+            .init_resource::<crate::input::focus::FocusArea>()
+            .add_message::<crate::cell::ContextSwitchRequested>()
+            .add_systems(Update, handle_pane_focus_change);
+        for (pane_id, document_id, offset) in [(first, first_doc, 0.0), (second, second_doc, 12.0)] {
+            app.world_mut().spawn((
+                ConversationContainer,
+                PaneMarker { pane_id, content: PaneContent::Conversation { document_id: document_id.clone() } },
+                PaneSavedState { document_id, scroll_offset: offset, scroll_target: offset, following: false },
+            ));
+        }
+        app.update();
+        app.world_mut().resource_mut::<TilingTree>().focus(second);
+        app.update();
+        assert_eq!(app.world().resource::<crate::cell::ConversationScrollState>().offset, 100.0);
+    }
+
+    #[test]
+    fn focus_switch_restores_saved_position_for_same_context() {
+        let mut tree = TilingTree::default_layout();
+        let first = tree.focused;
+        let second = tree.split(first, SplitDirection::Row).unwrap();
+        let document_id = kaijutsu_types::ContextId::new().to_string();
+        tree.set_conversation_document(first, &document_id);
+        tree.set_conversation_document(second, &document_id);
+        let mut app = App::new();
+        app.insert_resource(tree)
+            .init_resource::<crate::cell::ConversationScrollState>()
+            .init_resource::<crate::input::focus::FocusArea>()
+            .add_message::<crate::cell::ContextSwitchRequested>()
+            .add_systems(Update, handle_pane_focus_change);
+        for (pane_id, offset) in [(first, 0.0), (second, 12.0)] {
+            app.world_mut().spawn((
+                ConversationContainer,
+                PaneMarker { pane_id, content: PaneContent::Conversation { document_id: document_id.clone() } },
+                PaneSavedState { document_id: document_id.clone(), scroll_offset: offset, scroll_target: offset, following: false },
+            ));
+        }
+        app.update();
+        app.world_mut().resource_mut::<TilingTree>().focus(second);
+        app.update();
+        assert_eq!(app.world().resource::<crate::cell::ConversationScrollState>().offset, 12.0);
+    }
 
     #[test]
     fn pane_borders_follow_theme_without_tree_changes() {

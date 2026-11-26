@@ -780,7 +780,7 @@ pub struct PaneFocus;
 /// When focus switches between panes, the outgoing pane's scroll state
 /// is saved here and the incoming pane's is restored. Input text lives
 /// in the draft block (Status::Draft + ephemeral), not per-pane state.
-#[derive(Component, Debug, Clone, Default, Reflect)]
+#[derive(Component, Debug, Clone, Reflect)]
 #[reflect(Component)]
 pub struct PaneSavedState {
     /// Document this pane is viewing (empty = unassigned).
@@ -791,6 +791,17 @@ pub struct PaneSavedState {
     pub scroll_target: f32,
     /// Whether the pane was in follow (auto-scroll) mode.
     pub following: bool,
+}
+
+impl Default for PaneSavedState {
+    fn default() -> Self {
+        Self {
+            document_id: String::new(),
+            scroll_offset: 0.0,
+            scroll_target: 0.0,
+            following: true,
+        }
+    }
 }
 
 // ============================================================================
@@ -824,6 +835,11 @@ impl Plugin for TilingPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_pane_follows_conversation_tail() {
+        assert!(PaneSavedState::default().following);
+    }
 
     #[test]
     fn default_layout_has_conversation() {

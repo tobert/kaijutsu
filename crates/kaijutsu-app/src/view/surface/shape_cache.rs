@@ -1882,6 +1882,7 @@ pub fn apply_shaped_measurements(
         });
     if let Some(tail) = tail_now
         && let Some(prev) = *last_tail
+        && tail.context_id == prev.context_id
         && tail != prev
     {
         scroll_state.new_blocks_added = true;
@@ -3333,6 +3334,22 @@ mod tests {
             "a new tail block must anchor the reveal at the pre-growth height",
         );
         assert!(!state.new_blocks_added, "the stamp is consumed same-frame");
+    }
+
+    #[test]
+    fn switching_to_another_context_does_not_anchor_at_the_previous_height() {
+        let mut app = measure_app(true, 0.0);
+        let ent = install_geometry(&mut app, strip(2));
+        app.update();
+
+        let ctx = ContextId::new();
+        let ids = [BlockId::new(ctx, bid(1).principal_id, 1)];
+        let mut geom = app.world_mut().get_mut::<ConversationGeometry>(ent).unwrap();
+        geom.reconcile(&ids, |_| Some(seed()), &params(), 2);
+        geom.recompute_offsets();
+        app.update();
+
+        assert_eq!(app.world().resource::<ConversationScrollState>().pending_scroll_anchor, None);
     }
 
     // ---- shape_visible_blocks (the system) --------------------------------

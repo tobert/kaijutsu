@@ -9,6 +9,9 @@ App input flows through a central action table that maps key combinations to `Ac
 In Heroic, select a performer and press `Ctrl+G` to write a board note.
 Closing the editor returns to the selected performer.
 
+On a first visit, Conversation follows the newest blocks. Returning to a
+conversation restores its saved reading position, including the top.
+
 ### Neo workspace
 
 In the app, `Ctrl+A e` toggles Neo while the conversation is on screen. The
