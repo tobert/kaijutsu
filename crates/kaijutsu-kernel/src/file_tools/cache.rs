@@ -13,7 +13,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::block_store::SharedBlockStore;
 use crate::kernel_db::KernelDb;
-use crate::vfs::{MountTable, VfsOps};
+use crate::vfs::{FilePreimage, MountTable, VfsOps};
 use kaijutsu_types::DocKind;
 
 /// Default maximum cached file documents.
@@ -876,6 +876,18 @@ impl FileDocumentCache {
     /// but clean still returns `Ok(())` — that case genuinely has nothing to
     /// flush, and is not the bug.
     pub async fn flush_one(&self, path: &str) -> Result<(), FlushError> {
+        self.flush_one_inner(path, None).await.map(|_| ())
+    }
+
+    pub(crate) async fn flush_one_with_preimage(
+        &self, path: &str, expected: &str, limit: usize,
+    ) -> Result<FilePreimage, FlushError> {
+        self.flush_one_inner(path, Some((expected, limit))).await
+    }
+
+    async fn flush_one_inner(
+        &self, path: &str, observe: Option<(&str, usize)>,
+    ) -> Result<FilePreimage, FlushError> {
         let ctx_id = file_context_id(path);
         let (block_id, marks) = {
             let cache = self.cache.read();
@@ -886,7 +898,7 @@ impl FileDocumentCache {
                     });
                 }
                 Some(entry) if entry.dirty => (entry.block_id, entry.marks),
-                Some(_) => return Ok(()), // cached, not dirty: nothing to flush
+                Some(_) => return Ok(FilePreimage::Unavailable), // cached, not dirty: nothing to flush
                 None => {
                     return Err(FlushError::NotCached {
                         path: path.to_string(),
@@ -907,9 +919,10 @@ impl FileDocumentCache {
             .ok_or_else(|| FlushError::Backend(format!("flush_one({path}): buffer block {block_id} is missing")))?;
 
         let vfs_path = std::path::Path::new(path);
-        self.vfs
-            .write_all(vfs_path, content.as_bytes())
-            .await
+        // Only capture bytes this shell submitted. A concurrent editor can
+        // update the buffer before the flush takes its snapshot.
+        let limit = observe.filter(|(expected, _)| *expected == content).map(|(_, limit)| limit);
+        let preimage = self.vfs.write_all_with_preimage(vfs_path, content.as_bytes(), limit).await
             .map_err(|e| FlushError::Backend(format!("failed to flush {}: {}", path, e)))?;
 
         // Stamp the post-flush generation so our own write isn't later mistaken
@@ -918,7 +931,8 @@ impl FileDocumentCache {
         // this flush wrote, so the stamp applies either way.
         let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
         self.settle_clean(path, marks, Some(generation))
-            .map_err(|e| FlushError::Backend(format!("flush_one({path}): flushed to disk but {e}")))
+            .map_err(|e| FlushError::Backend(format!("flush_one({path}): flushed to disk but {e}")))?;
+        Ok(preimage)
     }
 
     /// Mark `path` clean and drop its swap marker, unless a

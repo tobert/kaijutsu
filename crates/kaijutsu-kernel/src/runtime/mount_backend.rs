@@ -12,10 +12,13 @@
 //! └── Tool discovery/calls → KaijutsuBackend → MCP broker
 //! ```
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use kaish_opentelemetry::baggage::BaggageExt;
 
 use kaish_kernel::backend::ConflictError;
 use kaish_kernel::tools::{ToolArgs, ToolCtx};
@@ -28,9 +31,28 @@ use kaijutsu_types::PrincipalId;
 use crate::file_tools::path::resolve_str;
 use crate::file_tools::cache::BufferMark;
 use crate::file_tools::{CacheReadError, FileDocumentCache};
-use crate::vfs::{FileType, MountTable, SetAttr, VfsError, VfsOps};
+use crate::vfs::{FilePreimage, FileType, MountTable, SetAttr, VfsError, VfsOps};
 
 use super::kaish_backend::KaijutsuBackend;
+use super::workbench::{MAX_TEXT_BYTES, WriteRecorder};
+
+pub(crate) const WORKBENCH_BAGGAGE: &str = "kaijutsu-workbench-call";
+
+// A shell backend outlives individual executions and is shared by kaish forks.
+// Kaish carries the call's baggage across pipeline and background tasks.
+pub(crate) type WorkbenchCalls = dashmap::DashMap<String, WriteRecorder>;
+
+// Keep a shell append or patch's read, flush, and observation in order across
+// callers sharing a workspace. LocalBackend separately sequences disk writes.
+static WORKSPACE_MUTATIONS: [tokio::sync::Mutex<()>; 64] =
+    [const { tokio::sync::Mutex::const_new(()) }; 64];
+static WORKSPACE_INODE_MUTATIONS: [tokio::sync::Mutex<()>; 64] =
+    [const { tokio::sync::Mutex::const_new(()) }; 64];
+
+struct WorkspaceMutation {
+    _name: tokio::sync::MutexGuard<'static, ()>,
+    _inode: Option<tokio::sync::MutexGuard<'static, ()>>,
+}
 
 /// Routes file *content* operations through the shared
 /// `FileDocumentCache` and directory/metadata/tool operations through
@@ -55,6 +77,7 @@ pub struct MountBackend {
     /// Performer whose contextual shell invoked this backend. File-cache
     /// mutations retain that input actor rather than the cache hydrator.
     actor: PrincipalId,
+    pub(crate) workbench_calls: WorkbenchCalls,
     /// When true, every mutating op is refused structurally with
     /// `PermissionDenied` *before* it can reach the shared mount table or the
     /// document cache — the invariant for `ShellPolicy::ReadOnly`.
@@ -78,6 +101,7 @@ impl MountBackend {
             file_cache,
             docs_tools,
             actor,
+            workbench_calls: WorkbenchCalls::new(),
             read_only: false,
         }
     }
@@ -97,6 +121,7 @@ impl MountBackend {
             file_cache,
             docs_tools,
             actor,
+            workbench_calls: WorkbenchCalls::new(),
             read_only: true,
         }
     }
@@ -153,6 +178,83 @@ impl MountBackend {
     fn cache_key(&self, path: &Path) -> BackendResult<String> {
         resolve_str(Path::new("/"), &path.to_string_lossy())
             .map_err(|e| BackendError::PermissionDenied(e.to_string()))
+    }
+
+    fn workbench_recorder(&self) -> Option<WriteRecorder> {
+        let context = kaish_opentelemetry::Context::current();
+        let call = context.baggage().get(WORKBENCH_BAGGAGE)?.as_str();
+        self.workbench_calls.get(call).map(|entry| entry.value().clone())
+    }
+
+    async fn workspace_path(&self, key: &str) -> Option<PathBuf> {
+        let path = Path::new(key);
+        let (mount, fs) = self.mount_table.owner_of(path).await?;
+        if !fs.is_workspace() {
+            return None;
+        }
+        Some(fs.real_root()?.join(path.strip_prefix(mount).ok()?))
+    }
+
+    async fn lock_workspace_path(&self, key: &str) -> Option<WorkspaceMutation> {
+        let path = self.workspace_path(key).await?;
+        let mut hash = DefaultHasher::new();
+        path.hash(&mut hash);
+        let slot = hash.finish() as usize % WORKSPACE_MUTATIONS.len();
+        // Lock the name first. A writer creating a missing file takes the
+        // same lock as a writer that reaches that name after creation.
+        let name = WORKSPACE_MUTATIONS[slot].lock().await;
+        let inode = if let Ok(metadata) = tokio::fs::metadata(&path).await && metadata.is_file() {
+            let mut hash = DefaultHasher::new();
+            (metadata.dev(), metadata.ino()).hash(&mut hash);
+            let slot = hash.finish() as usize % WORKSPACE_INODE_MUTATIONS.len();
+            Some(WORKSPACE_INODE_MUTATIONS[slot].lock().await)
+        } else {
+            None
+        };
+        Some(WorkspaceMutation { _name: name, _inode: inode })
+    }
+
+    async fn write_text(&self, key: &str, text: &str, workspace: bool) -> BackendResult<()> {
+        let recording = workspace && self.workbench_recorder().is_some();
+        let before = self.file_cache.mark_buffer(key).map_err(BackendError::Io)?;
+        self.file_cache.create_or_replace(key, text, self.actor).await.map_err(BackendError::Io)?;
+        self.file_cache.mark_dirty(key).map_err(BackendError::Io)?;
+        // Flush before reporting a change so failed writes leave no diff.
+        let preimage = if recording && text.len() <= MAX_TEXT_BYTES
+            && !text.as_bytes().contains(&0)
+        {
+            self.file_cache.flush_one_with_preimage(key, text, MAX_TEXT_BYTES).await
+        } else {
+            self.file_cache.flush_one(key).await.map(|()| FilePreimage::Unavailable)
+        };
+        let preimage = preimage.map_err(|e| self.roll_back_failed_flush(key, before, text, e))?;
+        if recording && let Some(recorder) = self.workbench_recorder() {
+            match preimage {
+                FilePreimage::Unavailable => recorder.unavailable(key.to_owned()).await,
+                FilePreimage::Missing => recorder.observe(key.to_owned(), None, text.to_owned()).await,
+                FilePreimage::Text(before) if before != text => {
+                    recorder.observe(key.to_owned(), Some(before), text.to_owned()).await;
+                }
+                FilePreimage::Text(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn log_mutation(&self, operation: &str, path: &Path, destination: Option<&Path>) {
+        let identity = self.docs_tools.shell_identity();
+        let (destination, target) = if operation == "symlink" {
+            (None, destination)
+        } else {
+            (destination, None)
+        };
+        tracing::info!(target: "kaijutsu_kernel::shell_file",
+            operation = %operation, path = %path.display(),
+            destination = %destination.unwrap_or(Path::new("")).display(),
+            target = %target.unwrap_or(Path::new("")).display(),
+            context = %identity.context, session = %identity.session,
+            requester = %identity.requester, performer = %identity.performer,
+            "shell file operation completed");
     }
 
     /// Write straight to the VFS, honoring `WriteMode`, without touching the
@@ -370,10 +472,11 @@ impl KernelBackend for MountBackend {
         // Read-only / OS mounts never touch the cache: let the VFS reject the
         // write cleanly rather than poison the cache with an un-flushable edit.
         if !self.mount_table.is_writable(path).await {
-            return self.raw_write(path, content, mode).await;
+            return self.raw_write(path, content, mode).await.inspect(|_| self.log_mutation("write", path, None));
         }
 
         let key = self.cache_key(path)?;
+        let workspace = self.lock_workspace_path(&key).await;
 
         // Binary content can't live in a document's text: write raw and
         // drop any cached text doc so a later read reloads fresh.
@@ -389,6 +492,10 @@ impl KernelBackend for MountBackend {
                 if let Err(e) = self.file_cache.invalidate(&key) {
                     tracing::warn!("mount_backend write (binary): {e}");
                 }
+                if workspace.is_some() && let Some(recorder) = self.workbench_recorder() {
+                    recorder.unavailable(key).await;
+                }
+                self.log_mutation("write", path, None);
                 return Ok(());
             }
         };
@@ -412,28 +519,19 @@ impl KernelBackend for MountBackend {
             }
         }
 
-        let before = self.file_cache.mark_buffer(&key).map_err(BackendError::Io)?;
-        self.file_cache
-            .create_or_replace(&key, text, self.actor)
-            .await
-            .map_err(BackendError::Io)?;
-        self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
-        // Write-through: external tools (cargo, git) read the real filesystem.
-        // A failed flush takes the text back out of the cache, so no later
-        // read or editor `:w` serves content that never reached disk.
-        if let Err(e) = self.file_cache.flush_one(&key).await {
-            return Err(self.roll_back_failed_flush(&key, before, text, e));
-        }
+        self.write_text(&key, text, workspace.is_some()).await?;
+        self.log_mutation("write", path, None);
         Ok(())
     }
 
     async fn append(&self, path: &Path, content: &[u8]) -> BackendResult<()> {
         self.deny_if_read_only("append", path)?;
         if !self.mount_table.is_writable(path).await {
-            return self.raw_append(path, content).await;
+            return self.raw_append(path, content).await.inspect(|_| self.log_mutation("append", path, None));
         }
 
         let key = self.cache_key(path)?;
+        let workspace = self.lock_workspace_path(&key).await;
         let suffix = match std::str::from_utf8(content) {
             Ok(s) => s,
             Err(_) => {
@@ -444,6 +542,10 @@ impl KernelBackend for MountBackend {
                 if let Err(e) = self.file_cache.invalidate(&key) {
                     tracing::warn!("mount_backend append (binary): {e}");
                 }
+                if workspace.is_some() && let Some(recorder) = self.workbench_recorder() {
+                    recorder.unavailable(key).await;
+                }
+                self.log_mutation("append", path, None);
                 return Ok(());
             }
         };
@@ -463,15 +565,8 @@ impl KernelBackend for MountBackend {
             }
         };
         let combined = format!("{existing}{suffix}");
-        let before = self.file_cache.mark_buffer(&key).map_err(BackendError::Io)?;
-        self.file_cache
-            .create_or_replace(&key, &combined, self.actor)
-            .await
-            .map_err(BackendError::Io)?;
-        self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
-        if let Err(e) = self.file_cache.flush_one(&key).await {
-            return Err(self.roll_back_failed_flush(&key, before, &combined, e));
-        }
+        self.write_text(&key, &combined, workspace.is_some()).await?;
+        self.log_mutation("append", path, None);
         Ok(())
     }
 
@@ -482,6 +577,7 @@ impl KernelBackend for MountBackend {
         // the write cleanly).
         let writable = self.mount_table.is_writable(path).await;
         let key = self.cache_key(path)?;
+        let workspace = self.lock_workspace_path(&key).await;
         let original = if writable {
             // For patch on a writable mount, both NotCached and Backend are
             // errors: we can't safely apply patch ops without the current content.
@@ -517,21 +613,15 @@ impl KernelBackend for MountBackend {
         }
 
         if writable {
-            let before = self.file_cache.mark_buffer(&key).map_err(BackendError::Io)?;
-            self.file_cache
-                .create_or_replace(&key, &text, self.actor)
-                .await
-                .map_err(BackendError::Io)?;
-            self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
-            if let Err(e) = self.file_cache.flush_one(&key).await {
-                return Err(self.roll_back_failed_flush(&key, before, &text, e));
-            }
+            self.write_text(&key, &text, workspace.is_some()).await?;
+            self.log_mutation("patch", path, None);
             Ok(())
         } else {
             self.mount_table
                 .write_all(path, text.as_bytes())
                 .await
                 .map_err(vfs_to_backend)
+                .inspect(|_| self.log_mutation("patch", path, None))
         }
     }
 
@@ -602,6 +692,7 @@ impl KernelBackend for MountBackend {
             .mkdir(path, 0o755)
             .await
             .map_err(vfs_to_backend)?;
+        self.log_mutation("mkdir", path, None);
         Ok(())
     }
 
@@ -623,6 +714,7 @@ impl KernelBackend for MountBackend {
         // discard cached content). A real content change is what bumps
         // generation and trips the staleness check. Invalidating here would risk
         // dropping an unflushed edit, so we let the staleness logic own freshness.
+        self.log_mutation("set_mtime", path, None);
         Ok(())
     }
 
@@ -635,13 +727,14 @@ impl KernelBackend for MountBackend {
             .getattr(path)
             .await
             .map_err(vfs_to_backend)?;
-        if !attr.is_dir() {
+        let result = if !attr.is_dir() {
             self.mount_table.unlink(path).await.map_err(vfs_to_backend)
         } else if recursive {
             self.remove_recursive(path).await
         } else {
             self.mount_table.rmdir(path).await.map_err(vfs_to_backend)
-        }
+        };
+        result.inspect(|_| self.log_mutation("remove", path, None))
     }
 
     async fn exists(&self, path: &Path) -> bool {
@@ -673,6 +766,7 @@ impl KernelBackend for MountBackend {
         if let Some(key) = &key {
             self.file_cache.recheck_disk_on_next_read(key);
         }
+        self.log_mutation("rename", from, Some(to));
         Ok(())
     }
 
@@ -689,6 +783,7 @@ impl KernelBackend for MountBackend {
             .symlink(link, target)
             .await
             .map_err(vfs_to_backend)?;
+        self.log_mutation("symlink", link, Some(target));
         Ok(())
     }
 
@@ -1024,6 +1119,26 @@ mod tests {
         ));
 
         MountBackend::new(mount_table, docs, file_cache, performer)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_shell_file_mutations_are_logged() {
+        let performer = PrincipalId::new();
+        let backend = test_mount_backend_as(performer).await;
+        let (logs, _guard) = crate::test_logs::capture_logs();
+        let from = Path::new("/tmp/observed.txt");
+        let to = Path::new("/tmp/moved.txt");
+        backend.write(from, b"private payload", WriteMode::Overwrite).await.unwrap();
+        backend.append(from, b"more").await.unwrap();
+        backend.rename(from, to).await.unwrap();
+        assert!(backend.rename(from, to).await.is_err());
+        let text = logs.text();
+        assert!(text.contains("operation=write"), "{text}");
+        assert!(text.contains("operation=append"), "{text}");
+        assert_eq!(text.matches("operation=rename").count(), 1, "{text}");
+        assert!(text.contains("/tmp/observed.txt") && text.contains("/tmp/moved.txt"), "{text}");
+        assert!(text.contains(&performer.to_string()), "{text}");
+        assert!(!text.contains("private payload"), "{text}");
     }
 
     /// A MountBackend over a `/tmp` whose writes the test can fail, with the

@@ -165,9 +165,43 @@ Folds and the reader's block landed in both clients (`docs/input.md`). Left from
 - **Media.** `lfm3-omni` reads images, audio and video and writes audio. The provider sends each media part the served model reads as an object: on 2026-11-17 an `audio/wav` asset block (`kj cas put`, then `kj block create --role asset --kind text --content-type audio/wav --content <hash>`) reached `lfm3-omni` on a generation turn, which described a 16-note clip and a 2-note clip differently. Video in is untested. Nothing carries audio out: the request sends no `output` and the reply reads none.
 - **lfm3 on tool loops.** A 1.7B model is weaker than Gemma 4 on long tool loops.
 
+## Next kaish pass — file activity
+
+- **Carry host invocation identity to backend calls.** In kaish 0.19.0,
+  `kaish-types/src/kernel.rs` exposes tracing baggage on `ExecuteOptions`.
+  The pipeline, scatter, and job schedulers propagate it with
+  `telemetry::bind_current_context`. Give an embedder a typed, process-local
+  value that follows execution to filesystem operations. A test should run
+  overlapping commands against one backend, including a pipeline, and see
+  the correct caller on each write with tracing disabled.
+- **Expose the lifetime of inherited jobs.** A shell can return while a job
+  started with `&` still owns the backend. In `kaish-kernel/src/kernel.rs`,
+  `run_background_pipeline` forks the scope and registers a kaish job.
+  Let the embedder associate that
+  job's writes and completion with the invocation that launched it. Test a
+  delayed write after the foreground command returns and a second command
+  begins in the same context.
+- **Identify explicit file reads.** For an optional per-command file list,
+  expose the path and purpose of a content read at the interpreter boundary.
+  `KernelBackend::read` receives a path and byte range. Count repeated reads
+  of a path once in the summary and keep the count for detail. Exercise
+  `cat`, input redirection, and path discovery in one test. Kaijutsu's
+  existing VFS activity digest counts mutations per directory across all
+  callers and serves a different purpose.
+
 ## `kj watch`: what the first build leaves open (2026-11-08)
 
 `kj watch` watches host files and delivers waiting changes before the next prompt. Open:
+- **Other file writers.** Workbench publishes diffs for mounted kaish text
+  writes with a command block in the active context. Writes inside host
+  programs, direct kernel writers, and `/v/docs` take separate paths.
+  `kj watch` can observe registered host paths between prompts. It has no
+  writer identity. A future live view of those observations needs to
+  preserve that distinction and recover after a missed delivery.
+- **File renames and removals in Workbench.** The shell file trace records
+  both operations. The Workbench diff shows the text written at the original
+  path. A write followed by `mv` or `rm` in the same call is a fixture for
+  showing where the file ended up.
 - **Only path watches.** Next sources named: a ledger event for a context, a council report.
 - **No way to wake a turn.**
 - **A fork copies no watches.**

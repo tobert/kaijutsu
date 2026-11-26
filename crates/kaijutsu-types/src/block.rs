@@ -204,6 +204,11 @@ impl BlockHeader {
         }
     }
 
+    /// The originating command of a captured shell write diff.
+    pub fn command_diff_parent(&self) -> Option<BlockId> {
+        self.kind.command_diff_parent(self.role, self.content_type, self.parent_id)
+    }
+
     /// Check if this is a root block (no parent).
     pub fn is_root(&self) -> bool {
         self.parent_id.is_none()
@@ -1289,6 +1294,14 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
+    fn command_diff_parent(self, role: Role, content_type: ContentType, parent: Option<BlockId>) -> Option<BlockId> {
+        if self == Self::Trace && role == Role::Asset && content_type == ContentType::Diff {
+            parent
+        } else {
+            None
+        }
+    }
+
     /// Parse from string (case-insensitive).
     ///
     /// Deliberate `Option`-returning sibling of the real `FromStr` impl —
@@ -1964,6 +1977,11 @@ impl BlockSnapshot {
     /// The principal that authored this block (always `id.principal_id`).
     pub fn author(&self) -> PrincipalId {
         self.id.principal_id
+    }
+
+    /// The originating command of a captured shell write diff.
+    pub fn command_diff_parent(&self) -> Option<BlockId> {
+        self.kind.command_diff_parent(self.role, self.content_type, self.parent_id)
     }
 
     /// Whether this is a drift held for its human's review: a `Drift`

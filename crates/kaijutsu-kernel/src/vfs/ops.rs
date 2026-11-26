@@ -18,6 +18,14 @@ use super::types::{DirEntry, FileAttr, MountKind, SetAttr, StatFs};
 /// override would use, rather than picking an unrelated size.
 pub const STREAM_CHUNK_SIZE: u32 = 256 * 1024;
 
+/// The text replaced by a successful workspace write.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FilePreimage {
+    Unavailable,
+    Missing,
+    Text(String),
+}
+
 /// Core VFS operations trait.
 ///
 /// All operations are path-based (no inode numbers) for RPC-friendliness.
@@ -135,6 +143,11 @@ pub trait VfsOps: Send + Sync {
         None
     }
 
+    /// Whether this mount is a workspace for shell diff capture.
+    fn is_workspace(&self) -> bool {
+        false
+    }
+
     /// What serves this mount: a host directory when [`Self::real_root`] names
     /// one, otherwise a kernel tree. An in-memory backend says so itself.
     fn mount_kind(&self) -> MountKind {
@@ -170,6 +183,15 @@ pub trait VfsOps: Send + Sync {
         }
         self.write(path, 0, data).await?;
         Ok(())
+    }
+
+    /// Replace a workspace file and return its previous UTF-8 text when available.
+    /// An absent file has a distinct preimage from an empty file.
+    async fn write_all_with_preimage(
+        &self, path: &Path, data: &[u8], _limit: Option<usize>,
+    ) -> VfsResult<FilePreimage> {
+        self.write_all(path, data).await?;
+        Ok(FilePreimage::Unavailable)
     }
 
     /// Open a streaming, chunked read over `path` — the substrate for

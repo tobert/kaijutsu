@@ -1794,7 +1794,7 @@ pub async fn create_shared_kernel_in(
 
     // Read-write ~/src (longest-prefix wins over /)
     if let Some(src_dir) = home_src_mount(&kaish_kernel::home_dir()) {
-        kernel.mount(&format!("{}", src_dir.display()), LocalBackend::new(&src_dir)).await;
+        kernel.mount(&src_dir, LocalBackend::new(&src_dir).workspace()).await;
     }
 
     // Read-write /tmp for scratch/interop with external tools.
@@ -1902,7 +1902,7 @@ pub async fn create_shared_kernel_in(
     // (`docs/mounts.md`).
     for dir in crate::ssh::validate_rw_mounts(rw_mounts).map_err(capnp::Error::failed)? {
         log::info!("Read-write mount at {}", dir.display());
-        kernel.mount(&dir, LocalBackend::new(&dir)).await;
+        kernel.mount(&dir, LocalBackend::new(&dir).workspace()).await;
     }
 
     // A walk from `/` enters every mount outside the kernel roots, so a

@@ -4,13 +4,28 @@
 //! to prevent escaping the root directory.
 
 use async_trait::async_trait;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use crate::vfs::error::{VfsError, VfsResult};
-use crate::vfs::ops::VfsOps;
+use crate::vfs::ops::{FilePreimage, VfsOps};
 use crate::vfs::types::{DirEntry, FileAttr, FileType, SetAttr, StatFs};
+
+// Serialize local VFS mutations to the same resolved name while the
+// replacement samples its preimage and commits. Writers outside the VFS do
+// not share these locks.
+static LOCAL_MUTATIONS: [tokio::sync::Mutex<()>; 128] =
+    [const { tokio::sync::Mutex::const_new(()) }; 128];
+static LOCAL_INODE_MUTATIONS: [tokio::sync::Mutex<()>; 128] =
+    [const { tokio::sync::Mutex::const_new(()) }; 128];
+
+fn mutation_slot(path: &Path) -> usize {
+    let mut hash = DefaultHasher::new();
+    path.hash(&mut hash);
+    hash.finish() as usize % LOCAL_MUTATIONS.len()
+}
 
 /// Local filesystem backend.
 ///
@@ -24,6 +39,7 @@ pub struct LocalBackend {
     root: PathBuf,
     read_only: bool,
     opaque: bool,
+    workspace: bool,
 }
 
 impl LocalBackend {
@@ -38,6 +54,7 @@ impl LocalBackend {
             root,
             read_only: false,
             opaque: false,
+            workspace: false,
         }
     }
 
@@ -49,6 +66,7 @@ impl LocalBackend {
             root,
             read_only: true,
             opaque: false,
+            workspace: false,
         }
     }
 
@@ -68,6 +86,50 @@ impl LocalBackend {
     pub fn opaque(mut self, opaque: bool) -> Self {
         self.opaque = opaque;
         self
+    }
+
+    /// Mark this host mount as a workspace.
+    pub fn workspace(mut self) -> Self {
+        self.workspace = true;
+        self
+    }
+
+    async fn lock_mutation(&self, path: &Path) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+        if self.is_workspace() {
+            Some(LOCAL_MUTATIONS[mutation_slot(path)].lock().await)
+        } else {
+            None
+        }
+    }
+
+    // Call this after the name lock. Hard links under different names can
+    // still change the same file contents in place.
+    async fn lock_inode(&self, path: &Path) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+        if !self.is_workspace() {
+            return None;
+        }
+        let metadata = fs::metadata(path).await.ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let mut hash = DefaultHasher::new();
+        (metadata.dev(), metadata.ino()).hash(&mut hash);
+        let slot = hash.finish() as usize % LOCAL_INODE_MUTATIONS.len();
+        Some(LOCAL_INODE_MUTATIONS[slot].lock().await)
+    }
+
+    async fn lock_rename(&self, from: &Path, to: &Path) -> (
+        Option<tokio::sync::MutexGuard<'static, ()>>,
+        Option<tokio::sync::MutexGuard<'static, ()>>,
+    ) {
+        if !self.is_workspace() {
+            return (None, None);
+        }
+        let from = mutation_slot(from);
+        let to = mutation_slot(to);
+        let first = LOCAL_MUTATIONS[from.min(to)].lock().await;
+        let second = if from != to { Some(LOCAL_MUTATIONS[from.max(to)].lock().await) } else { None };
+        (Some(first), second)
     }
 
     /// Get the root path.
@@ -325,6 +387,67 @@ impl LocalBackend {
         std::fs::File::open(parent)?.sync_all()
     }
 
+    // Mounted writes truncate or create in place so aliases to an inode see
+    // the same update. Opening for read is optional even on a writable file.
+    fn write_mounted_file(
+        target: &Path, lexical: &Path, data: &[u8], capture: Option<usize>,
+    ) -> std::io::Result<FilePreimage> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        let (mut file, before) = if std::fs::symlink_metadata(lexical).is_ok() {
+            let file = opts.open(target)?;
+            let before = if let Some(limit) = capture && let Ok(metadata) = file.metadata() {
+                Self::read_text_preimage(target, &metadata, limit)
+            } else {
+                FilePreimage::Unavailable
+            };
+            file.set_len(0)?;
+            (file, before)
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = opts.create_new(true).mode(0o644).open(target)?;
+            (file, capture.map_or(FilePreimage::Unavailable, |_| FilePreimage::Missing))
+        };
+        file.write_all(data)?;
+        Ok(before)
+    }
+
+    fn read_text_preimage(path: &Path, expected: &std::fs::Metadata, limit: usize) -> FilePreimage {
+        use std::io::Read;
+        use rustix::fs::{Mode, OFlags, open};
+
+        let file: std::fs::File = match open(
+            path, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty(),
+        ) {
+            Ok(fd) => fd.into(),
+            Err(_) => return FilePreimage::Unavailable,
+        };
+        let read = || {
+            let metadata = file.metadata().ok()?;
+            if !metadata.is_file() || metadata.len() > limit as u64
+                || (metadata.dev(), metadata.ino()) != (expected.dev(), expected.ino())
+            {
+                return None;
+            }
+            let mut bytes = Vec::new();
+            file.take((limit as u64).saturating_add(1)).read_to_end(&mut bytes).ok()?;
+            let current = std::fs::symlink_metadata(path).ok()?;
+            if (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec(), metadata.len())
+                != (current.dev(), current.ino(), current.ctime(), current.ctime_nsec(), current.len())
+                || bytes.len() as u64 != metadata.len() || bytes.contains(&0)
+            {
+                return None;
+            }
+            String::from_utf8(bytes).ok()
+        };
+        read().map_or(FilePreimage::Unavailable, FilePreimage::Text)
+    }
+
     fn metadata_to_attr(meta: &std::fs::Metadata) -> FileAttr {
         let kind = if meta.is_dir() {
             FileType::Directory
@@ -449,6 +572,8 @@ impl VfsOps for LocalBackend {
 
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
+        let _inode = self.lock_inode(&full_path).await;
 
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -479,8 +604,31 @@ impl VfsOps for LocalBackend {
     async fn write_all(&self, path: &Path, data: &[u8]) -> VfsResult<()> {
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
+        let guard = self.lock_mutation(&full_path).await;
         let data = data.to_vec();
-        tokio::task::spawn_blocking(move || Self::replace_file(&full_path, &data))
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            Self::replace_file(&full_path, &data)
+        })
+        .await
+        .map_err(|e| VfsError::other(format!("write_all: blocking task join failed: {e}")))?
+        .map_err(VfsError::from)
+    }
+
+    async fn write_all_with_preimage(
+        &self, path: &Path, data: &[u8], limit: Option<usize>,
+    ) -> VfsResult<FilePreimage> {
+        self.check_writable()?;
+        let full_path = self.resolve(path).await?;
+        let lexical = self.root.join(path.strip_prefix("/").unwrap_or(path));
+        let capture = limit.filter(|_| self.is_workspace() && full_path == lexical);
+        let guard = self.lock_mutation(&full_path).await;
+        let inode = self.lock_inode(&full_path).await;
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let _guards = (guard, inode);
+            Self::write_mounted_file(&full_path, &lexical, &data, capture)
+        })
             .await
             .map_err(|e| VfsError::other(format!("write_all: blocking task join failed: {e}")))?
             .map_err(VfsError::from)
@@ -489,6 +637,7 @@ impl VfsOps for LocalBackend {
     async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
 
         // Ensure parent directory exists
         if let Some(parent) = full_path.parent() {
@@ -513,6 +662,7 @@ impl VfsOps for LocalBackend {
     async fn mkdir(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
 
         // `tokio::fs::DirBuilder` has a direct `mode()` (unix), so this
         // needs no `spawn_blocking` of its own either.
@@ -533,6 +683,7 @@ impl VfsOps for LocalBackend {
         // NOT `resolve()` — it canonicalizes the final component, so deleting a
         // symlink would delete what it points at.
         let full_path = self.resolve_nofollow(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
         fs::remove_file(&full_path).await.map_err(VfsError::from)
     }
 
@@ -546,6 +697,7 @@ impl VfsOps for LocalBackend {
         self.check_writable()?;
         Self::refuse_mount_root(path)?;
         let full_path = self.resolve_nofollow(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
         fs::remove_dir(&full_path).await.map_err(VfsError::from)
     }
 
@@ -565,6 +717,7 @@ impl VfsOps for LocalBackend {
         Self::refuse_mount_root(to)?;
         let from_path = self.resolve_nofollow(from).await?;
         let to_path = self.resolve_nofollow(to).await?;
+        let _guards = self.lock_rename(&from_path, &to_path).await;
 
         // Ensure parent of destination exists
         if let Some(parent) = to_path.parent() {
@@ -579,6 +732,8 @@ impl VfsOps for LocalBackend {
     async fn truncate(&self, path: &Path, size: u64) -> VfsResult<()> {
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
+        let _inode = self.lock_inode(&full_path).await;
 
         let file = fs::OpenOptions::new()
             .write(true)
@@ -592,6 +747,8 @@ impl VfsOps for LocalBackend {
     async fn setattr(&self, path: &Path, attr: SetAttr) -> VfsResult<FileAttr> {
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
+        let _inode = self.lock_inode(&full_path).await;
 
         // Handle size
         if let Some(size) = attr.size {
@@ -652,6 +809,7 @@ impl VfsOps for LocalBackend {
     async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
         self.check_writable()?;
         let full_path = self.resolve_nofollow(path).await?;
+        let _guard = self.lock_mutation(&full_path).await;
 
         // Ensure parent directory exists
         if let Some(parent) = full_path.parent() {
@@ -667,6 +825,7 @@ impl VfsOps for LocalBackend {
         self.check_writable()?;
         let old_full = self.resolve(oldpath).await?;
         let new_full = self.resolve(newpath).await?;
+        let _guards = self.lock_rename(&old_full, &new_full).await;
 
         // Ensure parent of new path exists
         if let Some(parent) = new_full.parent() {
@@ -716,6 +875,10 @@ impl VfsOps for LocalBackend {
     fn real_root(&self) -> Option<PathBuf> {
         // Root is canonicalized at construction; a 1:1 host-directory view.
         Some(self.root.clone())
+    }
+
+    fn is_workspace(&self) -> bool {
+        self.workspace && !self.read_only
     }
 
     async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>> {
@@ -1541,5 +1704,24 @@ mod tests {
              single worker: resolve is canonicalizing inline instead of on \
              the blocking pool"
         );
+    }
+}
+
+#[cfg(test)]
+mod workbench_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn workbench_preimage_distinguishes_empty_missing_and_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path()).workspace();
+        let path = Path::new("file");
+
+        assert_eq!(backend.write_all_with_preimage(path, b"", Some(32)).await.unwrap(), FilePreimage::Missing);
+        assert_eq!(backend.write_all_with_preimage(path, b"\x00binary", Some(32)).await.unwrap(), FilePreimage::Text(String::new()));
+        assert_eq!(backend.write_all_with_preimage(path, b"\xff", Some(32)).await.unwrap(), FilePreimage::Unavailable);
+        assert_eq!(backend.write_all_with_preimage(path, b"new", Some(32)).await.unwrap(), FilePreimage::Unavailable);
+        assert_eq!(backend.write_all_with_preimage(path, b"final", Some(2)).await.unwrap(), FilePreimage::Unavailable);
+        assert_eq!(backend.read_all(path).await.unwrap(), b"final");
     }
 }

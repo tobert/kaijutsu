@@ -448,3 +448,93 @@ fn an_append_crosses_the_wire_as_a_suffix() {
         );
     });
 }
+
+#[test]
+fn a_running_shell_write_updates_one_diff_and_reconnect_restores_it() {
+    run_local(async {
+        use kaijutsu_types::{ContentType, Status};
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = kaijutsu_server::SshServerConfig::ephemeral(addr.port());
+        config.rw_mounts.push(dir.path().to_path_buf());
+        common::register_root_key(addr, config.root_key());
+        tokio::task::spawn_local(async move {
+            kaijutsu_server::SshServer::new(config).run_on_listener(listener).await.unwrap();
+        });
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "live-shell-diff").await.unwrap();
+        kernel.join_context(context, "live-shell-diff").await.unwrap();
+        let (observer, mut rx) = context_feed_channel(256);
+        kernel.subscribe_context(context, observer).await.unwrap();
+        let (blocks, version) = kernel.get_blocks_versioned(context, &BlockQuery::All).await.unwrap();
+        let mut mirror = ContextMirror::new(context);
+        mirror.apply_snapshot(blocks, version).unwrap();
+
+        let file = dir.path().join("notes.txt");
+        let append = dir.path().join("append");
+        let release = dir.path().join("release");
+        let command = format!(
+            "echo first > '{}'; while test ! -e '{}'; do sleep 0.01; done; echo second >> '{}'; while test ! -e '{}'; do sleep 0.01; done",
+            file.display(), append.display(), file.display(), release.display(),
+        );
+        kernel.edit_input(context, 0, &command, 0).await.unwrap();
+        let command_id = kernel.submit_input(context, true).await.unwrap().block_id;
+        let read_diff = |mirror: &ContextMirror, line: &str| {
+            mirror.blocks().iter().find(|block| {
+                block.content_type == ContentType::Diff
+                    && block.parent_id == Some(command_id)
+                    && block.content.lines().any(|candidate| candidate == line)
+            }).map(|block| block.id)
+        };
+        let first = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = read_diff(&mirror, "+first") { break id; }
+                let Some(FeedEvent::Changed(delivery)) = rx.recv().await else { panic!("feed stopped"); };
+                mirror.receive(delivery).unwrap();
+            }
+        }).await;
+        assert_eq!(tokio::fs::read(&file).await.unwrap(), b"first\n");
+        let id = first.expect("the first patch must reach the feed while the command is paused");
+        assert_eq!(mirror.block(&command_id).unwrap().status, Status::Running);
+        assert!(!mirror.block(&id).unwrap().content.contains("+second"));
+
+        std::fs::write(&append, "").unwrap();
+        let updated_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = read_diff(&mirror, "+second") { break id; }
+                let Some(FeedEvent::Changed(delivery)) = rx.recv().await else { panic!("feed stopped"); };
+                mirror.receive(delivery).unwrap();
+            }
+        }).await.expect("the appended line must reach the feed before command settlement");
+        assert_eq!(updated_id, id);
+        let patch = mirror.block(&id).unwrap().content.clone();
+        assert!(patch.contains("+first\n+second\n"));
+        assert_eq!(mirror.blocks().iter().filter(|block| block.content_type == ContentType::Diff).count(), 1);
+
+        drop(rx);
+        drop(kernel);
+        drop(client);
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        kernel.join_context(context, "live-shell-diff").await.unwrap();
+        let (observer, mut rx) = context_feed_channel(256);
+        kernel.subscribe_context(context, observer).await.unwrap();
+        let (blocks, version) = kernel.get_blocks_versioned(context, &BlockQuery::All).await.unwrap();
+        let mut mirror = ContextMirror::new(context);
+        mirror.apply_snapshot(blocks, version).unwrap();
+        assert_eq!(mirror.block(&id).unwrap().content, patch);
+
+        std::fs::write(&release, "").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mirror.block(&command_id).unwrap().status == Status::Running {
+                let Some(FeedEvent::Changed(delivery)) = rx.recv().await else { panic!("feed stopped"); };
+                mirror.receive(delivery).unwrap();
+            }
+        }).await.expect("the command must settle after release");
+        assert_eq!(mirror.block(&command_id).unwrap().status, Status::Done);
+        assert_eq!(mirror.block(&id).unwrap().content, patch);
+    });
+}

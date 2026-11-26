@@ -232,23 +232,18 @@ impl BlockDocument {
         ordered.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Get block statuses in document order (same ordering as
-    /// `blocks_ordered`/`block_ids_ordered`) without building `BlockSnapshot`s.
-    /// `BlockSnapshot::content` is populated by `BlockContent::text()`, which
-    /// clones a block's text into a fresh `String` — the one expensive field
-    /// (well, `.clone()`-expensive, on a large block) on an otherwise-cheap
-    /// struct of
-    /// header clones. Status-only callers (e.g. `journal_op`'s per-op live-
-    /// status recompute) don't need that text and were paying for it on every
-    /// journaled op, context-wide. This does the same order_key sort
-    /// `block_ids_ordered` does, but reads `header().status` directly instead
-    /// of routing through `get_block_snapshot`/`snapshot()`.
+    /// Get statuses for the context's live status in document order.
+    /// Workbench diffs describe command writes and contribute no status.
+    /// Read the headers directly so journal acceptance never clones block text.
     pub fn statuses_ordered(&self) -> Vec<Status> {
         let mut ordered: Vec<_> = self
             .blocks
             .iter()
-            .filter(|(_, b)| !b.is_deleted())
-            .map(|(id, b)| (b.order_key().to_string(), *id, b.header().status))
+            .filter_map(|(id, block)| {
+                let header = block.header();
+                (!block.is_deleted() && header.command_diff_parent().is_none())
+                    .then(|| (block.order_key().to_string(), *id, header.status))
+            })
             .collect();
         ordered.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         ordered.into_iter().map(|(_, _, status)| status).collect()

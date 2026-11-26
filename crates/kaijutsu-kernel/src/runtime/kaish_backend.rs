@@ -86,6 +86,10 @@ pub struct KaijutsuBackend {
 }
 
 impl KaijutsuBackend {
+    pub(super) fn shell_identity(&self) -> ShellIdentity {
+        self.identity
+    }
+
     /// Create a new backend with block store, kernel, and identity fields.
     ///
     /// Read context switches from the invocation's shared session map.

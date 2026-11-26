@@ -37,7 +37,7 @@ use kaish_kernel::tools::{ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::Tool;
 use kaish_kernel::output_limit::OutputLimitConfig;
 use kaish_kernel::{
-    ExecuteOptions, IgnoreConfig, Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig,
+    ExecuteOptions, IgnoreConfig, Kernel as KaishKernel, KernelConfig as KaishConfig,
 };
 
 use crate::Kernel as KaijutsuKernel;
@@ -47,7 +47,8 @@ use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use super::docs_filesystem::KaijutsuFilesystem;
 use super::kaish_backend::KaijutsuBackend;
-use super::mount_backend::MountBackend;
+use super::mount_backend::{MountBackend, WorkbenchCalls, WORKBENCH_BAGGAGE};
+use super::workbench::WriteRecorder;
 use super::read_only_fs::ReadOnlyFs;
 use super::swap_filesystem::SwapFilesystem;
 use super::context_shell::ShellIdentity;
@@ -63,6 +64,7 @@ pub struct EmbeddedKaish {
     /// dispatch an inner command through the full resolution chain (e.g.
     /// `timeout`) need `ctx.dispatcher`, which is only populated this way.
     kernel: Arc<KaishKernel>,
+    mount_backend: Arc<MountBackend>,
     /// Kernel name/id.
     name: String,
     /// Invocation-local session map for context tracking.
@@ -75,6 +77,26 @@ pub struct EmbeddedKaish {
     /// and the limit it cuts at; `None` for an Internal shell, whose results
     /// are never cut.
     preview_store: Option<(Arc<kaijutsu_cas::FileStore>, PreviewLimit)>,
+}
+
+struct WorkbenchCall<'a> {
+    calls: &'a WorkbenchCalls,
+    key: String,
+}
+
+impl<'a> WorkbenchCall<'a> {
+    fn new(calls: &'a WorkbenchCalls, opts: &mut ExecuteOptions, recorder: &WriteRecorder) -> Self {
+        let key = uuid::Uuid::new_v4().to_string();
+        opts.baggage.insert(WORKBENCH_BAGGAGE.into(), key.clone());
+        calls.insert(key.clone(), recorder.clone());
+        Self { calls, key }
+    }
+}
+
+impl Drop for WorkbenchCall<'_> {
+    fn drop(&mut self) {
+        self.calls.remove(&self.key);
+    }
 }
 
 /// Refuse tools whose effects cannot be limited to observation. Register these
@@ -487,7 +509,7 @@ impl EmbeddedKaish {
         // (real files + the FileDocumentCache), regardless of whether the
         // shared mount is writable. The `/v/*` document mounts bypass MountBackend,
         // so they're wrapped separately below.
-        let mount_backend: Arc<dyn KernelBackend> = if read_only {
+        let mount_backend = if read_only {
             Arc::new(MountBackend::new_read_only(
                 mount_table,
                 docs_backend.clone(),
@@ -577,7 +599,7 @@ impl EmbeddedKaish {
         let sid_for_tools = session_id;
         let timeouts = kernel.timeouts().clone();
         let kaish_kernel = KaishKernel::with_backend(
-            mount_backend,
+            mount_backend.clone(),
             config,
             |vfs| {
                 vfs.mount_arc(DOCS_ROOT, docs_mount);
@@ -614,6 +636,7 @@ impl EmbeddedKaish {
 
         Ok(Self {
             kernel: kaish_kernel,
+            mount_backend,
             name: name.to_string(),
             session_contexts,
             session_id,
@@ -671,6 +694,33 @@ impl EmbeddedKaish {
         if let Some((cas, limit)) = &self.preview_store {
             preview_for_model(&mut result, cas, *limit).await;
         }
+        Ok(result)
+    }
+
+    pub(crate) async fn execute_with_options_captured(
+        &self, code: &str, mut opts: ExecuteOptions, recorder: &WriteRecorder,
+    ) -> std::result::Result<ExecResult, kaish_kernel::KernelError> {
+        let _call = WorkbenchCall::new(&self.mount_backend.workbench_calls, &mut opts, recorder);
+        let mut result = self.execute_with_options(code, opts).await?;
+        result.baggage.remove(WORKBENCH_BAGGAGE);
+        Ok(result)
+    }
+
+    pub(crate) async fn execute_with_options_streaming_captured(
+        &self, code: &str, mut opts: ExecuteOptions,
+        on_output: &mut (dyn FnMut(&ExecResult) + Send), recorder: &WriteRecorder,
+    ) -> std::result::Result<ExecResult, kaish_kernel::KernelError> {
+        let _call = WorkbenchCall::new(&self.mount_backend.workbench_calls, &mut opts, recorder);
+        let mut result = self.execute_with_options_streaming(code, opts, &mut |output| {
+            if output.baggage.contains_key(WORKBENCH_BAGGAGE) {
+                let mut output = output.clone();
+                output.baggage.remove(WORKBENCH_BAGGAGE);
+                on_output(&output);
+            } else {
+                on_output(output);
+            }
+        }).await?;
+        result.baggage.remove(WORKBENCH_BAGGAGE);
         Ok(result)
     }
 
@@ -926,6 +976,104 @@ mod tests {
     /// somewhere durable to mark unsaved buffers with no further wiring.
     async fn test_kernel(name: &str) -> Arc<KaijutsuKernel> {
         Arc::new(KaijutsuKernel::new_ephemeral(name).await)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_file_traces_keep_the_bound_identity() {
+        let performer = PrincipalId::new();
+        let context = ContextId::new();
+        let session = SessionId::new();
+        let kernel = test_kernel("file-trace").await;
+        kernel.mount("/tmp", crate::vfs::backends::MemoryBackend::new()).await;
+        let shell = EmbeddedKaish::with_identity(
+            "file-trace", shared_block_store(performer), kernel, Some("/tmp".into()),
+            ShellIdentity { requester: performer, performer, reviewer: None, context, session },
+            crate::runtime::context_engine::session_context_map(), ExternalExec::Deny,
+            OutputProfile::AGENT, |_, _, _| {},
+        ).unwrap();
+        let (logs, _guard) = crate::test_logs::capture_logs();
+        let result = shell.execute_with_options(
+            "echo first > /tmp/one; echo second >> /tmp/one; mv /tmp/one /tmp/two",
+            ExecuteOptions::default(),
+        ).await.unwrap();
+        assert!(result.ok(), "{}", result.err);
+        let text = logs.text();
+        assert!(text.contains("operation=write"), "{text}");
+        assert!(text.contains("operation=append"), "{text}");
+        assert!(text.contains("operation=rename"), "{text}");
+        assert!(text.contains("/tmp/one") && text.contains("/tmp/two"), "{text}");
+        assert!(text.contains(&context.to_string()) && text.contains(&performer.to_string()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspace_appends_through_aliases_record_only_their_own_text() {
+        use kaijutsu_types::DocKind;
+        use kaijutsu_types::{BlockKind, ContentType, Role, Status};
+
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::MetadataExt;
+
+        let file = dir.path().join("shared.txt");
+        tokio::fs::write(&file, b"initial\n").await.unwrap();
+        let linked = dir.path().join("linked.txt");
+        tokio::fs::hard_link(&file, &linked).await.unwrap();
+        let original = tokio::fs::metadata(&file).await.unwrap();
+        let kernel = test_kernel("concurrent-workbench").await;
+        kernel.mount("/workspace", crate::vfs::backends::LocalBackend::new(dir.path()).workspace()).await;
+        let store = shared_block_store(PrincipalId::system());
+        let make_shell = |name: &str| {
+            let performer = PrincipalId::new();
+            let context = ContextId::new();
+            store.create_document(context, DocKind::Conversation, None).unwrap();
+            let command = store.insert_block(context, None, None, Role::User, BlockKind::ToolCall,
+                "append", Status::Running, ContentType::Plain).unwrap();
+            let recorder = WriteRecorder::start(store.clone(), command);
+            let shell = EmbeddedKaish::with_identity(
+                name, store.clone(), kernel.clone(), Some("/workspace".into()),
+                ShellIdentity { requester: performer, performer, reviewer: None, context, session: SessionId::new() },
+                crate::runtime::context_engine::session_context_map(), ExternalExec::Deny,
+                OutputProfile::AGENT, |_, _, _| {},
+            ).unwrap();
+            (shell, recorder, context, command)
+        };
+        let (left_shell, left_recorder, left_context, left_command) = make_shell("left");
+        let (right_shell, right_recorder, right_context, right_command) = make_shell("right");
+        let (left, right) = tokio::join!(
+            left_shell.execute_with_options_captured(
+                "echo left | cat >> shared.txt", ExecuteOptions::default(), &left_recorder,
+            ),
+            right_shell.execute_with_options_captured(
+                "echo right | cat >> linked.txt", ExecuteOptions::default(), &right_recorder,
+            ),
+        );
+        for result in [left.unwrap(), right.unwrap()] {
+            assert!(result.ok(), "{}", result.err);
+            assert!(!result.baggage.contains_key(WORKBENCH_BAGGAGE));
+        }
+        let (left, right) = tokio::join!(left_recorder.finish(), right_recorder.finish());
+        left.unwrap();
+        right.unwrap();
+        for (context, command, own, other) in [
+            (left_context, left_command, "left", "right"),
+            (right_context, right_command, "right", "left"),
+        ] {
+            let blocks = store.block_snapshots(context).unwrap();
+            assert_eq!(blocks.len(), 2, "{blocks:?}");
+            assert_eq!(blocks[1].parent_id, Some(command));
+            assert!(blocks[1].content.contains(&format!("+{own}\n")), "{}", blocks[1].content);
+            assert!(!blocks[1].content.contains(&format!("+{other}\n")), "{}", blocks[1].content);
+        }
+        let text = tokio::fs::read_to_string(&file).await.unwrap();
+        assert!(text == "initial\nleft\nright\n" || text == "initial\nright\nleft\n", "{text}");
+        assert_eq!(tokio::fs::read_to_string(&linked).await.unwrap(), text);
+        let uncaptured = left_shell.execute_with_options(
+            "echo uncaptured >> shared.txt", ExecuteOptions::default(),
+        ).await.unwrap();
+        assert!(uncaptured.ok(), "{}", uncaptured.err);
+        let current = tokio::fs::metadata(&file).await.unwrap();
+        assert_eq!((current.ino(), current.mode()), (original.ino(), original.mode()));
+        assert_eq!(tokio::fs::read_to_string(&linked).await.unwrap(), format!("{text}uncaptured\n"));
+        assert!(!store.block_snapshots(left_context).unwrap()[1].content.contains("uncaptured"));
     }
 
     const TP: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";

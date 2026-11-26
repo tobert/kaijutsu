@@ -134,6 +134,31 @@ parts:
   context, wiring VFS mounts, file buffer cache, per-context `JobManager`,
   output preview limits (`PREVIEW_LIMIT_BYTES`), `HOME`/`PATH`, and W3C trace
   context.
+- **Shell file operations.** Add `kaijutsu_kernel::shell_file=info` to the
+  server's `RUST_LOG` filter to follow successful operations on mounted
+  files as they finish. Records carry the operation, path, session, context,
+  requester, and performer. A rename includes both paths. A redirect can
+  open a file and write its output in separate operations. A program that
+  opens a host file itself bypasses the shell backend.
+- **Workbench diffs.** An agent's shell tool call or a recorded interactive
+  command can create and update a diff while it runs. Kaish captures
+  successful text writes, appends, and patches under the writable
+  `~/src` mount and directories configured with `--rw-mount` or
+  `[workspace].rw`. The first pending change starts a 100 ms window.
+  The kernel drains pending changes when the command finishes, including
+  after cancellation. Each command owns one diff block per changed path.
+  Another writer's edit starts a separate section if the next write sees
+  different file contents. The context change feed delivers updates and a
+  reconnecting client recovers the current patch from the context snapshot.
+  Each text snapshot can contain up to 256 KiB. A later uncaptured write to
+  a tracked file marks the patch incomplete. Scratch files on the default
+  `/tmp` mount, symlink aliases, and files opened directly by host programs
+  fall outside this capture path. File renames and removals appear in the
+  server's shell file trace.
+  Commands keep up to 8 MiB of recent file snapshots in memory. Older
+  snapshots go in a private directory under `workbench-spill` beside the
+  kernel's `cas` directory. Command completion removes it. A server crash
+  can leave a directory there.
 - **Host execution policy (`runtime/context_shell.rs`):** Controlled by the
   context's loadout. Contexts with the `Exec` capability run with
   `ExternalExec::Allow`; read-only contexts (`toolie`, `musician`) run with

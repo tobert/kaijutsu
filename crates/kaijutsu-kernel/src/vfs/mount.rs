@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 use super::error::{MountRow, REFUSAL_MOUNT_ROWS, ReadOnlyMount, VfsError, VfsResult};
-use super::ops::VfsOps;
+use super::ops::{FilePreimage, VfsOps};
 use super::types::{DirEntry, FileAttr, FileType, SetAttr, SnapshotNode, SnapshotResult, StatFs};
 
 /// Baseline listing-generation for a directory never observed to mutate
@@ -1058,6 +1058,30 @@ impl VfsOps for MountTable {
         fs.read_all(&relative).await
     }
 
+    async fn write_all_with_preimage(
+        &self, path: &Path, data: &[u8], limit: Option<usize>,
+    ) -> VfsResult<FilePreimage> {
+        let (fs, relative) = self.find_mount(path).await?;
+        if !fs.is_workspace() {
+            self.write_all(path, data).await?;
+            return Ok(FilePreimage::Unavailable);
+        }
+        let existing = self.getattr(path).await;
+        if existing.as_ref().is_ok_and(FileAttr::is_dir) {
+            return Err(VfsError::is_a_directory(path.display().to_string()));
+        }
+        let existed = existing.is_ok();
+        let before = self.name_refusal(path, fs.write_all_with_preimage(&relative, data, limit).await).await?;
+        let parent = Self::parent_dir(path);
+        if !existed || before == FilePreimage::Missing {
+            self.bump_generation(&parent);
+        }
+        // Match write_all's create or truncate, followed by its write.
+        self.bump_activity(&parent);
+        self.bump_activity(&parent);
+        Ok(before)
+    }
+
     /// Delegate `open_read_stream` to the owning backend, same rationale as
     /// `read_all` above: the trait's DEFAULT implementation just loops
     /// `read`, which is correct only for backends where `read` is cheap and
@@ -2000,6 +2024,26 @@ mod tests {
             .find(|(p, _)| p == dir)
             .map(|(_, total)| total)
             .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn captured_replacement_matches_write_all_activity_and_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = MountTable::new();
+        table.mount("/workspace", crate::vfs::backends::LocalBackend::new(dir.path()).workspace()).await;
+        let parent = Path::new("/workspace");
+        let ordinary = Path::new("/workspace/ordinary");
+        let captured = Path::new("/workspace/captured");
+
+        for text in [b"first".as_slice(), b"second".as_slice()] {
+            let before = (activity_of(&table, parent), table.global_activity(), table.generation_of(parent));
+            table.write_all(ordinary, text).await.unwrap();
+            let middle = (activity_of(&table, parent), table.global_activity(), table.generation_of(parent));
+            table.write_all_with_preimage(captured, text, Some(32)).await.unwrap();
+            let after = (activity_of(&table, parent), table.global_activity(), table.generation_of(parent));
+            assert_eq!((middle.0 - before.0, middle.1 - before.1, middle.2 - before.2),
+                (after.0 - middle.0, after.1 - middle.1, after.2 - middle.2));
+        }
     }
 
     #[tokio::test]

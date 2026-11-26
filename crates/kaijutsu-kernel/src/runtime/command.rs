@@ -8,11 +8,12 @@ use futures::FutureExt;
 
 use crate::Kernel;
 use crate::runtime::embedded_kaish::EmbeddedKaish;
-use kaijutsu_types::{BlockId, ContentType, ContextId, PrincipalId, Status};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
 
 use super::command_result::exec_result_to_hook_tool_result;
 use super::command_outcome::{CommandExecution, CommandOutcome};
 use super::shell_state::{persist_shell_state, snapshot_shell_state};
+use super::workbench::WriteRecorder;
 
 /// The adapter acknowledges a switch after updating its connection binding.
 /// Dropping the acknowledgement means the connection has departed.
@@ -405,8 +406,9 @@ pub async fn run_into_blocks(
     attempt.finish(settled)
 }
 
-/// Execute without transcript blocks. A result review retains an audit record
-/// only when it opens an ask; ordinary calls create no review record.
+/// Execute without admitting a new transcript pair. A recorded model call
+/// links workspace diffs to its existing call block. A result review retains
+/// an audit record only when it opens an ask.
 pub async fn run_without_blocks(
     kaish: &EmbeddedKaish,
     code: &str,
@@ -452,9 +454,29 @@ async fn capture_and_review(
 ) -> CommandAttempt {
     let started = std::time::Instant::now();
     let cancel = options.cancel_token.clone().unwrap_or_default();
+    let write_recorder = receipt.as_ref().map(|receipt| receipt.command_block_id)
+        .or(call.tool_call)
+        .map(|command| {
+            let spill_root = kernel.cas().config().base_path.with_file_name("workbench-spill");
+            (command, WriteRecorder::start_in(kernel.blocks().clone(), command, spill_root))
+        });
     let mut captured_outcome = None;
     let captured = std::panic::AssertUnwindSafe(Box::pin(capture_command(kaish, code, options,
-        kernel, context, run.context_switch, run.state_writeback, streams, &run.judged, &mut captured_outcome))).catch_unwind().await;
+        kernel, context, run.context_switch, run.state_writeback, streams, &run.judged,
+        write_recorder.as_ref().map(|(_, recorder)| recorder),
+        &mut captured_outcome))).catch_unwind().await;
+    if let Some((command, recorder)) = write_recorder
+        && let Err(error) = recorder.finish().await
+    {
+        tracing::error!(%command, %error, "could not finish publishing workspace diffs");
+        let notice = "Could not finish publishing workspace diffs for this command. Its successful file writes are on disk.";
+        if let Err(error) = kernel.blocks().insert_block_as(command.context_id, Some(&command), Some(&command),
+            Role::System, BlockKind::Notification, notice, Status::Done, ContentType::Plain,
+            Some(PrincipalId::system()))
+        {
+            tracing::error!(%command, %error, "could not publish the workspace diff failure notice");
+        }
+    }
     let (mut outcome, mut panic) = match captured {
         Ok(()) => (captured_outcome.expect("completed capture supplies its outcome"), None),
         Err(panic) => {
@@ -496,6 +518,7 @@ async fn capture_command(
     state_writeback: ShellStateWriteBack,
     streams: Option<kaish_kernel::scheduler::JobStreams>,
     judged: &[crate::council::programs::JudgedFile],
+    recorder: Option<&WriteRecorder>,
     captured: &mut Option<CommandOutcome>,
 ) {
     if options.cancel_token.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
@@ -512,9 +535,10 @@ async fn capture_command(
     let state_before = snapshot_shell_state(kaish).await;
 
     let started = std::time::Instant::now();
-    let result = match streams {
-        Some(streams) => Box::pin(execute_with_job_output(kaish, code, options, streams)).await,
-        None => kaish.execute_with_options(code, options).await,
+    let result = match (streams, recorder) {
+        (Some(streams), _) => Box::pin(execute_with_job_output(kaish, code, options, streams, recorder)).await,
+        (None, Some(recorder)) => kaish.execute_with_options_captured(code, options, recorder).await,
+        (None, None) => kaish.execute_with_options(code, options).await,
     };
     *captured = Some(CommandOutcome::from_execution(result, started.elapsed().as_millis() as u64));
     let outcome = captured.as_mut().expect("execution supplied its outcome");
@@ -556,14 +580,19 @@ async fn capture_command(
 async fn execute_with_job_output(
     kaish: &EmbeddedKaish, code: &str, options: kaish_kernel::ExecuteOptions,
     streams: kaish_kernel::scheduler::JobStreams,
+    recorder: Option<&WriteRecorder>,
 ) -> Result<kaish_kernel::interpreter::ExecResult, kaish_kernel::KernelError> {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<kaish_kernel::interpreter::ExecResult>();
     let mut on_output = move |result: &kaish_kernel::interpreter::ExecResult| {
         sender.send(result.clone()).expect("command output receiver lives through execution");
     };
     let execute = async {
-        let result = std::panic::AssertUnwindSafe(kaish.execute_with_options_streaming(code, options, &mut on_output))
-            .catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            match recorder {
+                Some(recorder) => kaish.execute_with_options_streaming_captured(code, options, &mut on_output, recorder).await,
+                None => kaish.execute_with_options_streaming(code, options, &mut on_output).await,
+            }
+        }).catch_unwind().await;
         drop(on_output);
         result
     };
@@ -643,6 +672,40 @@ mod fill_tests {
     use super::*;
     use crate::Kernel;
     use crate::block_store::DocumentKind;
+
+    #[tokio::test]
+    async fn a_foreground_model_shell_write_finishes_its_diff_without_an_operation_receipt() {
+        let kernel = Arc::new(Kernel::new_ephemeral("model-write-diff").await);
+        let context = ContextId::new();
+        let documents = kernel.blocks();
+        documents.create_document(context, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(context, None, None, "shell_write",
+            serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result_as(context, &command, Some(&command), "",
+            Status::Running, None, None, None, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(kernel.mount("/workbench-test", crate::vfs::LocalBackend::new(dir.path()).workspace()).await);
+        let kaish = EmbeddedKaish::with_identity("model-write-diff", documents.clone(), kernel.clone(), None,
+            crate::runtime::context_shell::ShellIdentity {
+                requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None,
+                context, session: kaijutsu_types::SessionId::new(),
+            },
+            crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
+            super::super::embedded_kaish::OutputProfile::AGENT, |_, _, _| {}).unwrap();
+        let mut call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
+        call.publishes_pair = true;
+        call.tool_call = Some(command);
+
+        let outcome = run_without_blocks(&kaish, "echo model-edit | tee /workbench-test/example.txt; exit 7",
+            &kernel, &call, CommandRunOptions::default()).await.unwrap();
+        assert_eq!(outcome.exec_result().code, 7);
+        assert_eq!(std::fs::read(dir.path().join("example.txt")).unwrap(), b"model-edit\n");
+        assert!(kernel.shell_operations().list_for_context(context).unwrap().is_empty());
+        assert_eq!(documents.get_block_snapshot(context, &output).unwrap().unwrap().status, Status::Running);
+        assert!(documents.block_snapshots(context).unwrap().iter().any(|block|
+            block.parent_id == Some(command) && block.content_type == ContentType::Diff
+                && block.content.lines().any(|line| line == "+model-edit")));
+    }
 
     struct PanicBuiltin;
 
@@ -851,12 +914,14 @@ mod fill_tests {
     #[tokio::test]
     async fn cancelling_a_running_command_settles_as_exit_130_in_every_record() {
         let kernel = Arc::new(Kernel::new_ephemeral("cancel-contract").await);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(kernel.mount("/workbench-test", crate::vfs::LocalBackend::new(dir.path()).workspace()).await);
         let ctx = ContextId::new();
         let documents = kernel.blocks();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
         let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
         let output = documents.insert_tool_result(ctx, &command, Some(&command), "", false, None, None).unwrap();
-        let code = "echo started; sleep 30; echo never";
+        let code = "echo saved > /workbench-test/example.txt; echo started; sleep 30; echo never";
         let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(), command, output, code, None).unwrap();
         let kaish = EmbeddedKaish::new("cancel-contract", documents.clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(ctx);
@@ -886,6 +951,10 @@ mod fill_tests {
         assert!(state.completed_at.is_some());
         assert_eq!(state.envelope.as_ref().unwrap().exit_code, Some(130), "the durable receipt agrees with the live outcome");
         for block in [&command, &output] { assert_eq!(documents.get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Error); }
+        assert_eq!(std::fs::read(dir.path().join("example.txt")).unwrap(), b"saved\n");
+        assert!(documents.block_snapshots(ctx).unwrap().iter().any(|block|
+            block.parent_id == Some(command) && block.content_type == ContentType::Diff
+                && block.content.lines().any(|line| line == "+saved")));
         let jobs = kernel.context_job_manager(ctx);
         let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
         assert_eq!(jobs.wait(job.id).await.unwrap().code, 130);

@@ -275,6 +275,12 @@ Disk is the source of truth; file buffers operate like vim swaps. Dirty buffers
 write durable rows, and `:w` refuses overwriting changed disk generations
 without explicit overrides.
 
+The mounted shell backend now traces successful file operations with the
+identity captured when its shell was built. That places observation after
+the write-through flush and preserves attribution for background work.
+External programs can open host files independently. Tracking those changes
+across a workspace remains open.
+
 ## The scripts that shipped and never arrived (August 20)
 
 rc seeding checks installation status visibly; uninstalled scripts report an

@@ -6866,6 +6866,7 @@ dependencies = [
  "kaish-tools-git",
  "kaish-types",
  "notify",
+ "opentelemetry 0.31.0",
  "parking_lot",
  "rand 0.10.4",
  "regex",
