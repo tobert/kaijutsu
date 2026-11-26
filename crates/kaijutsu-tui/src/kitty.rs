@@ -155,12 +155,12 @@ pub fn encode_virtual_placement(id: u32, cols: u16, rows: u16) -> String {
     format!("\x1b_Ga=p,U=1,i={id},c={cols},r={rows},q=2;\x1b\\")
 }
 
-/// Encode deletion of one image by ID (`a=d,d=i,q=2`).
+/// Encode deletion of one image (both placements and pixel data) by ID (`a=d,d=I,q=2`).
 pub fn encode_delete_image(id: u32) -> String {
-    format!("\x1b_Ga=d,d=i,i={id},q=2;\x1b\\")
+    format!("\x1b_Ga=d,d=I,i={id},q=2;\x1b\\")
 }
 
-/// Encode deletion of all Kitty images on the current screen (`a=d,d=A,q=2`).
+/// Encode deletion of all Kitty images (placements and pixel data) on the current screen (`a=d,d=A,q=2`).
 pub fn encode_delete_all() -> &'static str {
     "\x1b_Ga=d,d=A,q=2;\x1b\\"
 }
@@ -355,6 +355,12 @@ impl KittyStore {
             return None;
         }
         if let Some(&hit) = self.cache.get(&key) {
+            // True LRU: touch the hit key so hot visible images are never evicted
+            // ahead of off-screen images.
+            if let Some(pos) = self.lru.iter().position(|&k| k == key) {
+                self.lru.remove(pos);
+            }
+            self.lru.push_back(key);
             return Some(hit);
         }
         let raster = rasterize_svg(svg, max_cols, max_rows, self.cell_px)?;
@@ -385,15 +391,16 @@ impl KittyStore {
         std::mem::take(&mut self.pending_wire)
     }
 
-    /// Drop all cached images (e.g. on terminal resize when cell pixels change)
-    /// and queue a delete-all command.
+    /// Drop all cached images (e.g. on terminal resize when cell pixels change
+    /// or after SIGCONT resume), discarding any unsent uploads and queueing a
+    /// delete-all command.
     pub fn clear(&mut self) {
-        if !self.cache.is_empty() {
-            self.cache.clear();
-            self.lru.clear();
-            if self.enabled {
-                self.pending_wire.push(encode_delete_all().to_string());
-            }
+        let had_anything = !self.cache.is_empty() || !self.pending_wire.is_empty();
+        self.cache.clear();
+        self.lru.clear();
+        self.pending_wire.clear();
+        if self.enabled && had_anything {
+            self.pending_wire.push(encode_delete_all().to_string());
         }
     }
 
@@ -472,10 +479,34 @@ mod tests {
         assert_eq!(hit, img1);
         assert!(store.take_pending_wire().is_empty());
 
-        // Inserting two more evicts key 1.
+        // Inserting two more evicts key 1 using uppercase d=I (frees pixel data).
         let _ = store.ensure_svg(2, svg, 20, 10).unwrap();
         let _ = store.ensure_svg(3, svg, 20, 10).unwrap();
         let wire = store.take_pending_wire();
-        assert!(wire.iter().any(|w| w == &encode_delete_image(1)));
+        assert!(wire.iter().any(|w| w == "\x1b_Ga=d,d=I,i=1,q=2;\x1b\\"));
+    }
+
+    #[test]
+    fn store_lru_touches_on_hit_and_clear_drops_unsent_uploads() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><line x1="0" y1="40" x2="200" y2="40" stroke="#ffffff" stroke-width="2"/></svg>"##;
+        let mut store = KittyStore::enabled(CellPixels { width: 10, height: 20 });
+        store.max_images = 2;
+
+        let img1 = store.ensure_svg(1, svg, 20, 10).unwrap();
+        let img2 = store.ensure_svg(2, svg, 20, 10).unwrap();
+        let _ = store.take_pending_wire();
+
+        // Touch key 1 so key 2 becomes the oldest.
+        assert_eq!(store.ensure_svg(1, svg, 20, 10).unwrap(), img1);
+        let _ = store.ensure_svg(3, svg, 20, 10).unwrap();
+        let wire = store.take_pending_wire();
+        assert!(wire.iter().any(|w| w == &encode_delete_image(img2.id)), "key 2 evicted, not touched key 1");
+        assert!(!wire.iter().any(|w| w == &encode_delete_image(img1.id)));
+
+        // Queue a fresh upload, then clear(): unsent upload is discarded, only delete-all remains.
+        let _ = store.ensure_svg(4, svg, 20, 10).unwrap();
+        store.clear();
+        let after_clear = store.take_pending_wire();
+        assert_eq!(after_clear, vec![encode_delete_all().to_string()]);
     }
 }

@@ -83,6 +83,10 @@ pub(super) async fn on_input(
                     ls.key_state.ctrl_z_tap.reset();
                     ls.frame.presented.cursor_shape = None;
                     ls.frame.presented.title = None;
+                    if app.kitty.enabled {
+                        app.kitty.cell_px = crate::kitty::query_cell_pixels();
+                        app.kitty.clear();
+                    }
                     // `fg` put this terminal back in front of
                     // the player; a report may never say so.
                     app.saw_input();
