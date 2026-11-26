@@ -1,5 +1,8 @@
 # The heroic view
 
+The [playable room proposal](playable-room.md) starts at the rail, where
+the player can see the whole fleet, then follows a Heroic seat to its notes.
+
 The heroic view is a full-window 3D scene in the app that shows every
 performer's anticipation and commitment on the shared pulse. It is the client
 that `docs/issues.md`, "Anticipation and commitment — iteration order", step 4

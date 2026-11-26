@@ -223,6 +223,10 @@ progresses:
   its existing chapter and compress it as it cools. Daily detail belongs in
   git.
 
+Keep large media files such as concept art, design renders, and blog assets
+outside the repository. Save them locally for later publication. Commit the
+design decisions as text.
+
 We add files by name. We never run `cargo fmt`, work around its disabled
 config, or reformat by hand; we match surrounding style. See README.md, "Code
 Style". Commit and PR bodies explain decisions from the conversation and the
