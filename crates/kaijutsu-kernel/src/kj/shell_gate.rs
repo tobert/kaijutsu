@@ -67,9 +67,9 @@ use approval_ledger::types::{Origin, VarBinding};
 
 use super::gate::{GateSpec, GatedStatement};
 
-/// The `shell_write` tool's ledger identity.
-const INSTANCE: &str = "builtin.shell_write";
-const TOOL: &str = "shell_write";
+/// The writable `shell` tool's ledger identity.
+const INSTANCE: &str = "builtin.shell";
+const TOOL: &str = "shell";
 
 /// A submission this gate refuses to build an ask for at all — nothing
 /// durable is recorded, because there is nothing honest to show a human.
@@ -115,7 +115,7 @@ pub(crate) fn build_shell_gate_spec_with_stdin(
             .collect::<Vec<_>>()
             .join("\n");
         ShellGateBuildError::Parse(format!(
-            "shell_write: source does not parse, so it cannot be gated (and could not run \
+            "shell: source does not parse, so it cannot be gated (and could not run \
              either):\n{msg}"
         ))
     })?;
@@ -147,7 +147,7 @@ pub(crate) fn build_shell_gate_spec_with_stdin(
     let preview: String = source.chars().take(200).collect();
     let truncated = source.chars().count() > 200;
     let mut description = format!(
-        "shell_write: {} statement(s) — {preview}{}",
+        "shell: {} statement(s) — {preview}{}",
         statements.len(),
         if truncated { "…" } else { "" }
     );

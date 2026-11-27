@@ -49,12 +49,6 @@ kj binding allow "exec"
 # (docs/vi.md; Amy, 2026-08-20 — experiment ahead of a capability-names
 # sweep, docs/issues.md).
 kj binding allow "editor"
-# Facades: full interaction surface (shell + edit + submit). `facade:shell` is
-# the safe, unmarked shell (ExternalExec::Deny; kept explicit rather than
-# implied). `facade:shell_write` is the hot, mutating twin
-# (ExternalExec::Allow) —
-# JUDGMENT CALL (Amy should confirm): granted here because banto performs the
-# operator's console and wants the safe tool available by default AND the hot
-# one on hand, not because coordination is inherently a write-shell role.
+# Facades: full interaction surface (shell + edit + submit). Each character
+# holds one shell facade; banto holds the writable `facade:shell`.
 kj binding allow "facade:shell"
-kj binding allow "facade:shell_write"

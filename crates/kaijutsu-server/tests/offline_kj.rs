@@ -230,7 +230,7 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     let scripts = home.path().join("mock-scripts");
     std::fs::create_dir_all(&scripts).unwrap();
     std::fs::write(scripts.join("mock-model.json"), serde_json::json!([
-        [{"ToolUse": {"id": "offline-1", "name": "shell_write", "input": {"command": "echo offline-ran | tee marker"}}},
+        [{"ToolUse": {"id": "offline-1", "name": "shell", "input": {"command": "echo offline-ran | tee marker"}}},
          {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}],
         // A coder ends its task with `done`.
         ["TextStart", {"TextDelta": "understood"}, "TextEnd",

@@ -171,13 +171,13 @@ const READ_ONLY_REFUSALS: [&str; 3] = [
     "this git is read-only",
 ];
 
-/// Append the remedy to a read-only refusal: the write path is `shell_write`.
+/// Append the remedy to a read-only refusal: the write path is `shell`.
 fn name_the_write_path(envelope: &mut ShellEnvelope) {
     if !envelope.is_error() || !READ_ONLY_REFUSALS.iter().any(|refusal| envelope.stderr.contains(refusal)) { return; }
     if !envelope.stderr.is_empty() && !envelope.stderr.ends_with('\n') { envelope.stderr.push('\n'); }
     envelope.stderr.push_str(
-        "This is the read-only `shell`: it runs kaish builtins, read-only `git`, and read-only `kj`. \
-         Run host programs and git writes (commit, add, push) with `shell_write`, which asks for approval.\n");
+        "This is `shell_readonly`: it runs kaish builtins, read-only `git`, and read-only `kj`. \
+         Run host programs and git writes (commit, add, push) with `shell`, which asks for approval.\n");
 }
 
 #[cfg(test)]

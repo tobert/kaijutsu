@@ -93,7 +93,7 @@ impl Rig {
         let work = kaijutsu_client::context_id_from_create_result(&created).unwrap();
         kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("ledger-rpc-gate".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(work),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(work),
             match_principal: None, action: HookAction::Ask(AskSpec { description: Some("ledger rpc".into()) }),
             priority: 0, kaish_script_id: None,
         });
@@ -156,7 +156,7 @@ fn a_reviewer_reads_and_answers_the_ledger_without_a_context() {
         let detail = rig.amy_kj.get_ask(&request_id).await.unwrap().expect("the ask exists");
         assert_eq!(&detail.summary, card);
         assert_eq!(detail.exec_source.is_some(), card.has_exec_source, "the card and the record agree");
-        assert_eq!(detail.tool.as_deref(), Some("shell_write"));
+        assert_eq!(detail.tool.as_deref(), Some("shell"));
         assert!(detail.decision.is_none());
         assert!(rig.amy_kj.get_ask("no-such-ask").await.unwrap().is_none());
 

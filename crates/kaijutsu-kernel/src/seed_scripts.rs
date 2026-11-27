@@ -1169,7 +1169,7 @@ mod tests {
         types.sort_unstable();
         types.dedup();
 
-        const EXEC_GRANTS: [&str; 3] = ["\"*\"", "\"exec\"", "\"facade:shell_write\""];
+        const EXEC_GRANTS: [&str; 3] = ["\"*\"", "\"exec\"", "\"facade:shell\""];
 
         let mut missing = Vec::new();
         let mut unneeded = Vec::new();

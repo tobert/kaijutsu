@@ -614,7 +614,7 @@ fn pre_call_deny_on_shell_write_blocks_shell_execute_end_to_end() {
             .push(kaijutsu_kernel::mcp::HookEntry {
                 id: kaijutsu_kernel::mcp::HookId("deny-shell-write-e2e".into()),
                 match_instance: None,
-                match_tool: Some(kaijutsu_kernel::mcp::GlobPattern("shell_write".into())),
+                match_tool: Some(kaijutsu_kernel::mcp::GlobPattern("shell".into())),
                 match_context: None,
                 match_principal: None,
                 action: kaijutsu_kernel::mcp::HookAction::Deny("no shells today".into()),

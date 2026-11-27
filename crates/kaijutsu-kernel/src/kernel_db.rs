@@ -81,6 +81,7 @@ mod migrate_slot_roles;
 mod migrate_type_melt;
 mod migrate_council_backends;
 mod migrate_context_shadows;
+mod migrate_shell_facade;
 mod migrate_cast;
 mod migrate;
 #[cfg(test)]

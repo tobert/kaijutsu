@@ -54,7 +54,7 @@ fn call(id: &str, tool: &str, input: serde_json::Value) -> StreamEvent {
 }
 
 fn shell_write(id: &str, command: &str) -> StreamEvent {
-    call(id, "shell_write", serde_json::json!({ "command": command }))
+    call(id, "shell", serde_json::json!({ "command": command }))
 }
 
 /// One model response that makes `calls` in parallel.
@@ -177,7 +177,7 @@ impl Seat {
         self.server.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId(id.into()),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: Some(self.context),
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(body.into())),

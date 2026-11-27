@@ -450,7 +450,7 @@ impl Tool for KjBuiltin {
             match classify(&normalized) {
                 Ok(Effect::Read) => {}
                 Ok(_) => return ExecResult::failure(1,
-                    "kj: this command changes state and is unavailable in a read-only shell; use shell_write"),
+                    "kj: this command changes state and is unavailable in a read-only shell; use shell"),
                 Err(ClassifyError::Parse(error)) => {
                     if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp
                         | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand

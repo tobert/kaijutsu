@@ -3754,19 +3754,19 @@ uncovered = "allow"
     /// example: loosening is the operator's choice, per seat (F16).
     #[test]
     fn the_shipped_default_comments_out_the_shell_write_allow() {
-        const EXAMPLE_LINES: [&str; 2] = ["#   [rc.coder]", "#   allow = [\"shell_write\"]"];
+        const EXAMPLE_LINES: [&str; 2] = ["#   [rc.coder]", "#   allow = [\"shell\"]"];
         let shipped = crate::config_seed::DEFAULT_GATE_CONFIG;
         assert!(
             shipped.contains(&EXAMPLE_LINES.join("\n")),
-            "the shipped gate.toml must carry the shell_write example verbatim"
+            "the shipped gate.toml must carry the shell example verbatim"
         );
-        let source = "shell_write 'git commit -m \"a message\"'";
+        let source = "shell 'git commit -m \"a message\"'";
         assert_eq!(first_verdict(source, &config(shipped), Some("coder")), PolicyVerdict::Uncovered);
         let uncommented: String = EXAMPLE_LINES.iter().map(|l| format!("{}\n", &l[4..])).collect();
         let v = first_verdict(source, &config(&uncommented), Some("coder"));
         assert_eq!(
             allow_keys(&v),
-            vec![(Layer::Config(Section::Rc("coder".into())), "shell_write".to_string())],
+            vec![(Layer::Config(Section::Rc("coder".into())), "shell".to_string())],
             "got {v:?}"
         );
     }

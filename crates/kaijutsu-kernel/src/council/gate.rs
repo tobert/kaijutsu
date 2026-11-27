@@ -86,7 +86,7 @@ pub(crate) fn pass_option(case: CouncilCase, mode: JudgeMode) -> &'static str {
 }
 
 /// The tool whose gate-policy ask the council may decide on the RPC paths.
-const SHELL_WRITE: &str = "shell_write";
+const SHELL_WRITE: &str = "shell";
 
 /// The submission a council decision reads.
 #[derive(Clone, Copy, Debug)]
@@ -2638,17 +2638,17 @@ mod tests {
     #[test]
     fn only_the_shell_gate_and_the_gate_policy_ask_on_shell_write_are_eligible() {
         let params = |tool: &str| crate::mcp::types::KernelCallParams {
-            instance: crate::mcp::types::InstanceId::new("builtin.shell_write"),
+            instance: crate::mcp::types::InstanceId::new("builtin.shell"),
             tool: tool.into(),
             arguments: serde_json::json!({"command": "touch x"}),
         };
         let policy = crate::mcp::error::GATE_POLICY_SUBJECT;
         assert!(eligible(&crate::kj::shell_gate::build_shell_gate_spec("touch x").unwrap()));
-        assert!(eligible(&crate::kj::hook_gate::build_hook_gate_spec(policy, "d".into(), &params("shell_write"))));
-        assert!(!eligible(&crate::kj::hook_gate::build_hook_gate_spec("scorer", "d".into(), &params("shell_write"))));
-        assert!(!eligible(&crate::kj::hook_gate::build_hook_gate_spec(policy, "d".into(), &params("shell"))));
+        assert!(eligible(&crate::kj::hook_gate::build_hook_gate_spec(policy, "d".into(), &params("shell"))));
+        assert!(!eligible(&crate::kj::hook_gate::build_hook_gate_spec("scorer", "d".into(), &params("shell"))));
+        assert!(!eligible(&crate::kj::hook_gate::build_hook_gate_spec(policy, "d".into(), &params("shell_readonly"))));
         let review = crate::kj::hook_gate::build_result_review_spec(
-            policy, crate::mcp::McpHookPhase::PostCall, "d".into(), &params("shell_write"), "out",
+            policy, crate::mcp::McpHookPhase::PostCall, "d".into(), &params("shell"), "out",
         );
         assert!(!eligible(&review));
         let mut verb = crate::kj::shell_gate::build_shell_gate_spec("touch x").unwrap();

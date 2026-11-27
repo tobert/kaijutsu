@@ -14,7 +14,7 @@ set -e
 kj binding allow "drive"
 kj binding allow "builtin.notes"
 # Deliberately NOT granted: other builtin.* tool instances (block/file/resources/
-# kernel_info/tool_search), facade:shell (the safe tool) or facade:shell_write
+# kernel_info/tool_search), facade:shell_readonly (the safe tool) or facade:shell
 # (the hot one), facade:submit_input, and fork/drift/transport/operator/admin/house. A musician
 # drives itself and emits ABC text; it can read and add notes, but does not fork, merge
 # drift, run the transport, or do lifecycle.

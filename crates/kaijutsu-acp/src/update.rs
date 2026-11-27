@@ -95,7 +95,7 @@ pub fn acp_tool_kind(kind: Option<KjToolKind>, name: Option<&str>) -> AcpToolKin
         // runs a command, though its last word is `write`.
         let bare = name.rsplit([':', '.', '/']).next().unwrap_or(name);
         match bare {
-            "shell" | "shell_write" => return AcpToolKind::Execute,
+            "shell" | "shell_readonly" | "shell_write" => return AcpToolKind::Execute,
             "read_shell_operation" => return AcpToolKind::Read,
             _ => {}
         }

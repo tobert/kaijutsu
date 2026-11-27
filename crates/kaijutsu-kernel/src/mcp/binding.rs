@@ -51,7 +51,7 @@ pub type ResolvedName = (InstanceId, String);
 /// bit gates all three reach paths (human box, external MCP, in-kernel tool)
 /// so shell policy stays single-axis per flavor.
 pub const KNOWN_FACADES: &[&str] =
-    &["shell", "shell_write", "edit_input", "submit_input", "commit_capture"];
+    &["shell", "shell_readonly", "edit_input", "submit_input", "commit_capture"];
 
 /// The `kj` *authority* capabilities — bare-word grants that gate the
 /// escalation-relevant `kj` verbs which never reach the broker `call_tool` path
@@ -105,8 +105,8 @@ pub const KNOWN_AUTHORITIES: &[&str] = &[
 /// `facade:shell_write`. Cancellation also checks that capability at call time.
 pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[
     ("builtin.shell", "shell"),
-    ("builtin.shell_write", "shell_write"),
-    ("builtin.shell_operations", "shell_write"),
+    ("builtin.shell_readonly", "shell_readonly"),
+    ("builtin.shell_operations", "shell"),
 ];
 
 /// Instance-id prefix for MCP servers a connected client declared for one
@@ -803,33 +803,24 @@ mod tests {
         assert!(b.allows(&Capability::Facade("shell".into())));
         assert!(!b.allows(&Capability::Facade("edit_input".into())));
 
-        // `facade:shell` projects the SAFE shell and nothing else.
-        //
-        // This assertion changed with the 2026-08-17 shell/shell_write flag
-        // day and the change is the point: `builtin.shell_operations` used to ride
-        // the string `"shell"`, so it appeared here. It now rides
-        // `"shell_write"`, because background execution spawns host processes
-        // and is the mutating path by construction. A safe-facade holder
-        // (`toolie`) must NOT gain background visibility it never had — that
-        // is the "widens the safe shell's reach" failure the rename exists to
-        // avoid.
+        // `facade:shell` projects the writable shell and its background-job sibling.
         let mut cands = b.candidate_instances();
         cands.sort();
         assert_eq!(
             cands,
-            vec![inst("block"), inst("builtin.shell"), inst("file")],
-            "facade:shell must project only the safe shell — background is shell_write's"
+            vec![inst("block"), inst("builtin.shell"), inst("builtin.shell_operations"), inst("file")],
+            "facade:shell projects the writable shell and its background-job sibling"
         );
 
-        // And the write facade is what carries background.
-        let mut w = ContextToolBinding::new();
-        w.grant(Capability::Facade("shell_write".into()));
-        let mut wcands = w.candidate_instances();
-        wcands.sort();
+        // And `facade:shell_readonly` projects only the read-only shell — no background ops.
+        let mut ro = ContextToolBinding::new();
+        ro.grant(Capability::Facade("shell_readonly".into()));
+        let mut rocands = ro.candidate_instances();
+        rocands.sort();
         assert_eq!(
-            wcands,
-            vec![inst("builtin.shell_operations"), inst("builtin.shell_write")],
-            "facade:shell_write projects the mutating shell and its background-job sibling"
+            rocands,
+            vec![inst("builtin.shell_readonly")],
+            "facade:shell_readonly must project only the read-only shell — background is shell's"
         );
     }
 

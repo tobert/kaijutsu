@@ -180,8 +180,8 @@ mod tests {
     /// approval resumes it read-only; a writable one asks as `shell_write`.
     #[tokio::test]
     async fn an_ask_names_the_shell_the_policy_chose() {
-        for (policy, instance, tool) in [(ShellPolicy::ReadOnly, "builtin.shell", "shell"),
-            (ShellPolicy::Agent, "builtin.shell_write", "shell_write")] {
+        for (policy, instance, tool) in [(ShellPolicy::ReadOnly, "builtin.shell_readonly", "shell_readonly"),
+            (ShellPolicy::Agent, "builtin.shell", "shell")] {
             let (dispatcher, mut identity) = fixture().await;
             identity.reviewer = Some(crate::kj::test_helpers::test_reviewer_principal());
             let kernel = dispatcher.kernel();

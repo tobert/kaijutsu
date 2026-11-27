@@ -2173,7 +2173,7 @@ fn make_pending_shell_receipt(
     tool_ctx: &crate::ExecContext, tool_name: &str, params: &str,
     ask_id: Option<&str>, content: &mut String, is_error: &mut bool, status: &mut Status,
 ) {
-    if !matches!(tool_name, "shell" | "shell_write") || *status != Status::Waiting {
+    if !matches!(tool_name, "shell" | "shell_readonly") || *status != Status::Waiting {
         return;
     }
     let Some(ask_id) = ask_id else { return; };
@@ -2337,7 +2337,7 @@ async fn dispatch_recorded_tool_result(
         // and has already published the operation, so an answer can race the
         // hold: the worker checks for a holder under the lock it claims with, so
         // a hold registered after that claim finds the ask redeemed instead.
-        let background = matches!(tool_name, "shell" | "shell_write") && runs_in_background(&params);
+        let background = matches!(tool_name, "shell" | "shell_readonly") && runs_in_background(&params);
         let waiting_background = background.then(|| ShellEnvelope::from_tool_result(&content)).flatten()
             .filter(|env| env.status == kaijutsu_types::shell_envelope::ShellStatus::Waiting)
             .and_then(|env| env.ask_id)

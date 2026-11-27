@@ -109,7 +109,7 @@ async fn install_ask_hook(server: &SharedKernel, ctx: ContextId, id: &str) {
         .push(HookEntry {
             id: HookId(id.to_string()),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: Some(ctx),
             match_principal: None,
             action: HookAction::Ask(AskSpec {
@@ -549,7 +549,7 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral(addr.port());
         // `shell_write` gates itself, so the one ask is the tool's.
-        common::allow_in_shipped_gate(&config, &["kj context create", "shell_write"]);
+        common::allow_in_shipped_gate(&config, &["kj context create", "shell"]);
         config.auth_db_path = Some(auth_db_path);
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_local(async move {
@@ -584,7 +584,7 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         // The retained shell invokes the native shell_write tool, whose gate
         // records the authenticated identity on its pending ask.
         let submission = worker_kj
-            .shell_submit("shell_write --command 'echo should-not-run'", worker_ctx, true)
+            .shell_submit("shell --command 'echo should-not-run'", worker_ctx, true)
             .await
             .unwrap();
         assert!(!submission.operation_id.is_empty(), "the retained shell submission needs an operation id");

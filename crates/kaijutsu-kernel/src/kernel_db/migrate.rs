@@ -216,6 +216,7 @@ impl KernelDb {
         Self::migrate_type_melt(conn)?;
         Self::migrate_council_backends(conn)?;
         Self::migrate_context_shadows(conn)?;
+        Self::migrate_shell_facade_swap(conn)?;
         Self::ensure_context_guards(conn)?;
         Ok(())
     }

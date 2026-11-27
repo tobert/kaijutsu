@@ -220,7 +220,7 @@ async fn toolie_role_seeds_one_read_only_shell_and_refuses_writes_body() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(visible, ["shell"], "the toolie's roster is the read-only shell alone");
+    assert_eq!(visible, ["shell_readonly"], "the toolie's roster is the read-only shell alone");
     for (instance, tool) in [(&file, "read"), (&file, "write"), (&file, "edit"), (&block, "block_read"),
         (&block, "block_create")] {
         assert!(!binding.allows_tool(instance, tool), "toolie must NOT hold {instance}:{tool}");
@@ -235,15 +235,15 @@ async fn toolie_role_seeds_one_read_only_shell_and_refuses_writes_body() {
         "toolie must NOT hold the editor write capability"
     );
     assert!(
-        fx_broker_check(&h, &ctx, "shell").await.is_ok(),
-        "toolie must hold the SAFE shell facade under the unmarked name"
+        fx_broker_check(&h, &ctx, "shell_readonly").await.is_ok(),
+        "toolie must hold the read-only shell facade"
     );
     assert!(
         matches!(
-            fx_broker_check(&h, &ctx, "shell_write").await,
+            fx_broker_check(&h, &ctx, "shell").await,
             Err(McpError::FacadeDenied { .. })
         ),
-        "toolie shell_write facade must be refused"
+        "toolie writable shell facade must be refused"
     );
     assert!(
         matches!(
@@ -416,7 +416,6 @@ async fn root_role_is_a_model_less_admin_console_body() {
         Capability::Exec,
         Capability::Editor,
         Capability::Facade("shell".into()),
-        Capability::Facade("shell_write".into()),
         Capability::Facade("edit_input".into()),
         Capability::Facade("submit_input".into()),
     ] {
@@ -531,8 +530,8 @@ async fn the_toolie_reads_run_in_its_read_only_shell_body() {
         let call_ctx = call_ctx.clone();
         async move {
             let result = broker.call_tool(KernelCallParams {
-                instance: InstanceId::new("builtin.shell"),
-                tool: "shell".into(),
+                instance: InstanceId::new("builtin.shell_readonly"),
+                tool: "shell_readonly".into(),
                 arguments: serde_json::json!({"command": command}),
             }, &call_ctx, CancellationToken::new()).await.expect("the shell call settles");
             result.structured.expect("the shell returns its envelope")
@@ -628,7 +627,7 @@ async fn coder_loadout_is_a_worker_loadout_body() {
         let binding = h.kernel.broker().binding(&ctx).await
             .unwrap_or_else(|| panic!("{dir} rc must seed a binding"));
         for cap in [Capability::Drift, Capability::Fork, Capability::Exec, Capability::Editor,
-                    Capability::Facade("shell_write".into())] {
+                    Capability::Facade("shell".into())] {
             assert!(binding.allows(&cap), "{dir} should allow {cap:?}");
         }
         for cap in [Capability::House, Capability::Operator, Capability::Transport,
@@ -658,7 +657,7 @@ async fn senpai_loadout_is_a_narrow_orchestration_loadout_body() {
     let ctx = create_typed(&h, "senpai-seat", "senpai").await;
     let binding = h.kernel.broker().binding(&ctx).await.expect("senpai rc must seed a binding");
     for cap in [Capability::Senpai, Capability::Drive, Capability::Drift, Capability::Fork,
-                Capability::Exec, Capability::Editor, Capability::Facade("shell_write".into()),
+                Capability::Exec, Capability::Editor, Capability::Facade("shell".into()),
                 Capability::Instance(InstanceId::new("builtin.file")),
                 Capability::Instance(InstanceId::new("builtin.tasks"))] {
         assert!(binding.allows(&cap), "senpai should allow {cap:?}");

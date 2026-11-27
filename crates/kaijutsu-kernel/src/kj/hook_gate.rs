@@ -60,7 +60,7 @@ use crate::mcp::types::KernelCallParams;
 /// statements. `None` for any other tool, a missing or non-string
 /// `command`, or a command that does not parse.
 fn shell_source(params: &KernelCallParams) -> Option<(String, Vec<kaish_kernel::PlannedStatement>)> {
-    if !matches!(params.tool.as_str(), "shell" | "shell_write") {
+    if !matches!(params.tool.as_str(), "shell" | "shell_readonly") {
         return None;
     }
     let command = params.arguments.get("command")?.as_str()?;
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn result_review_binds_phase_and_captured_result_without_executable_authority() {
         use crate::mcp::McpHookPhase;
-        let params = call("shell_write", serde_json::json!({"command": "echo $TARGET"}));
+        let params = call("shell", serde_json::json!({"command": "echo $TARGET"}));
         let post = build_result_review_spec("review", McpHookPhase::PostCall, "review".into(), &params, "first result");
         let changed = build_result_review_spec("review", McpHookPhase::PostCall, "review".into(), &params, "second result");
         let error = build_result_review_spec("review", McpHookPhase::OnError, "review".into(), &params, "first result");
@@ -187,7 +187,7 @@ mod tests {
 
     fn call(tool: &str, arguments: serde_json::Value) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new("builtin.shell_write"),
+            instance: InstanceId::new("builtin.shell"),
             tool: tool.to_string(),
             arguments,
         }
@@ -207,7 +207,7 @@ mod tests {
     /// nothing to run.
     #[test]
     fn a_shell_write_hook_ask_carries_the_command_as_exec_source() {
-        let params = call("shell_write", serde_json::json!({ "command": " dd if=/dev/zero of=${DEV} \n" }));
+        let params = call("shell", serde_json::json!({ "command": " dd if=/dev/zero of=${DEV} \n" }));
         let spec = build_hook_gate_spec("risk-advisory", "d".into(), &params);
         assert_eq!(spec.exec_source.as_deref(), Some("dd if=/dev/zero of=${DEV}"));
         assert_eq!(spec.planned.len(), 1, "the planned statements ride the spec for the env snapshot");
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_shell_hook_ask_captures_separate_stdin() {
-        let params = call("shell_write", serde_json::json!({
+        let params = call("shell", serde_json::json!({
             "command": "cat", "stdin": "exact input\n",
         }));
         let spec = build_hook_gate_spec("review", "review input".into(), &params);
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn a_shell_write_hook_ask_names_its_free_variables() {
         let params = call(
-            "shell_write",
+            "shell",
             serde_json::json!({ "command": "dd if=/dev/zero of=${DEV} && echo \"${FOO}-${DEV}\"" }),
         );
         let spec = build_hook_gate_spec("h", "d".into(), &params);
@@ -251,7 +251,7 @@ mod tests {
     /// shape rather than promising an execution that cannot happen.
     #[test]
     fn an_unparseable_shell_command_carries_no_source() {
-        let params = call("shell_write", serde_json::json!({ "command": "echo ${" }));
+        let params = call("shell", serde_json::json!({ "command": "echo ${" }));
         let spec = build_hook_gate_spec("h", "d".into(), &params);
         assert_eq!(spec.exec_source, None);
         assert!(spec.planned.is_empty());

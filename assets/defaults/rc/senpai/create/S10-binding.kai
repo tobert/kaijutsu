@@ -2,7 +2,7 @@
 # Carries worker tools plus the `senpai` capability for direct-kohai
 # lifecycle, asks, and driving; drifts kernel-admin requests to banto.
 set -e
-kj binding allow "facade:shell_write"
+kj binding allow "facade:shell"
 kj binding allow "builtin.file"
 kj binding allow "builtin.tasks"
 # Direct-kohai orchestration (`kj context create/rotate/archive`, `kj drive`,

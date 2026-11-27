@@ -816,7 +816,7 @@ async fn edit_during_shell_submit(replace: bool, restore_text: bool) {
     });
     live_kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
         id: HookId("pause-shell-submit".into()),
-        match_instance: None, match_tool: Some(GlobPattern("shell_write".into())),
+        match_instance: None, match_tool: Some(GlobPattern("shell".into())),
         match_context: Some(context_id), match_principal: None,
         action: HookAction::Invoke(HookBody::Builtin { name: "pause".into(), hook: pause.clone() }),
         priority: 0, kaish_script_id: None,
@@ -877,7 +877,7 @@ fn refused_shell_submit_keeps_its_draft() {
         let context_id = open_context(&kernel, "draft-shell-refused").await;
         live_kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("refuse-shell-submit".into()),
-            match_instance: None, match_tool: Some(GlobPattern("shell_write".into())),
+            match_instance: None, match_tool: Some(GlobPattern("shell".into())),
             match_context: Some(context_id), match_principal: None,
             action: HookAction::Deny("test refusal".into()), priority: 0, kaish_script_id: None,
         });

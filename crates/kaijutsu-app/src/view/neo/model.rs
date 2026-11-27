@@ -305,7 +305,7 @@ pub(super) fn command_arg(call: &BlockSnapshot) -> Option<String> {
 }
 
 fn is_shell(tool: Option<&str>) -> bool {
-    matches!(tool, Some("shell" | "shell_write" | "shell_read" | "kaish.exec"))
+    matches!(tool, Some("shell" | "shell_readonly" | "shell_write" | "shell_read" | "kaish.exec"))
 }
 
 fn record(block: &BlockSnapshot, call: Option<&BlockSnapshot>, section: Section, content_type: ContentType, ask: Option<&str>) -> Record {

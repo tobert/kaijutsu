@@ -216,7 +216,7 @@ fn done(stop: &str) -> StreamEvent {
 /// One completion that calls `shell_write` with `command`.
 fn shell_write(id: &str, command: &str) -> Vec<StreamEvent> {
     vec![
-        StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input: json!({ "command": command }), signature: None },
+        StreamEvent::ToolUse { id: id.into(), name: "shell".into(), input: json!({ "command": command }), signature: None },
         done("tool_use"),
     ]
 }
@@ -434,7 +434,7 @@ impl AcpClient {
             match update.get("sessionUpdate").and_then(Value::as_str) {
                 Some("tool_call") => {
                     let title = update.get("title").and_then(Value::as_str).unwrap_or_default();
-                    if title.contains("shell_write") {
+                    if title.contains("shell") {
                         calls.push((id.to_string(), status.unwrap_or_default().to_string()));
                     }
                 }

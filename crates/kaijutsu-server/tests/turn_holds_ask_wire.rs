@@ -53,7 +53,7 @@ fn done(stop: &str) -> StreamEvent {
 }
 
 fn shell_write(id: &str, command: &str) -> StreamEvent {
-    StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input: serde_json::json!({ "command": command }), signature: None }
+    StreamEvent::ToolUse { id: id.into(), name: "shell".into(), input: serde_json::json!({ "command": command }), signature: None }
 }
 
 fn reply(text: &str) -> Vec<StreamEvent> {
@@ -494,7 +494,7 @@ fn a_soft_interrupt_ends_the_hold() { interrupt_ends_the_hold(false) }
 fn a_hold_outlasts_the_tool_call_timeout() {
     run_local(async {
         let h = Held::new("held-long").await;
-        h.server.kernel.broker().update_policy(&kaijutsu_kernel::mcp::InstanceId::new("builtin.shell_write"),
+        h.server.kernel.broker().update_policy(&kaijutsu_kernel::mcp::InstanceId::new("builtin.shell"),
             Some(Duration::from_millis(200)), None).await.unwrap();
         let marker = h.marker("long");
         let (sent, mut events) = h.drive(vec![
@@ -513,7 +513,7 @@ fn a_hold_outlasts_the_tool_call_timeout() {
 }
 
 fn background_shell_write(id: &str, command: &str) -> StreamEvent {
-    StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(),
+    StreamEvent::ToolUse { id: id.into(), name: "shell".into(),
         input: serde_json::json!({ "command": command, "run_in_background": true }), signature: None }
 }
 

@@ -4971,7 +4971,7 @@ mod tests {
         assert_eq!(run.rc_dir, "person", "a person's shell child runs person/");
         let binding = d.dispatch(&[s("binding"), s("show"), shell.context_id.to_hex()], &caller).await;
         assert!(binding.is_ok(), "{}", binding.message());
-        for facade in ["shell", "shell_write", "submit_input", "edit_input"] {
+        for facade in ["shell", "submit_input", "edit_input"] {
             assert!(binding.message().contains(facade), "the shell child holds facade:{facade}: {}", binding.message());
         }
         assert!(binding.message().contains("operator"), "and the person's authorities: {}", binding.message());

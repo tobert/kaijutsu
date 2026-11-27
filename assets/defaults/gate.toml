@@ -40,13 +40,13 @@
 #   [rc.coder]
 #   uncovered = "allow"   # sandboxed benchmark kernels only
 #
-# A model that runs the `shell_write` tool from its shell asks twice: once
-# here for the `shell_write` statement, then in the tool's own gate for the
+# A model that runs the `shell` tool from its shell asks twice: once
+# here for the `shell` statement, then in the tool's own gate for the
 # command it carries. Allowing the statement for a seat leaves the tool's
 # gate as the one ask. This default leaves it off so each seat opts in:
 #
 #   [rc.coder]
-#   allow = ["shell_write"]
+#   allow = ["shell"]
 
 # Council: a System 1 model check that may allow a statement the tiers
 # above leave to the human. It is off. To turn it on, uncomment the
@@ -210,5 +210,5 @@ allow = [
 # check-in has the read-only shell and needs no key.
 [rc.companion]
 allow = [
-  "shell_write",
+  "shell",
 ]

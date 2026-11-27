@@ -111,12 +111,12 @@ impl Tool for ReadOnlyDeniedBuiltin {
     fn name(&self) -> &str { self.name }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema::new(self.name, "Not available in a read-only kaijutsu shell; use shell_write.")
+        ToolSchema::new(self.name, "Not available in a read-only kaijutsu shell; use shell.")
     }
 
     async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
         ExecResult::failure(1, format!(
-            "{} is not available in a read-only kaijutsu shell: {}; use shell_write", self.name, self.reason,
+            "{} is not available in a read-only kaijutsu shell: {}; use shell", self.name, self.reason,
         ))
     }
 }

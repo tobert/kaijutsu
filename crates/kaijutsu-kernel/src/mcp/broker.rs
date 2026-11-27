@@ -1565,9 +1565,9 @@ impl Broker {
         context_id: &ContextId,
     ) -> McpResult<crate::runtime::context_shell::ShellPolicy> {
         use crate::runtime::context_shell::ShellPolicy;
-        match self.check_facade(context_id, "shell_write").await {
+        match self.check_facade(context_id, "shell").await {
             Ok(()) => Ok(ShellPolicy::Agent),
-            Err(McpError::FacadeDenied { .. }) => self.check_facade(context_id, "shell").await
+            Err(McpError::FacadeDenied { .. }) => self.check_facade(context_id, "shell_readonly").await
                 .map(|()| ShellPolicy::ReadOnly),
             Err(other) => Err(other),
         }
@@ -2042,7 +2042,7 @@ impl Broker {
         // named; anything else meets the hooks as before. A program that
         // does not parse is not allowed and the hooks see it as before.
         if phase == McpHookPhase::PreCall
-            && matches!(params.tool.as_str(), "shell" | "shell_write")
+            && matches!(params.tool.as_str(), "shell" | "shell_readonly")
             && let Some(command) = params.arguments.get("command").and_then(|v| v.as_str())
             && let Ok(statements) = kaish_kernel::ast::plan::plan_program(command)
         {
@@ -2743,7 +2743,7 @@ impl Broker {
         // ContextShellInputs as shell construction and approval creation.
         // Phases snapshot independently; a later ask can observe changed state.
         // A missing variable is null. Read faults stop this hook before execution.
-        if matches!(params.tool.as_str(), "shell" | "shell_write") {
+        if matches!(params.tool.as_str(), "shell" | "shell_readonly") {
             if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
                 match kaish_kernel::ast::plan::plan_program(command) {
                     Ok(statements) => {
@@ -2945,8 +2945,8 @@ impl Broker {
     /// broker's hook tables — the same identity `builtin.shell_write`'s real
     /// tool call presents, so a hook written against `shell_write` fires on
     /// both paths without change.
-    const SHELL_WRITE_INSTANCE: &'static str = "builtin.shell_write";
-    const SHELL_WRITE_TOOL: &'static str = "shell_write";
+    const SHELL_WRITE_INSTANCE: &'static str = "builtin.shell";
+    const SHELL_WRITE_TOOL: &'static str = "shell";
 
     pub(crate) fn shell_write_hook_params(command: &str) -> KernelCallParams {
         KernelCallParams {
@@ -2956,13 +2956,13 @@ impl Broker {
         }
     }
 
-    /// The identity the read-only `shell` tool's own call presents. A direct
-    /// exec on a read-only shell asks under it, so an approval resumes the
-    /// command read-only.
+    /// The identity the read-only `shell_readonly` tool's own call presents. A
+    /// direct exec on a read-only shell asks under it, so an approval resumes
+    /// the command read-only.
     pub(crate) fn read_only_shell_hook_params(command: &str) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new(super::servers::ShellServer::INSTANCE),
-            tool: super::servers::ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(super::servers::ShellServer::INSTANCE_READONLY),
+            tool: super::servers::ShellServer::TOOL_READONLY.to_string(),
             arguments: serde_json::json!({ "command": command }),
         }
     }
@@ -5070,14 +5070,14 @@ mod tests {
         let broker = Arc::new(Broker::new());
         let ctx = ContextId::new();
         let mut write_only = ContextToolBinding::new();
-        write_only.grant(super::super::binding::Capability::Facade("shell_write".into()));
+        write_only.grant(super::super::binding::Capability::Facade("shell".into()));
         broker.set_binding(ctx, write_only.clone()).await.unwrap();
-        assert!(matches!(broker.check_shell_facade(&ctx).await.expect("shell_write opens the RPC shell"),
-            ShellPolicy::Agent), "shell_write gives the writable shell");
-        assert!(!write_only.allows(&super::super::binding::Capability::Instance(InstanceId::new("builtin.shell"))),
+        assert!(matches!(broker.check_shell_facade(&ctx).await.expect("shell opens the RPC shell"),
+            ShellPolicy::Agent), "shell gives the writable shell");
+        assert!(!write_only.allows(&super::super::binding::Capability::Instance(InstanceId::new("builtin.shell_readonly"))),
             "the model does not get the read-only shell tool");
 
-        for facades in [&["shell"][..], &["shell", "shell_write"][..]] {
+        for facades in [&["shell_readonly"][..], &["shell_readonly", "shell"][..]] {
             let ctx = ContextId::new();
             let mut binding = ContextToolBinding::new();
             for facade in facades {
@@ -5085,13 +5085,13 @@ mod tests {
             }
             broker.set_binding(ctx, binding).await.unwrap();
             let policy = broker.check_shell_facade(&ctx).await.expect("a shell facade opens the RPC shell");
-            assert_eq!(matches!(policy, ShellPolicy::ReadOnly), facades == ["shell"],
-                "{facades:?}: only a seat without shell_write gets the read-only shell");
+            assert_eq!(matches!(policy, ShellPolicy::ReadOnly), facades == ["shell_readonly"],
+                "{facades:?}: only a seat without shell gets the read-only shell");
         }
 
         let none = ContextId::new();
         broker.set_binding(none, ContextToolBinding::new()).await.unwrap();
-        assert!(matches!(broker.check_shell_facade(&none).await, Err(McpError::FacadeDenied { ref facade }) if facade == "shell"));
+        assert!(matches!(broker.check_shell_facade(&none).await, Err(McpError::FacadeDenied { ref facade }) if facade == "shell_readonly"));
     }
 
     #[tokio::test]
@@ -9111,7 +9111,7 @@ mod tests {
         let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-plan").await;
         let ctx = approval_call_context(&kj, "kj_tool_plan_projects_the_shell_command");
 
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker
             .register_silently(svc, InstancePolicy::default())
             .await
@@ -9120,7 +9120,7 @@ mod tests {
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: hook_id("plan-check"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(
@@ -9134,7 +9134,7 @@ mod tests {
             kaish_script_id: None,
         });
 
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments =
             serde_json::json!({ "command": "a && b; c | d; for f in x; do delete $f; done" });
 
@@ -9178,12 +9178,12 @@ mod tests {
         for (index, (command, interpreter, raw, raw_path)) in cases.into_iter().enumerate() {
             let (broker, _kernel, kj) = wired_kaish_broker(&format!("kaish-hook-python-{index}")).await;
             let ctx = approval_call_context(&kj, "kj_tool_plan_names_a_python_program");
-            let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+            let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
             broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
             broker.hooks().write().await.pre_call.entries.push(HookEntry {
                 id: hook_id("python-plan"),
                 match_instance: None,
-                match_tool: Some(GlobPattern("shell_write".into())),
+                match_tool: Some(GlobPattern("shell".into())),
                 match_context: None,
                 match_principal: None,
                 action: HookAction::Invoke(HookBody::Kaish(format!(
@@ -9197,7 +9197,7 @@ mod tests {
                 priority: 0,
                 kaish_script_id: None,
             });
-            let mut call = params("svc", "shell_write");
+            let mut call = params("svc", "shell");
             call.arguments = serde_json::json!({ "command": command });
             let result = broker
                 .call_tool(call, &ctx, CancellationToken::new())
@@ -9218,7 +9218,7 @@ mod tests {
         let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-clause").await;
         let ctx = approval_call_context(&kj, "kj_tool_plan_clause_matches_the_shared_r");
 
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker
             .register_silently(svc, InstancePolicy::default())
             .await
@@ -9240,7 +9240,7 @@ mod tests {
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: hook_id("clause-check"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(format!(
@@ -9252,7 +9252,7 @@ mod tests {
             kaish_script_id: None,
         });
 
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments = serde_json::json!({ "command": command });
 
         let result = broker
@@ -9271,7 +9271,7 @@ mod tests {
     async fn kj_tool_plan_carries_the_free_variable_env_snapshot() {
         let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-plan-env").await;
 
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker
             .register_silently(svc, InstancePolicy::default())
             .await
@@ -9300,7 +9300,7 @@ mod tests {
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: hook_id("plan-env-check"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(
@@ -9314,7 +9314,7 @@ mod tests {
             kaish_script_id: None,
         });
 
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments = serde_json::json!({ "command": "echo ${FOO} ${BAZ}" });
 
         let result = broker
@@ -9332,7 +9332,7 @@ mod tests {
     ) -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>, CallContext) {
         let (broker, _kernel, kj) = wired_kaish_broker(name).await;
         let ctx = approval_call_context(&kj, name);
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker
             .register_silently(svc, InstancePolicy::default())
             .await
@@ -9344,7 +9344,7 @@ mod tests {
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: hook_id(id),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action,
@@ -9405,7 +9405,7 @@ mod tests {
     async fn kj_tool_plan_error_is_set_on_parse_failure() {
         let (broker, _kernel, _kj) = wired_kaish_broker("kaish-hook-clauses-error").await;
 
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker
             .register_silently(svc, InstancePolicy::default())
             .await
@@ -9414,7 +9414,7 @@ mod tests {
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: hook_id("clause-error-check"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(
@@ -9427,7 +9427,7 @@ mod tests {
         });
 
         // An unterminated single-quote never parses.
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments = serde_json::json!({ "command": "echo 'unterminated" });
 
         let result = broker
@@ -9479,7 +9479,7 @@ mod tests {
             )
             .await;
 
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker
             .register_silently(svc, InstancePolicy::default())
             .await
@@ -9562,7 +9562,7 @@ mod tests {
         // shape that escaped.
         let mut escaped = Vec::new();
         for cmd in denied {
-            let mut call = params("svc", "shell_write");
+            let mut call = params("svc", "shell");
             call.arguments = serde_json::json!({ "command": cmd });
             match broker
                 .call_tool(call, &ctx, CancellationToken::new())
@@ -9575,7 +9575,7 @@ mod tests {
         assert!(escaped.is_empty(), "the guard did not deny:\n{}", escaped.join("\n"));
 
         // A denial names its fix: write a script file and run the file.
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments = serde_json::json!({ "command": "bash -c 'echo hi'" });
         let err = broker.call_tool(call, &ctx, CancellationToken::new()).await
             .expect_err("bash -c is denied");
@@ -9584,7 +9584,7 @@ mod tests {
 
         // A command kaish cannot parse is a syntax error, not a policy
         // denial: say so, carry kaish's message, and name both fixes.
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments = serde_json::json!({ "command": "for x in a b; do echo $x; done | (cat)" });
         let err = broker.call_tool(call, &ctx, CancellationToken::new()).await
             .expect_err("an unparseable command is denied");
@@ -9597,7 +9597,7 @@ mod tests {
         // tail of a hook's stderr. A long command must not push the cause
         // off the front.
         let long = format!("for h in {}; do echo $h; done | (cat)", "abc ".repeat(200));
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments = serde_json::json!({ "command": long });
         let err = broker.call_tool(call, &ctx, CancellationToken::new()).await
             .expect_err("an unparseable command is denied");
@@ -9638,7 +9638,7 @@ mod tests {
         ];
         let mut blocked = Vec::new();
         for cmd in benign {
-            let mut call = params("svc", "shell_write");
+            let mut call = params("svc", "shell");
             call.arguments = serde_json::json!({ "command": cmd });
             let result = broker
                 .call_tool(call, &ctx, CancellationToken::new())
@@ -10605,7 +10605,7 @@ mod tests {
     }
 
     fn shell_write_call(command: &str) -> KernelCallParams {
-        let mut call = params("svc", "shell_write");
+        let mut call = params("svc", "shell");
         call.arguments = serde_json::json!({ "command": command });
         call
     }
@@ -10620,7 +10620,7 @@ mod tests {
         let (broker, _kernel, kj, _dir) =
             wired_kaish_broker_with_gate_toml("gate-toml-deny", "[global]\ndeny = [\"dd\"]\n").await;
         let ctx = approval_call_context(&kj, "a_deny_tier_statement_is_refused_at_pre_");
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_shell_write_hook(&broker, "asker", HookAction::Ask(AskSpec { description: None })).await;
 
@@ -10650,7 +10650,7 @@ mod tests {
         let (broker, _kernel, kj, _dir) =
             wired_kaish_broker_with_gate_toml("gate-toml-allow", "[global]\nallow = [\"rg\"]\n").await;
         let ctx = approval_call_context(&kj, "an_allow_tier_program_skips_the_hooks");
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_shell_write_hook(&broker, "asker", HookAction::Ask(AskSpec { description: None })).await;
 
@@ -10678,12 +10678,12 @@ mod tests {
         )
         .await;
         let ctx = approval_call_context(&kj, "kj_tool_plan_carries_the_tier_per_comman");
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: hook_id("tier-check"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(
@@ -10812,7 +10812,7 @@ mod tests {
     async fn a_context_id_with_no_row_makes_the_gate_unavailable_at_pre_call() {
         let (broker, _kernel, kj, _dir) =
             wired_kaish_broker_with_gate_toml("no-row", "[global]\nallow = [\"rg\"]\n").await;
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
 
         let err = broker
@@ -10981,7 +10981,7 @@ mod tests {
     async fn an_unusable_gate_toml_refuses_every_shell_call_as_unavailable() {
         let (broker, _kernel, _kj, _dir) =
             wired_kaish_broker_with_gate_toml("gate-toml-broken", "[global]\nallow = [\"kj nope\"]\n").await;
-        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
 
         let err = broker
@@ -11130,7 +11130,7 @@ mod tests {
         broker.hooks().write().await.post_call.entries.push(HookEntry {
             id: hook_id("shell-post-call-check"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(body.into())),
@@ -11171,7 +11171,7 @@ mod tests {
         broker.hooks().write().await.on_error.entries.push(HookEntry {
             id: hook_id("shell-on-error-check"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(body.into())),
@@ -11206,7 +11206,7 @@ mod tests {
         broker.hooks().write().await.post_call.entries.push(HookEntry {
             id: hook_id("shell-post-call-short-circuit"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::ShortCircuit(synthetic),
@@ -11254,7 +11254,7 @@ mod tests {
         broker.hooks().write().await.post_call.entries.push(HookEntry {
             id: hook_id("shell-post-call-always-fails"),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish("exit 1".into())),

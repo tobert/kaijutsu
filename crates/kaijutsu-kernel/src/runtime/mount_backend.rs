@@ -805,7 +805,7 @@ impl KernelBackend for MountBackend {
                 return Err(BackendError::ToolNotFound(name.to_string()));
             }
             return Err(BackendError::PermissionDenied(format!(
-                "{name}: MCP calls are unavailable in a read-only shell; use shell_write",
+                "{name}: MCP calls are unavailable in a read-only shell; use shell",
             )));
         }
         self.docs_tools.call_tool(name, args, ctx).await

@@ -6,5 +6,5 @@ if test -n "${KJ_ENGINEER_TOPIC:-}"; then
     kj binding allow "builtin.notes:notes"
   fi
 else
-  kj binding allow "facade:shell"
+  kj binding allow "facade:shell_readonly"
 fi

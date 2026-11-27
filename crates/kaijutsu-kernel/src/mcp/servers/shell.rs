@@ -1,13 +1,13 @@
 //! Broker tools for contextual shell execution.
 //!
-//! `shell` selects structural read-only execution. `shell_write` permits
-//! mutation, with host execution separately controlled by the context's Exec
-//! capability. Each call uses `EmbeddedKaish::for_context`, shared with RPC,
+//! `shell` permits mutation, with host execution separately controlled by the
+//! context's Exec capability. `shell_readonly` selects structural read-only
+//! execution. Each call uses `EmbeddedKaish::for_context`, shared with RPC,
 //! rc, hooks, and editor commands.
 //!
 //! The instances are facade projections: `facade:shell` and
-//! `facade:shell_write` govern visibility and dispatch without a second grant.
-//! Each rc directory's rc selects its contexts' loadout.
+//! `facade:shell_readonly` govern visibility and dispatch without a second
+//! grant. Each rc directory's rc selects its contexts' loadout.
 
 #[cfg(test)]
 use crate::runtime::command_result::shell_result_to_envelope;
@@ -152,11 +152,11 @@ pub(crate) fn tool_description() -> String {
     description(false, PreviewLimit::DEFAULT)
 }
 
-/// Broker server for `shell` or `shell_write`, selected at construction.
+/// Broker server for `shell` or `shell_readonly`, selected at construction.
 /// A weak broker reference avoids a cycle; each call constructs its own shell.
 pub struct ShellServer {
     instance_id: InstanceId,
-    /// The model-facing tool name: `shell` or `shell_write`.
+    /// The model-facing tool name: `shell` or `shell_readonly`.
     tool: &'static str,
     /// When true, materialize a read-only context kaish (no writes, no external
     /// commands; reads — incl. document views — still work).
@@ -166,31 +166,31 @@ pub struct ShellServer {
 }
 
 impl ShellServer {
-    /// Read-only execution; host subprocesses are disabled.
+    /// Writable execution; the context's Exec capability controls subprocesses.
     pub const INSTANCE: &'static str = "builtin.shell";
     pub const TOOL: &'static str = "shell";
-    /// Writable execution; the context's Exec capability controls subprocesses.
-    pub const INSTANCE_WRITE: &'static str = "builtin.shell_write";
-    pub const TOOL_WRITE: &'static str = "shell_write";
+    /// Read-only execution; host subprocesses are disabled.
+    pub const INSTANCE_READONLY: &'static str = "builtin.shell_readonly";
+    pub const TOOL_READONLY: &'static str = "shell_readonly";
 
-    /// The writable `shell_write` tool (gated by `facade:shell_write`).
+    /// The writable `shell` tool (gated by `facade:shell`).
     pub fn new(broker: Weak<Broker>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
-            instance_id: InstanceId::new(Self::INSTANCE_WRITE),
-            tool: Self::TOOL_WRITE,
+            instance_id: InstanceId::new(Self::INSTANCE),
+            tool: Self::TOOL,
             read_only: false,
             broker,
             notif_tx,
         }
     }
 
-    /// The safe, unmarked `shell` tool (gated by `facade:shell`).
+    /// The read-only `shell_readonly` tool (gated by `facade:shell_readonly`).
     pub fn new_read_only(broker: Weak<Broker>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
-            instance_id: InstanceId::new(Self::INSTANCE),
-            tool: Self::TOOL,
+            instance_id: InstanceId::new(Self::INSTANCE_READONLY),
+            tool: Self::TOOL_READONLY,
             read_only: true,
             broker,
             notif_tx,
@@ -519,22 +519,20 @@ mod tests {
         (broker, d)
     }
 
-    /// Params targeting the SAFE, unmarked `shell` tool (`ExternalExec::Deny`)
-    /// — the name a stale/default caller reaches for after the flag day.
+    /// Params targeting the read-only `shell_readonly` tool (`ExternalExec::Deny`).
     fn call(command: &str) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_READONLY),
+            tool: ShellServer::TOOL_READONLY.to_string(),
             arguments: serde_json::json!({ "command": command, "run_in_background": false }),
         }
     }
 
-    /// Params targeting the HOT, mutating `shell_write` tool
-    /// (`ExternalExec::Allow`) — granted not default.
+    /// Params targeting the writable `shell` tool (`ExternalExec::Allow`).
     fn call_write(command: &str) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
             arguments: serde_json::json!({ "command": command, "run_in_background": false }),
         }
     }
@@ -543,16 +541,16 @@ mod tests {
     /// `call`/`call_write`'s explicit wait.
     fn call_async(command: &str) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_READONLY),
+            tool: ShellServer::TOOL_READONLY.to_string(),
             arguments: serde_json::json!({ "command": command, "run_in_background": true }),
         }
     }
 
     fn call_write_async(command: &str) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
             arguments: serde_json::json!({ "command": command, "run_in_background": true }),
         }
     }
@@ -562,8 +560,8 @@ mod tests {
     /// from `call_async`'s explicit opt-in.
     fn call_omitted(command: &str) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
+            instance: InstanceId::new(ShellServer::INSTANCE_READONLY),
+            tool: ShellServer::TOOL_READONLY.to_string(),
             arguments: serde_json::json!({ "command": command }),
         }
     }
@@ -632,7 +630,7 @@ mod tests {
         let ctx_id = register_context(&d, Some("sh"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
@@ -656,7 +654,7 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("sh"), None, principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
             .with_actor(principal, Some(PrincipalId::new()));
@@ -710,7 +708,7 @@ mod tests {
         let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("shw"), principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
@@ -774,7 +772,7 @@ mod tests {
         let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("validrej"), principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
@@ -821,7 +819,7 @@ mod tests {
         let ctx_id = register_context(&d, Some("reject"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -862,7 +860,7 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("pending-shw"), principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
@@ -893,7 +891,7 @@ mod tests {
         let reviewer = PrincipalId::new();
         let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("deny-multi"), principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
             .with_actor(principal, Some(reviewer));
@@ -944,7 +942,7 @@ mod tests {
         }).unwrap();
         d.kernel_db().lock().assign_test_review(ctx_id, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
             .with_actor(principal, Some(reviewer));
@@ -1011,7 +1009,7 @@ mod tests {
             context_id: context, cwd: Some("/working".into()), updated_at: 0,
         }).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(context, binding).await.unwrap();
         let call = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let result = broker.call_tool(call_write("pwd"), &call, CancellationToken::new()).await.unwrap();
@@ -1036,8 +1034,8 @@ mod tests {
         let context = crate::kj::test_helpers::register_rooted_context(&d, Some("gone-cwd"), principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_readonly".into()));
         binding.grant(Capability::Facade("shell".into()));
-        binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(context, binding).await.unwrap();
         let call_ctx = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
 
@@ -1069,7 +1067,7 @@ mod tests {
         register_context(&d, Some("beta"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -1108,8 +1106,8 @@ mod tests {
         let context = crate::kj::test_helpers::register_rooted_context(&d, Some("cwd-change"), principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         for (params, cwd) in [
@@ -1145,8 +1143,8 @@ mod tests {
             context_id: context, cwd: Some("/work".into()), updated_at: 0,
         }).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let warning = serde_json::json!("cwd is /, which is almost always a mistake; cd to your work tree");
@@ -1175,7 +1173,7 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("sh"), None, principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -1226,12 +1224,12 @@ mod tests {
 
         let with = register_context(&d, Some("with"), None, principal);
         let mut b = ContextToolBinding::new();
-        b.grant(Capability::Facade("shell".into()));
+        b.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(with, b).await.unwrap();
         let cc = CallContext::new(principal, with, SessionId::new(), d.kernel_id());
         let visible = broker.list_visible_tools(with, &cc).await.unwrap();
         assert!(
-            visible.iter().any(|(name, _)| name == "shell"),
+            visible.iter().any(|(name, _)| name == "shell_readonly"),
             "facade:shell context should see the shell tool: {visible:?}"
         );
 
@@ -1240,7 +1238,7 @@ mod tests {
         let cc2 = CallContext::new(principal, without, SessionId::new(), d.kernel_id());
         let visible2 = broker.list_visible_tools(without, &cc2).await.unwrap();
         assert!(
-            !visible2.iter().any(|(name, _)| name == "shell"),
+            !visible2.iter().any(|(name, _)| name == "shell_readonly"),
             "no-facade context must not see the shell tool: {visible2:?}"
         );
     }
@@ -1288,7 +1286,7 @@ mod tests {
                 assert_eq!(slot.preview_kib, (name == "terse").then_some(4), "{name}: the context copies its model's limit");
             }
             let mut binding = ContextToolBinding::new();
-            binding.grant(Capability::Facade("shell".into()));
+            binding.grant(Capability::Facade("shell_readonly".into()));
             broker.set_binding(context, binding).await.unwrap();
             let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
 
@@ -1547,17 +1545,17 @@ mod tests {
         let ctx_id = register_context(&d, Some("ro"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
         assert!(
-            visible.iter().any(|(name, _)| name == "shell"),
+            visible.iter().any(|(name, _)| name == "shell_readonly"),
             "facade:shell must expose the safe shell tool: {visible:?}"
         );
         assert!(
-            !visible.iter().any(|(name, _)| name == "shell_write"),
+            !visible.iter().any(|(name, _)| name == "shell"),
             "facade:shell must NOT expose the hot shell_write tool: {visible:?}"
         );
     }
@@ -1572,17 +1570,17 @@ mod tests {
         let ctx_id = register_context(&d, Some("rw"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
         let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
         assert!(
-            visible.iter().any(|(name, _)| name == "shell_write"),
+            visible.iter().any(|(name, _)| name == "shell"),
             "facade:shell_write must expose the hot shell tool: {visible:?}"
         );
         assert!(
-            !visible.iter().any(|(name, _)| name == "shell"),
+            !visible.iter().any(|(name, _)| name == "shell_readonly"),
             "facade:shell_write must NOT expose the safe shell tool: {visible:?}"
         );
     }
@@ -1600,7 +1598,7 @@ mod tests {
         let ctx_id = register_context(&d, Some("roexec"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -1623,7 +1621,7 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("rohint"), None, principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
@@ -1632,11 +1630,11 @@ mod tests {
                 .expect("a refused command is a tool result, not a fault");
             assert!(result.is_error, "{command} must fail on the read-only shell: {result:?}");
             let streams = streams_of(&result);
-            assert!(streams.contains("shell_write"), "{command}: the refusal must name shell_write: {streams}");
+            assert!(streams.contains("with `shell`"), "{command}: the refusal must name shell_write: {streams}");
         }
 
         let result = broker.call_tool(call("cat /nonexistent-rohint"), &cc, CancellationToken::new()).await.unwrap();
-        assert!(!streams_of(&result).contains("shell_write"), "an ordinary failure gets no write-path hint");
+        assert!(!streams_of(&result).contains("with `shell`"), "an ordinary failure gets no write-path hint");
     }
 
     /// `which` on the read-only shell finds a program the host has, from the
@@ -1652,7 +1650,7 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("rowhich"), None, principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
@@ -1664,7 +1662,7 @@ mod tests {
         let result = broker.call_tool(call(&found), &cc, CancellationToken::new()).await.unwrap();
         let streams = streams_of(&result);
         assert!(result.is_error && !streams.contains("uid="), "the read-only shell must not run {found}: {streams}");
-        assert!(streams.contains("shell_write"), "the refusal must name shell_write: {streams}");
+        assert!(streams.contains("with `shell`"), "the refusal must name shell_write: {streams}");
     }
 
     /// A context
@@ -1683,14 +1681,14 @@ mod tests {
         // The stale grant: whatever an old rc script or cached binding still
         // says, unaware anything changed.
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
         // The mutating tool is gone: neither visible...
         let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
         assert!(
-            !visible.iter().any(|(name, _)| name == "shell_write"),
+            !visible.iter().any(|(name, _)| name == "shell"),
             "a stale facade:shell grant must not expose shell_write: {visible:?}"
         );
         // ...nor callable.
@@ -1745,7 +1743,7 @@ mod tests {
         let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("write-exec"), principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding.clone()).await.unwrap();
         d.kernel().broker().set_binding(ctx_id, binding).await.unwrap();
@@ -1783,7 +1781,7 @@ mod tests {
         let ctx_id = register_context(&d, Some("stale-exec"), None, principal);
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
@@ -1829,7 +1827,7 @@ mod tests {
         let context = register_context(&d, Some("shutdown-tool"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let receipt = broker.call_tool(call_async("echo started; sleep 30; echo never"), &cc, CancellationToken::new()).await.unwrap();
@@ -1864,7 +1862,7 @@ mod tests {
         let context = register_context(&d, Some("live-tool"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let receipt = broker.call_tool(call_async("echo first; sleep 30; echo last"), &cc, CancellationToken::new()).await.unwrap();
@@ -1898,7 +1896,7 @@ mod tests {
             let context = crate::kj::test_helpers::register_rooted_context(&d, Some("pool-full-gate"), principal);
             d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
             let mut binding = ContextToolBinding::new();
-            binding.grant(Capability::Facade("shell_write".into()));
+            binding.grant(Capability::Facade("shell".into()));
             broker.set_binding(context, binding).await.unwrap();
             let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
             let releases = d.kernel().fill_runtime_pool_for_test().await;
@@ -1925,7 +1923,7 @@ mod tests {
                 let context = crate::kj::test_helpers::register_rooted_context(&d, Some("archived-tool"), principal);
                 d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
                 let mut binding = ContextToolBinding::new();
-                binding.grant(Capability::Facade(if read_only { "shell" } else { "shell_write" }.into()));
+                binding.grant(Capability::Facade(if read_only { "shell_readonly" } else { "shell" }.into()));
                 broker.set_binding(context, binding).await.unwrap();
                 d.kernel_db().lock().archive_context(context).unwrap();
                 let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id())
@@ -1951,7 +1949,7 @@ mod tests {
                 let context = crate::kj::test_helpers::register_rooted_context(&d, Some("tool-state"), principal);
                 d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
                 let mut binding = ContextToolBinding::new();
-                binding.grant(Capability::Facade(if read_only { "shell" } else { "shell_write" }.into()));
+                binding.grant(Capability::Facade(if read_only { "shell_readonly" } else { "shell" }.into()));
                 broker.set_binding(context, binding).await.unwrap();
                 let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id())
                     .with_actor(principal, Some(PrincipalId::new()));
@@ -1984,13 +1982,13 @@ mod tests {
         let context = register_context(&d, Some("shutdown-hook"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         broker.hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("shutdown-hook".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+            match_tool: Some(GlobPattern("shell_readonly".into())), match_context: Some(context), match_principal: None,
             priority: 0, kaish_script_id: None, action: HookAction::Invoke(HookBody::Builtin {
                 name: "shutdown-hook".into(), hook: Arc::new(ShutdownHook { entered: entered.clone(), release: release.clone() }) }),
         });
@@ -2053,12 +2051,12 @@ mod tests {
         let context = register_context(&d, Some("detached-tool"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let release = Arc::new(tokio::sync::Notify::new());
         broker.hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("after-caller-drop".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+            match_tool: Some(GlobPattern("shell_readonly".into())), match_context: Some(context), match_principal: None,
             priority: 0, kaish_script_id: None, action: HookAction::Invoke(HookBody::Builtin {
                 name: "after-caller-drop".into(), hook: Arc::new(AfterCallerDrop(release.clone())) }),
         });
@@ -2100,12 +2098,12 @@ mod tests {
         let context = register_context(&d, Some("shell-hook-depth"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         broker.hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("reenter-shell".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+            match_tool: Some(GlobPattern("shell_readonly".into())), match_context: Some(context), match_principal: None,
             priority: 0, kaish_script_id: None,
             action: HookAction::Invoke(HookBody::Builtin { name: "reenter-shell".into(),
                 hook: Arc::new(ReenterShell { broker: Arc::downgrade(&broker), count: count.clone() }) }),
@@ -2136,11 +2134,11 @@ mod tests {
                 let context = crate::kj::test_helpers::register_rooted_context(&d, Some("failed-review-admission"), principal);
                 d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
                 let mut binding = ContextToolBinding::new();
-                binding.grant(Capability::Facade("shell".into()));
+                binding.grant(Capability::Facade("shell_readonly".into()));
                 broker.set_binding(context, binding).await.unwrap();
                 broker.hooks().write().await.post_call.entries.push(HookEntry {
                     id: HookId("failed-review-checkpoint".into()), match_instance: None,
-                    match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+                    match_tool: Some(GlobPattern("shell_readonly".into())), match_context: Some(context), match_principal: None,
                     action: HookAction::Ask(AskSpec { description: Some("Review captured output".into()) }),
                     priority: 0, kaish_script_id: None,
                 });
@@ -2191,7 +2189,7 @@ mod tests {
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
                 let mut binding = ContextToolBinding::new();
-                binding.grant(Capability::Facade("shell".into()));
+                binding.grant(Capability::Facade("shell_readonly".into()));
                 broker.set_binding(context, binding).await.unwrap();
                 let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id()).with_actor(principal, Some(reviewer));
                 let mut hooks = broker.hooks().write().await;
@@ -2202,7 +2200,7 @@ mod tests {
                     } else { HookAction::ShortCircuit(KernelToolResult::text("reviewed tool output")) }, 1),
                 ] {
                     hooks.post_call.entries.push(HookEntry { id: HookId(id.into()), match_instance: None,
-                        match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+                        match_tool: Some(GlobPattern("shell_readonly".into())), match_context: Some(context), match_principal: None,
                         action, priority, kaish_script_id: None });
                 }
                 drop(hooks);
@@ -2290,18 +2288,18 @@ mod tests {
             let context = register_context(&d, Some("settled-tool"), None, principal);
             d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
             let mut binding = ContextToolBinding::new();
-            binding.grant(Capability::Facade("shell".into()));
+            binding.grant(Capability::Facade("shell_readonly".into()));
             broker.set_binding(context, binding).await.unwrap();
             let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
             let replacement = serde_json::json!({"reviewed": true});
             broker.hooks().write().await.post_call.entries.push(HookEntry {
-                id: HookId("replace-shell-result".into()), match_instance: Some(GlobPattern(ShellServer::INSTANCE.into())),
-                match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+                id: HookId("replace-shell-result".into()), match_instance: Some(GlobPattern(ShellServer::INSTANCE_READONLY.into())),
+                match_tool: Some(GlobPattern("shell_readonly".into())), match_context: Some(context), match_principal: None,
                 priority: 0, kaish_script_id: None,
                 action: HookAction::ShortCircuit(KernelToolResult { is_error: false,
                     content: vec![ToolContent::Text("replacement".into())], structured: Some(replacement.clone()) }),
             });
-            let params = KernelCallParams { instance: InstanceId::new(ShellServer::INSTANCE), tool: "shell".into(),
+            let params = KernelCallParams { instance: InstanceId::new(ShellServer::INSTANCE_READONLY), tool: "shell_readonly".into(),
                 arguments: serde_json::json!({"command": "cat", "stdin": input, "run_in_background": run_in_background}) };
             let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
             let body = body_of(&result);
@@ -2336,7 +2334,7 @@ mod tests {
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let epoch = d.kernel_db().lock().begin_continuation(context, 1).unwrap().epoch;
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
 
@@ -2370,7 +2368,7 @@ mod tests {
             let context = register_context(&d, Some("spill-sync"), None, principal);
             d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
             let mut binding = ContextToolBinding::new();
-            binding.grant(Capability::Facade("shell".into()));
+            binding.grant(Capability::Facade("shell_readonly".into()));
             broker.set_binding(context, binding).await.unwrap();
             let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
             let result = broker.call_tool(call(command), &cc, CancellationToken::new()).await.unwrap();
@@ -2389,7 +2387,7 @@ mod tests {
             let context = register_context(&d, Some("spill-async"), None, principal);
             d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
             let mut binding = ContextToolBinding::new();
-            binding.grant(Capability::Facade("shell".into()));
+            binding.grant(Capability::Facade("shell_readonly".into()));
             broker.set_binding(context, binding).await.unwrap();
             let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
             let receipt = broker.call_tool(call_async(command), &cc, CancellationToken::new()).await.unwrap();
@@ -2432,7 +2430,7 @@ mod tests {
         let context = register_context(&d, Some("spill-mask"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let result = broker.call_tool(call("seq 1 12000; false"), &cc, CancellationToken::new()).await.unwrap();
@@ -2449,7 +2447,7 @@ mod tests {
         let context = register_context(&d, Some("async-safe-external"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         binding.grant(Capability::Exec);
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
@@ -2477,7 +2475,7 @@ mod tests {
         }).unwrap();
         d.kernel_db().lock().assign_test_review(context, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id())
             .with_actor(principal, Some(reviewer));
@@ -2509,7 +2507,7 @@ mod tests {
         let context = register_context(&d, Some("safe-job-control"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
 
@@ -2544,7 +2542,7 @@ mod tests {
         let principal = PrincipalId::new();
         let context = register_context(&d, Some("explicit-wait"), None, principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let result = broker.call_tool(call("echo explicit-wait"), &cc, CancellationToken::new()).await.unwrap();
@@ -2564,7 +2562,7 @@ mod tests {
         let principal = PrincipalId::new();
         let context = register_context(&d, Some("default-run-in-background"), None, principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_readonly".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let result = broker.call_tool(call_omitted("echo default-run-in-background"), &cc, CancellationToken::new()).await.unwrap();

@@ -236,7 +236,7 @@ impl Seats {
         self.native_tool(
             context,
             SessionId::new(),
-            "shell_write",
+            "shell",
             serde_json::json!({ "command": command, "run_in_background": run_in_background }),
         )
         .await
@@ -401,7 +401,7 @@ impl Seats {
             .push(HookEntry {
                 id: HookId("wire-ask-worker".into()),
                 match_instance: None,
-                match_tool: Some(GlobPattern("shell_write".into())),
+                match_tool: Some(GlobPattern("shell".into())),
                 match_context: Some(self.worker),
                 match_principal: None,
                 action: HookAction::Ask(AskSpec {
@@ -508,7 +508,7 @@ fn shutdown_joins_pre_call_kaish_hook_before_the_target_runs() {
         s.kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("shutdown-pre-call-kaish".into()),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: Some(s.worker),
             match_principal: None,
             action: HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Kaish(
@@ -578,7 +578,7 @@ fn shutdown_joins_result_hook_and_retains_captured_shell_output() {
         s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("shutdown-result-kaish".into()),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: Some(s.worker),
             match_principal: None,
             action: HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Kaish(
@@ -1516,14 +1516,14 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
     let table = if on_error { &mut hooks.on_error } else { &mut hooks.post_call };
     table.entries.push(HookEntry {
         id: HookId("observe-once".into()), match_instance: None,
-        match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+        match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
         match_principal: None, action: HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Builtin {
             name: "observe-once".into(), hook: Arc::new(CountResultHook(observed.clone())),
         }), priority: -1, kaish_script_id: None,
     });
     table.entries.push(HookEntry {
         id: HookId("review-result".into()), match_instance: None,
-        match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+        match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
         match_principal: None, action: if script {
             HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Kaish("echo review >&2; exit 3".into()))
         } else { HookAction::Ask(AskSpec { description: Some("Review captured result".into()) }) },
@@ -1532,14 +1532,14 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
     if twice {
         table.entries.push(HookEntry {
             id: HookId("second-review".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
             match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Second result review".into()) }),
             priority: 1, kaish_script_id: None,
         });
     }
     table.entries.push(HookEntry {
         id: HookId("after-review".into()), match_instance: None,
-        match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+        match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
         match_principal: None, action: HookAction::ShortCircuit(kaijutsu_kernel::mcp::KernelToolResult::text("reviewed result")),
         priority: 2, kaish_script_id: None,
     });
@@ -1601,7 +1601,7 @@ fn result_review_checkpoint_failure_refuses_without_publishing_an_ask() {
         let marker = scratch.marker();
         s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("failed-review-checkpoint".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
             match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review captured output".into()) }),
             priority: 0, kaish_script_id: None,
         });
@@ -1663,7 +1663,7 @@ fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
             let s = seats().await;
             s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
                 id: HookId("structured-shutdown-review".into()), match_instance: None,
-                match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+                match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
                 match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review kj shutdown result".into()) }),
                 priority: 0, kaish_script_id: None,
             });
@@ -1715,7 +1715,7 @@ fn structured_result_review_survives_rpc_disconnect() {
         s.worker_kj.join_context(s.worker, "structured-retained-review").await.unwrap();
         s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("structured-retained-review".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
             match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review retained kj result".into()) }),
             priority: 0, kaish_script_id: None,
         });
@@ -1750,7 +1750,7 @@ fn structured_result_review_returns_pending_then_continues_without_repeating_kj(
         let s = seats().await;
         s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("structured-review".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
             match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review kj result".into()) }),
             priority: 0, kaish_script_id: None,
         });
@@ -1799,7 +1799,7 @@ fn quiet_result_review_keeps_its_result_without_a_transcript_pair() {
         ] {
             hooks.post_call.entries.push(HookEntry {
                 id: HookId(id.into()), match_instance: None,
-                match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+                match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
                 match_principal: None, action, priority, kaish_script_id: None,
             });
         }
@@ -1866,7 +1866,7 @@ fn streaming_hooks_replace_output_in_every_phase() {
             let table = match phase { "pre" => &mut hooks.pre_call, "post" => &mut hooks.post_call, _ => &mut hooks.on_error };
             table.entries.push(HookEntry {
                 id: HookId("stream-replacement".into()), match_instance: None,
-                match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+                match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
                 match_principal: None, priority: 0, kaish_script_id: None,
                 action: HookAction::ShortCircuit(kaijutsu_kernel::mcp::KernelToolResult::text("settled stream")),
             });
@@ -1905,7 +1905,7 @@ fn streaming_result_reviews_wait_for_answer_or_interrupt_without_reexecution() {
                 ("stream-reviewed", HookAction::ShortCircuit(kaijutsu_kernel::mcp::KernelToolResult::text("approved stream")), 1),
             ] {
                 hooks.post_call.entries.push(HookEntry {
-                    id: HookId(id.into()), match_instance: None, match_tool: Some(GlobPattern("shell_write".into())),
+                    id: HookId(id.into()), match_instance: None, match_tool: Some(GlobPattern("shell".into())),
                     match_context: Some(s.worker), match_principal: None, action, priority, kaish_script_id: None,
                 });
             }
@@ -1956,7 +1956,7 @@ fn disconnect_settles_retained_stream_review_and_removes_the_session() {
         s.worker_kj.join_context(s.worker, "disconnect-review").await.unwrap();
         s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("disconnect-review".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
             match_principal: None, priority: 0, kaish_script_id: None,
             action: HookAction::Ask(AskSpec { description: Some("Review before disconnect".into()) }),
         });
@@ -1992,7 +1992,7 @@ fn shutdown_settles_retained_stream_review_before_join_returns() {
         s.worker_kj.join_context(s.worker, "shutdown-stream-review").await.unwrap();
         s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
             id: HookId("shutdown-stream-review".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker),
             match_principal: None, priority: 0, kaish_script_id: None,
             action: HookAction::Ask(AskSpec { description: Some("Review before shutdown".into()) }),
         });

@@ -56,7 +56,7 @@
 
 set -e
 
-mt="shell_write"
+mt="shell"
 hid="shell-escape-guard"
 t="kaish_path"
 p="/config/rc/lib/hooks/shell-guard.kai"

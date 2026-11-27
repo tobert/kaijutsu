@@ -98,7 +98,7 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         kernel.kernel_db.lock().assign_test_review_recasting(work, Some(coder), None).unwrap();
         kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("identity-wire-gate".into()), match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(work),
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(work),
             match_principal: None, action: HookAction::Ask(AskSpec { description: Some("identity wire".into()) }),
             priority: 0, kaish_script_id: None,
         });

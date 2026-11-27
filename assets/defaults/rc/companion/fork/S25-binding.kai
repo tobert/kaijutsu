@@ -5,4 +5,4 @@
 # To let a check-in use another tool, add a line here (docs/companion.md).
 set -e
 kj binding reset
-kj binding allow "facade:shell"
+kj binding allow "facade:shell_readonly"

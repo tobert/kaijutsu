@@ -31,4 +31,3 @@ kj binding allow "exec"
 # The kernel-owned editor's write path.
 kj binding allow "editor"
 kj binding allow "facade:shell"
-kj binding allow "facade:shell_write"

@@ -309,7 +309,7 @@ async fn build_ask(
     let (cwd, env) = match caller.context_id {
         Some(context) => {
             let inputs = crate::runtime::context_shell::ContextShellInputs::load(
-                kernel, context, spec.tool == "shell", ShellCwd::Context,
+                kernel, context, spec.tool == "shell_readonly", ShellCwd::Context,
             ).await.map_err(|error| error.to_string())?;
             let env = env_snapshot::values_from_inputs(&inputs, &spec.planned);
             (inputs.cwd.map(|path| path.to_string_lossy().into_owned()), env)
@@ -2761,8 +2761,8 @@ mod tests {
         let caller = caller_with_context(ctx_id);
 
         let params = crate::mcp::types::KernelCallParams {
-            instance: crate::mcp::types::InstanceId::new("builtin.shell_write"),
-            tool: "shell_write".to_string(),
+            instance: crate::mcp::types::InstanceId::new("builtin.shell"),
+            tool: "shell".to_string(),
             arguments: serde_json::json!({ "command": "echo ${FOO}" }),
         };
         let spec = crate::kj::hook_gate::build_hook_gate_spec("h", "hooked".into(), &params);
@@ -2891,8 +2891,8 @@ mod tests {
         let d = gate_dispatcher().await;
         let caller = registered_caller(&d);
         let params = crate::mcp::types::KernelCallParams {
-            instance: crate::mcp::types::InstanceId::new("builtin.shell_write"),
-            tool: "shell_write".into(),
+            instance: crate::mcp::types::InstanceId::new("builtin.shell"),
+            tool: "shell".into(),
             arguments: serde_json::json!({ "command": "kj block list; kj ledger list" }),
         };
         let spec = crate::kj::hook_gate::build_hook_gate_spec("risk-advisory", "d".into(), &params);

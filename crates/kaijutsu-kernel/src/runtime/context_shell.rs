@@ -831,8 +831,8 @@ mod tests {
             "curl -X POST http://127.0.0.1:9".to_string(),
         ] {
             let result = d.kernel().broker().call_tool(KernelCallParams {
-                instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE),
-                tool: "shell".into(),
+                instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE_READONLY),
+                tool: "shell_readonly".into(),
                 arguments: serde_json::json!({"command": command, "run_in_background": false}),
             }, &call_context, tokio_util::sync::CancellationToken::new()).await.unwrap();
             let text = format!("{result:?}");
@@ -848,7 +848,7 @@ mod tests {
         for command in ["kj context list", "kj block list", "kj vi open --help", "cat /config/kernel/readonly-editor.txt",
             "kj help", "kj context create help", "kj synth status", "kj synth help", "kj synth --help"] {
             let result = d.kernel().broker().call_tool(KernelCallParams {
-                instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE), tool: "shell".into(),
+                instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE_READONLY), tool: "shell_readonly".into(),
                 arguments: serde_json::json!({"command": command, "run_in_background": false}),
             }, &call_context, tokio_util::sync::CancellationToken::new()).await.unwrap();
             if result.is_error { failed_reads.push(format!("{command}: {result:?}")); }

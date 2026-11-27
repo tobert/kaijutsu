@@ -114,8 +114,8 @@ struct ExecutableAsk {
 fn runs_read_only(origin: approval_ledger::types::Origin, tool: Option<&str>) -> Result<bool, String> {
     use approval_ledger::types::Origin;
     match (origin, tool) {
-        (Origin::ShellGate, None | Some("shell_write")) | (Origin::Hook, Some("shell_write")) => Ok(false),
-        (Origin::Hook, Some("shell")) => Ok(true),
+        (Origin::ShellGate, None | Some("shell")) | (Origin::Hook, Some("shell")) => Ok(false),
+        (Origin::Hook, Some("shell_readonly")) => Ok(true),
         (origin, tool) => Err(format!("no shell policy for a {origin:?} ask on tool {tool:?}")),
     }
 }
@@ -1453,7 +1453,7 @@ mod lifetime_tests {
         let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
             context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
             reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
-            origin: Origin::Hook, instance: Some("builtin.shell".into()), tool: Some("shell".into()),
+            origin: Origin::Hook, instance: Some("builtin.shell_readonly".into()), tool: Some("shell_readonly".into()),
             hook_id: Some("asks-on-shell".into()),
             description: "a hook asked about a read-only call".into(), statements: vec![], authorized_label: None,
             rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
@@ -1472,7 +1472,7 @@ mod lifetime_tests {
         assert_eq!(cwd, None, "an approved read-only ask must not move the context's cwd");
         assert!(!kernel.kernel_db().lock().get_context_env(context).unwrap().iter().any(|row| row.key == "READ_ONLY_PROBE"),
             "an approved read-only ask must not change the context's env");
-        assert_eq!(runs_read_only(Origin::Hook, Some("shell_write")), Ok(false));
+        assert_eq!(runs_read_only(Origin::Hook, Some("shell")), Ok(false));
         assert_eq!(runs_read_only(Origin::ShellGate, None), Ok(false));
         assert!(runs_read_only(Origin::Hook, Some("write")).is_err(), "an unknown tool with a source is refused");
         kernel.shutdown_runtime_worker().await.ok();
@@ -1495,7 +1495,7 @@ mod lifetime_tests {
         let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
             context_id: context.as_bytes().to_vec(), actor_id: amy.as_bytes().to_vec(),
             reviewer_id: reviewer.as_bytes().to_vec(), principal_id: amy.as_bytes().to_vec(),
-            origin: Origin::ShellGate, instance: Some("builtin.shell_write".into()), tool: Some("shell_write".into()),
+            origin: Origin::ShellGate, instance: Some("builtin.shell".into()), tool: Some("shell".into()),
             hook_id: None, description: "an act that always asks".into(), statements: vec![], authorized_label: None,
             rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
             exec_source: Some(source.into()), exec_stdin: None, continuation_epoch: None, env: vec![],

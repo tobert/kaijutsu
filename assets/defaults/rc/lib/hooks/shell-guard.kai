@@ -5,7 +5,7 @@
 # SXX-name.{kai,md}, so it cannot be reached as one from either side.
 #
 # shell-escape-guard pre_call hook body (installed by S45-shell-guard.kai as
-# hook_id shell-escape-guard, match_tool shell_write). Scores KJ_TOOL_PLAN --
+# hook_id shell-escape-guard, match_tool shell). Scores KJ_TOOL_PLAN --
 # kaish's own parse of the command, descending into if/for/$(...) bodies --
 # rather than the raw command text, so quoting and wrapper commands cannot
 # hide the interpreter that will actually run. A pre_call hook that exits

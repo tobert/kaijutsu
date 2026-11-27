@@ -159,8 +159,8 @@ impl McpServerLike for ShellOperationsServer {
             }
             Self::TOOL_KILL => {
                 let p: CancelOperationParams = serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
-                if !broker.binding(&ctx.context_id).await.is_some_and(|b| b.allows(&crate::mcp::Capability::Facade("shell_write".into()))) {
-                    return Err(McpError::Protocol("cancel_shell_operation requires facade:shell_write".into()));
+                if !broker.binding(&ctx.context_id).await.is_some_and(|b| b.allows(&crate::mcp::Capability::Facade("shell".into()))) {
+                    return Err(McpError::Protocol("cancel_shell_operation requires facade:shell".into()));
                 }
                 let cancelled = registry.cancel(&p.id, ctx.context_id).await.map_err(McpError::Protocol)?;
                 Ok(json_result(serde_json::json!({"operation_id": p.id, "cancellation_requested": cancelled})))

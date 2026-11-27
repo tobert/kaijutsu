@@ -5,7 +5,7 @@ set -e
 # The writable shell. `gate.toml` allows `kj handoff note` for every context
 # and covers anything else this seat runs under `[rc.companion]`; a
 # statement no key covers asks the person.
-kj binding allow "facade:shell_write"
+kj binding allow "facade:shell"
 kj binding allow "editor"
 # Deliberately NOT granted: fork, exec, transport, house, operator, system.
 # The check-in clock belongs to the person. This seat does not set its own

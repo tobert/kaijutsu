@@ -742,7 +742,7 @@ async fn rig(via: Via, setup: Setup) -> Rig {
         db.assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();
     }
     let mut binding = ContextToolBinding::new();
-    binding.grant(Capability::Facade("shell_write".into()));
+    binding.grant(Capability::Facade("shell".into()));
     broker.set_binding(context_id, binding).await.unwrap();
     let ctx = CallContext::new(actor, context_id, SessionId::new(), d.kernel_id()).with_actor(actor, Some(reviewer));
     Rig { via, d, broker, ctx, mock, gate_server: server }
@@ -765,8 +765,8 @@ impl Rig {
             },
             Via::Tool => {
                 let params = KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-                    tool: ShellServer::TOOL_WRITE.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE),
+                    tool: ShellServer::TOOL.to_string(),
                     arguments: serde_json::json!({ "command": command }),
                 };
                 let result = self.broker.call_tool(params, ctx, CancellationToken::new()).await?;
@@ -783,8 +783,8 @@ impl Rig {
             Via::Rpc => self.submit(command).await,
             Via::Tool => {
                 let params = KernelCallParams {
-                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-                    tool: ShellServer::TOOL_WRITE.to_string(),
+                    instance: InstanceId::new(ShellServer::INSTANCE),
+                    tool: ShellServer::TOOL.to_string(),
                     arguments: serde_json::json!({ "command": command }),
                 };
                 self.broker.call_tool(params, &self.ctx, CancellationToken::new()).await.map(|_| ())
@@ -819,7 +819,7 @@ impl Rig {
             db.assign_test_review(context_id, Some(actor), reviewer).unwrap();
         }
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         self.broker.set_binding(context_id, binding).await.unwrap();
         CallContext::new(actor, context_id, SessionId::new(), self.d.kernel_id()).with_actor(actor, reviewer)
     }
@@ -1520,7 +1520,7 @@ async fn another_hook_s_ask_stands() {
         rig.broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("scorer".into()),
             match_instance: None,
-            match_tool: Some(GlobPattern("shell_write".into())),
+            match_tool: Some(GlobPattern("shell".into())),
             match_context: None,
             match_principal: None,
             action: HookAction::Ask(AskSpec { description: Some("the scorer is unsure".into()) }),
@@ -1586,7 +1586,7 @@ async fn with_the_council_disabled_nothing_changes() {
         let ask = rig.only_ask();
         let expected = match via {
             Via::Rpc => "gate policy: no layer covers statement #0 (`touch notes.txt`) and the actor is not a root character",
-            Via::Tool => "shell_write: 1 statement(s) — touch notes.txt",
+            Via::Tool => "shell: 1 statement(s) — touch notes.txt",
         };
         assert_eq!(ask.description, expected, "{via:?}");
         assert!(rig.signals(&ask.request_id).is_empty());
@@ -1961,7 +1961,7 @@ fn shell_write_call(id: &str, command: &str, background: bool) -> Vec<crate::llm
     use crate::llm::stream::StreamEvent;
     let input = serde_json::json!({ "command": command, "run_in_background": background });
     vec![
-        StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input, signature: None },
+        StreamEvent::ToolUse { id: id.into(), name: "shell".into(), input, signature: None },
         StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None },
     ]
 }
@@ -2377,8 +2377,8 @@ async fn a_script_changed_after_the_council_judged_it_does_not_run() {
     shell_and_program(&rig.mock, &ALLOW, FIRST, FIRST);
     let (reached, release) = rig.mock.hold_next_decision();
     let params = KernelCallParams {
-        instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-        tool: ShellServer::TOOL_WRITE.to_string(),
+        instance: InstanceId::new(ShellServer::INSTANCE),
+        tool: ShellServer::TOOL.to_string(),
         arguments: serde_json::json!({ "command": "python3 /work/fix.py" }),
     };
     let call = rig.broker.call_tool(params, &rig.ctx, CancellationToken::new());
@@ -2745,7 +2745,7 @@ async fn a_bump_refuses_with_guidance_and_opens_no_ask() {
 /// answer does.
 fn learn_allow_rule(db: &parking_lot::Mutex<crate::kernel_db::KernelDb>, via: Via, command: &str) {
     use approval_ledger::types::{NewAsk, NewPlanCommand, NewPlanStatement, Origin, RuleScope};
-    let tool = format!("{}.{}", ShellServer::INSTANCE_WRITE, ShellServer::TOOL_WRITE);
+    let tool = format!("{}.{}", ShellServer::INSTANCE, ShellServer::TOOL);
     let (origin, rendered, label) = match via {
         Via::Rpc => (Origin::Hook, format!("{tool} {}", serde_json::json!({ "command": command })), tool),
         Via::Tool => (Origin::ShellGate, command.to_string(), command.to_string()),
@@ -2756,8 +2756,8 @@ fn learn_allow_rule(db: &parking_lot::Mutex<crate::kernel_db::KernelDb>, via: Vi
         reviewer_id: vec![1, 2, 3],
         principal_id: vec![],
         origin,
-        instance: Some(ShellServer::INSTANCE_WRITE.into()),
-        tool: Some(ShellServer::TOOL_WRITE.into()),
+        instance: Some(ShellServer::INSTANCE.into()),
+        tool: Some(ShellServer::TOOL.into()),
         hook_id: None,
         description: "test fixture: learn an allow rule".into(),
         statements: vec![NewPlanStatement {
@@ -3377,11 +3377,11 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     let turns = dialogue(&rig, shadow.context_id);
     let roles: Vec<_> = turns.iter().map(|(r, _)| *r).collect();
     assert_eq!(roles, [User, Model, User, Model, User, Model], "{turns:?}");
-    assert_eq!(turns[0].1, "shell_write: echo static");
+    assert_eq!(turns[0].1, "shell: echo static");
     assert_eq!(turns[1].1, "ran");
-    assert_eq!(turns[2].1, "shell_write: touch /work/marker");
+    assert_eq!(turns[2].1, "shell: touch /work/marker");
     assert_eq!(turns[3].1, "ran");
-    assert_eq!(turns[4].1, "shell_write: rm /work/marker");
+    assert_eq!(turns[4].1, "shell: rm /work/marker");
     assert_eq!(turns[5].1, "asked the reviewer");
     assert!(rig.mock.builds_for("shadow").is_empty(), "a judge on a chat backend is hydrated whole, never primed");
     assert_eq!(rig.mock.decisions().len(), 2, "only the gate's two decisions: a chat judge is not asked yet");
@@ -3499,7 +3499,7 @@ async fn rotating_a_judged_seat_archives_its_shadow_and_the_successor_gets_its_o
         }
 
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         rig.broker.set_binding(successor, binding).await.unwrap();
         let next = CallContext::new(rig.ctx.actor_id, successor, SessionId::new(), rig.d.kernel_id())
             .with_actor(rig.ctx.actor_id, rig.ctx.reviewer_id);
@@ -3509,7 +3509,7 @@ async fn rotating_a_judged_seat_archives_its_shadow_and_the_successor_gets_its_o
         assert_ne!(new[0].context_id, old);
         assert_eq!(new[0].label.as_deref(), Some("judge-council-seat"), "{rc_dir}: the archived shadow freed the label");
         let turns = dialogue(&rig, new[0].context_id);
-        assert_eq!(turns, [(User, "shell_write: echo after".to_string()), (Model, "ran".to_string())], "{rc_dir}");
+        assert_eq!(turns, [(User, "shell: echo after".to_string()), (Model, "ran".to_string())], "{rc_dir}");
         rig.finish().await;
     }
 }
@@ -3593,7 +3593,7 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     let puts = rig.mock.wait_for_builds("shadow", 1).await;
     // Priming runs on its own task, so it may read the outcome turn too.
     let turns: Vec<&str> = puts[0].turns.iter().map(String::as_str).collect();
-    assert_eq!(turns[0], "shell_write: echo one", "{turns:?}");
+    assert_eq!(turns[0], "shell: echo one", "{turns:?}");
     assert!(puts[0].system.contains("Unwind the command before you judge it"), "the council framing opens it: {}", puts[0].system);
     assert!(puts[0].system.contains("You are a tool interpreter."), "the judge stance follows: {}", puts[0].system);
     assert!(!puts[0].system.contains("seat"), "the system message names no seat: {}", puts[0].system);
@@ -3601,7 +3601,7 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     rig.submit("echo two").await.unwrap();
     let puts = rig.mock.wait_for_builds("shadow", 2).await;
     let turns: Vec<&str> = puts[1].turns.iter().map(String::as_str).collect();
-    assert_eq!(turns[..3], ["shell_write: echo one", "ran", "shell_write: echo two"], "{turns:?}");
+    assert_eq!(turns[..3], ["shell: echo one", "ran", "shell: echo two"], "{turns:?}");
     assert!(rig.mock.decisions().is_empty(), "a call no council decided is recorded, not judged");
     rig.finish().await;
 }
@@ -4407,8 +4407,8 @@ async fn a_script_changed_after_a_model_judge_read_it_does_not_run() {
     let (rig, seen) = decisions_rig(Via::Tool, vec![slow]).await;
     rig.write("/work/fix.py", "print('judged')\n").await;
     let params = KernelCallParams {
-        instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-        tool: ShellServer::TOOL_WRITE.to_string(),
+        instance: InstanceId::new(ShellServer::INSTANCE),
+        tool: ShellServer::TOOL.to_string(),
         arguments: serde_json::json!({ "command": "python3 /work/fix.py" }),
     };
     let call = rig.broker.call_tool(params, &rig.ctx, CancellationToken::new());

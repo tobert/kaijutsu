@@ -2903,9 +2903,9 @@ esac
         // The child only observes: the copy of the main seat's writable shell is cleared.
         let binding = d.dispatch(&argv(&["binding", "show", &first_id.to_hex()]), &console_caller(&d)).await;
         assert!(binding.is_ok(), "{}", binding.message());
-        assert!(binding.message().contains("facades: shell"), "the read-only shell: {}", binding.message());
+        assert!(binding.message().contains("facades: shell_readonly"), "the read-only shell: {}", binding.message());
         assert!(binding.message().contains("authorities: (none)"), "no extra authority: {}", binding.message());
-        assert!(!binding.message().contains("shell_write"), "no writable shell: {}", binding.message());
+        assert!(!binding.message().contains("facades: shell\n"), "no writable shell: {}", binding.message());
 
         // A second tick sweeps the first child, then forks the next.
         fire_companion_tick(&d, main, 2).await;
@@ -3241,7 +3241,7 @@ esac
         let script = vec![
             vec![
                 StreamEvent::ToolUse {
-                    id: "call_rotate".into(), name: "shell_write".into(),
+                    id: "call_rotate".into(), name: "shell".into(),
                     input: serde_json::json!({
                         "command": "kj context rotate --handoff 'the next seat has the plan'"
                     }),
@@ -3271,7 +3271,7 @@ esac
         {
             let tools = tools.lock();
             assert_eq!(tools.len(), 2, "one tool round and one signoff call: {tools:?}");
-            assert!(tools[0].iter().any(|tool| tool == "shell_write"), "the first call holds the writable shell: {:?}", tools[0]);
+            assert!(tools[0].iter().any(|tool| tool == "shell"), "the first call holds the writable shell: {:?}", tools[0]);
             assert_eq!(tools[1], ["done"], "the signoff call offers only done: {:?}", tools[1]);
         }
         assert!(sent.lock().len() == 2, "the signoff call was sent");
@@ -3353,7 +3353,7 @@ esac
         let script = vec![
             vec![
                 StreamEvent::ToolUse {
-                    id: "call_rotate".into(), name: "shell_write".into(),
+                    id: "call_rotate".into(), name: "shell".into(),
                     input: serde_json::json!({"command": "kj context rotate"}),
                     signature: None,
                 },
@@ -3456,7 +3456,7 @@ esac
         let script = vec![
             vec![
                 StreamEvent::ToolUse {
-                    id: "call_rotate".into(), name: "shell_write".into(),
+                    id: "call_rotate".into(), name: "shell".into(),
                     input: serde_json::json!({"command": "kj context rotate"}),
                     signature: None,
                 },
@@ -3464,7 +3464,7 @@ esac
             ],
             vec![
                 StreamEvent::ToolUse {
-                    id: "call_shell".into(), name: "shell_write".into(),
+                    id: "call_shell".into(), name: "shell".into(),
                     input: serde_json::json!({
                         "command": "kj block create --role model --kind text --content 'hallucinated shell ran'"
                     }),
@@ -3549,7 +3549,7 @@ esac
         let script = vec![
             vec![
                 StreamEvent::ToolUse {
-                    id: "call_rotate".into(), name: "shell_write".into(),
+                    id: "call_rotate".into(), name: "shell".into(),
                     input: serde_json::json!({
                         "command": "kj context rotate --handoff 'the next seat has the plan'"
                     }),
@@ -3658,7 +3658,7 @@ esac
         let script = vec![
             vec![
                 StreamEvent::ToolUse {
-                    id: "call_rotate".into(), name: "shell_write".into(),
+                    id: "call_rotate".into(), name: "shell".into(),
                     input: serde_json::json!({"command": "kj context rotate"}),
                     signature: None,
                 },
@@ -4575,7 +4575,7 @@ esac
             assert!(r.is_ok(), "create failed: {}", r.message());
             let ctx = lookup_context_id(&d, "loadout");
             let binding = d.kernel().broker().binding(&ctx).await.expect("the coder rc binds the context");
-            assert_eq!(binding.allowed_facades, ["shell_write", "edit_input", "submit_input", "commit_capture"], "facades");
+            assert_eq!(binding.allowed_facades, ["shell", "edit_input", "submit_input", "commit_capture"], "facades");
             let instances: Vec<&str> = binding.allowed_instances.iter().map(|i| i.as_str()).collect();
             assert_eq!(instances, ["builtin.file", "builtin.tasks", "builtin.turn"], "instances");
         });
