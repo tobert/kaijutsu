@@ -34,7 +34,7 @@ From DeepSeek Kaibo reviews and the Slices 1–3 build (`docs/board.md`):
 - **Narrow dock labels collide.** At 640px the header and footer labels overlap
   even though the conversation and Neo panels fit. Give dock labels a width
   budget and elide lower-priority status before they cover navigation hints.
-- **Pending ask receipt status.** The desktop's open `shell_write` ask
+- **Pending ask receipt status.** The desktop's open `shell` ask
   `01a20b2c` had a receipt displayed as `Error` after app restart, while the
   ask remained pending. Audit the durable status and server repair path;
   `runtime/command.rs` already tests replacement of a `Waiting` placeholder.

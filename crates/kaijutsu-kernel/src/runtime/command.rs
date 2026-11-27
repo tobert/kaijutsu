@@ -647,7 +647,7 @@ async fn apply_result_hooks(
     invocation: Option<CommandHooks<'_>>,
     review: &super::result_review::CommandResultReview,
 ) {
-    let direct = crate::mcp::Broker::shell_write_hook_params(code);
+    let direct = crate::mcp::Broker::shell_hook_params(code);
     let (broker, params) = invocation.as_ref().map_or((kernel.broker().as_ref(), &direct), |hook| (hook.broker, hook.params));
     let verdict = match &outcome.execution {
         CommandExecution::Completed(result) => {

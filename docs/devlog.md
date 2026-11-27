@@ -773,3 +773,13 @@ attempt copied a long ABC phrase and exhausted the output budget before
 the call closed. Limiting the excerpt to the opening two bars let the next
 call complete. Plain LFM3 handles the desk on Spaceghost’s other GPU.
 The engineer reads notes addressed to `@Toolie` at its own cadence.
+
+## Shell tool naming
+
+Swapped the two shell tools so `shell` (`builtin.shell`, `facade:shell`) is the
+read-write shell and `shell_readonly` (`builtin.shell_readonly`,
+`facade:shell_readonly`) is the explicit read-only shell. Each character now
+holds a single shell facade, dropping the duplicate read-only shell from
+`banto` and `person`. Migration `shell-facade-swap-v1` remaps persisted
+bindings and hooks on boot so existing read-only contexts move to
+`facade:shell_readonly` rather than widening to writable.

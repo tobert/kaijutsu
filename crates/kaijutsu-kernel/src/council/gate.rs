@@ -86,7 +86,7 @@ pub(crate) fn pass_option(case: CouncilCase, mode: JudgeMode) -> &'static str {
 }
 
 /// The tool whose gate-policy ask the council may decide on the RPC paths.
-const SHELL_WRITE: &str = "shell";
+const SHELL: &str = "shell";
 
 /// The submission a council decision reads.
 #[derive(Clone, Copy, Debug)]
@@ -1778,7 +1778,7 @@ pub(crate) fn eligible(spec: &GateSpec) -> bool {
     match spec.origin {
         Origin::ShellGate => true,
         Origin::Hook => {
-            spec.hook_id.as_deref() == Some(crate::mcp::error::GATE_POLICY_SUBJECT) && spec.tool == SHELL_WRITE
+            spec.hook_id.as_deref() == Some(crate::mcp::error::GATE_POLICY_SUBJECT) && spec.tool == SHELL
         }
         Origin::HookResult | Origin::KjVerb | Origin::Drift | Origin::Refusal | Origin::Board => false,
     }

@@ -2945,13 +2945,13 @@ impl Broker {
     /// broker's hook tables — the same identity `builtin.shell_write`'s real
     /// tool call presents, so a hook written against `shell_write` fires on
     /// both paths without change.
-    const SHELL_WRITE_INSTANCE: &'static str = "builtin.shell";
-    const SHELL_WRITE_TOOL: &'static str = "shell";
+    const SHELL_INSTANCE: &'static str = "builtin.shell";
+    const SHELL_TOOL: &'static str = "shell";
 
-    pub(crate) fn shell_write_hook_params(command: &str) -> KernelCallParams {
+    pub(crate) fn shell_hook_params(command: &str) -> KernelCallParams {
         KernelCallParams {
-            instance: InstanceId::new(Self::SHELL_WRITE_INSTANCE),
-            tool: Self::SHELL_WRITE_TOOL.to_string(),
+            instance: InstanceId::new(Self::SHELL_INSTANCE),
+            tool: Self::SHELL_TOOL.to_string(),
             arguments: serde_json::json!({ "command": command }),
         }
     }
@@ -2979,7 +2979,7 @@ impl Broker {
         ctx: &CallContext,
         cancel: &CancellationToken,
     ) -> ShellHookVerdict {
-        self.shell_pre_call_hooks_as(Self::shell_write_hook_params(command), command, ctx, cancel).await
+        self.shell_pre_call_hooks_as(Self::shell_hook_params(command), command, ctx, cancel).await
     }
 
     /// [`Self::shell_pre_call_hooks`] for a read-only shell: `PreCall` runs
@@ -4765,7 +4765,7 @@ mod tests {
             slot: kernel.reserve_runtime_slot().unwrap(),
             admission: kernel.admit_context(context).unwrap(),
             kernel: kernel.clone(), broker: kernel.broker().clone(), kaish,
-            params: Broker::shell_write_hook_params("echo never"),
+            params: Broker::shell_hook_params("echo never"),
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
             code: "echo never".into(), stdin: None, background: true, read_only: false,
             timeout: kernel.timeouts().shell_command_default,
@@ -4811,7 +4811,7 @@ mod tests {
             slot: kernel.reserve_runtime_slot().unwrap(),
             admission: kernel.admit_context(context).unwrap(),
             kernel: kernel.clone(), broker: broker.clone(), kaish,
-            params: Broker::shell_write_hook_params("echo never"),
+            params: Broker::shell_hook_params("echo never"),
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
             code: "echo never".into(), stdin: None, background: true, read_only: false,
             timeout: kernel.timeouts().shell_command_default,
@@ -11145,7 +11145,7 @@ mod tests {
         };
         let verdict = broker
             .result_post_call_hooks(
-                &Broker::shell_write_hook_params("echo unmistakable-real-stdout; exit 7"),
+                &Broker::shell_hook_params("echo unmistakable-real-stdout; exit 7"),
                 &CallContext::test(),
                 &real_result,
                 None,
@@ -11182,7 +11182,7 @@ mod tests {
         let real_err = McpError::Protocol("unmistakable-real-failure".into());
         let verdict = broker
             .result_error_hooks(
-                &Broker::shell_write_hook_params("false"), &CallContext::test(), &real_err,
+                &Broker::shell_hook_params("false"), &CallContext::test(), &real_err,
                 None, &CancellationToken::new(),
             )
             .await;
@@ -11217,7 +11217,7 @@ mod tests {
         let real_result = KernelToolResult::text("the-real-command-output");
         let verdict = broker
             .result_post_call_hooks(
-                &Broker::shell_write_hook_params("echo the-real-command-output"),
+                &Broker::shell_hook_params("echo the-real-command-output"),
                 &CallContext::test(),
                 &real_result,
                 None,
@@ -11265,7 +11265,7 @@ mod tests {
         let real_result = KernelToolResult::text("the-real-command-output");
         let verdict = broker
             .result_post_call_hooks(
-                &Broker::shell_write_hook_params("echo the-real-command-output"),
+                &Broker::shell_hook_params("echo the-real-command-output"),
                 &CallContext::test(),
                 &real_result,
                 None,

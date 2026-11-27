@@ -1,4 +1,4 @@
-# The shell-escape guard. A `shell_write` command that hands text to a second shell --
+# The shell-escape guard. A `shell` command that hands text to a second shell --
 # `sh -c`, `bash -c`, or any wrapper (`sudo`, `env`, `xargs`, ...) that ends
 # up invoking one -- is opaque to the shell gate: `kj/shell_gate.rs`'s own
 # module docs name this exact gap, and a text-pattern match on the raw
@@ -15,7 +15,7 @@
 # interpreter's name cannot hide it and a comment or a `grep` pattern that
 # merely mentions "sh -c" cannot trip it. Shell interpreters (sh, bash, zsh,
 # dash, ksh, fish, busybox) deny outright by name: there is no legitimate
-# reason a `shell_write` call needs a second shell instead of running the
+# reason a `shell` call needs a second shell instead of running the
 # command as kaish directly, and busybox's own applet name lives in its args
 # rather than its own name, so it cannot be told apart from any other
 # invocation without denying the binary itself. Scripting interpreters

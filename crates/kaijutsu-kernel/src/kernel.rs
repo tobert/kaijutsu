@@ -1118,42 +1118,30 @@ impl Kernel {
             .register_silently(policy_server, InstancePolicy::for_kernel(self))
             .await?;
 
-        // builtin.shell_write — the in-kernel projection of the `shell_write`
-        // facade as a broker tool (`ShellServer::new`), so the native LLM
-        // agent gets the HOT, mutating shell (the RPC seam alone never
-        // reached its tool roster). Gated by `facade:shell_write` via the
-        // binding's facade projection (FACADE_PROJECTED_INSTANCES), NOT a
-        // separate instance grant — one capability covers both surfaces.
-        // A stale `facade:shell` grant (the safe, read-only tool) does not
-        // reach this instance. Holds
-        // Weak<Broker> to reach the kj dispatcher (wired post-bootstrap by
-        // `set_kj_dispatcher`) and materialize a per-context kaish on demand.
-        //
-        // Both shell instances use `InstancePolicy::for_shell`: their broker
-        // cap is a backstop above the longest command a call may ask for.
-        let shell_write_server = Arc::new(
+        // builtin.shell — the in-kernel projection of the `shell` facade as a
+        // broker tool (`ShellServer::new`, tool name `shell`), giving the
+        // native LLM agent the writable shell. Gated by `facade:shell` via
+        // FACADE_PROJECTED_INSTANCES so one capability covers RPC, MCP, and
+        // broker tool calls. Both shell instances use
+        // `InstancePolicy::for_shell` so the broker cap sits above the longest
+        // command a call may request.
+        let shell_server = Arc::new(
             crate::mcp::servers::ShellServer::new(Arc::downgrade(&self.broker)),
         );
         self.broker
-            .register_silently(shell_write_server, InstancePolicy::for_shell(self))
+            .register_silently(shell_server, InstancePolicy::for_shell(self))
             .await?;
 
-        // builtin.shell — the SAFE, unmarked twin (`ShellServer::new_read_only`,
-        // tool name `shell`) for roles that must not write or shell out (the
-        // `toolie`), and the name every caller reaches for by default post-flag-
-        // day. Same facade-projection mechanism (FACADE_PROJECTED_INSTANCES),
-        // gated by `facade:shell`. The constraint rides in the tool *name* so
-        // the model never attempts a write it can't perform. `read_only_shell`
-        // retires as a name entirely — this instance now answers to `shell`. A
-        // safe-only role never grants `facade:shell_write`, so it gets this
-        // shell or the hot one, not both (broad `*`/`facade:*` roles, and
-        // `director`, may see both — a harmless strict subset for `*`/`facade:
-        // *`, and an explicit operator's-console choice for `director`).
-        let shell_server = Arc::new(
+        // builtin.shell_readonly — the read-only twin
+        // (`ShellServer::new_read_only`, tool name `shell_readonly`) for roles
+        // that must not mutate state or spawn host commands (`toolie`,
+        // `companion` check-ins). Projected by `facade:shell_readonly`. Each
+        // shipped character grants one shell facade, never both.
+        let shell_readonly_server = Arc::new(
             crate::mcp::servers::ShellServer::new_read_only(Arc::downgrade(&self.broker)),
         );
         self.broker
-            .register_silently(shell_server, InstancePolicy::for_shell(self))
+            .register_silently(shell_readonly_server, InstancePolicy::for_shell(self))
             .await?;
 
         // Context-owned shell operation inspection and cancellation.

@@ -119,7 +119,8 @@
             let prefix = format!("/config/rc/{dir}/create/");
             let mut expected = Vec::new();
             for (path, _) in crate::seed_scripts::seed_files().into_iter()
-                .filter(|(path, _)| path.starts_with(&prefix) && path.ends_with(".md") && !path.ends_with("/S18-arrival.md")) {
+                .filter(|(path, _)| path.starts_with(&prefix) && path.ends_with(".md")
+                    && !path.ends_with("/S18-arrival.md") && !path.ends_with("/S00-engineer.md")) {
                 let data = d.kernel().vfs().read_all(std::path::Path::new(&path)).await.unwrap();
                 expected.push(String::from_utf8(data).unwrap());
             }
@@ -183,7 +184,7 @@
         let bass = seed_body("/config/rc/musician/chairs/bass.md").expect("bass chair");
         let drums = seed_body("/config/rc/musician/chairs/drums.md").expect("drums chair");
         for (name, chair, header) in [
-            ("bass", bass, "X:1\nT:bass\nM:4/4\nL:1/4\nK:C\n"),
+            ("bass", bass, "X:1\nT:bass\nM:4/4\nL:1/4\nK:C clef=bass\n"),
             ("drums", drums, "X:1\nT:drums\nM:4/4\nL:1/4\n%%MIDI channel 10\nK:C\n"),
         ] {
             assert!(chair.contains(header), "the {name} chair writes out its header: {chair}");

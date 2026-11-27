@@ -165,7 +165,7 @@ parts:
   `ExternalExec::LookupOnly` and a builtin read-only `git` tool.
 - **Shell escape guard (`S45-shell-guard.kai`):** Every shipped character that
   grants `Exec` installs the `shell-escape-guard` `pre_call` hook on
-  `shell_write`. Its hook body lives at `/config/rc/lib/hooks/shell-guard.kai`
+  `shell`. Its hook body lives at `/config/rc/lib/hooks/shell-guard.kai`
   and is read fresh from `/config` on each call, inspecting `KJ_TOOL_PLAN` to
   refuse unnecessary `sh -c` / `bash -c` wrappers and suggest native kaish or
   `kj` commands. If the context's working directory no longer exists, the

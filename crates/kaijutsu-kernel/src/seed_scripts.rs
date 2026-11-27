@@ -1307,7 +1307,7 @@ mod tests {
         }
         let person = seed_body("/config/rc/person/create/S10-binding.kai").expect("person binding");
         let banto = seed_body("/config/rc/banto/create/S10-binding.kai").expect("banto binding");
-        for grant in ["admin", "house", "operator", "system", "exec", "facade:shell_write"] {
+        for grant in ["admin", "house", "operator", "system", "exec", "facade:shell"] {
             let line = format!("kj binding allow \"{grant}\"\n");
             assert!(person.contains(&line), "person grants {grant}");
             assert!(banto.contains(&line), "banto grants {grant}");
@@ -1317,7 +1317,11 @@ mod tests {
         for dir in ["assistant", "banto", "coder", "companion", "council", "kohai", "person", "senpai", "storyteller", "toolie"] {
             let link = seed_body(&format!("/config/rc/{dir}/create/S11-person-input.kai"))
                 .unwrap_or_else(|| panic!("{dir}/create/S11-person-input.kai missing"));
-            assert_eq!(link.trim(), "/config/rc/lib/create/S11-person-input.kai");
+            if dir == "toolie" {
+                assert!(link.contains(". /config/rc/lib/create/S11-person-input.kai"), "{link}");
+            } else {
+                assert_eq!(link.trim(), "/config/rc/lib/create/S11-person-input.kai");
+            }
         }
         assert!(banto.contains("kj binding allow \"drive\"\n"), "banto drives the contexts it starts");
         assert!(!person.contains("kj binding allow \"drive\"\n"), "a person refuses drives");

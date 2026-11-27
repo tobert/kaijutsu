@@ -42,14 +42,12 @@ pub type ResolvedName = (InstanceId, String);
 /// (`ExternalExec::Deny`) — the name a caller reaches for by default has to be
 /// the one that cannot hurt anything. `shell_write` is the hot, mutating
 /// facade (`ExternalExec::Allow`), granted not default. There is no
-/// `shell_readonly` facade name.
-///
-/// The `shell`/`shell_write` facades additionally **project** the in-kernel
-/// `builtin.shell`/`builtin.shell_write` broker tools (see
+/// The `shell`/`shell_readonly` facades additionally **project** the in-kernel
+/// `builtin.shell`/`builtin.shell_readonly` broker tools (see
 /// [`FACADE_PROJECTED_INSTANCES`]) so the native LLM agent — whose tool
 /// roster is built from broker tools, not facades — gets a shell. The facade
 /// bit gates all three reach paths (human box, external MCP, in-kernel tool)
-/// so shell policy stays single-axis per flavor.
+/// so shell policy stays single-axis per character.
 pub const KNOWN_FACADES: &[&str] =
     &["shell", "shell_readonly", "edit_input", "submit_input", "commit_capture"];
 
@@ -92,17 +90,14 @@ pub const KNOWN_AUTHORITIES: &[&str] = &[
 /// binding treats a projected instance as allowed exactly when its backing
 /// facade is allowed.
 ///
-/// `builtin.shell` is the SAFE tool (`ExternalExec::Deny`), projected by
-/// `facade:shell` — the unmarked name a caller reaches for by default.
-/// `builtin.shell_write` is the HOT, mutating tool (`ExternalExec::Allow`),
-/// projected by `facade:shell_write`. There is no `shell_readonly` facade name.
-/// A role grants one or the other (or both — `director`, the operator's
-/// console, holds both post-flag-day) so it sees one shell or two, never a
-/// stale mismatch. Broad `facade:*` roles match both projections and see both
-/// tools — a harmless strict subset, accepted to keep the gate single-axis.
+/// `builtin.shell` is the writable tool, projected by `facade:shell` (host
+/// subprocesses are separately gated by `exec`). `builtin.shell_readonly` is
+/// the read-only tool (`ExternalExec::LookupOnly`), projected by
+/// `facade:shell_readonly`. Each shipped character grants one shell facade,
+/// never both.
 ///
-/// Shell operation inspection and cancellation are projected by
-/// `facade:shell_write`. Cancellation also checks that capability at call time.
+/// Shell operation inspection and cancellation are projected by `facade:shell`.
+/// Cancellation also checks that capability at call time.
 pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[
     ("builtin.shell", "shell"),
     ("builtin.shell_readonly", "shell_readonly"),
