@@ -234,3 +234,16 @@ tracing-opentelemetry = "0.34"
 
 # Testing
 tempfile = "3"
+
+# Temporary git pin to unreleased kaish main (still 0.19.0 in-tree).
+# Patching crates-io keeps kaish-tools-curl / kaish-tools-git (from
+# kaish-extras, which asks for crates.io 0.19) unified on a single copy of
+# kaish-types / kaish-tool-api. Remove this block once the next kaish release
+# lands on crates.io.
+[patch.crates-io]
+kaish-glob = { git = "https://github.com/tobert/kaish", rev = "c7e71b3096d40f9bb01bcc88768f5b04b5901113" }
+kaish-help = { git = "https://github.com/tobert/kaish", rev = "c7e71b3096d40f9bb01bcc88768f5b04b5901113" }
+kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "c7e71b3096d40f9bb01bcc88768f5b04b5901113" }
+kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "c7e71b3096d40f9bb01bcc88768f5b04b5901113" }
+kaish-types = { git = "https://github.com/tobert/kaish", rev = "c7e71b3096d40f9bb01bcc88768f5b04b5901113" }
+kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "c7e71b3096d40f9bb01bcc88768f5b04b5901113" }

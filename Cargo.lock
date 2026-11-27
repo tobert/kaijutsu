@@ -7081,8 +7081,7 @@ dependencies = [
 [[package]]
 name = "kaish-glob"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4de7741a64b0bfe024da75dc96a266ec3ed96d77b71909e60a7398a361f014c"
+source = "git+https://github.com/tobert/kaish?rev=c7e71b3096d40f9bb01bcc88768f5b04b5901113#c7e71b3096d40f9bb01bcc88768f5b04b5901113"
 dependencies = [
  "async-trait",
  "ignore",
@@ -7093,8 +7092,7 @@ dependencies = [
 [[package]]
 name = "kaish-help"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1429361a3b89083e8dce6fbc4e41ae8492511ddb29fc3cd20f6f9b3e4fab0dbf"
+source = "git+https://github.com/tobert/kaish?rev=c7e71b3096d40f9bb01bcc88768f5b04b5901113#c7e71b3096d40f9bb01bcc88768f5b04b5901113"
 dependencies = [
  "kaish-types",
 ]
@@ -7102,8 +7100,7 @@ dependencies = [
 [[package]]
 name = "kaish-kernel"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c91e7a2bc098b323fe38b190649088819d00ef00162167b07e9f641c069ee50"
+source = "git+https://github.com/tobert/kaish?rev=c7e71b3096d40f9bb01bcc88768f5b04b5901113#c7e71b3096d40f9bb01bcc88768f5b04b5901113"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -7155,8 +7152,7 @@ dependencies = [
 [[package]]
 name = "kaish-tool-api"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db49c9906995307ac5b073082b3c8804f41b8d55e8b3be7e5c89c77873258e9f"
+source = "git+https://github.com/tobert/kaish?rev=c7e71b3096d40f9bb01bcc88768f5b04b5901113#c7e71b3096d40f9bb01bcc88768f5b04b5901113"
 dependencies = [
  "async-trait",
  "clap",
@@ -7221,8 +7217,7 @@ dependencies = [
 [[package]]
 name = "kaish-types"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d06b0e13f0c3f7f6edc8e66f095d3cbfd382d6283bd898fd77e8ad801ebc3e0b"
+source = "git+https://github.com/tobert/kaish?rev=c7e71b3096d40f9bb01bcc88768f5b04b5901113#c7e71b3096d40f9bb01bcc88768f5b04b5901113"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -7235,8 +7230,7 @@ dependencies = [
 [[package]]
 name = "kaish-vfs"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317f38604ab4ff1aed038d9cf6a1c62d4f48fd34a80741438ffb0551ce59f9d7"
+source = "git+https://github.com/tobert/kaish?rev=c7e71b3096d40f9bb01bcc88768f5b04b5901113#c7e71b3096d40f9bb01bcc88768f5b04b5901113"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
