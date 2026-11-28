@@ -36,32 +36,20 @@ use super::super::types::ToolContent;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShellParams {
-    /// kaish command to run in your current kernel context.
+    /// kaish command to run in this context.
     pub command: String,
-    /// Optional standard input fed to the first stdin-reading command in
-    /// `command` (e.g. `jq '.name'`, `grep foo`, `patch`). Lets you pipe a
-    /// payload you already have — a generated document, a block's text — into a
-    /// pipeline without first writing a temp file. A command that reads no
-    /// stdin ignores it.
+    /// Optional stdin fed to the first stdin-reading command (e.g. `jq '.name'`,
+    /// `grep foo`, `patch`). Ignored if nothing reads stdin.
     #[serde(default)]
     pub stdin: Option<String>,
-    /// Return immediately with an operation receipt instead of waiting for
-    /// command completion and result hooks. Defaults to `false`, which waits:
-    /// a result review then returns a pending refusal; inspect its captured
-    /// and final results with `kj ledger show` after the reviewer answers.
-    ///
-    /// Pass `true` for long-running work: an asynchronous command runs the
-    /// same complete kaish program as a call that waits, with the same
-    /// context identity, tools, mounts, variables, working directory, and
-    /// external-command policy. It returns a stable operation receipt
-    /// without waiting for completion; read, wait, or cancel it through the
-    /// shell operation API.
+    /// Return immediately with an operation ID instead of waiting. Default
+    /// `false` (waits for completion). Use `true` for long-running work, then
+    /// collect results with `kj wait --operation '<id>'` or
+    /// `read_shell_operation`.
     #[serde(default)]
     pub run_in_background: bool,
-    /// Milliseconds a command that waits may run before it is killed; what
-    /// it printed until then is returned. Defaults to 600000 (10 minutes),
-    /// at most 3600000 (1 hour). For longer work, pass
-    /// `run_in_background: true`.
+    /// Milliseconds a waiting command may run before being killed (default
+    /// 600000, max 3600000). Use `run_in_background: true` for longer work.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -84,21 +72,23 @@ pub(crate) fn resolve_command_timeout(
     }
 }
 
-// What the shell is, in a few sentences every request carries. Models
-// already write good shell and JSON, so the description invites the shell
-// they know and leans on kaish to refuse a program that does not parse.
-// Language detail stays in `help`, and the text describes kaish by what it
-// is, never by another shell.
-const ABOUT_KAISH: &str = "The shell is kaish (会sh): familiar shell syntax \
-     with a JSON data model. Write the shell you know. kaish parses the whole \
-     program before running any of it; when a command does not parse, it is \
-     refused without running. Quote any word holding more than letters, \
-     digits, and `_ . - / @ + ^ ~`: double quotes when it holds a variable, \
-     single quotes to keep it literal. Builtins such as grep, sed, awk, find, \
-     jq, and glob run inside the shell and print JSON with `--json`; other \
-     programs run from PATH. Put multi-step work in a script file and run the \
-     file. `help` lists topics; `help <command>` explains one. `kj help` covers \
-     contexts, drift, and forks.";
+// Shared kaish syntax and discovery rules carried by both `shell` and
+// `shell_readonly`. Anything specific to writable execution (PATH programs,
+// script files, gate/guard) stays in the writable prefix so `shell_readonly`
+// never contradicts itself.
+const ABOUT_KAISH_CORE: &str = "The shell is kaish (会sh): familiar shell syntax \
+     with a JSON data model. kaish parses the whole command before running any \
+     of it; syntax errors fail without running.\n\n\
+     Examples:\n\
+     - `grep -rn 'fn foo(' src/ | head -n 40` — single-quote literals with \
+     spaces or punctuation (anything outside letters, digits, and \
+     `_ . - / @ + ^ ~`).\n\
+     - `echo \"$DIR/out\"` — double-quote strings with variables.\n\
+     - `find src -name '*.rs' --json | jq 'length'` — builtins (`cat`, `grep`, \
+     `sed`, `awk`, `find`, `jq`, `glob`) run in-process and emit JSON with \
+     `--json`.\n\n\
+     Run `help` for topics, `help <command>` for one builtin, and `kj help` \
+     for contexts, drift, forks, and boards.";
 
 // What a model turn reads after a command (`ShellEnvelope::model_text`),
 // with the preview limit of the context that lists the tool.
@@ -126,22 +116,29 @@ fn result_contract(limit: PreviewLimit) -> String {
     )
 }
 
-/// The tool description of `shell_write`, or of `shell` when `read_only`, for
-/// a context whose preview limit is `limit`.
+/// The tool description of `shell`, or of `shell_readonly` when `read_only`,
+/// for a context whose preview limit is `limit`.
 fn description(read_only: bool, limit: PreviewLimit) -> String {
     if !read_only {
-        return format!("Run a command in your current kernel context. {ABOUT_KAISH}\n\n{}", result_contract(limit));
+        return format!(
+            "Run a command in this context. Read-only builtins and `kj` reads \
+             run immediately; writes and host commands on PATH pass the \
+             approval gate. Never wrap commands in `sh -c`, `bash -c`, or \
+             `python3 -c` — write kaish directly, or put multi-step work in a \
+             script file, check it with `kaish-validate file.kai`, and run the \
+             file.\n\n{ABOUT_KAISH_CORE}\n\n{}",
+            result_contract(limit)
+        );
     }
-    // The model sees the policy alongside kaish syntax, without pointing it at
-    // `shell_write` (read-only seats do not hold `shell_write`).
+    // Read-only seats do not hold `shell`; keep the description self-consistent
+    // without advertising PATH execution or script file creation.
     format!(
-        "Run a READ-ONLY command in your current kernel context. Submitted \
-         commands cannot mutate shared state. File writes, external commands, \
-         mutating `kj` verbs, editor input, `curl`, and MCP calls are refused \
-         in this read-only shell. `which` finds host programs on PATH \
-         (read-only cannot run them). Inspect with filesystem builtins \
-         (`cat`, `grep`, `find`), `/v/docs`, and read-only `kj` \
-         commands.\n\n{ABOUT_KAISH}\n\n{}",
+        "Run a READ-ONLY command in this context. Cannot modify files, run \
+         host programs on PATH, or run mutating `kj` verbs, `curl`, `vi`, or \
+         MCP tools. Use filesystem builtins (`cat`, `grep`, `find`, `glob`, \
+         `sed`, `awk`, `jq`), read-only `git` (`git status`, `git diff`, \
+         `git log`), `/v/docs`, and read-only `kj` commands. `which` locates \
+         host programs on PATH without running them.\n\n{ABOUT_KAISH_CORE}\n\n{}",
         result_contract(limit)
     )
 }
@@ -433,6 +430,13 @@ mod tests {
             let description = tool.description.as_deref().unwrap();
             assert!(!description.contains("/v/input"), "{}: {description}", tool.name);
             assert!(!tool.input_schema.to_string().contains("/v/input"));
+            if tool.name == ShellServer::TOOL_READONLY {
+                assert!(!description.contains("script file"), "read-only shell must not suggest writing script files: {description}");
+                assert!(description.contains("git status"), "read-only shell should advertise read-only git: {description}");
+            } else {
+                assert!(description.contains("kaish-validate"), "writable shell should advertise kaish-validate: {description}");
+                assert!(description.contains("sh -c"), "writable shell should warn against sh -c wrappers: {description}");
+            }
             println!("{} description: {description}\nschema: {}", tool.name, tool.input_schema);
         }
     }
